@@ -188,6 +188,7 @@ async def whatsapp_webhook(request: Request, background_tasks: BackgroundTasks):
     try:
         payload = await request.json()
         logger.info(f"Webhook recebido: {payload.get('event')}")
+        logger.info(f"Payload completo: {payload}")  # DEBUG: Ver payload completo
         
         # Verificar se é mensagem recebida (não enviada por nós)
         event = payload.get('event', '')
