@@ -2,6 +2,7 @@
 Configurações da aplicação carregadas de variáveis de ambiente.
 """
 from pydantic_settings import BaseSettings
+from pydantic import Field
 from typing import Optional
 
 
@@ -11,10 +12,10 @@ class Settings(BaseSettings):
     # Anthropic API (Claude)
     anthropic_api_key: str
     
-    # Evolution API (WhatsApp)
-    evolution_api_url: str
-    evolution_api_key: str
-    evolution_instance_name: str = "clinica-bot"
+    # Evolution API (WhatsApp) - usando Wasender
+    evolution_api_url: str = Field(..., env="WASENDER_URL")
+    evolution_api_key: str = Field(..., env="WASENDER_API_KEY")
+    evolution_instance_name: str = Field(default="clinica-bot", env="WASENDER_PROJECT_NAME")
     
     # Google Calendar
     google_calendar_id: str
