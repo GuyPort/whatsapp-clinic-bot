@@ -196,8 +196,9 @@ async def whatsapp_webhook(request: Request, background_tasks: BackgroundTasks):
             return {"status": "ignored", "reason": "not a message event"}
         
         data = payload.get('data', {})
-        key = data.get('key', {})
-        message_data = data.get('message', {})
+        messages = data.get('messages', {})
+        key = messages.get('key', {})
+        message_data = messages.get('message', {})
         
         # Ignorar mensagens enviadas por nós
         if key.get('fromMe', False):
