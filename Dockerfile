@@ -27,6 +27,6 @@ EXPOSE 8000
 # Variável de ambiente
 ENV PYTHONUNBUFFERED=1
 
-# Comando para rodar
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Comando para rodar - CORRIGIDO para usar run.py
+CMD ["python", "run.py"]
 
