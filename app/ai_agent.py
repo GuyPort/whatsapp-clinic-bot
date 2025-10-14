@@ -9,7 +9,7 @@ from anthropic import Anthropic
 
 from sqlalchemy.orm import Session
 
-from app.config import settings
+from app.simple_config import settings
 from app.models import (
     Patient, Appointment, ConversationContext,
     AppointmentStatus, ConversationState

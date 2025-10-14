@@ -7,7 +7,7 @@ from contextlib import contextmanager
 from typing import Generator
 import os
 
-from app.config import settings
+from app.simple_config import settings
 from app.models import Base
 
 

@@ -7,7 +7,7 @@ import json
 import pytz
 from typing import Optional, Dict, Any
 
-from app.config import settings
+from app.simple_config import settings
 
 
 def get_brazil_timezone():

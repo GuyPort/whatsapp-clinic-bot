@@ -11,7 +11,7 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 import pytz
 
-from app.config import settings
+from app.simple_config import settings
 from app.utils import get_brazil_timezone
 
 logger = logging.getLogger(__name__)
