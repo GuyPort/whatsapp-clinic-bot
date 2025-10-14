@@ -191,7 +191,7 @@ async def whatsapp_webhook(request: Request, background_tasks: BackgroundTasks):
         
         # Verificar se é mensagem recebida (não enviada por nós)
         event = payload.get('event', '')
-        if event != 'messages.upsert':
+        if event not in ['messages.upsert', 'messages.received']:
             return {"status": "ignored", "reason": "not a message event"}
         
         data = payload.get('data', {})
