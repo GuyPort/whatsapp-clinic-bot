@@ -1,0 +1,55 @@
+{
+  "nome_clinica": "Clínica Exemplo",
+  "medica_responsavel": "Dra. Maria Silva",
+  "especialidade": "Dermatologia",
+  "endereco": "Rua Exemplo, 123 - Centro - Cidade/UF - CEP 12345-678",
+  "telefone_contato": "(11) 91234-5678",
+  "email": "contato@clinicaexemplo.com.br",
+  
+  "horario_funcionamento": {
+    "segunda": "08:00-18:00",
+    "terca": "08:00-18:00",
+    "quarta": "08:00-18:00",
+    "quinta": "08:00-18:00",
+    "sexta": "08:00-18:00",
+    "sabado": "08:00-12:00",
+    "domingo": "FECHADO"
+  },
+  
+  "tipos_consulta": [
+    {
+      "tipo": "Consulta Dermatológica",
+      "duracao_minutos": 30,
+      "valor_particular": 350.00,
+      "convenios_aceitos": ["particular", "unimed", "bradesco saúde"]
+    },
+    {
+      "tipo": "Retorno",
+      "duracao_minutos": 20,
+      "valor_particular": 200.00,
+      "convenios_aceitos": ["particular", "unimed", "bradesco saúde"]
+    },
+    {
+      "tipo": "Procedimento Estético",
+      "duracao_minutos": 60,
+      "valor_particular": 600.00,
+      "convenios_aceitos": ["particular"]
+    }
+  ],
+  
+  "regras_agendamento": {
+    "dias_minimos_antecedencia": 2,
+    "intervalo_entre_consultas_minutos": 15,
+    "horario_primeira_consulta": "08:00",
+    "horario_ultima_consulta": "17:30",
+    "horario_ultima_consulta_sabado": "11:30"
+  },
+  
+  "informacoes_adicionais": {
+    "estacionamento": "Estacionamento gratuito no local",
+    "acessibilidade": "Clínica com acesso para cadeirantes",
+    "formas_pagamento": ["Dinheiro", "Cartão de crédito", "Cartão de débito", "Pix"],
+    "politica_cancelamento": "Cancelamentos devem ser feitos com no mínimo 24 horas de antecedência"
+  }
+}
+
