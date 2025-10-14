@@ -59,19 +59,25 @@ if __name__ == "__main__":
     print("🤖 WhatsApp Clinic Bot")
     print("=" * 50)
     
-    if not check_environment():
+    print("🔍 Verificando ambiente...")
+    check_environment()
+    
+    print("🚀 Iniciando servidor Uvicorn...")
+    try:
+        port = int(os.getenv("PORT", 8000))
+        print(f"📡 Porta configurada: {port}")
+        
+        print("🔄 Iniciando FastAPI...")
+        uvicorn.run(
+            "app.main:app",
+            host="0.0.0.0",
+            port=port,
+            reload=False,  # Desabilitado para produção
+            log_level="info"
+        )
+    except Exception as e:
+        print(f"❌ ERRO FATAL ao iniciar o servidor Uvicorn: {e}")
+        import traceback
+        traceback.print_exc()
         sys.exit(1)
-    
-    print("✅ Ambiente configurado!")
-    print("🚀 Iniciando servidor...\n")
-    
-    # Rodar servidor - CORRIGIDO para funcionar no Railway
-    port = int(os.getenv("PORT", 8000))
-    uvicorn.run(
-        "app.main:app",
-        host="0.0.0.0",
-        port=port,
-        reload=False,  # Desabilitado para produção
-        log_level="info"
-    )
 
