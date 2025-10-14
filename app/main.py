@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager
 import logging
 from typing import Dict, Any
 
-from app.config_new import settings
+from app.simple_config import settings
 from app.database import init_db, get_db
 from app.ai_agent import ai_agent
 from app.whatsapp_service import whatsapp_service
