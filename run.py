@@ -41,12 +41,13 @@ if __name__ == "__main__":
     print("✅ Ambiente configurado!")
     print("🚀 Iniciando servidor...\n")
     
-    # Rodar servidor
+    # Rodar servidor - CORRIGIDO para funcionar no Railway
+    port = int(os.getenv("PORT", 8000))
     uvicorn.run(
         "app.main:app",
         host="0.0.0.0",
-        port=8000,
-        reload=True,
+        port=port,
+        reload=False,  # Desabilitado para produção
         log_level="info"
     )
 
