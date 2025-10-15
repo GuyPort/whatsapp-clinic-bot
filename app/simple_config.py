@@ -8,14 +8,8 @@ import os
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 WASENDER_URL_RAW = os.getenv("WASENDER_URL", "")
 
-# CORREÇÃO DEFINITIVA DA URL
-if WASENDER_URL_RAW.startswith("ttps://"):
-    EVOLUTION_API_URL = WASENDER_URL_RAW.replace("ttps://", "https://")
-else:
-    EVOLUTION_API_URL = WASENDER_URL_RAW
-
-# Remover /api/send-message se existir
-EVOLUTION_API_URL = EVOLUTION_API_URL.rstrip("/api/send-message/").rstrip("/")
+# CORREÇÃO DEFINITIVA DA URL - HARDCODED
+EVOLUTION_API_URL = "https://wasenderapi.com"
 
 EVOLUTION_API_KEY = os.getenv("WASENDER_API_KEY")
 EVOLUTION_INSTANCE_NAME = os.getenv("WASENDER_PROJECT_NAME", "clinica-bot")
