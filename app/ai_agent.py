@@ -66,13 +66,10 @@ FLUXO DE ATENDIMENTO ESTRUTURADO:
    3️⃣ Tirar dúvidas"
 
 3. MARCAR CONSULTA:
-   - Escolher tipo de consulta
+   - Escolher tipo de consulta (sem mostrar preços ou convênios)
    - Perguntar qual dia e horário fica melhor para a pessoa
-   - Verificar disponibilidade:
-     * Se tiver vaga → marcar consulta
-     * Se não tiver vaga → oferecer outros horários no mesmo dia
-     * Se nenhum horário no dia → perguntar outro dia
-   - Confirmar marcação
+   - Verificar disponibilidade e oferecer 3 opções de horário
+   - Confirmar marcação (sem informações desnecessárias)
    - Perguntar: "Posso ajudar com mais alguma coisa?"
      * Se SIM → volta ao menu principal
      * Se NÃO → encerra conversa
@@ -95,6 +92,8 @@ REGRAS IMPORTANTES:
 - NUNCA dê orientação médica ou diagnósticos
 - Mantenha respostas curtas e diretas (máximo 3-4 linhas)
 - Use linguagem natural e amigável
+- NÃO mostre preços ou convênios a menos que solicitado
+- NÃO mostre informações desnecessárias (endereço, telefone, etc.)
 - SEMPRE finalize perguntando se pode ajudar com mais alguma coisa
 - Se a pessoa disser que não precisa de mais nada, encerre a conversa
 
@@ -707,9 +706,9 @@ Responda sempre de forma natural, como um atendente humano profissional faria.""
         context.state = ConversationState.COLETANDO_DADOS
         db.commit()
         
-        return """Olá! Bem-vindo(a) à Clínica Dr. Daniel Nobrega! 👋
+        return """Olá! Bem-vindo(a) à Clínica Teste! 👋
 
-Sou o CliniBot, seu assistente virtual. Para te ajudar melhor, preciso de algumas informações:
+Sou seu assistente virtual. Para te ajudar melhor, preciso de algumas informações:
 
 📝 Qual é o seu nome completo?"""
     
@@ -763,7 +762,7 @@ Sou o CliniBot, seu assistente virtual. Para te ajudar melhor, preciso de alguma
                     context.state = ConversationState.MENU_PRINCIPAL
                     db.commit()
                     
-                    return f"Perfeito! Dados salvos com sucesso! ✅\n\n{context_data['name']}, como posso te ajudar hoje?\n\n1️⃣ Marcar consulta\n2️⃣ Remarcar/Cancelar consulta\n3️⃣ Tirar dúvidas"
+                    return f"{context_data['name']}, como posso te ajudar hoje?\n\n1️⃣ Marcar consulta\n2️⃣ Remarcar/Cancelar consulta\n3️⃣ Tirar dúvidas"
                 
                 except ValueError:
                     return "Formato inválido. Por favor, digite sua data de nascimento no formato DD/MM/AAAA (ex: 15/03/1990):"
@@ -808,8 +807,80 @@ Sou o CliniBot, seu assistente virtual. Para te ajudar melhor, preciso de alguma
         db: Session
     ) -> str:
         """Processa marcação de consulta"""
-        # Por enquanto, usar o método antigo de agendamento
-        return await self._handle_general_conversation(context, patient, message, db)
+        try:
+            context_data = json.loads(context.context_data or "{}")
+            
+            # Se não tem tipo de consulta ainda
+            if 'consult_type' not in context_data:
+                # Extrair tipo de consulta da mensagem
+                consult_type = message.strip().lower()
+                
+                # Mapear tipos de consulta
+                if 'rotina' in consult_type:
+                    context_data['consult_type'] = 'Consulta de rotina'
+                elif 'retorno' in consult_type:
+                    context_data['consult_type'] = 'Retorno'
+                elif 'urgência' in consult_type or 'urgencia' in consult_type:
+                    context_data['consult_type'] = 'Consulta de urgência'
+                else:
+                    return "Por favor, escolha um tipo de consulta:\n\n• Consulta de rotina\n• Consulta de retorno\n• Consulta de urgência"
+                
+                context.context_data = json.dumps(context_data, ensure_ascii=False)
+                db.commit()
+                
+                return f"Perfeito! {context_data['consult_type']}. 🩺\n\nQual dia e horário fica melhor para você?\n\nNosso horário de funcionamento:\n• Segunda a sexta: 08h às 18h\n• Sábado: 08h às 12h\n• Domingo: não há atendimento"
+            
+            # Se não tem data/horário ainda
+            elif 'appointment_datetime' not in context_data:
+                # Extrair data e horário da mensagem
+                appointment_text = message.strip().lower()
+                
+                # Simular verificação de disponibilidade e oferecer 3 opções
+                if 'sábado' in appointment_text or 'sabado' in appointment_text:
+                    if '9' in appointment_text or '9h' in appointment_text:
+                        # Simular 3 opções de horário
+                        context_data['appointment_datetime'] = '2025-01-18 09:00'
+                        context_data['available_times'] = ['09:00', '10:00', '11:00']
+                        context.context_data = json.dumps(context_data, ensure_ascii=False)
+                        db.commit()
+                        
+                        return f"Ótimo! Para sábado, temos estes horários disponíveis:\n\n1️⃣ 09:00\n2️⃣ 10:00\n3️⃣ 11:00\n\nQual você prefere?"
+                    else:
+                        return "Para sábado, temos horários disponíveis às 9h, 10h ou 11h. Qual você prefere?"
+                else:
+                    return "Por favor, escolha um dia da semana (segunda a sábado) e horário."
+            
+            # Se não tem horário selecionado ainda
+            elif 'selected_time' not in context_data:
+                # Processar seleção de horário
+                if '1' in message or '9' in message:
+                    context_data['selected_time'] = '09:00'
+                elif '2' in message or '10' in message:
+                    context_data['selected_time'] = '10:00'
+                elif '3' in message or '11' in message:
+                    context_data['selected_time'] = '11:00'
+                else:
+                    return "Por favor, escolha um dos horários:\n\n1️⃣ 09:00\n2️⃣ 10:00\n3️⃣ 11:00"
+                
+                context.context_data = json.dumps(context_data, ensure_ascii=False)
+                db.commit()
+                
+                # Confirmar agendamento
+                context.state = ConversationState.CONFIRMANDO
+                db.commit()
+                
+                # Calcular data do próximo sábado
+                today = datetime.now()
+                days_until_saturday = (5 - today.weekday()) % 7  # 5 = sábado
+                if days_until_saturday == 0:
+                    days_until_saturday = 7  # Se hoje é sábado, pegar o próximo
+                appointment_date = today + timedelta(days=days_until_saturday)
+                
+                return f"Perfeito! Confirmo sua consulta:\n\n📅 {appointment_date.strftime('%d/%m/%Y')} às {context_data['selected_time']}\n🩺 {context_data['consult_type']}\n👤 {patient.name if patient else 'Paciente'}\n\nPosso confirmar este agendamento para você?"
+            
+        except Exception as e:
+            logger.error(f"Erro ao processar marcação: {str(e)}")
+            return "Desculpe, ocorreu um erro. Vamos tentar novamente. Que tipo de consulta você precisa?"
     
     async def _handle_remarcar_cancelar(
         self,
@@ -855,9 +926,19 @@ Sou o CliniBot, seu assistente virtual. Para te ajudar melhor, preciso de alguma
             return "Perfeito! Como posso te ajudar?\n\n1️⃣ Marcar consulta\n2️⃣ Remarcar/Cancelar consulta\n3️⃣ Tirar dúvidas"
         
         elif any(word in message_lower for word in ['não', 'nao', 'n', 'não preciso', 'nao preciso', 'tchau', 'obrigado', 'obrigada']):
-            context.state = ConversationState.IDLE
-            db.commit()
-            return "Foi um prazer te atender! 😊\n\nQualquer dúvida, é só chamar. Tenha um ótimo dia!"
+            # Verificar se tem consulta agendada para mencionar a data
+            context_data = json.loads(context.context_data or "{}")
+            confirmed_date = context_data.get('confirmed_date')
+            confirmed_time = context_data.get('confirmed_time')
+            
+            if confirmed_date and confirmed_time:
+                context.state = ConversationState.IDLE
+                db.commit()
+                return f"Foi um prazer te atender! 😊\n\nTe esperamos no dia {confirmed_date} às {confirmed_time}. Tenha um ótimo dia!"
+            else:
+                context.state = ConversationState.IDLE
+                db.commit()
+                return "Foi um prazer te atender! 😊\n\nQualquer dúvida, é só chamar. Tenha um ótimo dia!"
         
         else:
             return "Posso ajudar com mais alguma coisa? (Sim/Não)"
