@@ -24,6 +24,8 @@ logger.info(f"WASENDER_URL original: {WASENDER_URL_RAW}")
 logger.info(f"EVOLUTION_API_URL processada: {EVOLUTION_API_URL}")
 logger.info(f"EVOLUTION_INSTANCE_NAME: {EVOLUTION_INSTANCE_NAME}")
 logger.info(f"EVOLUTION_API_KEY: {EVOLUTION_API_KEY[:10] if EVOLUTION_API_KEY else 'None'}...")
+logger.info(f"URL contém ttps://: {'ttps://' in WASENDER_URL_RAW}")
+logger.info(f"URL após replace: {WASENDER_URL_RAW.replace('ttps://', 'https://')}")
 logger.info(f"=========================")
 
 # Classe simples para compatibilidade
