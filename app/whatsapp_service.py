@@ -39,7 +39,7 @@ class WhatsAppService:
             True se enviado com sucesso, False caso contrário
         """
         try:
-            url = f"{self.base_url}/message/sendText/{self.instance_name}"
+            url = f"{self.base_url}/api/send-message/message/sendText/{self.instance_name}"
             
             # Garantir que o número está no formato correto
             if not phone.endswith('@s.whatsapp.net'):
@@ -78,7 +78,7 @@ class WhatsAppService:
             True se enviado com sucesso
         """
         try:
-            url = f"{self.base_url}/message/sendButtons/{self.instance_name}"
+            url = f"{self.base_url}/api/send-message/message/sendButtons/{self.instance_name}"
             
             if not phone.endswith('@s.whatsapp.net'):
                 phone = f"{phone}@s.whatsapp.net"
@@ -114,7 +114,7 @@ class WhatsAppService:
             Dicionário com status da instância
         """
         try:
-            url = f"{self.base_url}/instance/connectionState/{self.instance_name}"
+            url = f"{self.base_url}/api/send-message/instance/connectionState/{self.instance_name}"
             
             async with httpx.AsyncClient(timeout=10.0) as client:
                 response = await client.get(url, headers=self.headers)
@@ -140,7 +140,7 @@ class WhatsAppService:
             True se marcado com sucesso
         """
         try:
-            url = f"{self.base_url}/chat/markMessageAsRead/{self.instance_name}"
+            url = f"{self.base_url}/api/send-message/chat/markMessageAsRead/{self.instance_name}"
             
             if not phone.endswith('@s.whatsapp.net'):
                 phone = f"{phone}@s.whatsapp.net"
