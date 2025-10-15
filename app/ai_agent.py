@@ -19,7 +19,7 @@ from app.utils import (
     extract_date_from_message, parse_date_br, is_valid_birth_date,
     format_datetime_br, detect_frustration_keywords,
     detect_inappropriate_language, now_brazil, format_currency,
-    parse_weekday_from_message
+    parse_weekday_from_message, get_brazil_timezone
 )
 from app.appointment_rules import appointment_rules
 from app.calendar_service import calendar_service
@@ -188,7 +188,12 @@ Responda sempre de forma natural, como um atendente humano profissional faria.""
         
         # Reset se última interação foi há mais de 1 hora
         if context.last_message_at:
-            time_diff = now_brazil() - context.last_message_at
+            # Garantir que ambos os datetimes tenham timezone
+            last_msg = context.last_message_at
+            if last_msg.tzinfo is None:
+                last_msg = get_brazil_timezone().localize(last_msg)
+            
+            time_diff = now_brazil() - last_msg
             if time_diff > timedelta(hours=1):
                 context.state = ConversationState.IDLE
                 context.context_data = "{}"
