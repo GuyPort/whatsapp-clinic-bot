@@ -7,6 +7,12 @@ import os
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 EVOLUTION_API_URL = os.getenv("WASENDER_URL", "").replace("ttps://", "https://").rstrip("/api/send-message/").rstrip("/")
 EVOLUTION_API_KEY = os.getenv("WASENDER_API_KEY")
+
+# Debug: Log da URL para verificar
+import logging
+logger = logging.getLogger(__name__)
+logger.info(f"WASENDER_URL original: {os.getenv('WASENDER_URL', '')}")
+logger.info(f"EVOLUTION_API_URL processada: {EVOLUTION_API_URL}")
 EVOLUTION_INSTANCE_NAME = os.getenv("WASENDER_PROJECT_NAME", "clinica-bot")
 GOOGLE_CALENDAR_ID = os.getenv("GOOGLE_CALENDAR_ID")
 GOOGLE_SERVICE_ACCOUNT_FILE = "google-credentials.json"

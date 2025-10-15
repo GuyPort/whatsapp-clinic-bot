@@ -21,6 +21,11 @@ class WhatsAppService:
             "apikey": self.api_key,
             "Content-Type": "application/json"
         }
+        
+        # Debug: Log das configurações
+        logger.info(f"WhatsAppService - base_url: {self.base_url}")
+        logger.info(f"WhatsAppService - instance_name: {self.instance_name}")
+        logger.info(f"WhatsAppService - api_key: {self.api_key[:10]}...")
     
     async def send_message(self, phone: str, message: str) -> bool:
         """
