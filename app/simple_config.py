@@ -30,6 +30,7 @@ logger.info(f"EVOLUTION_INSTANCE_NAME: {EVOLUTION_INSTANCE_NAME}")
 logger.info(f"EVOLUTION_API_KEY: {EVOLUTION_API_KEY[:10] if EVOLUTION_API_KEY else 'None'}...")
 logger.info(f"URL contém ttps://: {'ttps://' in WASENDER_URL_RAW}")
 logger.info(f"URL após replace: {WASENDER_URL_RAW.replace('ttps://', 'https://')}")
+logger.info(f"WASENDER_PROJECT_NAME env: {os.getenv('WASENDER_PROJECT_NAME', 'NÃO DEFINIDO')}")
 logger.info(f"===============================================")
 
 # Classe simples para compatibilidade
