@@ -5,7 +5,7 @@ import os
 
 # Configurações carregadas diretamente das variáveis de ambiente
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
-EVOLUTION_API_URL = os.getenv("WASENDER_URL", "").replace("ttps://", "https://")
+EVOLUTION_API_URL = os.getenv("WASENDER_URL", "").replace("ttps://", "https://").rstrip("/api/send-message/").rstrip("/")
 EVOLUTION_API_KEY = os.getenv("WASENDER_API_KEY")
 EVOLUTION_INSTANCE_NAME = os.getenv("WASENDER_PROJECT_NAME", "clinica-bot")
 GOOGLE_CALENDAR_ID = os.getenv("GOOGLE_CALENDAR_ID")
