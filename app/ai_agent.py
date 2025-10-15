@@ -192,7 +192,7 @@ Responda sempre de forma natural, como um atendente humano profissional faria.""
         if not context:
             context = ConversationContext(
                 phone=phone,
-                state=ConversationState.IDLE,
+                state=ConversationState.BOAS_VINDAS,
                 context_data="{}",
                 message_count=0
             )
@@ -222,30 +222,30 @@ Responda sempre de forma natural, como um atendente humano profissional faria.""
     ) -> str:
         """Processa mensagem baseado no estado da conversa"""
         
-        # Se está em processo de agendamento estruturado
-        if context.state == ConversationState.ASKING_NAME:
-            return await self._handle_name_input(context, message, db)
+        # Fluxo estruturado de atendimento
+        if context.state == ConversationState.BOAS_VINDAS:
+            return await self._handle_boas_vindas(context, message, db)
         
-        elif context.state == ConversationState.ASKING_BIRTH_DATE:
-            return await self._handle_birth_date_input(context, patient, message, db)
+        elif context.state == ConversationState.COLETANDO_DADOS:
+            return await self._handle_coletando_dados(context, patient, message, db)
         
-        elif context.state == ConversationState.ASKING_CONSULT_TYPE:
-            return await self._handle_consult_type_input(context, patient, message, db)
+        elif context.state == ConversationState.MENU_PRINCIPAL:
+            return await self._handle_menu_principal(context, patient, message, db)
         
-        elif context.state == ConversationState.ASKING_DAY:
-            return await self._handle_day_input(context, patient, message, db)
+        elif context.state == ConversationState.MARCAR_CONSULTA:
+            return await self._handle_marcar_consulta(context, patient, message, db)
         
-        elif context.state == ConversationState.SHOWING_TIMES:
-            return await self._handle_time_selection(context, patient, message, db)
+        elif context.state == ConversationState.REMARCAR_CANCELAR:
+            return await self._handle_remarcar_cancelar(context, patient, message, db)
         
-        elif context.state == ConversationState.CONFIRMING:
+        elif context.state == ConversationState.TIRAR_DUVIDAS:
+            return await self._handle_tirar_duvidas(context, patient, message, db)
+        
+        elif context.state == ConversationState.CONFIRMANDO:
             return await self._handle_confirmation(context, patient, message, db)
         
-        elif context.state == ConversationState.RESCHEDULING:
-            return await self._handle_rescheduling(context, patient, message, db)
-        
-        elif context.state == ConversationState.CANCELLING:
-            return await self._handle_cancelling(context, patient, message, db)
+        elif context.state == ConversationState.FINALIZANDO:
+            return await self._handle_finalizando(context, patient, message, db)
         
         # Estado IDLE ou ESCALATED: processar com Claude
         else:
@@ -694,6 +694,173 @@ Responda sempre de forma natural, como um atendente humano profissional faria.""
     ) -> str:
         """Mesmo que rescheduling, já tratado acima"""
         return await self._handle_rescheduling(context, patient, message, db)
+    
+    # ==================== NOVOS MÉTODOS PARA FLUXO ESTRUTURADO ====================
+    
+    async def _handle_boas_vindas(
+        self,
+        context: ConversationContext,
+        message: str,
+        db: Session
+    ) -> str:
+        """Mensagem de boas-vindas e início da coleta de dados"""
+        context.state = ConversationState.COLETANDO_DADOS
+        db.commit()
+        
+        return """Olá! Bem-vindo(a) à Clínica Dr. Daniel Nobrega! 👋
+
+Sou o CliniBot, seu assistente virtual. Para te ajudar melhor, preciso de algumas informações:
+
+📝 Qual é o seu nome completo?"""
+    
+    async def _handle_coletando_dados(
+        self,
+        context: ConversationContext,
+        patient: Optional[Patient],
+        message: str,
+        db: Session
+    ) -> str:
+        """Coleta nome e data de nascimento"""
+        try:
+            context_data = json.loads(context.context_data or "{}")
+            
+            # Se não tem nome ainda
+            if 'name' not in context_data:
+                # Extrair nome da mensagem
+                name = message.strip()
+                if len(name) < 2:
+                    return "Por favor, digite seu nome completo:"
+                
+                context_data['name'] = name
+                context.context_data = json.dumps(context_data, ensure_ascii=False)
+                db.commit()
+                
+                return f"Prazer em conhecê-lo(a), {name}! 😊\n\n📅 Agora preciso da sua data de nascimento (formato DD/MM/AAAA):"
+            
+            # Se não tem data de nascimento ainda
+            elif 'birth_date' not in context_data:
+                # Validar data
+                try:
+                    birth_date = datetime.strptime(message.strip(), "%d/%m/%Y").date()
+                    context_data['birth_date'] = birth_date.isoformat()
+                    context.context_data = json.dumps(context_data, ensure_ascii=False)
+                    
+                    # Criar ou atualizar paciente
+                    if not patient:
+                        patient = Patient(
+                            name=context_data['name'],
+                            phone=context.phone,
+                            birth_date=birth_date
+                        )
+                        db.add(patient)
+                    else:
+                        patient.name = context_data['name']
+                        patient.birth_date = birth_date
+                    
+                    db.commit()
+                    
+                    # Ir para menu principal
+                    context.state = ConversationState.MENU_PRINCIPAL
+                    db.commit()
+                    
+                    return f"Perfeito! Dados salvos com sucesso! ✅\n\n{context_data['name']}, como posso te ajudar hoje?\n\n1️⃣ Marcar consulta\n2️⃣ Remarcar/Cancelar consulta\n3️⃣ Tirar dúvidas"
+                
+                except ValueError:
+                    return "Formato inválido. Por favor, digite sua data de nascimento no formato DD/MM/AAAA (ex: 15/03/1990):"
+            
+        except Exception as e:
+            logger.error(f"Erro ao coletar dados: {str(e)}")
+            return "Desculpe, ocorreu um erro. Vamos tentar novamente. Qual é o seu nome completo?"
+    
+    async def _handle_menu_principal(
+        self,
+        context: ConversationContext,
+        patient: Optional[Patient],
+        message: str,
+        db: Session
+    ) -> str:
+        """Processa seleção do menu principal"""
+        message_lower = message.lower().strip()
+        
+        if '1' in message_lower or 'marcar' in message_lower or 'consulta' in message_lower:
+            context.state = ConversationState.MARCAR_CONSULTA
+            db.commit()
+            return "Ótimo! Vamos marcar sua consulta. 🩺\n\nQue tipo de consulta você precisa?\n\n• Consulta de rotina\n• Consulta de retorno\n• Consulta de urgência"
+        
+        elif '2' in message_lower or 'remarcar' in message_lower or 'cancelar' in message_lower:
+            context.state = ConversationState.REMARCAR_CANCELAR
+            db.commit()
+            return "Vou te ajudar com remarcação ou cancelamento. 🔄\n\nPrimeiro, vou buscar suas consultas agendadas..."
+        
+        elif '3' in message_lower or 'dúvida' in message_lower or 'duvida' in message_lower:
+            context.state = ConversationState.TIRAR_DUVIDAS
+            db.commit()
+            return "Claro! Estou aqui para tirar suas dúvidas. 🤔\n\nO que você gostaria de saber sobre nossa clínica?"
+        
+        else:
+            return "Por favor, escolha uma das opções:\n\n1️⃣ Marcar consulta\n2️⃣ Remarcar/Cancelar consulta\n3️⃣ Tirar dúvidas"
+    
+    async def _handle_marcar_consulta(
+        self,
+        context: ConversationContext,
+        patient: Optional[Patient],
+        message: str,
+        db: Session
+    ) -> str:
+        """Processa marcação de consulta"""
+        # Por enquanto, usar o método antigo de agendamento
+        return await self._handle_general_conversation(context, patient, message, db)
+    
+    async def _handle_remarcar_cancelar(
+        self,
+        context: ConversationContext,
+        patient: Optional[Patient],
+        message: str,
+        db: Session
+    ) -> str:
+        """Processa remarcação ou cancelamento"""
+        # Por enquanto, usar o método antigo de remarcação
+        return await self._handle_general_conversation(context, patient, message, db)
+    
+    async def _handle_tirar_duvidas(
+        self,
+        context: ConversationContext,
+        patient: Optional[Patient],
+        message: str,
+        db: Session
+    ) -> str:
+        """Processa dúvidas sobre a clínica"""
+        # Usar Claude para responder dúvidas
+        response = await self._handle_general_conversation(context, patient, message, db)
+        
+        # Após responder, perguntar se precisa de mais alguma coisa
+        context.state = ConversationState.FINALIZANDO
+        db.commit()
+        
+        return f"{response}\n\nPosso ajudar com mais alguma coisa?"
+    
+    async def _handle_finalizando(
+        self,
+        context: ConversationContext,
+        patient: Optional[Patient],
+        message: str,
+        db: Session
+    ) -> str:
+        """Finaliza conversa ou volta ao menu"""
+        message_lower = message.lower().strip()
+        
+        if any(word in message_lower for word in ['sim', 's', 'yes', 'quero', 'preciso']):
+            context.state = ConversationState.MENU_PRINCIPAL
+            db.commit()
+            return "Perfeito! Como posso te ajudar?\n\n1️⃣ Marcar consulta\n2️⃣ Remarcar/Cancelar consulta\n3️⃣ Tirar dúvidas"
+        
+        elif any(word in message_lower for word in ['não', 'nao', 'n', 'não preciso', 'nao preciso', 'tchau', 'obrigado', 'obrigada']):
+            context.state = ConversationState.IDLE
+            db.commit()
+            return "Foi um prazer te atender! 😊\n\nQualquer dúvida, é só chamar. Tenha um ótimo dia!"
+        
+        else:
+            return "Posso ajudar com mais alguma coisa? (Sim/Não)"
 
 
 # Instância global
