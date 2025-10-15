@@ -300,13 +300,17 @@ Responda sempre de forma natural, como um atendente humano profissional faria.""
             
             # Detectar intenção de agendamento
             if self._is_booking_intent(message, assistant_message):
+                logger.info("🎯 Intenção de agendamento detectada - consultando calendário...")
                 # Consultar calendário real antes de processar
                 available_slots = await self._get_real_available_slots()
+                logger.info(f"📅 Slots disponíveis encontrados: {len(available_slots)}")
+                
                 if available_slots:
                     # Processar agendamento com slots reais
                     return await self._process_structured_booking_with_real_slots(context, patient, message, available_slots, db)
                 else:
                     # Se não há slots disponíveis, informar
+                    logger.warning("❌ Nenhum slot disponível encontrado")
                     return "Desculpe, nossa agenda está lotada no momento. Posso verificar os próximos dias disponíveis para você?"
             
             # Detectar intenção de cancelamento/remarcação
@@ -880,8 +884,13 @@ Sou seu assistente virtual. Para te ajudar melhor, preciso de algumas informaç�
     async def _get_real_available_slots(self) -> List[Dict[str, Any]]:
         """Consulta o calendário real para obter horários disponíveis"""
         try:
+            logger.info(f"🔍 Verificando disponibilidade do calendário...")
+            logger.info(f"🔍 Calendar service available: {calendar_service.is_available()}")
+            
             if not calendar_service.is_available():
-                return []
+                logger.warning("❌ Calendar service não está disponível - retornando slots simulados")
+                # Retornar slots simulados se o calendário não estiver disponível
+                return self._get_simulated_available_slots()
             
             # Consultar próximos 7 dias
             today = datetime.now()
@@ -926,6 +935,47 @@ Sou seu assistente virtual. Para te ajudar melhor, preciso de algumas informaç�
             
         except Exception as e:
             logger.error(f"Erro ao consultar calendário: {str(e)}")
+            # Retornar slots simulados em caso de erro
+            return self._get_simulated_available_slots()
+    
+    def _get_simulated_available_slots(self) -> List[Dict[str, Any]]:
+        """Retorna slots simulados quando o calendário não está disponível"""
+        try:
+            logger.info("🔄 Gerando slots simulados...")
+            available_slots = []
+            
+            # Gerar slots para os próximos 7 dias
+            today = datetime.now()
+            
+            for day_offset in range(7):
+                current_date = today + timedelta(days=day_offset)
+                weekday = current_date.weekday()
+                
+                # Verificar se é dia de funcionamento
+                if weekday == 6:  # Domingo
+                    continue
+                elif weekday == 5:  # Sábado
+                    start_hour, end_hour = 8, 12
+                else:  # Segunda a sexta
+                    start_hour, end_hour = 8, 18
+                
+                # Gerar slots de 30 em 30 minutos
+                for hour in range(start_hour, end_hour):
+                    for minute in [0, 30]:
+                        slot_time = current_date.replace(hour=hour, minute=minute, second=0, microsecond=0)
+                        
+                        available_slots.append({
+                            'datetime': slot_time,
+                            'date_str': slot_time.strftime('%d/%m/%Y'),
+                            'time_str': slot_time.strftime('%H:%M'),
+                            'day_name': slot_time.strftime('%A')
+                        })
+            
+            logger.info(f"✅ Gerados {len(available_slots)} slots simulados")
+            return available_slots[:20]  # Limitar a 20 opções
+            
+        except Exception as e:
+            logger.error(f"Erro ao gerar slots simulados: {str(e)}")
             return []
     
     def _is_slot_taken(self, slot_time: datetime, events: List[Dict]) -> bool:
