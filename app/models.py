@@ -20,14 +20,14 @@ class AppointmentStatus(enum.Enum):
 class ConversationState(enum.Enum):
     """Estados possíveis da conversa"""
     IDLE = "idle"                           # Sem conversa ativa
-    ASKING_NAME = "asking_name"             # Perguntando nome
-    ASKING_BIRTH_DATE = "asking_birth_date" # Perguntando data de nascimento
-    ASKING_DAY = "asking_day"               # Perguntando dia preferido
-    SHOWING_TIMES = "showing_times"         # Mostrando horários disponíveis
-    CONFIRMING = "confirming"               # Confirmando agendamento
-    ASKING_CONSULT_TYPE = "asking_consult_type"  # Perguntando tipo de consulta
-    RESCHEDULING = "rescheduling"           # Processo de remarcar
-    CANCELLING = "cancelling"               # Processo de cancelar
+    BOAS_VINDAS = "boas_vindas"             # Mensagem de boas-vindas
+    COLETANDO_DADOS = "coletando_dados"     # Coletando nome e data de nascimento
+    MENU_PRINCIPAL = "menu_principal"       # Mostrando menu principal
+    MARCAR_CONSULTA = "marcar_consulta"     # Processo de marcar consulta
+    REMARCAR_CANCELAR = "remarcar_cancelar" # Processo de remarcar/cancelar
+    TIRAR_DUVIDAS = "tirar_duvidas"        # Processo de tirar dúvidas
+    CONFIRMANDO = "confirmando"             # Confirmando agendamento
+    FINALIZANDO = "finalizando"             # Finalizando conversa
     ESCALATED = "escalated"                 # Escalado para humano
 
 
