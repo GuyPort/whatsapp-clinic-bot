@@ -205,7 +205,14 @@ async def whatsapp_webhook(request: Request, background_tasks: BackgroundTasks):
             return {"status": "ignored", "reason": "message from bot"}
         
         # Extrair informações
-        phone = key.get('remoteJid', '').replace('@s.whatsapp.net', '')
+        phone = key.get('remoteJid', '')
+        
+        # Ignorar mensagens de newsletter e grupos
+        if '@newsletter' in phone or '@g.us' in phone:
+            logger.info(f"Ignorando mensagem de newsletter/grupo: {phone}")
+            return {"status": "ignored", "reason": "newsletter or group message"}
+        
+        phone = phone.replace('@s.whatsapp.net', '')
         
         # Extrair texto da mensagem
         message_text = None
