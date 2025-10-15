@@ -8,6 +8,13 @@ import logging
 from typing import Dict, Any
 
 from app.simple_config import settings
+
+# Debug: Log das configurações no startup
+logger.info("=== STARTUP DEBUG ===")
+logger.info(f"Evolution API URL: {settings.evolution_api_url}")
+logger.info(f"Instance Name: {settings.evolution_instance_name}")
+logger.info(f"API Key: {settings.evolution_api_key[:10] if settings.evolution_api_key else 'None'}...")
+logger.info("===================")
 from app.database import init_db, get_db
 from app.ai_agent import ai_agent
 from app.whatsapp_service import whatsapp_service

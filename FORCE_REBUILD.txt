@@ -1,0 +1,2 @@
+Este arquivo força o Railway a fazer rebuild completo
+Timestamp: 2025-10-15 14:47:00

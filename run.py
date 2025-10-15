@@ -58,9 +58,18 @@ def check_environment():
 if __name__ == "__main__":
     print("🤖 WhatsApp Clinic Bot")
     print("=" * 50)
+    print("🚀 FORCE REBUILD - 2025-10-15 14:47:00")
+    print("=" * 50)
     
     print("🔍 Verificando ambiente...")
     check_environment()
+    
+    # Debug: Mostrar configurações
+    print("🔧 CONFIGURAÇÕES DEBUG:")
+    print(f"WASENDER_URL: {os.getenv('WASENDER_URL', 'NÃO DEFINIDO')}")
+    print(f"WASENDER_API_KEY: {os.getenv('WASENDER_API_KEY', 'NÃO DEFINIDO')[:10]}...")
+    print(f"WASENDER_PROJECT_NAME: {os.getenv('WASENDER_PROJECT_NAME', 'NÃO DEFINIDO')}")
+    print("=" * 50)
     
     print("🚀 Iniciando servidor Uvicorn...")
     try:
