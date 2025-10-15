@@ -23,6 +23,13 @@ TIMEZONE = "America/Sao_Paulo"
 # Debug: Log das configurações
 import logging
 logger = logging.getLogger(__name__)
+print("=== CONFIGURAÇÕES DEBUG - REBUILD DEFINITIVO ===")
+print(f"WASENDER_URL original: {WASENDER_URL_RAW}")
+print(f"EVOLUTION_API_URL processada: {EVOLUTION_API_URL}")
+print(f"EVOLUTION_INSTANCE_NAME: {EVOLUTION_INSTANCE_NAME}")
+print(f"EVOLUTION_API_KEY: {EVOLUTION_API_KEY[:10] if EVOLUTION_API_KEY else 'None'}...")
+print(f"WASENDER_PROJECT_NAME env: {os.getenv('WASENDER_PROJECT_NAME', 'NÃO DEFINIDO')}")
+print("===============================================")
 logger.info(f"=== CONFIGURAÇÕES DEBUG - REBUILD DEFINITIVO ===")
 logger.info(f"WASENDER_URL original: {WASENDER_URL_RAW}")
 logger.info(f"EVOLUTION_API_URL processada: {EVOLUTION_API_URL}")
