@@ -10,6 +10,7 @@ from typing import Dict, Any
 from app.simple_config import settings
 
 # Debug: Log das configurações no startup
+logger = logging.getLogger(__name__)
 logger.info("=== STARTUP DEBUG ===")
 logger.info(f"Evolution API URL: {settings.evolution_api_url}")
 logger.info(f"Instance Name: {settings.evolution_instance_name}")
