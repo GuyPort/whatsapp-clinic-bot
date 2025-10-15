@@ -804,27 +804,30 @@ Sou seu assistente virtual. Para te ajudar melhor, preciso de algumas informaç�
         """Processa seleção do menu principal"""
         message_lower = message.lower().strip()
         
-        # Verificar se é uma seleção válida (apenas números ou palavras-chave específicas)
-        if message_lower in ['1', 'um', 'marcar', 'marcar consulta']:
+        # Verificar se é uma seleção válida com mais variações
+        # Opção 1 - Marcar consulta
+        if any(word in message_lower for word in ['1', 'um', 'primeiro', 'primeira', 'marcar', 'consulta', 'agendar', 'agendamento']):
             context.state = ConversationState.MARCAR_CONSULTA
             db.commit()
             return "Ótimo! Vamos marcar sua consulta. 🩺\n\nQue tipo de consulta você precisa?\n\n• Consulta de rotina\n• Consulta de retorno\n• Consulta de urgência"
         
-        elif message_lower in ['2', 'dois', 'remarcar', 'cancelar', 'remarcar consulta', 'cancelar consulta']:
+        # Opção 2 - Remarcar/Cancelar
+        elif any(word in message_lower for word in ['2', 'dois', 'segundo', 'segunda', 'remarcar', 'cancelar', 'alterar', 'mudar']):
             context.state = ConversationState.REMARCAR_CANCELAR
             db.commit()
             return "Vou te ajudar com remarcação ou cancelamento. 🔄\n\nPrimeiro, vou buscar suas consultas agendadas..."
         
-        elif message_lower in ['3', 'três', 'tres', 'dúvida', 'duvida', 'tirar dúvidas']:
+        # Opção 3 - Tirar dúvidas
+        elif any(word in message_lower for word in ['3', 'três', 'tres', 'terceiro', 'terceira', 'dúvida', 'duvida', 'dúvidas', 'duvidas', 'pergunta', 'perguntas', 'informação', 'informações', 'saber', 'quero saber']):
             context.state = ConversationState.TIRAR_DUVIDAS
             db.commit()
             return "Claro! Estou aqui para tirar suas dúvidas. 🤔\n\nO que você gostaria de saber sobre nossa clínica?"
         
         else:
-            # Se não for uma seleção válida, insistir na pergunta
+            # Se não for uma seleção válida, insistir na pergunta com instrução clara
             context_data = json.loads(context.context_data or "{}")
             name = context_data.get('name', '')
-            return f"{name}, por favor escolha uma das opções:\n\n1️⃣ Marcar consulta\n2️⃣ Remarcar/Cancelar consulta\n3️⃣ Tirar dúvidas"
+            return f"{name}, por favor escolha uma das opções:\n\n1️⃣ Marcar consulta\n2️⃣ Remarcar/Cancelar consulta\n3️⃣ Tirar dúvidas\n\nDigite a opção que você deseja escrevendo o número correspondente (1, 2 ou 3)."
     
     async def _handle_marcar_consulta(
         self,
