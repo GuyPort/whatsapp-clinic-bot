@@ -5,14 +5,9 @@ import os
 
 # Configurações carregadas diretamente das variáveis de ambiente
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
-EVOLUTION_API_URL = os.getenv("WASENDER_URL", "").replace("ttps://", "https://").rstrip("/api/send-message/").rstrip("/")
+WASENDER_URL_RAW = os.getenv("WASENDER_URL", "")
+EVOLUTION_API_URL = WASENDER_URL_RAW.replace("ttps://", "https://").rstrip("/api/send-message/").rstrip("/")
 EVOLUTION_API_KEY = os.getenv("WASENDER_API_KEY")
-
-# Debug: Log da URL para verificar
-import logging
-logger = logging.getLogger(__name__)
-logger.info(f"WASENDER_URL original: {os.getenv('WASENDER_URL', '')}")
-logger.info(f"EVOLUTION_API_URL processada: {EVOLUTION_API_URL}")
 EVOLUTION_INSTANCE_NAME = os.getenv("WASENDER_PROJECT_NAME", "clinica-bot")
 GOOGLE_CALENDAR_ID = os.getenv("GOOGLE_CALENDAR_ID")
 GOOGLE_SERVICE_ACCOUNT_FILE = "google-credentials.json"
@@ -20,6 +15,16 @@ DATABASE_URL = "sqlite:///./data/appointments.db"
 ENVIRONMENT = "production"
 LOG_LEVEL = "INFO"
 TIMEZONE = "America/Sao_Paulo"
+
+# Debug: Log das configurações
+import logging
+logger = logging.getLogger(__name__)
+logger.info(f"=== CONFIGURAÇÕES DEBUG ===")
+logger.info(f"WASENDER_URL original: {WASENDER_URL_RAW}")
+logger.info(f"EVOLUTION_API_URL processada: {EVOLUTION_API_URL}")
+logger.info(f"EVOLUTION_INSTANCE_NAME: {EVOLUTION_INSTANCE_NAME}")
+logger.info(f"EVOLUTION_API_KEY: {EVOLUTION_API_KEY[:10] if EVOLUTION_API_KEY else 'None'}...")
+logger.info(f"=========================")
 
 # Classe simples para compatibilidade
 class Settings:
