@@ -228,8 +228,11 @@ Responda sempre de forma natural, como um atendente humano profissional faria.""
         if context.state == ConversationState.BOAS_VINDAS:
             return await self._handle_boas_vindas(context, message, db)
         
-        elif context.state == ConversationState.COLETANDO_DADOS:
-            return await self._handle_coletando_dados(context, patient, message, db)
+        elif context.state == ConversationState.COLETANDO_NOME:
+            return await self._handle_coletando_nome(context, message, db)
+        
+        elif context.state == ConversationState.COLETANDO_NASCIMENTO:
+            return await self._handle_coletando_nascimento(context, patient, message, db)
         
         elif context.state == ConversationState.MENU_PRINCIPAL:
             return await self._handle_menu_principal(context, patient, message, db)
@@ -711,7 +714,7 @@ Responda sempre de forma natural, como um atendente humano profissional faria.""
         db: Session
     ) -> str:
         """Mensagem de boas-vindas e início da coleta de dados"""
-        context.state = ConversationState.COLETANDO_DADOS
+        context.state = ConversationState.COLETANDO_NOME
         db.commit()
         
         return """Olá! Bem-vindo(a) à Clínica Teste! 👋
@@ -720,64 +723,76 @@ Sou seu assistente virtual. Para te ajudar melhor, preciso de algumas informaç�
 
 📝 Qual é o seu nome completo?"""
     
-    async def _handle_coletando_dados(
+    async def _handle_coletando_nome(
+        self,
+        context: ConversationContext,
+        message: str,
+        db: Session
+    ) -> str:
+        """Coleta nome completo"""
+        try:
+            # Extrair nome da mensagem
+            name = message.strip()
+            if len(name) < 2:
+                return "Por favor, digite seu nome completo:"
+            
+            # Salvar nome no contexto
+            context_data = json.loads(context.context_data or "{}")
+            context_data['name'] = name
+            context.context_data = json.dumps(context_data, ensure_ascii=False)
+            
+            # Ir para próximo estado
+            context.state = ConversationState.COLETANDO_NASCIMENTO
+            db.commit()
+            
+            return f"Prazer em conhecê-lo(a), {name}! 😊\n\n📅 Agora preciso da sua data de nascimento (formato DD/MM/AAAA):"
+            
+        except Exception as e:
+            logger.error(f"Erro ao coletar nome: {str(e)}")
+            return "Desculpe, ocorreu um erro. Vamos tentar novamente. Qual é o seu nome completo?"
+    
+    async def _handle_coletando_nascimento(
         self,
         context: ConversationContext,
         patient: Optional[Patient],
         message: str,
         db: Session
     ) -> str:
-        """Coleta nome e data de nascimento"""
+        """Coleta data de nascimento"""
         try:
             context_data = json.loads(context.context_data or "{}")
+            name = context_data.get('name', '')
             
-            # Se não tem nome ainda
-            if 'name' not in context_data:
-                # Extrair nome da mensagem
-                name = message.strip()
-                if len(name) < 2:
-                    return "Por favor, digite seu nome completo:"
+            # Validar data
+            try:
+                birth_date = datetime.strptime(message.strip(), "%d/%m/%Y").date()
                 
-                context_data['name'] = name
-                context.context_data = json.dumps(context_data, ensure_ascii=False)
+                # Criar ou atualizar paciente
+                if not patient:
+                    patient = Patient(
+                        name=name,
+                        phone=context.phone,
+                        birth_date=birth_date
+                    )
+                    db.add(patient)
+                else:
+                    patient.name = name
+                    patient.birth_date = birth_date
+                
                 db.commit()
                 
-                return f"Prazer em conhecê-lo(a), {name}! 😊\n\n📅 Agora preciso da sua data de nascimento (formato DD/MM/AAAA):"
-            
-            # Se não tem data de nascimento ainda
-            elif 'birth_date' not in context_data:
-                # Validar data
-                try:
-                    birth_date = datetime.strptime(message.strip(), "%d/%m/%Y").date()
-                    context_data['birth_date'] = birth_date.isoformat()
-                    context.context_data = json.dumps(context_data, ensure_ascii=False)
-                    
-                    # Criar ou atualizar paciente
-                    if not patient:
-                        patient = Patient(
-                            name=context_data['name'],
-                            phone=context.phone,
-                            birth_date=birth_date
-                        )
-                        db.add(patient)
-                    else:
-                        patient.name = context_data['name']
-                        patient.birth_date = birth_date
-                    
-                    db.commit()
-                    
-                    # Ir para menu principal
-                    context.state = ConversationState.MENU_PRINCIPAL
-                    db.commit()
-                    
-                    return f"{context_data['name']}, como posso te ajudar hoje?\n\n1️⃣ Marcar consulta\n2️⃣ Remarcar/Cancelar consulta\n3️⃣ Tirar dúvidas"
+                # Ir para menu principal
+                context.state = ConversationState.MENU_PRINCIPAL
+                db.commit()
                 
-                except ValueError:
-                    return "Formato inválido. Por favor, digite sua data de nascimento no formato DD/MM/AAAA (ex: 15/03/1990):"
+                return f"{name}, como posso te ajudar hoje?\n\n1️⃣ Marcar consulta\n2️⃣ Remarcar/Cancelar consulta\n3️⃣ Tirar dúvidas"
+            
+            except ValueError:
+                return "Formato inválido. Por favor, digite sua data de nascimento no formato DD/MM/AAAA (ex: 15/03/1990):"
             
         except Exception as e:
-            logger.error(f"Erro ao coletar dados: {str(e)}")
-            return "Desculpe, ocorreu um erro. Vamos tentar novamente. Qual é o seu nome completo?"
+            logger.error(f"Erro ao coletar nascimento: {str(e)}")
+            return "Desculpe, ocorreu um erro. Vamos tentar novamente. Qual é a sua data de nascimento?"
     
     async def _handle_menu_principal(
         self,
@@ -789,23 +804,27 @@ Sou seu assistente virtual. Para te ajudar melhor, preciso de algumas informaç�
         """Processa seleção do menu principal"""
         message_lower = message.lower().strip()
         
-        if '1' in message_lower or 'marcar' in message_lower or 'consulta' in message_lower:
+        # Verificar se é uma seleção válida (apenas números ou palavras-chave específicas)
+        if message_lower in ['1', 'um', 'marcar', 'marcar consulta']:
             context.state = ConversationState.MARCAR_CONSULTA
             db.commit()
             return "Ótimo! Vamos marcar sua consulta. 🩺\n\nQue tipo de consulta você precisa?\n\n• Consulta de rotina\n• Consulta de retorno\n• Consulta de urgência"
         
-        elif '2' in message_lower or 'remarcar' in message_lower or 'cancelar' in message_lower:
+        elif message_lower in ['2', 'dois', 'remarcar', 'cancelar', 'remarcar consulta', 'cancelar consulta']:
             context.state = ConversationState.REMARCAR_CANCELAR
             db.commit()
             return "Vou te ajudar com remarcação ou cancelamento. 🔄\n\nPrimeiro, vou buscar suas consultas agendadas..."
         
-        elif '3' in message_lower or 'dúvida' in message_lower or 'duvida' in message_lower:
+        elif message_lower in ['3', 'três', 'tres', 'dúvida', 'duvida', 'tirar dúvidas']:
             context.state = ConversationState.TIRAR_DUVIDAS
             db.commit()
             return "Claro! Estou aqui para tirar suas dúvidas. 🤔\n\nO que você gostaria de saber sobre nossa clínica?"
         
         else:
-            return "Por favor, escolha uma das opções:\n\n1️⃣ Marcar consulta\n2️⃣ Remarcar/Cancelar consulta\n3️⃣ Tirar dúvidas"
+            # Se não for uma seleção válida, insistir na pergunta
+            context_data = json.loads(context.context_data or "{}")
+            name = context_data.get('name', '')
+            return f"{name}, por favor escolha uma das opções:\n\n1️⃣ Marcar consulta\n2️⃣ Remarcar/Cancelar consulta\n3️⃣ Tirar dúvidas"
     
     async def _handle_marcar_consulta(
         self,

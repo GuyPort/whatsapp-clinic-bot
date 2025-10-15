@@ -21,7 +21,8 @@ class ConversationState(enum.Enum):
     """Estados possíveis da conversa"""
     IDLE = "idle"                           # Sem conversa ativa
     BOAS_VINDAS = "boas_vindas"             # Mensagem de boas-vindas
-    COLETANDO_DADOS = "coletando_dados"     # Coletando nome e data de nascimento
+    COLETANDO_NOME = "coletando_nome"       # Coletando nome completo
+    COLETANDO_NASCIMENTO = "coletando_nascimento"  # Coletando data de nascimento
     MENU_PRINCIPAL = "menu_principal"       # Mostrando menu principal
     MARCAR_CONSULTA = "marcar_consulta"     # Processo de marcar consulta
     REMARCAR_CANCELAR = "remarcar_cancelar" # Processo de remarcar/cancelar
