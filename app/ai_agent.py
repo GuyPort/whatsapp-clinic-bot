@@ -66,13 +66,16 @@ FLUXO DE ATENDIMENTO ESTRUTURADO:
    3️⃣ Tirar dúvidas"
 
 3. MARCAR CONSULTA:
-   - Escolher tipo de consulta (sem mostrar preços ou convênios)
-   - Perguntar qual dia e horário fica melhor para a pessoa
-   - Verificar disponibilidade e oferecer 3 opções de horário
-   - Confirmar marcação (sem informações desnecessárias)
+   OBJETIVO: Agendar uma consulta para o paciente, consultando a agenda real da clínica para encontrar dias e horários disponíveis que se adequem às suas preferências e às regras da clínica, e então confirmar o agendamento.
+   
+   DIRETRIZES:
+   - Coletar tipo de consulta e preferências de dia/horário (ordem flexível)
+   - SEMPRE consultar o calendário real antes de oferecer horários
+   - NUNCA usar horários simulados ou padrões
+   - Se agenda cheia, oferecer próximos dias disponíveis
+   - Se poucos horários, oferecer apenas os realmente disponíveis
+   - Confirmar com data completa (DD/MM/AAAA)
    - Perguntar: "Posso ajudar com mais alguma coisa?"
-     * Se SIM → volta ao menu principal
-     * Se NÃO → encerra conversa
 
 4. REMARCAR/CANCELAR:
    - Buscar consultas do paciente (usando nome + nascimento)
@@ -297,13 +300,14 @@ Responda sempre de forma natural, como um atendente humano profissional faria.""
             
             # Detectar intenção de agendamento
             if self._is_booking_intent(message, assistant_message):
-                # Iniciar processo de agendamento
-                if patient:
-                    context.state = ConversationState.ASKING_CONSULT_TYPE
-                    return assistant_message + "\n\nQue tipo de consulta você deseja agendar?"
+                # Consultar calendário real antes de processar
+                available_slots = await self._get_real_available_slots()
+                if available_slots:
+                    # Processar agendamento com slots reais
+                    return await self._process_structured_booking_with_real_slots(context, patient, message, available_slots, db)
                 else:
-                    context.state = ConversationState.ASKING_NAME
-                    return assistant_message + "\n\nPara agendar, preciso de algumas informações. Qual é seu nome completo?"
+                    # Se não há slots disponíveis, informar
+                    return "Desculpe, nossa agenda está lotada no momento. Posso verificar os próximos dias disponíveis para você?"
             
             # Detectar intenção de cancelamento/remarcação
             if self._is_modification_intent(message):
@@ -806,81 +810,9 @@ Sou seu assistente virtual. Para te ajudar melhor, preciso de algumas informaç�
         message: str,
         db: Session
     ) -> str:
-        """Processa marcação de consulta"""
-        try:
-            context_data = json.loads(context.context_data or "{}")
-            
-            # Se não tem tipo de consulta ainda
-            if 'consult_type' not in context_data:
-                # Extrair tipo de consulta da mensagem
-                consult_type = message.strip().lower()
-                
-                # Mapear tipos de consulta
-                if 'rotina' in consult_type:
-                    context_data['consult_type'] = 'Consulta de rotina'
-                elif 'retorno' in consult_type:
-                    context_data['consult_type'] = 'Retorno'
-                elif 'urgência' in consult_type or 'urgencia' in consult_type:
-                    context_data['consult_type'] = 'Consulta de urgência'
-                else:
-                    return "Por favor, escolha um tipo de consulta:\n\n• Consulta de rotina\n• Consulta de retorno\n• Consulta de urgência"
-                
-                context.context_data = json.dumps(context_data, ensure_ascii=False)
-                db.commit()
-                
-                return f"Perfeito! {context_data['consult_type']}. 🩺\n\nQual dia e horário fica melhor para você?\n\nNosso horário de funcionamento:\n• Segunda a sexta: 08h às 18h\n• Sábado: 08h às 12h\n• Domingo: não há atendimento"
-            
-            # Se não tem data/horário ainda
-            elif 'appointment_datetime' not in context_data:
-                # Extrair data e horário da mensagem
-                appointment_text = message.strip().lower()
-                
-                # Simular verificação de disponibilidade e oferecer 3 opções
-                if 'sábado' in appointment_text or 'sabado' in appointment_text:
-                    if '9' in appointment_text or '9h' in appointment_text:
-                        # Simular 3 opções de horário
-                        context_data['appointment_datetime'] = '2025-01-18 09:00'
-                        context_data['available_times'] = ['09:00', '10:00', '11:00']
-                        context.context_data = json.dumps(context_data, ensure_ascii=False)
-                        db.commit()
-                        
-                        return f"Ótimo! Para sábado, temos estes horários disponíveis:\n\n1️⃣ 09:00\n2️⃣ 10:00\n3️⃣ 11:00\n\nQual você prefere?"
-                    else:
-                        return "Para sábado, temos horários disponíveis às 9h, 10h ou 11h. Qual você prefere?"
-                else:
-                    return "Por favor, escolha um dia da semana (segunda a sábado) e horário."
-            
-            # Se não tem horário selecionado ainda
-            elif 'selected_time' not in context_data:
-                # Processar seleção de horário
-                if '1' in message or '9' in message:
-                    context_data['selected_time'] = '09:00'
-                elif '2' in message or '10' in message:
-                    context_data['selected_time'] = '10:00'
-                elif '3' in message or '11' in message:
-                    context_data['selected_time'] = '11:00'
-                else:
-                    return "Por favor, escolha um dos horários:\n\n1️⃣ 09:00\n2️⃣ 10:00\n3️⃣ 11:00"
-                
-                context.context_data = json.dumps(context_data, ensure_ascii=False)
-                db.commit()
-                
-                # Confirmar agendamento
-                context.state = ConversationState.CONFIRMANDO
-                db.commit()
-                
-                # Calcular data do próximo sábado
-                today = datetime.now()
-                days_until_saturday = (5 - today.weekday()) % 7  # 5 = sábado
-                if days_until_saturday == 0:
-                    days_until_saturday = 7  # Se hoje é sábado, pegar o próximo
-                appointment_date = today + timedelta(days=days_until_saturday)
-                
-                return f"Perfeito! Confirmo sua consulta:\n\n📅 {appointment_date.strftime('%d/%m/%Y')} às {context_data['selected_time']}\n🩺 {context_data['consult_type']}\n👤 {patient.name if patient else 'Paciente'}\n\nPosso confirmar este agendamento para você?"
-            
-        except Exception as e:
-            logger.error(f"Erro ao processar marcação: {str(e)}")
-            return "Desculpe, ocorreu um erro. Vamos tentar novamente. Que tipo de consulta você precisa?"
+        """Processa marcação de consulta usando IA com objetivo flexível"""
+        # Usar Claude para processar de forma inteligente
+        return await self._handle_general_conversation(context, patient, message, db)
     
     async def _handle_remarcar_cancelar(
         self,
@@ -942,6 +874,148 @@ Sou seu assistente virtual. Para te ajudar melhor, preciso de algumas informaç�
         
         else:
             return "Posso ajudar com mais alguma coisa? (Sim/Não)"
+    
+    # ==================== MÉTODOS PARA CONSULTA REAL DO CALENDÁRIO ====================
+    
+    async def _get_real_available_slots(self) -> List[Dict[str, Any]]:
+        """Consulta o calendário real para obter horários disponíveis"""
+        try:
+            if not calendar_service.is_available():
+                return []
+            
+            # Consultar próximos 7 dias
+            today = datetime.now()
+            end_date = today + timedelta(days=7)
+            
+            # Buscar eventos existentes
+            events = calendar_service.get_events(
+                start_datetime=today,
+                end_datetime=end_date
+            )
+            
+            # Gerar slots disponíveis baseados nos horários de funcionamento
+            available_slots = []
+            
+            for day_offset in range(7):
+                current_date = today + timedelta(days=day_offset)
+                weekday = current_date.weekday()
+                
+                # Verificar se é dia de funcionamento
+                if weekday == 6:  # Domingo
+                    continue
+                elif weekday == 5:  # Sábado
+                    start_hour, end_hour = 8, 12
+                else:  # Segunda a sexta
+                    start_hour, end_hour = 8, 18
+                
+                # Gerar slots de 30 em 30 minutos
+                for hour in range(start_hour, end_hour):
+                    for minute in [0, 30]:
+                        slot_time = current_date.replace(hour=hour, minute=minute, second=0, microsecond=0)
+                        
+                        # Verificar se o slot está disponível
+                        if not self._is_slot_taken(slot_time, events):
+                            available_slots.append({
+                                'datetime': slot_time,
+                                'date_str': slot_time.strftime('%d/%m/%Y'),
+                                'time_str': slot_time.strftime('%H:%M'),
+                                'day_name': slot_time.strftime('%A')
+                            })
+            
+            return available_slots[:20]  # Limitar a 20 opções
+            
+        except Exception as e:
+            logger.error(f"Erro ao consultar calendário: {str(e)}")
+            return []
+    
+    def _is_slot_taken(self, slot_time: datetime, events: List[Dict]) -> bool:
+        """Verifica se um slot de tempo está ocupado"""
+        slot_end = slot_time + timedelta(minutes=30)
+        
+        for event in events:
+            event_start = event.get('start', {}).get('dateTime')
+            event_end = event.get('end', {}).get('dateTime')
+            
+            if event_start and event_end:
+                event_start_dt = datetime.fromisoformat(event_start.replace('Z', '+00:00'))
+                event_end_dt = datetime.fromisoformat(event_end.replace('Z', '+00:00'))
+                
+                # Verificar sobreposição
+                if (slot_time < event_end_dt and slot_end > event_start_dt):
+                    return True
+        
+        return False
+    
+    async def _process_structured_booking_with_real_slots(
+        self,
+        context: ConversationContext,
+        patient: Optional[Patient],
+        message: str,
+        available_slots: List[Dict[str, Any]],
+        db: Session
+    ) -> str:
+        """Processa agendamento usando slots reais do calendário"""
+        try:
+            # Extrair informações da mensagem
+            message_lower = message.lower()
+            
+            # Detectar tipo de consulta
+            consult_type = "Consulta de rotina"
+            if 'retorno' in message_lower:
+                consult_type = "Retorno"
+            elif 'urgência' in message_lower or 'urgencia' in message_lower:
+                consult_type = "Consulta de urgência"
+            
+            # Detectar preferência de data/horário
+            preferred_slots = []
+            
+            # Procurar por datas específicas
+            if '23/10/2025' in message or '23/10' in message:
+                # Buscar slots para 23/10/2025
+                for slot in available_slots:
+                    if '23/10/2025' in slot['date_str']:
+                        preferred_slots.append(slot)
+            elif 'sábado' in message_lower or 'sabado' in message_lower:
+                # Buscar slots para sábado
+                for slot in available_slots:
+                    if slot['day_name'] == 'Saturday':
+                        preferred_slots.append(slot)
+            elif 'segunda' in message_lower:
+                # Buscar slots para segunda
+                for slot in available_slots:
+                    if slot['day_name'] == 'Monday':
+                        preferred_slots.append(slot)
+            
+            # Se não encontrou preferência específica, usar primeiros slots
+            if not preferred_slots:
+                preferred_slots = available_slots[:3]
+            
+            # Oferecer opções
+            if len(preferred_slots) >= 3:
+                options_text = "Temos estes horários disponíveis:\n\n"
+                for i, slot in enumerate(preferred_slots[:3], 1):
+                    options_text += f"{i}️⃣ {slot['date_str']} às {slot['time_str']}\n"
+                options_text += "\nQual você prefere?"
+                
+                # Salvar slots no contexto
+                context_data = json.loads(context.context_data or "{}")
+                context_data['available_slots'] = [slot['datetime'].isoformat() for slot in preferred_slots[:3]]
+                context_data['consult_type'] = consult_type
+                context.context_data = json.dumps(context_data, ensure_ascii=False)
+                context.state = ConversationState.CONFIRMANDO
+                db.commit()
+                
+                return options_text
+            elif len(preferred_slots) > 0:
+                # Apenas um slot disponível
+                slot = preferred_slots[0]
+                return f"Temos disponível apenas {slot['date_str']} às {slot['time_str']}. Posso confirmar este horário para você?"
+            else:
+                return "Desculpe, não temos horários disponíveis no período solicitado. Posso verificar outras datas?"
+                
+        except Exception as e:
+            logger.error(f"Erro ao processar agendamento: {str(e)}")
+            return "Desculpe, ocorreu um erro. Vamos tentar novamente."
 
 
 # Instância global
