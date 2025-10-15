@@ -63,14 +63,14 @@ def normalize_phone(phone: str) -> str:
         phone: Número de telefone com ou sem formatação
         
     Returns:
-        Número limpo (apenas dígitos)
+        Número limpo (apenas dígitos) com código do país
     """
     # Remove tudo que não é dígito
     clean = re.sub(r'\D', '', phone)
     
-    # Remove código do país se presente (55)
-    if clean.startswith('55') and len(clean) > 11:
-        clean = clean[2:]
+    # Garantir que tem código do país (55) para Brasil
+    if not clean.startswith('55') and len(clean) >= 10:
+        clean = '55' + clean
     
     return clean
 
