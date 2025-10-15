@@ -1,12 +1,22 @@
 """
 Configurações simples sem Pydantic para evitar problemas de cache.
+VERSÃO: 2025-10-15 15:07:00 - REBUILD DEFINITIVO
 """
 import os
 
 # Configurações carregadas diretamente das variáveis de ambiente
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 WASENDER_URL_RAW = os.getenv("WASENDER_URL", "")
-EVOLUTION_API_URL = WASENDER_URL_RAW.replace("ttps://", "https://").rstrip("/api/send-message/").rstrip("/")
+
+# CORREÇÃO DEFINITIVA DA URL
+if WASENDER_URL_RAW.startswith("ttps://"):
+    EVOLUTION_API_URL = WASENDER_URL_RAW.replace("ttps://", "https://")
+else:
+    EVOLUTION_API_URL = WASENDER_URL_RAW
+
+# Remover /api/send-message se existir
+EVOLUTION_API_URL = EVOLUTION_API_URL.rstrip("/api/send-message/").rstrip("/")
+
 EVOLUTION_API_KEY = os.getenv("WASENDER_API_KEY")
 EVOLUTION_INSTANCE_NAME = os.getenv("WASENDER_PROJECT_NAME", "clinica-bot")
 GOOGLE_CALENDAR_ID = os.getenv("GOOGLE_CALENDAR_ID")
@@ -19,14 +29,14 @@ TIMEZONE = "America/Sao_Paulo"
 # Debug: Log das configurações
 import logging
 logger = logging.getLogger(__name__)
-logger.info(f"=== CONFIGURAÇÕES DEBUG ===")
+logger.info(f"=== CONFIGURAÇÕES DEBUG - REBUILD DEFINITIVO ===")
 logger.info(f"WASENDER_URL original: {WASENDER_URL_RAW}")
 logger.info(f"EVOLUTION_API_URL processada: {EVOLUTION_API_URL}")
 logger.info(f"EVOLUTION_INSTANCE_NAME: {EVOLUTION_INSTANCE_NAME}")
 logger.info(f"EVOLUTION_API_KEY: {EVOLUTION_API_KEY[:10] if EVOLUTION_API_KEY else 'None'}...")
 logger.info(f"URL contém ttps://: {'ttps://' in WASENDER_URL_RAW}")
 logger.info(f"URL após replace: {WASENDER_URL_RAW.replace('ttps://', 'https://')}")
-logger.info(f"=========================")
+logger.info(f"===============================================")
 
 # Classe simples para compatibilidade
 class Settings:

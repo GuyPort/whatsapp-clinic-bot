@@ -58,7 +58,7 @@ def check_environment():
 if __name__ == "__main__":
     print("🤖 WhatsApp Clinic Bot")
     print("=" * 50)
-    print("🚀 FORCE REBUILD - 2025-10-15 14:47:00")
+    print("🚀 FORCE REBUILD - 2025-10-15 15:07:00 - REBUILD DEFINITIVO")
     print("=" * 50)
     
     print("🔍 Verificando ambiente...")
