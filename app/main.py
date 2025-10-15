@@ -1,12 +1,11 @@
 """
 Aplicação FastAPI principal com webhooks do WhatsApp.
 """
-from fastapi import FastAPI, Request, HTTPException, BackgroundTasks, Depends
+from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
 from fastapi.responses import HTMLResponse, JSONResponse
 from contextlib import asynccontextmanager
 import logging
 from typing import Dict, Any, List
-from sqlalchemy.orm import Session
 
 from app.simple_config import settings
 
@@ -341,157 +340,162 @@ from app.calendar_service import calendar_service
 # ==================== ENDPOINTS DO BANCO DE DADOS ====================
 
 @app.get("/admin/patients")
-async def get_patients(db: Session = Depends(get_db)):
+async def get_patients():
     """Lista todos os pacientes cadastrados"""
     try:
-        patients = db.query(Patient).order_by(Patient.created_at.desc()).all()
-        return {
-            "total": len(patients),
-            "patients": [
-                {
-                    "id": p.id,
-                    "name": p.name,
-                    "phone": p.phone,
-                    "birth_date": p.birth_date,
-                    "created_at": p.created_at.isoformat(),
-                    "appointments_count": len(p.appointments)
-                }
-                for p in patients
-            ]
-        }
+        with get_db() as db:
+            patients = db.query(Patient).order_by(Patient.created_at.desc()).all()
+            return {
+                "total": len(patients),
+                "patients": [
+                    {
+                        "id": p.id,
+                        "name": p.name,
+                        "phone": p.phone,
+                        "birth_date": p.birth_date,
+                        "created_at": p.created_at.isoformat(),
+                        "appointments_count": len(p.appointments)
+                    }
+                    for p in patients
+                ]
+            }
     except Exception as e:
         logger.error(f"Erro ao buscar pacientes: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/admin/appointments")
-async def get_appointments(db: Session = Depends(get_db)):
+async def get_appointments():
     """Lista todas as consultas agendadas"""
     try:
-        appointments = db.query(Appointment).order_by(Appointment.appointment_date.desc()).all()
-        return {
-            "total": len(appointments),
-            "appointments": [
-                {
-                    "id": a.id,
-                    "patient_name": a.patient.name,
-                    "patient_phone": a.patient.phone,
-                    "appointment_date": a.appointment_date,
-                    "appointment_time": a.appointment_time,
-                    "consult_type": a.consult_type,
-                    "status": a.status.value,
-                    "notes": a.notes,
-                    "created_at": a.created_at.isoformat()
-                }
-                for a in appointments
-            ]
-        }
+        with get_db() as db:
+            appointments = db.query(Appointment).order_by(Appointment.appointment_date.desc()).all()
+            return {
+                "total": len(appointments),
+                "appointments": [
+                    {
+                        "id": a.id,
+                        "patient_name": a.patient.name,
+                        "patient_phone": a.patient.phone,
+                        "appointment_date": a.appointment_date,
+                        "appointment_time": a.appointment_time,
+                        "consult_type": a.consult_type,
+                        "status": a.status.value,
+                        "notes": a.notes,
+                        "created_at": a.created_at.isoformat()
+                    }
+                    for a in appointments
+                ]
+            }
     except Exception as e:
         logger.error(f"Erro ao buscar consultas: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/admin/conversations")
-async def get_conversations(db: Session = Depends(get_db)):
+async def get_conversations():
     """Lista contextos de conversas ativas"""
     try:
-        conversations = db.query(ConversationContext).order_by(ConversationContext.last_message_at.desc()).all()
-        return {
-            "total": len(conversations),
-            "conversations": [
-                {
-                    "id": c.id,
-                    "patient_name": c.patient.name,
-                    "patient_phone": c.patient.phone,
-                    "state": c.state.value,
-                    "last_message_at": c.last_message_at.isoformat() if c.last_message_at else None,
-                    "created_at": c.created_at.isoformat()
-                }
-                for c in conversations
-            ]
-        }
+        with get_db() as db:
+            conversations = db.query(ConversationContext).order_by(ConversationContext.last_message_at.desc()).all()
+            return {
+                "total": len(conversations),
+                "conversations": [
+                    {
+                        "id": c.id,
+                        "patient_name": c.patient.name,
+                        "patient_phone": c.patient.phone,
+                        "state": c.state.value,
+                        "last_message_at": c.last_message_at.isoformat() if c.last_message_at else None,
+                        "created_at": c.created_at.isoformat()
+                    }
+                    for c in conversations
+                ]
+            }
     except Exception as e:
         logger.error(f"Erro ao buscar conversas: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/admin/dashboard")
-async def get_dashboard(db: Session = Depends(get_db)):
+async def get_dashboard():
     """Dashboard com estatísticas gerais"""
     try:
-        # Contadores
-        total_patients = db.query(Patient).count()
-        total_appointments = db.query(Appointment).count()
-        active_conversations = db.query(ConversationContext).filter(
-            ConversationContext.state != ConversationState.IDLE
-        ).count()
-        
-        # Consultas por status
-        appointments_by_status = {}
-        for status in AppointmentStatus:
-            count = db.query(Appointment).filter(Appointment.status == status).count()
-            appointments_by_status[status.value] = count
-        
-        # Consultas recentes (últimos 7 dias)
-        from datetime import datetime, timedelta
-        week_ago = datetime.utcnow() - timedelta(days=7)
-        recent_appointments = db.query(Appointment).filter(
-            Appointment.created_at >= week_ago
-        ).count()
-        
-        return {
-            "summary": {
-                "total_patients": total_patients,
-                "total_appointments": total_appointments,
-                "active_conversations": active_conversations,
-                "recent_appointments": recent_appointments
-            },
-            "appointments_by_status": appointments_by_status
-        }
+        with get_db() as db:
+            # Contadores
+            total_patients = db.query(Patient).count()
+            total_appointments = db.query(Appointment).count()
+            active_conversations = db.query(ConversationContext).filter(
+                ConversationContext.state != ConversationState.IDLE
+            ).count()
+            
+            # Consultas por status
+            appointments_by_status = {}
+            for status in AppointmentStatus:
+                count = db.query(Appointment).filter(Appointment.status == status).count()
+                appointments_by_status[status.value] = count
+            
+            # Consultas recentes (últimos 7 dias)
+            from datetime import datetime, timedelta
+            week_ago = datetime.utcnow() - timedelta(days=7)
+            recent_appointments = db.query(Appointment).filter(
+                Appointment.created_at >= week_ago
+            ).count()
+            
+            return {
+                "summary": {
+                    "total_patients": total_patients,
+                    "total_appointments": total_appointments,
+                    "active_conversations": active_conversations,
+                    "recent_appointments": recent_appointments
+                },
+                "appointments_by_status": appointments_by_status
+            }
     except Exception as e:
         logger.error(f"Erro ao buscar dashboard: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/admin/patient/{patient_id}")
-async def get_patient_details(patient_id: int, db: Session = Depends(get_db)):
+async def get_patient_details(patient_id: int):
     """Detalhes de um paciente específico"""
     try:
-        patient = db.query(Patient).filter(Patient.id == patient_id).first()
-        if not patient:
-            raise HTTPException(status_code=404, detail="Paciente não encontrado")
-        
-        appointments = db.query(Appointment).filter(Appointment.patient_id == patient_id).all()
-        conversations = db.query(ConversationContext).filter(ConversationContext.patient_id == patient_id).all()
-        
-        return {
-            "patient": {
-                "id": patient.id,
-                "name": patient.name,
-                "phone": patient.phone,
-                "birth_date": patient.birth_date,
-                "created_at": patient.created_at.isoformat()
-            },
-            "appointments": [
-                {
-                    "id": a.id,
-                    "appointment_date": a.appointment_date,
-                    "appointment_time": a.appointment_time,
-                    "consult_type": a.consult_type,
-                    "status": a.status.value,
-                    "notes": a.notes
-                }
-                for a in appointments
-            ],
-            "conversations": [
-                {
-                    "id": c.id,
-                    "state": c.state.value,
-                    "last_message_at": c.last_message_at.isoformat() if c.last_message_at else None
-                }
-                for c in conversations
-            ]
-        }
+        with get_db() as db:
+            patient = db.query(Patient).filter(Patient.id == patient_id).first()
+            if not patient:
+                raise HTTPException(status_code=404, detail="Paciente não encontrado")
+            
+            appointments = db.query(Appointment).filter(Appointment.patient_id == patient_id).all()
+            conversations = db.query(ConversationContext).filter(ConversationContext.patient_id == patient_id).all()
+            
+            return {
+                "patient": {
+                    "id": patient.id,
+                    "name": patient.name,
+                    "phone": patient.phone,
+                    "birth_date": patient.birth_date,
+                    "created_at": patient.created_at.isoformat()
+                },
+                "appointments": [
+                    {
+                        "id": a.id,
+                        "appointment_date": a.appointment_date,
+                        "appointment_time": a.appointment_time,
+                        "consult_type": a.consult_type,
+                        "status": a.status.value,
+                        "notes": a.notes
+                    }
+                    for a in appointments
+                ],
+                "conversations": [
+                    {
+                        "id": c.id,
+                        "state": c.state.value,
+                        "last_message_at": c.last_message_at.isoformat() if c.last_message_at else None
+                    }
+                    for c in conversations
+                ]
+            }
     except HTTPException:
         raise
     except Exception as e:
