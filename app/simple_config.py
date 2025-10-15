@@ -9,7 +9,7 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 WASENDER_URL_RAW = os.getenv("WASENDER_URL", "")
 
 # CORREÇÃO DEFINITIVA DA URL - HARDCODED
-EVOLUTION_API_URL = "https://wasenderapi.com"
+EVOLUTION_API_URL = "https://wasenderapi.com/api/send-message"
 
 EVOLUTION_API_KEY = os.getenv("WASENDER_API_KEY")
 EVOLUTION_INSTANCE_NAME = os.getenv("WASENDER_PROJECT_NAME", "clinica-bot")
