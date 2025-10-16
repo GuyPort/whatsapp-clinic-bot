@@ -22,7 +22,6 @@ from app.utils import (
     parse_weekday_from_message, get_brazil_timezone
 )
 from app.appointment_rules import appointment_rules
-from app.calendar_service import calendar_service
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +43,7 @@ class AIAgent:
         """Constrói o system prompt com informações da clínica"""
         clinic_info_str = json.dumps(self.clinic_info, indent=2, ensure_ascii=False)
         
-        return f"""Você é um assistente virtual de uma clínica médica no Brasil. Seu nome é CliniBot.
+        return f"""Você é um assistente virtual de uma clínica médica no Brasil. Seu nome é Andressa.
 
 INFORMAÇÕES DA CLÍNICA:
 {clinic_info_str}
@@ -66,24 +65,16 @@ FLUXO DE ATENDIMENTO ESTRUTURADO:
    3️⃣ Tirar dúvidas"
 
 3. MARCAR CONSULTA:
-   OBJETIVO: Agendar uma consulta para o paciente, validando horários e confirmando o agendamento.
+   OBJETIVO: Agendar uma consulta para o paciente e enviar notificação para a clínica.
    
    DIRETRIZES:
    - Perguntar: "Que dia e horário você tem disponibilidade?"
-   - Mostrar horários de funcionamento: Segunda a sexta (08h às 18h), Sábado (08h às 12h), Domingo (fechado)
-   - VALIDAR se o horário está dentro do funcionamento da clínica
-   - Se horário VÁLIDO: confirmar e marcar no Google Calendar
-   - Se horário INVÁLIDO: explicar o problema e pedir novo horário
+   - VALIDAR se a data é futura
+   - Se data VÁLIDA: confirmar e enviar notificação
+   - Se data INVÁLIDA: explicar o problema e pedir nova data
    - Sempre confirmar antes de marcar: "Posso confirmar este agendamento para você?"
-   - Após confirmar: marcar no Google Calendar e salvar no banco
+   - Após confirmar: enviar notificação para a clínica
    - Perguntar: "Posso ajudar com mais alguma coisa?"
-   
-   VALIDAÇÃO DE HORÁRIO:
-   - Segunda a sexta: 08:00 às 17:30 (último horário 17:30)
-   - Sábado: 08:00 às 11:30 (último horário 11:30)
-   - Domingo: FECHADO
-   - Verificar se é dia útil válido
-   - Verificar se horário está dentro do funcionamento
    
    IMPORTANTE: NÃO perguntar sobre tipo de consulta, convênio ou valores. Apenas agendar a consulta.
 
@@ -318,8 +309,8 @@ Responda sempre de forma natural, como um atendente humano profissional faria.""
             
             # Detectar confirmação de agendamento
             if self._is_booking_confirmation(assistant_message):
-                logger.info("🎯 Confirmação de agendamento detectada - marcando no Google Calendar...")
-                return await self._process_booking_confirmation(context, patient, assistant_message, db)
+                logger.info("🎯 Confirmação de agendamento detectada - enviando notificação...")
+                # A confirmação será processada pelo fluxo normal de estados
             
             # Detectar intenção de cancelamento/remarcação
             if self._is_modification_intent(message):
@@ -535,40 +526,41 @@ Responda sempre de forma natural, como um atendente humano profissional faria.""
             appointment_time = datetime.fromisoformat(appointment_time_str).time()
             appointment_datetime = datetime.combine(appointment_date, appointment_time)
             
-            # Criar no Google Calendar
-            google_event_id = None
-            if calendar_service.is_available():
-                google_event_id = calendar_service.create_event(
-                    title=f"Consulta - {patient.name}",
-                    start_datetime=appointment_datetime,
-                    duration_minutes=30,
-                    description=f"Paciente: {patient.name}\nTelefone: {patient.phone}"
-                )
+            # Enviar notificação via WhatsApp
+            notification_message = f"""🩺 NOVA CONSULTA AGENDADA
+
+👤 Paciente: {patient.name}
+📅 Data de nascimento: {patient.birth_date}
+📆 Data da consulta: {requested_date}
+⏰ Horário: {requested_time}
+📞 Telefone: {patient.phone}
+
+Agendado via WhatsApp Bot"""
             
-            # Criar no banco
-            appointment = Appointment(
-                patient_id=patient.id,
-                appointment_date=appointment_date,
-                appointment_time=appointment_time,
-                status=AppointmentStatus.SCHEDULED,
-                notes=f"Google Calendar Event ID: {google_event_id}" if google_event_id else None
-            )
-            db.add(appointment)
-            db.commit()
+            # Enviar notificação para o número da clínica
+            try:
+                from app.whatsapp_service import WhatsAppService
+                whatsapp_service = WhatsAppService()
+                notification_sent = await whatsapp_service.send_message(
+                    phone="+5524998539136",
+                    message=notification_message
+                )
+                if notification_sent:
+                    logger.info("✅ Notificação enviada com sucesso para +55 24 99853-9136")
+                else:
+                    logger.error("❌ Falha ao enviar notificação")
+            except Exception as e:
+                logger.error(f"Erro ao enviar notificação: {str(e)}")
             
             # Resetar contexto
             context.state = ConversationState.IDLE
             context.context_data = "{}"
             
-            clinic_info = load_clinic_info()
-            address = clinic_info.get('endereco', '')
-            
             return (
                 f"✅ Consulta agendada com sucesso!\n\n"
                 f"📅 Data: {requested_date} às {requested_time}\n"
-                f"⏱️ Duração: 30 minutos\n"
-                f"📍 Endereço: {address}\n\n"
-                f"Lembramos que cancelamentos devem ser feitos com 24h de antecedência.\n"
+                f"⏱️ Duração: 30 minutos\n\n"
+                f"📱 Enviamos uma notificação para a clínica com seus dados.\n"
                 f"Até lá! 😊"
             )
         else:
@@ -644,9 +636,6 @@ Responda sempre de forma natural, como um atendente humano profissional faria.""
                 
                 if action == 'cancel':
                     # Cancelar
-                    if appointment.google_event_id and calendar_service.is_available():
-                        calendar_service.delete_event(appointment.google_event_id)
-                    
                     appointment.status = AppointmentStatus.CANCELLED
                     appointment.cancellation_reason = "Cancelado pelo paciente"
                     db.commit()
@@ -816,11 +805,6 @@ Sou seu assistente virtual. Para te ajudar melhor, preciso de algumas informaç�
         
         return """Que dia e horário você tem disponibilidade?
 
-Nosso horário de funcionamento:
-• Segunda a sexta: 08h às 18h
-• Sábado: 08h às 12h
-• Domingo: não há atendimento
-
 Por favor, escreva no formato: DD/MM/AAAA às HH:MM
 Exemplo: 25/10/2025 às 14:30"""
     
@@ -853,18 +837,9 @@ Exemplo: 25/10/2025 às 14:30"""
             except ValueError:
                 return "Data ou horário inválido. Por favor, use o formato: DD/MM/AAAA às HH:MM"
             
-            # Verificar se é dia de funcionamento
-            weekday = appointment_date.weekday()
-            if weekday == 6:  # Domingo
-                return "Domingo não há atendimento. Por favor, escolha outro dia."
-            
-            # Verificar horário de funcionamento
-            if weekday == 5:  # Sábado
-                if appointment_time < datetime.strptime("08:00", "%H:%M").time() or appointment_time >= datetime.strptime("12:00", "%H:%M").time():
-                    return "Sábado atendemos apenas das 08h às 12h. Por favor, escolha outro horário."
-            else:  # Segunda a sexta
-                if appointment_time < datetime.strptime("08:00", "%H:%M").time() or appointment_time >= datetime.strptime("18:00", "%H:%M").time():
-                    return "Segunda a sexta atendemos das 08h às 18h. Por favor, escolha outro horário."
+            # Validação simplificada - apenas verificar se data é válida
+            if appointment_date < datetime.now().date():
+                return "Por favor, escolha uma data futura."
             
             # Salvar no contexto
             context_data = json.loads(context.context_data or "{}")
@@ -878,7 +853,7 @@ Exemplo: 25/10/2025 às 14:30"""
             context.state = ConversationState.CONFIRMANDO
             db.commit()
             
-            return f"Perfeito! O horário {date_str} às {time_str} está dentro do nosso horário de funcionamento. Posso confirmar este agendamento para você?"
+            return f"Perfeito! O horário {date_str} às {time_str} está disponível. Posso confirmar este agendamento para você?"
             
         except Exception as e:
             logger.error(f"Erro ao processar data/horário: {str(e)}")
@@ -945,193 +920,7 @@ Exemplo: 25/10/2025 às 14:30"""
         else:
             return "Posso ajudar com mais alguma coisa? (Sim/Não)"
     
-    # ==================== MÉTODOS PARA CONSULTA REAL DO CALENDÁRIO ====================
-    
-    async def _get_real_available_slots(self) -> List[Dict[str, Any]]:
-        """Consulta o calendário real para obter horários disponíveis"""
-        try:
-            logger.info(f"🔍 Verificando disponibilidade do calendário...")
-            logger.info(f"🔍 Calendar service available: {calendar_service.is_available()}")
-            
-            if not calendar_service.is_available():
-                logger.warning("❌ Calendar service não está disponível - retornando slots simulados")
-                # Retornar slots simulados se o calendário não estiver disponível
-                return self._get_simulated_available_slots()
-            
-            # Consultar próximos 7 dias
-            today = datetime.now()
-            end_date = today + timedelta(days=7)
-            
-            # Buscar eventos existentes
-            events = calendar_service.get_events(
-                start_datetime=today,
-                end_datetime=end_date
-            )
-            
-            # Gerar slots disponíveis baseados nos horários de funcionamento
-            available_slots = []
-            
-            for day_offset in range(7):
-                current_date = today + timedelta(days=day_offset)
-                weekday = current_date.weekday()
-                
-                # Verificar se é dia de funcionamento
-                if weekday == 6:  # Domingo
-                    continue
-                elif weekday == 5:  # Sábado
-                    start_hour, end_hour = 8, 12
-                else:  # Segunda a sexta
-                    start_hour, end_hour = 8, 18
-                
-                # Gerar slots de 30 em 30 minutos
-                for hour in range(start_hour, end_hour):
-                    for minute in [0, 30]:
-                        slot_time = current_date.replace(hour=hour, minute=minute, second=0, microsecond=0)
-                        
-                        # Verificar se o slot está disponível
-                        if not self._is_slot_taken(slot_time, events):
-                            available_slots.append({
-                                'datetime': slot_time,
-                                'date_str': slot_time.strftime('%d/%m/%Y'),
-                                'time_str': slot_time.strftime('%H:%M'),
-                                'day_name': slot_time.strftime('%A')
-                            })
-            
-            return available_slots[:20]  # Limitar a 20 opções
-            
-        except Exception as e:
-            logger.error(f"Erro ao consultar calendário: {str(e)}")
-            # Retornar slots simulados em caso de erro
-            return self._get_simulated_available_slots()
-    
-    def _get_simulated_available_slots(self) -> List[Dict[str, Any]]:
-        """Retorna slots simulados quando o calendário não está disponível"""
-        try:
-            logger.info("🔄 Gerando slots simulados...")
-            available_slots = []
-            
-            # Gerar slots para os próximos 7 dias
-            today = datetime.now()
-            
-            for day_offset in range(7):
-                current_date = today + timedelta(days=day_offset)
-                weekday = current_date.weekday()
-                
-                # Verificar se é dia de funcionamento
-                if weekday == 6:  # Domingo
-                    continue
-                elif weekday == 5:  # Sábado
-                    start_hour, end_hour = 8, 12
-                else:  # Segunda a sexta
-                    start_hour, end_hour = 8, 18
-                
-                # Gerar slots de 30 em 30 minutos
-                for hour in range(start_hour, end_hour):
-                    for minute in [0, 30]:
-                        slot_time = current_date.replace(hour=hour, minute=minute, second=0, microsecond=0)
-                        
-                        available_slots.append({
-                            'datetime': slot_time,
-                            'date_str': slot_time.strftime('%d/%m/%Y'),
-                            'time_str': slot_time.strftime('%H:%M'),
-                            'day_name': slot_time.strftime('%A')
-                        })
-            
-            logger.info(f"✅ Gerados {len(available_slots)} slots simulados")
-            return available_slots[:20]  # Limitar a 20 opções
-            
-        except Exception as e:
-            logger.error(f"Erro ao gerar slots simulados: {str(e)}")
-            return []
-    
-    def _is_slot_taken(self, slot_time: datetime, events: List[Dict]) -> bool:
-        """Verifica se um slot de tempo está ocupado"""
-        slot_end = slot_time + timedelta(minutes=30)
-        
-        for event in events:
-            event_start = event.get('start', {}).get('dateTime')
-            event_end = event.get('end', {}).get('dateTime')
-            
-            if event_start and event_end:
-                event_start_dt = datetime.fromisoformat(event_start.replace('Z', '+00:00'))
-                event_end_dt = datetime.fromisoformat(event_end.replace('Z', '+00:00'))
-                
-                # Verificar sobreposição
-                if (slot_time < event_end_dt and slot_end > event_start_dt):
-                    return True
-        
-        return False
-    
-    async def _process_structured_booking_with_real_slots(
-        self,
-        context: ConversationContext,
-        patient: Optional[Patient],
-        message: str,
-        available_slots: List[Dict[str, Any]],
-        db: Session
-    ) -> str:
-        """Processa agendamento usando slots reais do calendário"""
-        try:
-            # Extrair informações da mensagem
-            message_lower = message.lower()
-            
-            # Detectar tipo de consulta
-            consult_type = "Consulta de rotina"
-            if 'retorno' in message_lower:
-                consult_type = "Retorno"
-            elif 'urgência' in message_lower or 'urgencia' in message_lower:
-                consult_type = "Consulta de urgência"
-            
-            # Detectar preferência de data/horário
-            preferred_slots = []
-            
-            # Procurar por datas específicas
-            if '23/10/2025' in message or '23/10' in message:
-                # Buscar slots para 23/10/2025
-                for slot in available_slots:
-                    if '23/10/2025' in slot['date_str']:
-                        preferred_slots.append(slot)
-            elif 'sábado' in message_lower or 'sabado' in message_lower:
-                # Buscar slots para sábado
-                for slot in available_slots:
-                    if slot['day_name'] == 'Saturday':
-                        preferred_slots.append(slot)
-            elif 'segunda' in message_lower:
-                # Buscar slots para segunda
-                for slot in available_slots:
-                    if slot['day_name'] == 'Monday':
-                        preferred_slots.append(slot)
-            
-            # Se não encontrou preferência específica, usar primeiros slots
-            if not preferred_slots:
-                preferred_slots = available_slots[:3]
-            
-            # Oferecer opções
-            if len(preferred_slots) >= 3:
-                options_text = "Temos estes horários disponíveis:\n\n"
-                for i, slot in enumerate(preferred_slots[:3], 1):
-                    options_text += f"{i}️⃣ {slot['date_str']} às {slot['time_str']}\n"
-                options_text += "\nQual você prefere?"
-                
-                # Salvar slots no contexto
-                context_data = json.loads(context.context_data or "{}")
-                context_data['available_slots'] = [slot['datetime'].isoformat() for slot in preferred_slots[:3]]
-                context_data['consult_type'] = consult_type
-                context.context_data = json.dumps(context_data, ensure_ascii=False)
-                context.state = ConversationState.CONFIRMANDO
-                db.commit()
-                
-                return options_text
-            elif len(preferred_slots) > 0:
-                # Apenas um slot disponível
-                slot = preferred_slots[0]
-                return f"Temos disponível apenas {slot['date_str']} às {slot['time_str']}. Posso confirmar este horário para você?"
-            else:
-                return "Desculpe, não temos horários disponíveis no período solicitado. Posso verificar outras datas?"
-                
-        except Exception as e:
-            logger.error(f"Erro ao processar agendamento: {str(e)}")
-            return "Desculpe, ocorreu um erro. Vamos tentar novamente."
+    # ==================== MÉTODOS REMOVIDOS - NÃO MAIS NECESSÁRIOS ====================
     
     # ==================== MÉTODOS PARA FLUXO DE CONSULTA ====================
     
@@ -1147,73 +936,6 @@ Exemplo: 25/10/2025 às 14:30"""
         ]
         return any(phrase in message_lower for phrase in confirmation_phrases)
     
-    async def _process_booking_confirmation(
-        self,
-        context: ConversationContext,
-        patient: Optional[Patient],
-        assistant_message: str,
-        db: Session
-    ) -> str:
-        """Processa confirmação de agendamento e marca no Google Calendar"""
-        try:
-            # Extrair data e horário da mensagem da IA
-            import re
-            pattern = r'(\d{2}/\d{2}/\d{4})\s*às\s*(\d{2}:\d{2})'
-            match = re.search(pattern, assistant_message)
-            
-            if not match:
-                logger.warning("Não foi possível extrair data/horário da confirmação")
-                return assistant_message
-            
-            date_str, time_str = match.groups()
-            
-            # Converter para datetime
-            appointment_date = datetime.strptime(date_str, "%d/%m/%Y").date()
-            appointment_time = datetime.strptime(time_str, "%H:%M").time()
-            appointment_datetime = datetime.combine(appointment_date, appointment_time)
-            
-            # Marcar no Google Calendar
-            calendar_event_id = None
-            if calendar_service.is_available():
-                try:
-                    calendar_event_id = calendar_service.create_event(
-                        title=f"Consulta - {patient.name if patient else 'Paciente'}",
-                        start_datetime=appointment_datetime,
-                        duration_minutes=30,
-                        description=f"Consulta agendada via WhatsApp\nPaciente: {patient.name if patient else 'N/A'}\nTelefone: {context.phone}",
-                        attendee_email=None
-                    )
-                    logger.info(f"Evento criado no Google Calendar: {calendar_event_id}")
-                except Exception as e:
-                    logger.error(f"Erro ao criar evento no Google Calendar: {str(e)}")
-            
-            # Criar no banco de dados
-            if patient:
-                appointment = Appointment(
-                    patient_id=patient.id,
-                    appointment_date=appointment_date,
-                    appointment_time=appointment_time,
-                    status=AppointmentStatus.SCHEDULED,
-                    notes=f"Agendado via WhatsApp - Google Calendar Event ID: {calendar_event_id}" if calendar_event_id else "Agendado via WhatsApp"
-                )
-                db.add(appointment)
-                db.commit()
-            
-            # Salvar dados da consulta confirmada no contexto
-            context_data = json.loads(context.context_data or "{}")
-            context_data['confirmed_date'] = date_str
-            context_data['confirmed_time'] = time_str
-            context.context_data = json.dumps(context_data, ensure_ascii=False)
-            
-            # Ir para finalização
-            context.state = ConversationState.FINALIZANDO
-            db.commit()
-            
-            return f"Perfeito! Sua consulta está confirmada para {date_str} às {time_str}. ✅\n\nPosso ajudar com mais alguma coisa?"
-            
-        except Exception as e:
-            logger.error(f"Erro ao processar confirmação de agendamento: {str(e)}")
-            return assistant_message  # Retornar mensagem original se der erro
     
     async def _handle_conversa_encerrada(
         self,
