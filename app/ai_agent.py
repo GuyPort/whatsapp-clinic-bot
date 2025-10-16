@@ -507,6 +507,7 @@ Responda sempre de forma natural, como um atendente humano profissional faria.""
         db: Session
     ) -> str:
         """Processa confirmação do agendamento"""
+        logger.info(f"🔄 Processando confirmação: '{message}'")
         message_lower = message.lower()
         
         if 'sim' in message_lower or 'confirmo' in message_lower or 'ok' in message_lower:
@@ -522,9 +523,16 @@ Responda sempre de forma natural, como um atendente humano profissional faria.""
                 return "Desculpe, houve um erro. Por favor, comece o agendamento novamente."
             
             # Converter para datetime com timezone correto
-            appointment_date = datetime.fromisoformat(appointment_date_str).date()
-            appointment_time = datetime.fromisoformat(appointment_time_str).time()
-            appointment_datetime = datetime.combine(appointment_date, appointment_time)
+            try:
+                appointment_date = datetime.fromisoformat(appointment_date_str).date()
+                # Converter string de tempo para time object
+                appointment_time = datetime.strptime(appointment_time_str, '%H:%M:%S').time()
+                appointment_datetime = datetime.combine(appointment_date, appointment_time)
+                logger.info(f"✅ Datetime convertido: {appointment_datetime}")
+            except Exception as e:
+                logger.error(f"❌ Erro ao converter datetime: {str(e)}")
+                context.state = ConversationState.IDLE
+                return "Desculpe, houve um erro. Por favor, comece o agendamento novamente."
             
             # Enviar notificação via WhatsApp
             notification_message = f"""🩺 NOVA CONSULTA AGENDADA
