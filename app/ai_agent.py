@@ -1239,6 +1239,25 @@ Exemplo: 25/10/2025 às 14:30"""
                 appointment_date = datetime.fromisoformat(context_data.get('appointment_date')).date()
                 appointment_time = datetime.fromisoformat(context_data.get('appointment_time')).time()
                 
+                # Criar datetime completo para o Google Calendar
+                appointment_datetime = datetime.combine(appointment_date, appointment_time)
+                
+                # Marcar no Google Calendar
+                calendar_event_id = None
+                if calendar_service.is_available():
+                    try:
+                        calendar_event_id = calendar_service.create_event(
+                            title=f"Consulta - {patient.name if patient else 'Paciente'}",
+                            start_datetime=appointment_datetime,
+                            duration_minutes=30,  # Duração padrão de 30 minutos
+                            description=f"Consulta agendada via WhatsApp\nPaciente: {patient.name if patient else 'N/A'}\nTelefone: {context.phone}",
+                            attendee_email=None  # Não temos email do paciente
+                        )
+                        logger.info(f"Evento criado no Google Calendar: {calendar_event_id}")
+                    except Exception as e:
+                        logger.error(f"Erro ao criar evento no Google Calendar: {str(e)}")
+                        # Continuar mesmo se falhar no Google Calendar
+                
                 # Criar no banco de dados
                 if patient:
                     appointment = Appointment(
@@ -1246,10 +1265,16 @@ Exemplo: 25/10/2025 às 14:30"""
                         appointment_date=appointment_date,
                         appointment_time=appointment_time,
                         consult_type="Consulta de rotina",
-                        status=AppointmentStatus.SCHEDULED
+                        status=AppointmentStatus.SCHEDULED,
+                        notes=f"Google Calendar Event ID: {calendar_event_id}" if calendar_event_id else None
                     )
                     db.add(appointment)
                     db.commit()
+                
+                # Salvar dados da consulta confirmada no contexto
+                context_data['confirmed_date'] = appointment_date.strftime('%d/%m/%Y')
+                context_data['confirmed_time'] = appointment_time.strftime('%H:%M')
+                context.context_data = json.dumps(context_data, ensure_ascii=False)
                 
                 # Ir para finalização
                 context.state = ConversationState.FINALIZANDO
