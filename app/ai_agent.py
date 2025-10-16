@@ -539,18 +539,23 @@ Agendado via WhatsApp Bot"""
             
             # Enviar notificação para o número da clínica
             try:
+                logger.info("🔄 Tentando enviar notificação para +55 24 99853-9136...")
                 from app.whatsapp_service import WhatsAppService
                 whatsapp_service = WhatsAppService()
+                
+                logger.info(f"📱 Enviando mensagem: {notification_message[:100]}...")
                 notification_sent = await whatsapp_service.send_message(
-                    phone="+5524998539136",
+                    phone="5524998539136",
                     message=notification_message
                 )
+                
                 if notification_sent:
                     logger.info("✅ Notificação enviada com sucesso para +55 24 99853-9136")
                 else:
-                    logger.error("❌ Falha ao enviar notificação")
+                    logger.error("❌ Falha ao enviar notificação - retornou False")
             except Exception as e:
-                logger.error(f"Erro ao enviar notificação: {str(e)}")
+                logger.error(f"❌ Erro ao enviar notificação: {str(e)}")
+                logger.error(f"❌ Tipo do erro: {type(e).__name__}")
             
             # Resetar contexto
             context.state = ConversationState.IDLE
