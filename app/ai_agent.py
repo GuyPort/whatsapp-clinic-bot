@@ -679,9 +679,9 @@ Agendado via WhatsApp Bot"""
         context.state = ConversationState.COLETANDO_NOME
         db.commit()
         
-        return """Olá! Bem-vindo(a) à Clínica Teste! 👋
+        return """Olá! Bem-vindo(a) ao Consultório Dra. Rose! 👋
 
-Sou seu assistente virtual. Para te ajudar melhor, preciso de algumas informações:
+Sou a Andressa, sua assistente virtual. Para te ajudar melhor, preciso de algumas informações:
 
 📝 Qual é o seu nome completo?"""
     
@@ -769,9 +769,7 @@ Sou seu assistente virtual. Para te ajudar melhor, preciso de algumas informaç�
         # Verificar se é uma seleção válida com mais variações
         # Opção 1 - Marcar consulta
         if any(word in message_lower for word in ['1', 'um', 'primeiro', 'primeira', 'marcar', 'consulta', 'agendar', 'agendamento']):
-            context.state = ConversationState.MARCAR_CONSULTA
-            db.commit()
-            return "Ótimo! Vamos marcar sua consulta. 🩺\n\nQue dia e horário você tem disponibilidade?"
+            return await self._handle_marcar_consulta(context, patient, message, db)
         
         # Opção 2 - Remarcar/Cancelar
         elif any(word in message_lower for word in ['2', 'dois', 'segundo', 'segunda', 'remarcar', 'cancelar', 'alterar', 'mudar']):
@@ -950,9 +948,9 @@ Exemplo: 25/10/2025 às 14:30"""
         context.context_data = "{}"
         db.commit()
         
-        return """Olá! Bem-vindo(a) à Clínica Teste! 👋
+        return """Olá! Bem-vindo(a) ao Consultório Dra. Rose! 👋
 
-Sou seu assistente virtual. Para te ajudar melhor, preciso de algumas informações:
+Sou a Andressa, sua assistente virtual. Para te ajudar melhor, preciso de algumas informações:
 
 📝 Qual é o seu nome completo?"""
 
