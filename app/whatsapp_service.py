@@ -25,7 +25,7 @@ class WhatsAppService:
         # Debug: Log das configurações
         logger.info(f"WhatsAppService - base_url: {self.base_url}")
         logger.info(f"WhatsAppService - instance_name: {self.instance_name}")
-        logger.info(f"WhatsAppService - api_key: {self.api_key[:10]}...")
+        logger.info(f"WhatsAppService - api_key: {self.api_key[:10] if self.api_key else 'None'}...")
     
     async def send_message(self, phone: str, message: str) -> bool:
         """

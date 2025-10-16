@@ -518,6 +518,13 @@ Responda sempre de forma natural, como um atendente humano profissional faria.""
             requested_date = context_data.get('requested_date')
             requested_time = context_data.get('requested_time')
             
+            # Debug: mostrar o que está sendo processado
+            logger.info(f"🔍 Dados do contexto na confirmação: {context_data}")
+            logger.info(f"🔍 appointment_date_str: {appointment_date_str}")
+            logger.info(f"🔍 appointment_time_str: {appointment_time_str}")
+            logger.info(f"🔍 requested_date: {requested_date}")
+            logger.info(f"🔍 requested_time: {requested_time}")
+            
             if not appointment_date_str or not appointment_time_str:
                 context.state = ConversationState.IDLE
                 return "Desculpe, houve um erro. Por favor, comece o agendamento novamente."
@@ -859,6 +866,9 @@ Exemplo: 25/10/2025 às 14:30"""
             context_data['appointment_date'] = appointment_date.isoformat()
             context_data['appointment_time'] = appointment_time.isoformat()
             context.context_data = json.dumps(context_data, ensure_ascii=False)
+            
+            # Debug: mostrar o que está sendo salvo
+            logger.info(f"🔍 Dados salvos no contexto: {context_data}")
             
             # Ir para confirmação
             context.state = ConversationState.CONFIRMANDO

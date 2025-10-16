@@ -3,9 +3,11 @@ Aplicação FastAPI principal com webhooks do WhatsApp.
 """
 from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
 from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 from contextlib import asynccontextmanager
 import logging
 from typing import Dict, Any, List
+from datetime import datetime, date
 
 from app.simple_config import settings
 
@@ -144,9 +146,18 @@ async def root():
                 <h3>📊 Endpoints</h3>
                 <ul>
                     <li><code>GET /</code> - Esta página</li>
+                    <li><code>GET /dashboard</code> - Dashboard de consultas</li>
                     <li><code>GET /health</code> - Health check</li>
                     <li><code>POST /webhook/whatsapp</code> - Webhook do WhatsApp</li>
                 </ul>
+            </div>
+            
+            <div class="info">
+                <h3>🎛️ Painel de Controle</h3>
+                <p>Visualize todas as consultas agendadas em tempo real:</p>
+                <a href="/dashboard" class="btn btn-primary btn-lg">
+                    <i class="fas fa-chart-line"></i> Abrir Dashboard
+                </a>
             </div>
             
             <div class="footer">
@@ -392,6 +403,64 @@ async def get_appointments():
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/api/appointments/scheduled")
+async def get_scheduled_appointments():
+    """API para o dashboard - consultas agendadas com estatísticas"""
+    try:
+        with get_db() as db:
+            from datetime import datetime, timedelta
+            
+            # Buscar consultas agendadas ordenadas por data
+            appointments = db.query(Appointment).join(Patient).filter(
+                Appointment.status == AppointmentStatus.SCHEDULED
+            ).order_by(Appointment.appointment_date, Appointment.appointment_time).all()
+            
+            # Calcular estatísticas
+            today = datetime.now().date()
+            week_start = today - timedelta(days=today.weekday())  # Início da semana
+            week_end = week_start + timedelta(days=6)  # Fim da semana
+            
+            stats = {
+                "scheduled": db.query(Appointment).filter(
+                    Appointment.status == AppointmentStatus.SCHEDULED
+                ).count(),
+                "total_patients": db.query(Patient).count(),
+                "today": db.query(Appointment).filter(
+                    Appointment.appointment_date == today,
+                    Appointment.status == AppointmentStatus.SCHEDULED
+                ).count(),
+                "this_week": db.query(Appointment).filter(
+                    Appointment.appointment_date >= week_start,
+                    Appointment.appointment_date <= week_end,
+                    Appointment.status == AppointmentStatus.SCHEDULED
+                ).count()
+            }
+            
+            # Formatar consultas
+            formatted_appointments = []
+            for apt in appointments:
+                formatted_appointments.append({
+                    "id": apt.id,
+                    "patient_name": apt.patient.name,
+                    "patient_phone": apt.patient.phone,
+                    "patient_birth_date": apt.patient.birth_date,
+                    "appointment_date": apt.appointment_date.isoformat(),
+                    "appointment_time": apt.appointment_time.strftime("%H:%M:%S"),
+                    "status": apt.status.value,
+                    "notes": apt.notes,
+                    "created_at": apt.created_at.isoformat()
+                })
+            
+            return {
+                "stats": stats,
+                "appointments": formatted_appointments
+            }
+            
+    except Exception as e:
+        logger.error(f"Erro ao buscar consultas agendadas: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/admin/conversations")
 async def get_conversations():
     """Lista contextos de conversas ativas"""
@@ -454,6 +523,295 @@ async def get_dashboard():
     except Exception as e:
         logger.error(f"Erro ao buscar dashboard: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/dashboard")
+async def dashboard():
+    """Dashboard simples para visualizar consultas agendadas"""
+    return HTMLResponse(content="""
+    <!DOCTYPE html>
+    <html lang="pt-BR">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Dashboard - Consultas Agendadas</title>
+        <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+        <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+        <style>
+            body {
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                min-height: 100vh;
+                font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            }
+            .dashboard-container {
+                background: rgba(255, 255, 255, 0.95);
+                border-radius: 15px;
+                box-shadow: 0 10px 40px rgba(0,0,0,0.2);
+                margin: 20px;
+                padding: 30px;
+            }
+            .header {
+                text-align: center;
+                margin-bottom: 30px;
+                border-bottom: 2px solid #667eea;
+                padding-bottom: 20px;
+            }
+            .stats-card {
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                color: white;
+                border-radius: 10px;
+                padding: 20px;
+                margin-bottom: 20px;
+                text-align: center;
+            }
+            .appointment-card {
+                background: white;
+                border: 1px solid #e0e0e0;
+                border-radius: 10px;
+                padding: 20px;
+                margin-bottom: 15px;
+                box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+                transition: transform 0.2s;
+            }
+            .appointment-card:hover {
+                transform: translateY(-2px);
+                box-shadow: 0 4px 20px rgba(0,0,0,0.15);
+            }
+            .status-badge {
+                padding: 5px 15px;
+                border-radius: 20px;
+                font-size: 12px;
+                font-weight: bold;
+            }
+            .status-scheduled { background-color: #28a745; color: white; }
+            .status-cancelled { background-color: #dc3545; color: white; }
+            .status-completed { background-color: #17a2b8; color: white; }
+            .btn-refresh {
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                border: none;
+                color: white;
+                padding: 12px 30px;
+                border-radius: 25px;
+                font-weight: bold;
+                transition: all 0.3s;
+            }
+            .btn-refresh:hover {
+                transform: translateY(-2px);
+                box-shadow: 0 5px 15px rgba(102, 126, 234, 0.4);
+                color: white;
+            }
+            .loading {
+                text-align: center;
+                padding: 50px;
+                color: #666;
+            }
+            .no-appointments {
+                text-align: center;
+                padding: 50px;
+                color: #666;
+                background: #f8f9fa;
+                border-radius: 10px;
+                margin-top: 20px;
+            }
+            .patient-info {
+                font-size: 14px;
+                color: #666;
+                margin-top: 5px;
+            }
+            .appointment-time {
+                font-size: 18px;
+                font-weight: bold;
+                color: #667eea;
+            }
+        </style>
+    </head>
+    <body>
+        <div class="container-fluid">
+            <div class="dashboard-container">
+                <div class="header">
+                    <h1><i class="fas fa-calendar-check"></i> Dashboard - Consultas Agendadas</h1>
+                    <p class="text-muted">Consultório Dra. Rose</p>
+                </div>
+
+                <!-- Estatísticas -->
+                <div class="row mb-4">
+                    <div class="col-md-3">
+                        <div class="stats-card">
+                            <h3 id="total-scheduled">-</h3>
+                            <p>Consultas Agendadas</p>
+                        </div>
+                    </div>
+                    <div class="col-md-3">
+                        <div class="stats-card">
+                            <h3 id="total-patients">-</h3>
+                            <p>Total de Pacientes</p>
+                        </div>
+                    </div>
+                    <div class="col-md-3">
+                        <div class="stats-card">
+                            <h3 id="today-appointments">-</h3>
+                            <p>Consultas Hoje</p>
+                        </div>
+                    </div>
+                    <div class="col-md-3">
+                        <div class="stats-card">
+                            <h3 id="week-appointments">-</h3>
+                            <p>Esta Semana</p>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Botão Atualizar -->
+                <div class="text-center mb-4">
+                    <button class="btn btn-refresh" onclick="loadAppointments()">
+                        <i class="fas fa-sync-alt"></i> Atualizar Consultas
+                    </button>
+                    <p class="text-muted mt-2">
+                        Última atualização: <span id="last-update">-</span>
+                    </p>
+                </div>
+
+                <!-- Lista de Consultas -->
+                <div id="appointments-container">
+                    <div class="loading">
+                        <i class="fas fa-spinner fa-spin fa-2x"></i>
+                        <p>Carregando consultas...</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+        <script>
+            // Carregar dados ao abrir a página
+            document.addEventListener('DOMContentLoaded', function() {
+                loadAppointments();
+            });
+
+            async function loadAppointments() {
+                try {
+                    // Mostrar loading
+                    document.getElementById('appointments-container').innerHTML = `
+                        <div class="loading">
+                            <i class="fas fa-spinner fa-spin fa-2x"></i>
+                            <p>Carregando consultas...</p>
+                        </div>
+                    `;
+
+                    // Buscar consultas
+                    const response = await fetch('/api/appointments/scheduled');
+                    const data = await response.json();
+
+                    // Atualizar estatísticas
+                    updateStats(data.stats);
+
+                    // Atualizar lista de consultas
+                    displayAppointments(data.appointments);
+
+                    // Atualizar timestamp
+                    document.getElementById('last-update').textContent = new Date().toLocaleString('pt-BR');
+
+                } catch (error) {
+                    console.error('Erro ao carregar consultas:', error);
+                    document.getElementById('appointments-container').innerHTML = `
+                        <div class="alert alert-danger">
+                            <i class="fas fa-exclamation-triangle"></i>
+                            Erro ao carregar consultas. Tente novamente.
+                        </div>
+                    `;
+                }
+            }
+
+            function updateStats(stats) {
+                document.getElementById('total-scheduled').textContent = stats.scheduled || 0;
+                document.getElementById('total-patients').textContent = stats.total_patients || 0;
+                document.getElementById('today-appointments').textContent = stats.today || 0;
+                document.getElementById('week-appointments').textContent = stats.this_week || 0;
+            }
+
+            function displayAppointments(appointments) {
+                const container = document.getElementById('appointments-container');
+                
+                if (!appointments || appointments.length === 0) {
+                    container.innerHTML = `
+                        <div class="no-appointments">
+                            <i class="fas fa-calendar-times fa-3x mb-3"></i>
+                            <h4>Nenhuma consulta agendada</h4>
+                            <p>As consultas agendadas aparecerão aqui.</p>
+                        </div>
+                    `;
+                    return;
+                }
+
+                const html = appointments.map(appointment => `
+                    <div class="appointment-card">
+                        <div class="row align-items-center">
+                            <div class="col-md-2 text-center">
+                                <div class="appointment-time">
+                                    ${formatTime(appointment.appointment_time)}
+                                </div>
+                                <div class="text-muted">
+                                    ${formatDate(appointment.appointment_date)}
+                                </div>
+                            </div>
+                            <div class="col-md-4">
+                                <h5 class="mb-1">${appointment.patient_name}</h5>
+                                <div class="patient-info">
+                                    <i class="fas fa-phone"></i> ${appointment.patient_phone}
+                                    <br>
+                                    <i class="fas fa-birthday-cake"></i> ${appointment.patient_birth_date}
+                                </div>
+                            </div>
+                            <div class="col-md-3">
+                                <span class="status-badge status-${appointment.status}">
+                                    ${getStatusText(appointment.status)}
+                                </span>
+                                ${appointment.notes ? `<div class="text-muted mt-1"><small>${appointment.notes}</small></div>` : ''}
+                            </div>
+                            <div class="col-md-3 text-end">
+                                <small class="text-muted">
+                                    Agendado em: ${formatDateTime(appointment.created_at)}
+                                </small>
+                            </div>
+                        </div>
+                    </div>
+                `).join('');
+
+                container.innerHTML = html;
+            }
+
+            function formatTime(timeStr) {
+                return timeStr.substring(0, 5); // HH:MM
+            }
+
+            function formatDate(dateStr) {
+                const date = new Date(dateStr);
+                return date.toLocaleDateString('pt-BR', {
+                    weekday: 'short',
+                    day: '2-digit',
+                    month: '2-digit',
+                    year: 'numeric'
+                });
+            }
+
+            function formatDateTime(dateTimeStr) {
+                const date = new Date(dateTimeStr);
+                return date.toLocaleString('pt-BR');
+            }
+
+            function getStatusText(status) {
+                const statusMap = {
+                    'scheduled': 'Agendada',
+                    'completed': 'Realizada',
+                    'cancelled': 'Cancelada',
+                    'no_show': 'Não Compareceu'
+                };
+                return statusMap[status] || status;
+            }
+        </script>
+    </body>
+    </html>
+    """)
 
 
 @app.get("/admin/patient/{patient_id}")
