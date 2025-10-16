@@ -22,7 +22,7 @@ from app.database import init_db, get_db
 from app.ai_agent import ai_agent
 from app.whatsapp_service import whatsapp_service
 from app.utils import normalize_phone
-from app.models import Patient, Appointment, ConversationContext, AppointmentStatus, ConversationState
+from app.models import Appointment
 
 # Configurar logging
 logging.basicConfig(
@@ -352,23 +352,35 @@ from app.calendar_service import calendar_service
 
 @app.get("/admin/patients")
 async def get_patients():
-    """Lista todos os pacientes cadastrados"""
+    """Lista todos os pacientes únicos baseado nas consultas"""
     try:
         with get_db() as db:
-            patients = db.query(Patient).order_by(Patient.created_at.desc()).all()
+            appointments = db.query(Appointment).order_by(Appointment.created_at.desc()).all()
+            patients = []
+            seen_patients = set()
+            
+            for apt in appointments:
+                patient_key = f"{apt.patient_name}_{apt.patient_birth_date}"
+                if patient_key not in seen_patients:
+                    patients.append({
+                        "id": apt.id,
+                        "name": apt.patient_name,
+                        "phone": "N/A",
+                        "birth_date": apt.patient_birth_date,
+                        "created_at": apt.created_at.isoformat(),
+                        "appointments_count": 1  # Contagem simplificada
+                    })
+                    seen_patients.add(patient_key)
+                else:
+                    # Incrementar contador se já existe
+                    for p in patients:
+                        if f"{p['name']}_{p['birth_date']}" == patient_key:
+                            p['appointments_count'] += 1
+                            break
+            
             return {
                 "total": len(patients),
-                "patients": [
-                    {
-                        "id": p.id,
-                        "name": p.name,
-                        "phone": p.phone,
-                        "birth_date": p.birth_date,
-                        "created_at": p.created_at.isoformat(),
-                        "appointments_count": len(p.appointments)
-                    }
-                    for p in patients
-                ]
+                "patients": patients
             }
     except Exception as e:
         logger.error(f"Erro ao buscar pacientes: {str(e)}")
@@ -386,13 +398,11 @@ async def get_appointments():
                 "appointments": [
                     {
                         "id": a.id,
-                        "patient_name": a.patient.name,
-                        "patient_phone": a.patient.phone,
+                        "patient_name": a.patient_name,
+                        "patient_phone": "N/A",
                         "appointment_date": a.appointment_date,
                         "appointment_time": a.appointment_time,
-                        "consult_type": a.consultation_type,
-                        "status": a.status.value,
-                        "notes": a.notes,
+                        "patient_birth_date": a.patient_birth_date,
                         "created_at": a.created_at.isoformat()
                     }
                     for a in appointments
@@ -410,29 +420,30 @@ async def get_scheduled_appointments():
         with get_db() as db:
             from datetime import datetime, timedelta
             
-            # Buscar consultas agendadas ordenadas por data
-            appointments = db.query(Appointment).join(Patient).filter(
-                Appointment.status == AppointmentStatus.SCHEDULED
-            ).order_by(Appointment.appointment_date, Appointment.appointment_time).all()
+            # Buscar todas as consultas ordenadas por data
+            appointments = db.query(Appointment).order_by(
+                Appointment.appointment_date, Appointment.appointment_time
+            ).all()
             
             # Calcular estatísticas
             today = datetime.now().date()
             week_start = today - timedelta(days=today.weekday())  # Início da semana
             week_end = week_start + timedelta(days=6)  # Fim da semana
             
+            # Contar pacientes únicos
+            unique_patients = set()
+            for apt in appointments:
+                unique_patients.add(f"{apt.patient_name}_{apt.patient_birth_date}")
+            
             stats = {
-                "scheduled": db.query(Appointment).filter(
-                    Appointment.status == AppointmentStatus.SCHEDULED
-                ).count(),
-                "total_patients": db.query(Patient).count(),
+                "scheduled": len(appointments),
+                "total_patients": len(unique_patients),
                 "today": db.query(Appointment).filter(
-                    Appointment.appointment_date == today,
-                    Appointment.status == AppointmentStatus.SCHEDULED
+                    Appointment.appointment_date == today
                 ).count(),
                 "this_week": db.query(Appointment).filter(
                     Appointment.appointment_date >= week_start,
-                    Appointment.appointment_date <= week_end,
-                    Appointment.status == AppointmentStatus.SCHEDULED
+                    Appointment.appointment_date <= week_end
                 ).count()
             }
             
@@ -441,13 +452,12 @@ async def get_scheduled_appointments():
             for apt in appointments:
                 formatted_appointments.append({
                     "id": apt.id,
-                    "patient_name": apt.patient.name,
-                    "patient_phone": apt.patient.phone,
-                    "patient_birth_date": apt.patient.birth_date,
+                    "patient_name": apt.patient_name,
+                    "patient_phone": "N/A",
+                    "patient_birth_date": apt.patient_birth_date,
                     "appointment_date": apt.appointment_date.isoformat(),
                     "appointment_time": apt.appointment_time.strftime("%H:%M:%S"),
-                    "status": apt.status.value,
-                    "notes": apt.notes,
+                    "status": "scheduled",
                     "created_at": apt.created_at.isoformat()
                 })
             

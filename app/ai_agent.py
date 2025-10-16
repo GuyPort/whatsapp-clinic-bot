@@ -10,10 +10,7 @@ from anthropic import Anthropic
 from sqlalchemy.orm import Session
 
 from app.simple_config import settings
-from app.models import (
-    Patient, Appointment, ConversationContext,
-    AppointmentStatus, ConversationState
-)
+from app.models import Appointment
 from app.utils import (
     load_clinic_info, normalize_phone, extract_name_from_message,
     extract_date_from_message, parse_date_br, is_valid_birth_date,
@@ -545,13 +542,10 @@ Responda sempre de forma natural, como um atendente humano profissional faria.""
             try:
                 from app.models import Appointment
                 appointment = Appointment(
-                    patient_id=patient.id,
+                    patient_name=patient.name,
+                    patient_birth_date=patient.birth_date,
                     appointment_date=appointment_date,
-                    appointment_time=appointment_time,
-                    consultation_type="Consulta Geral",
-                    duration_minutes=30,
-                    status=AppointmentStatus.SCHEDULED,
-                    notes=f"Agendado via WhatsApp Bot em {now_brazil().strftime('%d/%m/%Y %H:%M')}"
+                    appointment_time=appointment_time
                 )
                 db.add(appointment)
                 db.commit()
