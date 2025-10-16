@@ -66,16 +66,24 @@ FLUXO DE ATENDIMENTO ESTRUTURADO:
    3️⃣ Tirar dúvidas"
 
 3. MARCAR CONSULTA:
-   OBJETIVO: Agendar uma consulta para o paciente, consultando a agenda real da clínica para encontrar dias e horários disponíveis que se adequem às suas preferências e às regras da clínica, e então confirmar o agendamento.
+   -OBJETIVO: Agendar uma consulta para o paciente, validando horários e confirmando o agendamento.
    
    DIRETRIZES:
-   - Coletar tipo de consulta e preferências de dia/horário (ordem flexível)
-   - SEMPRE consultar o calendário real antes de oferecer horários
-   - NUNCA usar horários simulados ou padrões
-   - Se agenda cheia, oferecer próximos dias disponíveis
-   - Se poucos horários, oferecer apenas os realmente disponíveis
-   - Confirmar com data completa (DD/MM/AAAA)
+   - Perguntar: "Que dia e horário você tem disponibilidade?"
+   - Mostrar horários de funcionamento: Segunda a sexta (08h às 18h), Sábado (08h às 12h), Domingo (fechado)
+   - VALIDAR se o horário está dentro do funcionamento da clínica
+   - Se horário VÁLIDO: confirmar e marcar no Google Calendar
+   - Se horário INVÁLIDO: explicar o problema e pedir novo horário
+   - Sempre confirmar antes de marcar: "Posso confirmar este agendamento para você?"
+   - Após confirmar: marcar no Google Calendar e salvar no banco
    - Perguntar: "Posso ajudar com mais alguma coisa?"
+   
+   VALIDAÇÃO DE HORÁRIO:
+   - Segunda a sexta: 08:00 às 17:30 (último horário 17:30)
+   - Sábado: 08:00 às 11:30 (último horário 11:30)
+   - Domingo: FECHADO
+   - Verificar se é dia útil válido
+   - Verificar se horário está dentro do funcionamento
 
 4. REMARCAR/CANCELAR:
    - Buscar consultas do paciente (usando nome + nascimento)
@@ -240,15 +248,6 @@ Responda sempre de forma natural, como um atendente humano profissional faria.""
         elif context.state == ConversationState.MARCAR_CONSULTA:
             return await self._handle_marcar_consulta(context, patient, message, db)
         
-        elif context.state == ConversationState.PERGUNTANDO_DATA_HORARIO:
-            return await self._handle_perguntando_data_horario(context, patient, message, db)
-        
-        elif context.state == ConversationState.VERIFICANDO_DISPONIBILIDADE:
-            return await self._handle_verificando_disponibilidade(context, patient, message, db)
-        
-        elif context.state == ConversationState.CONFIRMANDO_AGENDAMENTO:
-            return await self._handle_confirmando_agendamento(context, patient, message, db)
-        
         elif context.state == ConversationState.REMARCAR_CANCELAR:
             return await self._handle_remarcar_cancelar(context, patient, message, db)
         
@@ -313,20 +312,10 @@ Responda sempre de forma natural, como um atendente humano profissional faria.""
             context_data['history'] = conversation_history[-10:]
             context.context_data = json.dumps(context_data, ensure_ascii=False)
             
-            # Detectar intenção de agendamento
-            if self._is_booking_intent(message, assistant_message):
-                logger.info("🎯 Intenção de agendamento detectada - consultando calendário...")
-                # Consultar calendário real antes de processar
-                available_slots = await self._get_real_available_slots()
-                logger.info(f"📅 Slots disponíveis encontrados: {len(available_slots)}")
-                
-                if available_slots:
-                    # Processar agendamento com slots reais
-                    return await self._process_structured_booking_with_real_slots(context, patient, message, available_slots, db)
-                else:
-                    # Se não há slots disponíveis, informar
-                    logger.warning("❌ Nenhum slot disponível encontrado")
-                    return "Desculpe, nossa agenda está lotada no momento. Posso verificar os próximos dias disponíveis para você?"
+            # Detectar confirmação de agendamento
+            if self._is_booking_confirmation(assistant_message):
+                logger.info("🎯 Confirmação de agendamento detectada - marcando no Google Calendar...")
+                return await self._process_booking_confirmation(context, patient, assistant_message, db)
             
             # Detectar intenção de cancelamento/remarcação
             if self._is_modification_intent(message):
@@ -848,20 +837,9 @@ Sou seu assistente virtual. Para te ajudar melhor, preciso de algumas informaç�
         message: str,
         db: Session
     ) -> str:
-        """Inicia processo de marcação de consulta"""
-        # Ir para próximo estado
-        context.state = ConversationState.PERGUNTANDO_DATA_HORARIO
-        db.commit()
-        
-        return """Que dia e horário você tem disponibilidade?
-
-Nosso horário de funcionamento:
-• Segunda a sexta: 08h às 18h
-• Sábado: 08h às 12h
-• Domingo: não há atendimento
-
-Por favor, escreva no formato: DD/MM/AAAA às HH:MM
-Exemplo: 25/10/2025 às 14:30"""
+        """Processa marcação de consulta usando IA"""
+        # Usar Claude para processar de forma inteligente
+        return await self._handle_general_conversation(context, patient, message, db)
     
     async def _handle_remarcar_cancelar(
         self,
@@ -1114,187 +1092,86 @@ Exemplo: 25/10/2025 às 14:30"""
     
     # ==================== MÉTODOS PARA FLUXO DE CONSULTA ====================
     
-    async def _handle_perguntando_data_horario(
+    def _is_booking_confirmation(self, message: str) -> bool:
+        """Detecta se a IA confirmou um agendamento"""
+        message_lower = message.lower()
+        confirmation_phrases = [
+            "posso confirmar este agendamento",
+            "posso confirmar",
+            "confirmar este agendamento",
+            "agendamento confirmado",
+            "consulta confirmada"
+        ]
+        return any(phrase in message_lower for phrase in confirmation_phrases)
+    
+    async def _process_booking_confirmation(
         self,
         context: ConversationContext,
         patient: Optional[Patient],
-        message: str,
+        assistant_message: str,
         db: Session
     ) -> str:
-        """Processa data e horário fornecidos pelo usuário"""
+        """Processa confirmação de agendamento e marca no Google Calendar"""
         try:
-            # Extrair data e horário da mensagem
-            message_clean = message.strip()
-            
-            # Procurar padrão DD/MM/AAAA às HH:MM
+            # Extrair data e horário da mensagem da IA
             import re
             pattern = r'(\d{2}/\d{2}/\d{4})\s*às\s*(\d{2}:\d{2})'
-            match = re.search(pattern, message_clean)
+            match = re.search(pattern, assistant_message)
             
             if not match:
-                return "Formato inválido. Por favor, use o formato: DD/MM/AAAA às HH:MM\nExemplo: 25/10/2025 às 14:30"
+                logger.warning("Não foi possível extrair data/horário da confirmação")
+                return assistant_message
             
             date_str, time_str = match.groups()
             
-            # Validar data
-            try:
-                appointment_date = datetime.strptime(date_str, "%d/%m/%Y").date()
-                appointment_time = datetime.strptime(time_str, "%H:%M").time()
-            except ValueError:
-                return "Data ou horário inválido. Por favor, use o formato: DD/MM/AAAA às HH:MM"
+            # Converter para datetime
+            appointment_date = datetime.strptime(date_str, "%d/%m/%Y").date()
+            appointment_time = datetime.strptime(time_str, "%H:%M").time()
+            appointment_datetime = datetime.combine(appointment_date, appointment_time)
             
-            # Verificar se é dia de funcionamento
-            weekday = appointment_date.weekday()
-            if weekday == 6:  # Domingo
-                return "Domingo não há atendimento. Por favor, escolha outro dia."
+            # Marcar no Google Calendar
+            calendar_event_id = None
+            if calendar_service.is_available():
+                try:
+                    calendar_event_id = calendar_service.create_event(
+                        title=f"Consulta - {patient.name if patient else 'Paciente'}",
+                        start_datetime=appointment_datetime,
+                        duration_minutes=30,
+                        description=f"Consulta agendada via WhatsApp\nPaciente: {patient.name if patient else 'N/A'}\nTelefone: {context.phone}",
+                        attendee_email=None
+                    )
+                    logger.info(f"Evento criado no Google Calendar: {calendar_event_id}")
+                except Exception as e:
+                    logger.error(f"Erro ao criar evento no Google Calendar: {str(e)}")
             
-            # Verificar horário de funcionamento
-            if weekday == 5:  # Sábado
-                if appointment_time < datetime.strptime("08:00", "%H:%M").time() or appointment_time >= datetime.strptime("12:00", "%H:%M").time():
-                    return "Sábado atendemos apenas das 08h às 12h. Por favor, escolha outro horário."
-            else:  # Segunda a sexta
-                if appointment_time < datetime.strptime("08:00", "%H:%M").time() or appointment_time >= datetime.strptime("18:00", "%H:%M").time():
-                    return "Segunda a sexta atendemos das 08h às 18h. Por favor, escolha outro horário."
+            # Criar no banco de dados
+            if patient:
+                appointment = Appointment(
+                    patient_id=patient.id,
+                    appointment_date=appointment_date,
+                    appointment_time=appointment_time,
+                    consult_type="Consulta de rotina",
+                    status=AppointmentStatus.SCHEDULED,
+                    notes=f"Google Calendar Event ID: {calendar_event_id}" if calendar_event_id else None
+                )
+                db.add(appointment)
+                db.commit()
             
-            # Salvar no contexto
+            # Salvar dados da consulta confirmada no contexto
             context_data = json.loads(context.context_data or "{}")
-            context_data['requested_date'] = date_str
-            context_data['requested_time'] = time_str
-            context_data['appointment_date'] = appointment_date.isoformat()
-            context_data['appointment_time'] = appointment_time.isoformat()
+            context_data['confirmed_date'] = date_str
+            context_data['confirmed_time'] = time_str
             context.context_data = json.dumps(context_data, ensure_ascii=False)
             
-            # Ir para verificação de disponibilidade
-            context.state = ConversationState.VERIFICANDO_DISPONIBILIDADE
+            # Ir para finalização
+            context.state = ConversationState.FINALIZANDO
             db.commit()
             
-            return f"Verificando disponibilidade para {date_str} às {time_str}... ⏳"
+            return f"Perfeito! Sua consulta está confirmada para {date_str} às {time_str}. ✅\n\nPosso ajudar com mais alguma coisa?"
             
         except Exception as e:
-            logger.error(f"Erro ao processar data/horário: {str(e)}")
-            return "Desculpe, ocorreu um erro. Por favor, tente novamente com o formato: DD/MM/AAAA às HH:MM"
-    
-    async def _handle_verificando_disponibilidade(
-        self,
-        context: ConversationContext,
-        patient: Optional[Patient],
-        message: str,
-        db: Session
-    ) -> str:
-        """Verifica se horário está dentro do funcionamento da clínica"""
-        try:
-            context_data = json.loads(context.context_data or "{}")
-            date_str = context_data.get('requested_date')
-            time_str = context_data.get('requested_time')
-            appointment_date = datetime.fromisoformat(context_data.get('appointment_date'))
-            appointment_time = datetime.fromisoformat(context_data.get('appointment_time')).time()
-            
-            # Verificar se está dentro do horário de funcionamento
-            weekday = appointment_date.weekday()
-            
-            # Verificar horário de funcionamento
-            is_within_hours = False
-            if weekday == 5:  # Sábado
-                if appointment_time >= datetime.strptime("08:00", "%H:%M").time() and appointment_time < datetime.strptime("12:00", "%H:%M").time():
-                    is_within_hours = True
-            elif weekday < 5:  # Segunda a sexta
-                if appointment_time >= datetime.strptime("08:00", "%H:%M").time() and appointment_time < datetime.strptime("18:00", "%H:%M").time():
-                    is_within_hours = True
-            
-            if is_within_hours:
-                # Horário válido - confirmar
-                context.state = ConversationState.CONFIRMANDO_AGENDAMENTO
-                db.commit()
-                
-                return f"Perfeito! O horário {date_str} às {time_str} está dentro do nosso horário de funcionamento. Posso confirmar este agendamento para você?"
-            else:
-                # Horário inválido - pedir novo horário
-                context.state = ConversationState.PERGUNTANDO_DATA_HORARIO
-                db.commit()
-                
-                if weekday == 5:  # Sábado
-                    return f"O horário {time_str} não está dentro do nosso horário de funcionamento de sábado (08h às 12h). Por favor, escolha um horário entre 08:00 e 11:30."
-                else:  # Segunda a sexta
-                    return f"O horário {time_str} não está dentro do nosso horário de funcionamento (08h às 18h). Por favor, escolha um horário entre 08:00 e 17:30."
-            
-        except Exception as e:
-            logger.error(f"Erro ao verificar horário: {str(e)}")
-            return "Desculpe, ocorreu um erro. Por favor, tente novamente com o formato: DD/MM/AAAA às HH:MM"
-    
-    
-    async def _handle_confirmando_agendamento(
-        self,
-        context: ConversationContext,
-        patient: Optional[Patient],
-        message: str,
-        db: Session
-    ) -> str:
-        """Confirma e agenda a consulta"""
-        try:
-            message_lower = message.lower().strip()
-            
-            if 'sim' in message_lower or 'confirmo' in message_lower or 'ok' in message_lower:
-                # Confirmar agendamento
-                context_data = json.loads(context.context_data or "{}")
-                appointment_date = datetime.fromisoformat(context_data.get('appointment_date')).date()
-                appointment_time = datetime.fromisoformat(context_data.get('appointment_time')).time()
-                
-                # Criar datetime completo para o Google Calendar
-                appointment_datetime = datetime.combine(appointment_date, appointment_time)
-                
-                # Marcar no Google Calendar
-                calendar_event_id = None
-                if calendar_service.is_available():
-                    try:
-                        calendar_event_id = calendar_service.create_event(
-                            title=f"Consulta - {patient.name if patient else 'Paciente'}",
-                            start_datetime=appointment_datetime,
-                            duration_minutes=30,  # Duração padrão de 30 minutos
-                            description=f"Consulta agendada via WhatsApp\nPaciente: {patient.name if patient else 'N/A'}\nTelefone: {context.phone}",
-                            attendee_email=None  # Não temos email do paciente
-                        )
-                        logger.info(f"Evento criado no Google Calendar: {calendar_event_id}")
-                    except Exception as e:
-                        logger.error(f"Erro ao criar evento no Google Calendar: {str(e)}")
-                        # Continuar mesmo se falhar no Google Calendar
-                
-                # Criar no banco de dados
-                if patient:
-                    appointment = Appointment(
-                        patient_id=patient.id,
-                        appointment_date=appointment_date,
-                        appointment_time=appointment_time,
-                        consult_type="Consulta de rotina",
-                        status=AppointmentStatus.SCHEDULED,
-                        notes=f"Google Calendar Event ID: {calendar_event_id}" if calendar_event_id else None
-                    )
-                    db.add(appointment)
-                    db.commit()
-                
-                # Salvar dados da consulta confirmada no contexto
-                context_data['confirmed_date'] = appointment_date.strftime('%d/%m/%Y')
-                context_data['confirmed_time'] = appointment_time.strftime('%H:%M')
-                context.context_data = json.dumps(context_data, ensure_ascii=False)
-                
-                # Ir para finalização
-                context.state = ConversationState.FINALIZANDO
-                db.commit()
-                
-                return f"Perfeito! Sua consulta está confirmada para {appointment_date.strftime('%d/%m/%Y')} às {appointment_time.strftime('%H:%M')}. ✅\n\nPosso ajudar com mais alguma coisa?"
-            
-            elif 'não' in message_lower or 'nao' in message_lower or 'cancelar' in message_lower:
-                # Cancelar agendamento
-                context.state = ConversationState.MENU_PRINCIPAL
-                db.commit()
-                return "Agendamento cancelado. Como posso te ajudar?\n\n1️⃣ Marcar consulta\n2️⃣ Remarcar/Cancelar consulta\n3️⃣ Tirar dúvidas"
-            
-            else:
-                return "Por favor, responda com Sim ou Não para confirmar o agendamento."
-            
-        except Exception as e:
-            logger.error(f"Erro ao confirmar agendamento: {str(e)}")
-            return "Desculpe, ocorreu um erro. Por favor, tente novamente."
-    
+            logger.error(f"Erro ao processar confirmação de agendamento: {str(e)}")
+            return assistant_message  # Retornar mensagem original se der erro
     
     async def _handle_conversa_encerrada(
         self,
