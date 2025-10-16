@@ -2,7 +2,7 @@
 Modelos de banco de dados para o bot da clínica.
 """
 from datetime import datetime, date, time
-from sqlalchemy import Column, Integer, String, DateTime, Date, Time, ForeignKey, Text, Enum, Float
+from sqlalchemy import Column, Integer, String, DateTime, Date, Time, ForeignKey, Text, Enum, Float, Index
 from sqlalchemy.orm import relationship, declarative_base
 import enum
 
@@ -78,6 +78,11 @@ class Appointment(Base):
     
     # Relacionamentos
     patient = relationship("Patient", back_populates="appointments")
+    
+    # Índice composto para otimizar queries de conflito de horários
+    __table_args__ = (
+        Index('idx_appointment_date_status', 'appointment_date', 'status'),
+    )
     
     def __repr__(self):
         return f"<Appointment(id={self.id}, patient_id={self.patient_id}, date='{self.appointment_date}', status='{self.status}')>"

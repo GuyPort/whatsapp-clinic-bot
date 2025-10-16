@@ -14,12 +14,24 @@ from app.models import Base
 # Garantir que o diretório data existe
 os.makedirs("data", exist_ok=True)
 
-# Criar engine do SQLAlchemy
-engine = create_engine(
-    settings.database_url,
-    connect_args={"check_same_thread": False},  # Necessário para SQLite
-    echo=settings.log_level == "DEBUG"  # Log de SQL queries em debug
-)
+# Criar engine do SQLAlchemy com suporte a PostgreSQL e SQLite
+# Configuração dinâmica baseada no tipo de banco
+if settings.database_url.startswith("sqlite"):
+    # Configuração para SQLite (desenvolvimento local)
+    engine = create_engine(
+        settings.database_url,
+        connect_args={"check_same_thread": False},  # Necessário para SQLite
+        echo=settings.log_level == "DEBUG"
+    )
+else:
+    # Configuração para PostgreSQL (produção Railway)
+    engine = create_engine(
+        settings.database_url,
+        echo=settings.log_level == "DEBUG",
+        pool_pre_ping=True,  # Verifica conexão antes de usar
+        pool_size=10,  # Pool de conexões
+        max_overflow=20  # Máximo de conexões extras
+    )
 
 # Criar SessionLocal
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
