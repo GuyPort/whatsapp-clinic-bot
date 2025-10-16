@@ -249,6 +249,9 @@ Responda sempre de forma natural, como um atendente humano profissional faria.""
         elif context.state == ConversationState.MARCAR_CONSULTA:
             return await self._handle_marcar_consulta(context, patient, message, db)
         
+        elif context.state == ConversationState.PROCESSANDO_AGENDAMENTO:
+            return await self._handle_processando_agendamento(context, patient, message, db)
+        
         elif context.state == ConversationState.REMARCAR_CANCELAR:
             return await self._handle_remarcar_cancelar(context, patient, message, db)
         
@@ -518,20 +521,26 @@ Responda sempre de forma natural, como um atendente humano profissional faria.""
         if 'sim' in message_lower or 'confirmo' in message_lower or 'ok' in message_lower:
             # Criar agendamento
             context_data = json.loads(context.context_data or "{}")
-            selected_slot_str = context_data.get('selected_slot')
+            appointment_date_str = context_data.get('appointment_date')
+            appointment_time_str = context_data.get('appointment_time')
+            requested_date = context_data.get('requested_date')
+            requested_time = context_data.get('requested_time')
             
-            if not selected_slot_str:
+            if not appointment_date_str or not appointment_time_str:
                 context.state = ConversationState.IDLE
                 return "Desculpe, houve um erro. Por favor, comece o agendamento novamente."
             
-            selected_slot = datetime.fromisoformat(selected_slot_str)
+            # Converter para datetime com timezone correto
+            appointment_date = datetime.fromisoformat(appointment_date_str).date()
+            appointment_time = datetime.fromisoformat(appointment_time_str).time()
+            appointment_datetime = datetime.combine(appointment_date, appointment_time)
             
             # Criar no Google Calendar
             google_event_id = None
             if calendar_service.is_available():
                 google_event_id = calendar_service.create_event(
                     title=f"Consulta - {patient.name}",
-                    start_datetime=selected_slot,
+                    start_datetime=appointment_datetime,
                     duration_minutes=30,
                     description=f"Paciente: {patient.name}\nTelefone: {patient.phone}"
                 )
@@ -539,8 +548,8 @@ Responda sempre de forma natural, como um atendente humano profissional faria.""
             # Criar no banco
             appointment = Appointment(
                 patient_id=patient.id,
-                appointment_date=selected_slot.date(),
-                appointment_time=selected_slot.time(),
+                appointment_date=appointment_date,
+                appointment_time=appointment_time,
                 status=AppointmentStatus.SCHEDULED,
                 notes=f"Google Calendar Event ID: {google_event_id}" if google_event_id else None
             )
@@ -556,7 +565,7 @@ Responda sempre de forma natural, como um atendente humano profissional faria.""
             
             return (
                 f"✅ Consulta agendada com sucesso!\n\n"
-                f"📅 Data: {format_datetime_br(selected_slot)}\n"
+                f"📅 Data: {requested_date} às {requested_time}\n"
                 f"⏱️ Duração: 30 minutos\n"
                 f"📍 Endereço: {address}\n\n"
                 f"Lembramos que cancelamentos devem ser feitos com 24h de antecedência.\n"
@@ -800,9 +809,80 @@ Sou seu assistente virtual. Para te ajudar melhor, preciso de algumas informaç�
         message: str,
         db: Session
     ) -> str:
-        """Processa marcação de consulta usando IA"""
-        # Usar Claude para processar de forma inteligente
-        return await self._handle_general_conversation(context, patient, message, db)
+        """Inicia processo de marcação de consulta"""
+        # Ir para próximo estado
+        context.state = ConversationState.PROCESSANDO_AGENDAMENTO
+        db.commit()
+        
+        return """Que dia e horário você tem disponibilidade?
+
+Nosso horário de funcionamento:
+• Segunda a sexta: 08h às 18h
+• Sábado: 08h às 12h
+• Domingo: não há atendimento
+
+Por favor, escreva no formato: DD/MM/AAAA às HH:MM
+Exemplo: 25/10/2025 às 14:30"""
+    
+    async def _handle_processando_agendamento(
+        self,
+        context: ConversationContext,
+        patient: Optional[Patient],
+        message: str,
+        db: Session
+    ) -> str:
+        """Processa data e horário fornecidos pelo usuário"""
+        try:
+            # Extrair data e horário da mensagem
+            message_clean = message.strip()
+            
+            # Procurar padrão DD/MM/AAAA às HH:MM
+            import re
+            pattern = r'(\d{2}/\d{2}/\d{4})\s*às\s*(\d{2}:\d{2})'
+            match = re.search(pattern, message_clean)
+            
+            if not match:
+                return "Formato inválido. Por favor, use o formato: DD/MM/AAAA às HH:MM\nExemplo: 25/10/2025 às 14:30"
+            
+            date_str, time_str = match.groups()
+            
+            # Validar data
+            try:
+                appointment_date = datetime.strptime(date_str, "%d/%m/%Y").date()
+                appointment_time = datetime.strptime(time_str, "%H:%M").time()
+            except ValueError:
+                return "Data ou horário inválido. Por favor, use o formato: DD/MM/AAAA às HH:MM"
+            
+            # Verificar se é dia de funcionamento
+            weekday = appointment_date.weekday()
+            if weekday == 6:  # Domingo
+                return "Domingo não há atendimento. Por favor, escolha outro dia."
+            
+            # Verificar horário de funcionamento
+            if weekday == 5:  # Sábado
+                if appointment_time < datetime.strptime("08:00", "%H:%M").time() or appointment_time >= datetime.strptime("12:00", "%H:%M").time():
+                    return "Sábado atendemos apenas das 08h às 12h. Por favor, escolha outro horário."
+            else:  # Segunda a sexta
+                if appointment_time < datetime.strptime("08:00", "%H:%M").time() or appointment_time >= datetime.strptime("18:00", "%H:%M").time():
+                    return "Segunda a sexta atendemos das 08h às 18h. Por favor, escolha outro horário."
+            
+            # Salvar no contexto
+            context_data = json.loads(context.context_data or "{}")
+            context_data['requested_date'] = date_str
+            context_data['requested_time'] = time_str
+            context_data['appointment_date'] = appointment_date.isoformat()
+            context_data['appointment_time'] = appointment_time.isoformat()
+            context.context_data = json.dumps(context_data, ensure_ascii=False)
+            
+            # Ir para confirmação
+            context.state = ConversationState.CONFIRMANDO
+            db.commit()
+            
+            return f"Perfeito! O horário {date_str} às {time_str} está dentro do nosso horário de funcionamento. Posso confirmar este agendamento para você?"
+            
+        except Exception as e:
+            logger.error(f"Erro ao processar data/horário: {str(e)}")
+            return "Desculpe, ocorreu um erro. Por favor, tente novamente com o formato: DD/MM/AAAA às HH:MM"
     
     async def _handle_remarcar_cancelar(
         self,

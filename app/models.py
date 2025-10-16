@@ -25,6 +25,7 @@ class ConversationState(enum.Enum):
     COLETANDO_NASCIMENTO = "coletando_nascimento"  # Coletando data de nascimento
     MENU_PRINCIPAL = "menu_principal"       # Mostrando menu principal
     MARCAR_CONSULTA = "marcar_consulta"     # Processo de marcar consulta
+    PROCESSANDO_AGENDAMENTO = "processando_agendamento"  # Processando data/horário fornecido
     REMARCAR_CANCELAR = "remarcar_cancelar" # Processo de remarcar/cancelar
     TIRAR_DUVIDAS = "tirar_duvidas"        # Processo de tirar dúvidas
     CONFIRMANDO = "confirmando"             # Confirmando agendamento
