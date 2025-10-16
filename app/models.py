@@ -60,19 +60,15 @@ class Appointment(Base):
     patient_id = Column(Integer, ForeignKey("patients.id"), nullable=False)
     
     # Informações da consulta
-    appointment_date = Column(DateTime, nullable=False, index=True)
-    duration_minutes = Column(Integer, nullable=False)
-    consultation_type = Column(String(100), nullable=False)
-    value = Column(Float, nullable=True)
-    payment_method = Column(String(50), nullable=True)  # particular, convênio, etc
+    appointment_date = Column(Date, nullable=False, index=True)
+    appointment_time = Column(Time, nullable=False)
+    consult_type = Column(String(100), nullable=False, default="Consulta de rotina")
     
     # Status e rastreamento
     status = Column(Enum(AppointmentStatus), default=AppointmentStatus.SCHEDULED, nullable=False)
-    google_event_id = Column(String(500), nullable=True, index=True)
     
     # Notas e observações
     notes = Column(Text, nullable=True)
-    cancellation_reason = Column(Text, nullable=True)
     
     # Timestamps
     created_at = Column(DateTime, default=datetime.utcnow)

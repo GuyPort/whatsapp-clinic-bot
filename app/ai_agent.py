@@ -66,7 +66,7 @@ FLUXO DE ATENDIMENTO ESTRUTURADO:
    3️⃣ Tirar dúvidas"
 
 3. MARCAR CONSULTA:
-   -OBJETIVO: Agendar uma consulta para o paciente, validando horários e confirmando o agendamento.
+   OBJETIVO: Agendar uma consulta para o paciente, validando horários e confirmando o agendamento.
    
    DIRETRIZES:
    - Perguntar: "Que dia e horário você tem disponibilidade?"
@@ -1152,7 +1152,7 @@ Sou seu assistente virtual. Para te ajudar melhor, preciso de algumas informaç�
                     appointment_time=appointment_time,
                     consult_type="Consulta de rotina",
                     status=AppointmentStatus.SCHEDULED,
-                    notes=f"Google Calendar Event ID: {calendar_event_id}" if calendar_event_id else None
+                    notes=f"Agendado via WhatsApp - Google Calendar Event ID: {calendar_event_id}" if calendar_event_id else "Agendado via WhatsApp"
                 )
                 db.add(appointment)
                 db.commit()
