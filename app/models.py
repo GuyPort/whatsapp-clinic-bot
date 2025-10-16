@@ -63,6 +63,8 @@ class Appointment(Base):
     # Informações da consulta
     appointment_date = Column(Date, nullable=False, index=True)
     appointment_time = Column(Time, nullable=False)
+    consultation_type = Column(String(100), default="Consulta Geral", nullable=False)
+    duration_minutes = Column(Integer, default=30, nullable=False)
     
     # Status e rastreamento
     status = Column(Enum(AppointmentStatus), default=AppointmentStatus.SCHEDULED, nullable=False)

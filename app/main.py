@@ -390,7 +390,7 @@ async def get_appointments():
                         "patient_phone": a.patient.phone,
                         "appointment_date": a.appointment_date,
                         "appointment_time": a.appointment_time,
-                        "consult_type": a.consult_type,
+                        "consult_type": a.consultation_type,
                         "status": a.status.value,
                         "notes": a.notes,
                         "created_at": a.created_at.isoformat()
@@ -623,6 +623,34 @@ async def dashboard():
                 font-weight: bold;
                 color: #667eea;
             }
+            .table {
+                background: white;
+                border-radius: 10px;
+                overflow: hidden;
+                box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            }
+            .table thead th {
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                border: none;
+                color: white;
+                font-weight: bold;
+                padding: 15px;
+            }
+            .table tbody tr {
+                transition: all 0.2s;
+            }
+            .table tbody tr:hover {
+                background-color: #f8f9fa;
+                transform: scale(1.01);
+            }
+            .table td {
+                padding: 15px;
+                vertical-align: middle;
+                border-color: #e9ecef;
+            }
+            .table-striped tbody tr:nth-of-type(odd) {
+                background-color: rgba(102, 126, 234, 0.05);
+            }
         </style>
     </head>
     <body>
@@ -743,39 +771,42 @@ async def dashboard():
                     return;
                 }
 
-                const html = appointments.map(appointment => `
-                    <div class="appointment-card">
-                        <div class="row align-items-center">
-                            <div class="col-md-2 text-center">
-                                <div class="appointment-time">
-                                    ${formatTime(appointment.appointment_time)}
-                                </div>
-                                <div class="text-muted">
-                                    ${formatDate(appointment.appointment_date)}
-                                </div>
-                            </div>
-                            <div class="col-md-4">
-                                <h5 class="mb-1">${appointment.patient_name}</h5>
-                                <div class="patient-info">
-                                    <i class="fas fa-phone"></i> ${appointment.patient_phone}
-                                    <br>
-                                    <i class="fas fa-birthday-cake"></i> ${appointment.patient_birth_date}
-                                </div>
-                            </div>
-                            <div class="col-md-3">
-                                <span class="status-badge status-${appointment.status}">
-                                    ${getStatusText(appointment.status)}
-                                </span>
-                                ${appointment.notes ? `<div class="text-muted mt-1"><small>${appointment.notes}</small></div>` : ''}
-                            </div>
-                            <div class="col-md-3 text-end">
-                                <small class="text-muted">
-                                    Agendado em: ${formatDateTime(appointment.created_at)}
-                                </small>
-                            </div>
-                        </div>
+                const html = `
+                    <div class="table-responsive">
+                        <table class="table table-striped table-hover">
+                            <thead class="table-dark">
+                                <tr>
+                                    <th>Nome</th>
+                                    <th>Data de Nascimento</th>
+                                    <th>Data da Consulta</th>
+                                    <th>Horário</th>
+                                    <th>Status</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                ${appointments.map(appointment => `
+                                    <tr>
+                                        <td>
+                                            <strong>${appointment.patient_name}</strong>
+                                            <br>
+                                            <small class="text-muted">📞 ${appointment.patient_phone}</small>
+                                        </td>
+                                        <td>${appointment.patient_birth_date}</td>
+                                        <td>${formatDate(appointment.appointment_date)}</td>
+                                        <td>
+                                            <strong class="text-primary">${formatTime(appointment.appointment_time)}</strong>
+                                        </td>
+                                        <td>
+                                            <span class="status-badge status-${appointment.status}">
+                                                ${getStatusText(appointment.status)}
+                                            </span>
+                                        </td>
+                                    </tr>
+                                `).join('')}
+                            </tbody>
+                        </table>
                     </div>
-                `).join('');
+                `;
 
                 container.innerHTML = html;
             }
@@ -839,7 +870,7 @@ async def get_patient_details(patient_id: int):
                         "id": a.id,
                         "appointment_date": a.appointment_date,
                         "appointment_time": a.appointment_time,
-                        "consult_type": a.consult_type,
+                        "consult_type": a.consultation_type,
                         "status": a.status.value,
                         "notes": a.notes
                     }

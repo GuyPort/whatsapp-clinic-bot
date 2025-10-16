@@ -541,6 +541,25 @@ Responda sempre de forma natural, como um atendente humano profissional faria.""
                 context.state = ConversationState.IDLE
                 return "Desculpe, houve um erro. Por favor, comece o agendamento novamente."
             
+            # Criar agendamento no banco de dados
+            try:
+                from app.models import Appointment
+                appointment = Appointment(
+                    patient_id=patient.id,
+                    appointment_date=appointment_date,
+                    appointment_time=appointment_time,
+                    consultation_type="Consulta Geral",
+                    duration_minutes=30,
+                    status=AppointmentStatus.SCHEDULED,
+                    notes=f"Agendado via WhatsApp Bot em {now_brazil().strftime('%d/%m/%Y %H:%M')}"
+                )
+                db.add(appointment)
+                db.commit()
+                logger.info(f"✅ Consulta salva no banco: ID {appointment.id}")
+            except Exception as e:
+                logger.error(f"❌ Erro ao salvar consulta no banco: {str(e)}")
+                db.rollback()
+            
             # Enviar notificação via WhatsApp
             notification_message = f"""🩺 NOVA CONSULTA AGENDADA
 
