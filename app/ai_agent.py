@@ -240,6 +240,18 @@ Responda sempre de forma natural, como um atendente humano profissional faria.""
         elif context.state == ConversationState.MARCAR_CONSULTA:
             return await self._handle_marcar_consulta(context, patient, message, db)
         
+        elif context.state == ConversationState.PERGUNTANDO_DATA_HORARIO:
+            return await self._handle_perguntando_data_horario(context, patient, message, db)
+        
+        elif context.state == ConversationState.VERIFICANDO_DISPONIBILIDADE:
+            return await self._handle_verificando_disponibilidade(context, patient, message, db)
+        
+        elif context.state == ConversationState.ESCOLHENDO_HORARIO_ALTERNATIVO:
+            return await self._handle_escolhendo_horario_alternativo(context, patient, message, db)
+        
+        elif context.state == ConversationState.CONFIRMANDO_AGENDAMENTO:
+            return await self._handle_confirmando_agendamento(context, patient, message, db)
+        
         elif context.state == ConversationState.REMARCAR_CANCELAR:
             return await self._handle_remarcar_cancelar(context, patient, message, db)
         
@@ -251,6 +263,9 @@ Responda sempre de forma natural, como um atendente humano profissional faria.""
         
         elif context.state == ConversationState.FINALIZANDO:
             return await self._handle_finalizando(context, patient, message, db)
+        
+        elif context.state == ConversationState.CONVERSA_ENCERRADA:
+            return await self._handle_conversa_encerrada(context, patient, message, db)
         
         # Estado IDLE ou ESCALATED: processar com Claude
         else:
@@ -836,9 +851,20 @@ Sou seu assistente virtual. Para te ajudar melhor, preciso de algumas informaç�
         message: str,
         db: Session
     ) -> str:
-        """Processa marcação de consulta usando IA com objetivo flexível"""
-        # Usar Claude para processar de forma inteligente
-        return await self._handle_general_conversation(context, patient, message, db)
+        """Inicia processo de marcação de consulta"""
+        # Ir para próximo estado
+        context.state = ConversationState.PERGUNTANDO_DATA_HORARIO
+        db.commit()
+        
+        return """Que dia e horário você tem disponibilidade?
+
+Nosso horário de funcionamento:
+• Segunda a sexta: 08h às 18h
+• Sábado: 08h às 12h
+• Domingo: não há atendimento
+
+Por favor, escreva no formato: DD/MM/AAAA às HH:MM
+Exemplo: 25/10/2025 às 14:30"""
     
     async def _handle_remarcar_cancelar(
         self,
@@ -890,11 +916,11 @@ Sou seu assistente virtual. Para te ajudar melhor, preciso de algumas informaç�
             confirmed_time = context_data.get('confirmed_time')
             
             if confirmed_date and confirmed_time:
-                context.state = ConversationState.IDLE
+                context.state = ConversationState.CONVERSA_ENCERRADA
                 db.commit()
                 return f"Foi um prazer te atender! 😊\n\nTe esperamos no dia {confirmed_date} às {confirmed_time}. Tenha um ótimo dia!"
             else:
-                context.state = ConversationState.IDLE
+                context.state = ConversationState.CONVERSA_ENCERRADA
                 db.commit()
                 return "Foi um prazer te atender! 😊\n\nQualquer dúvida, é só chamar. Tenha um ótimo dia!"
         
@@ -1088,6 +1114,280 @@ Sou seu assistente virtual. Para te ajudar melhor, preciso de algumas informaç�
         except Exception as e:
             logger.error(f"Erro ao processar agendamento: {str(e)}")
             return "Desculpe, ocorreu um erro. Vamos tentar novamente."
+    
+    # ==================== MÉTODOS PARA FLUXO DE CONSULTA ====================
+    
+    async def _handle_perguntando_data_horario(
+        self,
+        context: ConversationContext,
+        patient: Optional[Patient],
+        message: str,
+        db: Session
+    ) -> str:
+        """Processa data e horário fornecidos pelo usuário"""
+        try:
+            # Extrair data e horário da mensagem
+            message_clean = message.strip()
+            
+            # Procurar padrão DD/MM/AAAA às HH:MM
+            import re
+            pattern = r'(\d{2}/\d{2}/\d{4})\s*às\s*(\d{2}:\d{2})'
+            match = re.search(pattern, message_clean)
+            
+            if not match:
+                return "Formato inválido. Por favor, use o formato: DD/MM/AAAA às HH:MM\nExemplo: 25/10/2025 às 14:30"
+            
+            date_str, time_str = match.groups()
+            
+            # Validar data
+            try:
+                appointment_date = datetime.strptime(date_str, "%d/%m/%Y").date()
+                appointment_time = datetime.strptime(time_str, "%H:%M").time()
+            except ValueError:
+                return "Data ou horário inválido. Por favor, use o formato: DD/MM/AAAA às HH:MM"
+            
+            # Verificar se é dia de funcionamento
+            weekday = appointment_date.weekday()
+            if weekday == 6:  # Domingo
+                return "Domingo não há atendimento. Por favor, escolha outro dia."
+            
+            # Verificar horário de funcionamento
+            if weekday == 5:  # Sábado
+                if appointment_time < datetime.strptime("08:00", "%H:%M").time() or appointment_time >= datetime.strptime("12:00", "%H:%M").time():
+                    return "Sábado atendemos apenas das 08h às 12h. Por favor, escolha outro horário."
+            else:  # Segunda a sexta
+                if appointment_time < datetime.strptime("08:00", "%H:%M").time() or appointment_time >= datetime.strptime("18:00", "%H:%M").time():
+                    return "Segunda a sexta atendemos das 08h às 18h. Por favor, escolha outro horário."
+            
+            # Salvar no contexto
+            context_data = json.loads(context.context_data or "{}")
+            context_data['requested_date'] = date_str
+            context_data['requested_time'] = time_str
+            context_data['appointment_date'] = appointment_date.isoformat()
+            context_data['appointment_time'] = appointment_time.isoformat()
+            context.context_data = json.dumps(context_data, ensure_ascii=False)
+            
+            # Ir para verificação de disponibilidade
+            context.state = ConversationState.VERIFICANDO_DISPONIBILIDADE
+            db.commit()
+            
+            return f"Verificando disponibilidade para {date_str} às {time_str}... ⏳"
+            
+        except Exception as e:
+            logger.error(f"Erro ao processar data/horário: {str(e)}")
+            return "Desculpe, ocorreu um erro. Por favor, tente novamente com o formato: DD/MM/AAAA às HH:MM"
+    
+    async def _handle_verificando_disponibilidade(
+        self,
+        context: ConversationContext,
+        patient: Optional[Patient],
+        message: str,
+        db: Session
+    ) -> str:
+        """Verifica disponibilidade no Google Calendar"""
+        try:
+            context_data = json.loads(context.context_data or "{}")
+            date_str = context_data.get('requested_date')
+            time_str = context_data.get('requested_time')
+            appointment_date = datetime.fromisoformat(context_data.get('appointment_date'))
+            appointment_time = datetime.fromisoformat(context_data.get('appointment_time')).time()
+            
+            # Criar datetime completo
+            requested_datetime = datetime.combine(appointment_date, appointment_time)
+            
+            # Consultar calendário real
+            available_slots = await self._get_real_available_slots()
+            
+            # Verificar se o horário específico está disponível
+            is_available = True
+            if available_slots:
+                # Verificar conflitos
+                for slot in available_slots:
+                    slot_datetime = slot['datetime']
+                    if abs((slot_datetime - requested_datetime).total_seconds()) < 1800:  # 30 minutos
+                        is_available = False
+                        break
+            
+            if is_available:
+                # Horário disponível - confirmar
+                context.state = ConversationState.CONFIRMANDO_AGENDAMENTO
+                db.commit()
+                
+                return f"Perfeito! O horário {date_str} às {time_str} está disponível. Posso confirmar este agendamento para você?"
+            else:
+                # Horário ocupado - oferecer alternativas
+                context.state = ConversationState.ESCOLHENDO_HORARIO_ALTERNATIVO
+                db.commit()
+                
+                # Gerar horários alternativos próximos
+                alternatives = self._generate_alternative_times(requested_datetime, available_slots)
+                
+                if alternatives:
+                    context_data['alternative_times'] = [alt.isoformat() for alt in alternatives]
+                    context.context_data = json.dumps(context_data, ensure_ascii=False)
+                    
+                    options_text = f"O horário {date_str} às {time_str} está ocupado, mas temos estes horários próximos no mesmo dia:\n\n"
+                    for i, alt_time in enumerate(alternatives, 1):
+                        options_text += f"{i}️⃣ {alt_time.strftime('%H:%M')}\n"
+                    options_text += "\nQual você prefere?"
+                    
+                    return options_text
+                else:
+                    return f"O horário {date_str} às {time_str} está ocupado e não temos horários próximos disponíveis. Por favor, escolha outro dia."
+            
+        except Exception as e:
+            logger.error(f"Erro ao verificar disponibilidade: {str(e)}")
+            return "Desculpe, ocorreu um erro ao verificar disponibilidade. Por favor, tente novamente."
+    
+    async def _handle_escolhendo_horario_alternativo(
+        self,
+        context: ConversationContext,
+        patient: Optional[Patient],
+        message: str,
+        db: Session
+    ) -> str:
+        """Processa seleção de horário alternativo"""
+        try:
+            context_data = json.loads(context.context_data or "{}")
+            alternative_times = context_data.get('alternative_times', [])
+            
+            # Processar seleção
+            message_lower = message.lower().strip()
+            
+            selected_time = None
+            if message_lower in ['1', 'um', 'primeiro']:
+                selected_time = datetime.fromisoformat(alternative_times[0])
+            elif message_lower in ['2', 'dois', 'segundo']:
+                selected_time = datetime.fromisoformat(alternative_times[1])
+            elif message_lower in ['3', 'três', 'tres', 'terceiro']:
+                selected_time = datetime.fromisoformat(alternative_times[2])
+            else:
+                return "Por favor, escolha um dos horários disponíveis (1, 2 ou 3)."
+            
+            # Atualizar contexto com horário selecionado
+            context_data['selected_date'] = selected_time.strftime('%d/%m/%Y')
+            context_data['selected_time'] = selected_time.strftime('%H:%M')
+            context_data['appointment_date'] = selected_time.date().isoformat()
+            context_data['appointment_time'] = selected_time.time().isoformat()
+            context.context_data = json.dumps(context_data, ensure_ascii=False)
+            
+            # Ir para confirmação
+            context.state = ConversationState.CONFIRMANDO_AGENDAMENTO
+            db.commit()
+            
+            return f"Perfeito! Posso confirmar o agendamento para {selected_time.strftime('%d/%m/%Y')} às {selected_time.strftime('%H:%M')}?"
+            
+        except Exception as e:
+            logger.error(f"Erro ao processar horário alternativo: {str(e)}")
+            return "Desculpe, ocorreu um erro. Por favor, tente novamente."
+    
+    async def _handle_confirmando_agendamento(
+        self,
+        context: ConversationContext,
+        patient: Optional[Patient],
+        message: str,
+        db: Session
+    ) -> str:
+        """Confirma e agenda a consulta"""
+        try:
+            message_lower = message.lower().strip()
+            
+            if 'sim' in message_lower or 'confirmo' in message_lower or 'ok' in message_lower:
+                # Confirmar agendamento
+                context_data = json.loads(context.context_data or "{}")
+                appointment_date = datetime.fromisoformat(context_data.get('appointment_date')).date()
+                appointment_time = datetime.fromisoformat(context_data.get('appointment_time')).time()
+                
+                # Criar no banco de dados
+                if patient:
+                    appointment = Appointment(
+                        patient_id=patient.id,
+                        appointment_date=appointment_date,
+                        appointment_time=appointment_time,
+                        consult_type="Consulta de rotina",
+                        status=AppointmentStatus.SCHEDULED
+                    )
+                    db.add(appointment)
+                    db.commit()
+                
+                # Ir para finalização
+                context.state = ConversationState.FINALIZANDO
+                db.commit()
+                
+                return f"Perfeito! Sua consulta está confirmada para {appointment_date.strftime('%d/%m/%Y')} às {appointment_time.strftime('%H:%M')}. ✅\n\nPosso ajudar com mais alguma coisa?"
+            
+            elif 'não' in message_lower or 'nao' in message_lower or 'cancelar' in message_lower:
+                # Cancelar agendamento
+                context.state = ConversationState.MENU_PRINCIPAL
+                db.commit()
+                return "Agendamento cancelado. Como posso te ajudar?\n\n1️⃣ Marcar consulta\n2️⃣ Remarcar/Cancelar consulta\n3️⃣ Tirar dúvidas"
+            
+            else:
+                return "Por favor, responda com Sim ou Não para confirmar o agendamento."
+            
+        except Exception as e:
+            logger.error(f"Erro ao confirmar agendamento: {str(e)}")
+            return "Desculpe, ocorreu um erro. Por favor, tente novamente."
+    
+    def _generate_alternative_times(self, requested_datetime: datetime, available_slots: List[Dict]) -> List[datetime]:
+        """Gera horários alternativos próximos"""
+        alternatives = []
+        
+        # Gerar horários próximos (30 min antes e depois)
+        base_time = requested_datetime.time()
+        
+        # Horários próximos
+        nearby_times = [
+            requested_datetime - timedelta(minutes=30),
+            requested_datetime + timedelta(minutes=30),
+            requested_datetime + timedelta(minutes=60)
+        ]
+        
+        for alt_time in nearby_times:
+            # Verificar se está dentro do horário de funcionamento
+            weekday = alt_time.weekday()
+            if weekday == 6:  # Domingo
+                continue
+            
+            if weekday == 5:  # Sábado
+                if alt_time.time() < datetime.strptime("08:00", "%H:%M").time() or alt_time.time() >= datetime.strptime("12:00", "%H:%M").time():
+                    continue
+            else:  # Segunda a sexta
+                if alt_time.time() < datetime.strptime("08:00", "%H:%M").time() or alt_time.time() >= datetime.strptime("18:00", "%H:%M").time():
+                    continue
+            
+            # Verificar se não conflita com slots ocupados
+            conflict = False
+            if available_slots:
+                for slot in available_slots:
+                    slot_datetime = slot['datetime']
+                    if abs((slot_datetime - alt_time).total_seconds()) < 1800:  # 30 minutos
+                        conflict = True
+                        break
+            
+            if not conflict:
+                alternatives.append(alt_time)
+        
+        return alternatives[:3]  # Máximo 3 alternativas
+    
+    async def _handle_conversa_encerrada(
+        self,
+        context: ConversationContext,
+        patient: Optional[Patient],
+        message: str,
+        db: Session
+    ) -> str:
+        """Reinicia o ciclo completo quando a conversa foi encerrada"""
+        # Resetar contexto para início
+        context.state = ConversationState.BOAS_VINDAS
+        context.context_data = "{}"
+        db.commit()
+        
+        return """Olá! Bem-vindo(a) à Clínica Teste! 👋
+
+Sou seu assistente virtual. Para te ajudar melhor, preciso de algumas informações:
+
+📝 Qual é o seu nome completo?"""
 
 
 # Instância global
