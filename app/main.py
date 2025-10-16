@@ -486,6 +486,18 @@ async def get_conversations():
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/admin/init-db")
+async def init_database():
+    """Força a criação das tabelas no banco de dados"""
+    try:
+        from app.database import init_db
+        init_db()
+        return {"message": "✅ Banco de dados inicializado com sucesso!", "status": "success"}
+    except Exception as e:
+        logger.error(f"Erro ao inicializar banco: {str(e)}")
+        return {"message": f"❌ Erro ao inicializar banco: {str(e)}", "status": "error"}
+
+
 @app.get("/admin/dashboard")
 async def get_dashboard():
     """Dashboard com estatísticas gerais"""
