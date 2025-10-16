@@ -486,6 +486,7 @@ async def get_conversations():
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/admin/init-db")
 @app.post("/admin/init-db")
 async def init_database():
     """Força a criação das tabelas no banco de dados"""
