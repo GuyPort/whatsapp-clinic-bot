@@ -84,6 +84,8 @@ FLUXO DE ATENDIMENTO ESTRUTURADO:
    - Domingo: FECHADO
    - Verificar se é dia útil válido
    - Verificar se horário está dentro do funcionamento
+   
+   IMPORTANTE: NÃO perguntar sobre tipo de consulta, convênio ou valores. Apenas agendar a consulta.
 
 4. REMARCAR/CANCELAR:
    - Buscar consultas do paciente (usando nome + nascimento)
@@ -103,7 +105,6 @@ REGRAS IMPORTANTES:
 - NUNCA dê orientação médica ou diagnósticos
 - Mantenha respostas curtas e diretas (máximo 3-4 linhas)
 - Use linguagem natural e amigável
-- NÃO mostre preços ou convênios a menos que solicitado
 - NÃO mostre informações desnecessárias (endereço, telefone, etc.)
 - SEMPRE finalize perguntando se pode ajudar com mais alguma coisa
 - Se a pessoa disser que não precisa de mais nada, encerre a conversa
@@ -406,39 +407,8 @@ Responda sempre de forma natural, como um atendente humano profissional faria.""
         
         # Continuar para agendamento
         context.state = ConversationState.ASKING_CONSULT_TYPE
-        return "Perfeito! Que tipo de consulta você deseja agendar?"
+        return "Perfeito! Que dia e horário você tem disponibilidade?"
     
-    async def _handle_consult_type_input(
-        self,
-        context: ConversationContext,
-        patient: Patient,
-        message: str,
-        db: Session
-    ) -> str:
-        """Processa escolha do tipo de consulta"""
-        consult_types = appointment_rules.get_consultation_types()
-        
-        # Tentar identificar tipo
-        selected_type = None
-        message_lower = message.lower()
-        
-        for ctype in consult_types:
-            if ctype['tipo'].lower() in message_lower:
-                selected_type = ctype
-                break
-        
-        # Se não identificou, mostrar opções
-        if not selected_type:
-            options = "\n".join([f"• {ct['tipo']}" for ct in consult_types])
-            return f"Temos os seguintes tipos de consulta:\n\n{options}\n\nQual você deseja?"
-        
-        # Salvar tipo escolhido
-        context_data = json.loads(context.context_data or "{}")
-        context_data['selected_consultation_type'] = selected_type
-        context.context_data = json.dumps(context_data, ensure_ascii=False)
-        context.state = ConversationState.ASKING_DAY
-        
-        return f"Ótimo! {selected_type['tipo']} - {format_currency(selected_type['valor_particular'])}\n\nQue dia seria melhor para você?"
     
     async def _handle_day_input(
         self,
@@ -449,8 +419,7 @@ Responda sempre de forma natural, como um atendente humano profissional faria.""
     ) -> str:
         """Processa entrada do dia desejado"""
         context_data = json.loads(context.context_data or "{}")
-        consultation_type = context_data.get('selected_consultation_type', {})
-        duration = consultation_type.get('duracao_minutos', 30)
+        duration = 30  # Duração padrão de 30 minutos
         
         # Tentar extrair data ou dia da semana
         target_date = None
@@ -526,10 +495,8 @@ Responda sempre de forma natural, como um atendente humano profissional faria.""
                 context.context_data = json.dumps(context_data, ensure_ascii=False)
                 context.state = ConversationState.CONFIRMING
                 
-                consultation_type = context_data.get('selected_consultation_type', {})
-                
                 return (
-                    f"Perfeito! Vou agendar sua {consultation_type.get('tipo', 'consulta')} para "
+                    f"Perfeito! Vou agendar sua consulta para "
                     f"{format_datetime_br(selected_slot)}.\n\n"
                     f"Confirma o agendamento? (Sim/Não)"
                 )
@@ -552,7 +519,6 @@ Responda sempre de forma natural, como um atendente humano profissional faria.""
             # Criar agendamento
             context_data = json.loads(context.context_data or "{}")
             selected_slot_str = context_data.get('selected_slot')
-            consultation_type = context_data.get('selected_consultation_type', {})
             
             if not selected_slot_str:
                 context.state = ConversationState.IDLE
@@ -566,19 +532,17 @@ Responda sempre de forma natural, como um atendente humano profissional faria.""
                 google_event_id = calendar_service.create_event(
                     title=f"Consulta - {patient.name}",
                     start_datetime=selected_slot,
-                    duration_minutes=consultation_type.get('duracao_minutos', 30),
-                    description=f"Paciente: {patient.name}\nTelefone: {patient.phone}\nTipo: {consultation_type.get('tipo', 'Consulta')}"
+                    duration_minutes=30,
+                    description=f"Paciente: {patient.name}\nTelefone: {patient.phone}"
                 )
             
             # Criar no banco
             appointment = Appointment(
                 patient_id=patient.id,
-                appointment_date=selected_slot,
-                duration_minutes=consultation_type.get('duracao_minutos', 30),
-                consultation_type=consultation_type.get('tipo', 'Consulta'),
-                value=consultation_type.get('valor_particular'),
+                appointment_date=selected_slot.date(),
+                appointment_time=selected_slot.time(),
                 status=AppointmentStatus.SCHEDULED,
-                google_event_id=google_event_id
+                notes=f"Google Calendar Event ID: {google_event_id}" if google_event_id else None
             )
             db.add(appointment)
             db.commit()
@@ -593,8 +557,7 @@ Responda sempre de forma natural, como um atendente humano profissional faria.""
             return (
                 f"✅ Consulta agendada com sucesso!\n\n"
                 f"📅 Data: {format_datetime_br(selected_slot)}\n"
-                f"⏱️ Duração: {consultation_type.get('duracao_minutos')} minutos\n"
-                f"💰 Valor: {format_currency(consultation_type.get('valor_particular'))}\n"
+                f"⏱️ Duração: 30 minutos\n"
                 f"📍 Endereço: {address}\n\n"
                 f"Lembramos que cancelamentos devem ser feitos com 24h de antecedência.\n"
                 f"Até lá! 😊"
@@ -626,7 +589,7 @@ Responda sempre de forma natural, como um atendente humano profissional faria.""
         # Mostrar consultas
         message = "Suas consultas agendadas:\n\n"
         for i, apt in enumerate(future_appointments, 1):
-            message += f"{i}. {apt.consultation_type} - {format_datetime_br(apt.appointment_date)}\n"
+            message += f"{i}. Consulta - {format_datetime_br(apt.appointment_date)}\n"
         
         context_data = json.loads(context.context_data or "{}")
         action = context_data.get('action', 'cancel')
@@ -810,7 +773,7 @@ Sou seu assistente virtual. Para te ajudar melhor, preciso de algumas informaç�
         if any(word in message_lower for word in ['1', 'um', 'primeiro', 'primeira', 'marcar', 'consulta', 'agendar', 'agendamento']):
             context.state = ConversationState.MARCAR_CONSULTA
             db.commit()
-            return "Ótimo! Vamos marcar sua consulta. 🩺\n\nQue tipo de consulta você precisa?\n\n• Consulta de rotina\n• Consulta de retorno\n• Consulta de urgência"
+            return "Ótimo! Vamos marcar sua consulta. 🩺\n\nQue dia e horário você tem disponibilidade?"
         
         # Opção 2 - Remarcar/Cancelar
         elif any(word in message_lower for word in ['2', 'dois', 'segundo', 'segunda', 'remarcar', 'cancelar', 'alterar', 'mudar']):
@@ -1150,7 +1113,6 @@ Sou seu assistente virtual. Para te ajudar melhor, preciso de algumas informaç�
                     patient_id=patient.id,
                     appointment_date=appointment_date,
                     appointment_time=appointment_time,
-                    consult_type="Consulta de rotina",
                     status=AppointmentStatus.SCHEDULED,
                     notes=f"Agendado via WhatsApp - Google Calendar Event ID: {calendar_event_id}" if calendar_event_id else "Agendado via WhatsApp"
                 )
