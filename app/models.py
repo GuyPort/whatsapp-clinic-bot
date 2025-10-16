@@ -1,8 +1,8 @@
 """
 Modelos de banco de dados para o bot da clínica.
 """
-from datetime import datetime
-from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Text, Enum, Float
+from datetime import datetime, date, time
+from sqlalchemy import Column, Integer, String, DateTime, Date, Time, ForeignKey, Text, Enum, Float
 from sqlalchemy.orm import relationship, declarative_base
 import enum
 
