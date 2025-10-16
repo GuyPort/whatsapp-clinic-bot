@@ -246,9 +246,6 @@ Responda sempre de forma natural, como um atendente humano profissional faria.""
         elif context.state == ConversationState.VERIFICANDO_DISPONIBILIDADE:
             return await self._handle_verificando_disponibilidade(context, patient, message, db)
         
-        elif context.state == ConversationState.ESCOLHENDO_HORARIO_ALTERNATIVO:
-            return await self._handle_escolhendo_horario_alternativo(context, patient, message, db)
-        
         elif context.state == ConversationState.CONFIRMANDO_AGENDAMENTO:
             return await self._handle_confirmando_agendamento(context, patient, message, db)
         
@@ -1184,7 +1181,7 @@ Exemplo: 25/10/2025 às 14:30"""
         message: str,
         db: Session
     ) -> str:
-        """Verifica disponibilidade no Google Calendar"""
+        """Verifica se horário está dentro do funcionamento da clínica"""
         try:
             context_data = json.loads(context.context_data or "{}")
             date_str = context_data.get('requested_date')
@@ -1192,94 +1189,38 @@ Exemplo: 25/10/2025 às 14:30"""
             appointment_date = datetime.fromisoformat(context_data.get('appointment_date'))
             appointment_time = datetime.fromisoformat(context_data.get('appointment_time')).time()
             
-            # Criar datetime completo
-            requested_datetime = datetime.combine(appointment_date, appointment_time)
+            # Verificar se está dentro do horário de funcionamento
+            weekday = appointment_date.weekday()
             
-            # Consultar calendário real
-            available_slots = await self._get_real_available_slots()
+            # Verificar horário de funcionamento
+            is_within_hours = False
+            if weekday == 5:  # Sábado
+                if appointment_time >= datetime.strptime("08:00", "%H:%M").time() and appointment_time < datetime.strptime("12:00", "%H:%M").time():
+                    is_within_hours = True
+            elif weekday < 5:  # Segunda a sexta
+                if appointment_time >= datetime.strptime("08:00", "%H:%M").time() and appointment_time < datetime.strptime("18:00", "%H:%M").time():
+                    is_within_hours = True
             
-            # Verificar se o horário específico está disponível
-            is_available = True
-            if available_slots:
-                # Verificar conflitos
-                for slot in available_slots:
-                    slot_datetime = slot['datetime']
-                    if abs((slot_datetime - requested_datetime).total_seconds()) < 1800:  # 30 minutos
-                        is_available = False
-                        break
-            
-            if is_available:
-                # Horário disponível - confirmar
+            if is_within_hours:
+                # Horário válido - confirmar
                 context.state = ConversationState.CONFIRMANDO_AGENDAMENTO
                 db.commit()
                 
-                return f"Perfeito! O horário {date_str} às {time_str} está disponível. Posso confirmar este agendamento para você?"
+                return f"Perfeito! O horário {date_str} às {time_str} está dentro do nosso horário de funcionamento. Posso confirmar este agendamento para você?"
             else:
-                # Horário ocupado - oferecer alternativas
-                context.state = ConversationState.ESCOLHENDO_HORARIO_ALTERNATIVO
+                # Horário inválido - pedir novo horário
+                context.state = ConversationState.PERGUNTANDO_DATA_HORARIO
                 db.commit()
                 
-                # Gerar horários alternativos próximos
-                alternatives = self._generate_alternative_times(requested_datetime, available_slots)
-                
-                if alternatives:
-                    context_data['alternative_times'] = [alt.isoformat() for alt in alternatives]
-                    context.context_data = json.dumps(context_data, ensure_ascii=False)
-                    
-                    options_text = f"O horário {date_str} às {time_str} está ocupado, mas temos estes horários próximos no mesmo dia:\n\n"
-                    for i, alt_time in enumerate(alternatives, 1):
-                        options_text += f"{i}️⃣ {alt_time.strftime('%H:%M')}\n"
-                    options_text += "\nQual você prefere?"
-                    
-                    return options_text
-                else:
-                    return f"O horário {date_str} às {time_str} está ocupado e não temos horários próximos disponíveis. Por favor, escolha outro dia."
+                if weekday == 5:  # Sábado
+                    return f"O horário {time_str} não está dentro do nosso horário de funcionamento de sábado (08h às 12h). Por favor, escolha um horário entre 08:00 e 11:30."
+                else:  # Segunda a sexta
+                    return f"O horário {time_str} não está dentro do nosso horário de funcionamento (08h às 18h). Por favor, escolha um horário entre 08:00 e 17:30."
             
         except Exception as e:
-            logger.error(f"Erro ao verificar disponibilidade: {str(e)}")
-            return "Desculpe, ocorreu um erro ao verificar disponibilidade. Por favor, tente novamente."
+            logger.error(f"Erro ao verificar horário: {str(e)}")
+            return "Desculpe, ocorreu um erro. Por favor, tente novamente com o formato: DD/MM/AAAA às HH:MM"
     
-    async def _handle_escolhendo_horario_alternativo(
-        self,
-        context: ConversationContext,
-        patient: Optional[Patient],
-        message: str,
-        db: Session
-    ) -> str:
-        """Processa seleção de horário alternativo"""
-        try:
-            context_data = json.loads(context.context_data or "{}")
-            alternative_times = context_data.get('alternative_times', [])
-            
-            # Processar seleção
-            message_lower = message.lower().strip()
-            
-            selected_time = None
-            if message_lower in ['1', 'um', 'primeiro']:
-                selected_time = datetime.fromisoformat(alternative_times[0])
-            elif message_lower in ['2', 'dois', 'segundo']:
-                selected_time = datetime.fromisoformat(alternative_times[1])
-            elif message_lower in ['3', 'três', 'tres', 'terceiro']:
-                selected_time = datetime.fromisoformat(alternative_times[2])
-            else:
-                return "Por favor, escolha um dos horários disponíveis (1, 2 ou 3)."
-            
-            # Atualizar contexto com horário selecionado
-            context_data['selected_date'] = selected_time.strftime('%d/%m/%Y')
-            context_data['selected_time'] = selected_time.strftime('%H:%M')
-            context_data['appointment_date'] = selected_time.date().isoformat()
-            context_data['appointment_time'] = selected_time.time().isoformat()
-            context.context_data = json.dumps(context_data, ensure_ascii=False)
-            
-            # Ir para confirmação
-            context.state = ConversationState.CONFIRMANDO_AGENDAMENTO
-            db.commit()
-            
-            return f"Perfeito! Posso confirmar o agendamento para {selected_time.strftime('%d/%m/%Y')} às {selected_time.strftime('%H:%M')}?"
-            
-        except Exception as e:
-            logger.error(f"Erro ao processar horário alternativo: {str(e)}")
-            return "Desculpe, ocorreu um erro. Por favor, tente novamente."
     
     async def _handle_confirmando_agendamento(
         self,
@@ -1329,46 +1270,6 @@ Exemplo: 25/10/2025 às 14:30"""
             logger.error(f"Erro ao confirmar agendamento: {str(e)}")
             return "Desculpe, ocorreu um erro. Por favor, tente novamente."
     
-    def _generate_alternative_times(self, requested_datetime: datetime, available_slots: List[Dict]) -> List[datetime]:
-        """Gera horários alternativos próximos"""
-        alternatives = []
-        
-        # Gerar horários próximos (30 min antes e depois)
-        base_time = requested_datetime.time()
-        
-        # Horários próximos
-        nearby_times = [
-            requested_datetime - timedelta(minutes=30),
-            requested_datetime + timedelta(minutes=30),
-            requested_datetime + timedelta(minutes=60)
-        ]
-        
-        for alt_time in nearby_times:
-            # Verificar se está dentro do horário de funcionamento
-            weekday = alt_time.weekday()
-            if weekday == 6:  # Domingo
-                continue
-            
-            if weekday == 5:  # Sábado
-                if alt_time.time() < datetime.strptime("08:00", "%H:%M").time() or alt_time.time() >= datetime.strptime("12:00", "%H:%M").time():
-                    continue
-            else:  # Segunda a sexta
-                if alt_time.time() < datetime.strptime("08:00", "%H:%M").time() or alt_time.time() >= datetime.strptime("18:00", "%H:%M").time():
-                    continue
-            
-            # Verificar se não conflita com slots ocupados
-            conflict = False
-            if available_slots:
-                for slot in available_slots:
-                    slot_datetime = slot['datetime']
-                    if abs((slot_datetime - alt_time).total_seconds()) < 1800:  # 30 minutos
-                        conflict = True
-                        break
-            
-            if not conflict:
-                alternatives.append(alt_time)
-        
-        return alternatives[:3]  # Máximo 3 alternativas
     
     async def _handle_conversa_encerrada(
         self,

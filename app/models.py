@@ -26,8 +26,7 @@ class ConversationState(enum.Enum):
     MENU_PRINCIPAL = "menu_principal"       # Mostrando menu principal
     MARCAR_CONSULTA = "marcar_consulta"     # Processo de marcar consulta
     PERGUNTANDO_DATA_HORARIO = "perguntando_data_horario"  # Perguntando dia e horário
-    VERIFICANDO_DISPONIBILIDADE = "verificando_disponibilidade"  # Verificando no Google Calendar
-    ESCOLHENDO_HORARIO_ALTERNATIVO = "escolhendo_horario_alternativo"  # Escolhendo horário alternativo
+    VERIFICANDO_DISPONIBILIDADE = "verificando_disponibilidade"  # Verificando horário de funcionamento
     CONFIRMANDO_AGENDAMENTO = "confirmando_agendamento"  # Confirmando agendamento
     REMARCAR_CANCELAR = "remarcar_cancelar" # Processo de remarcar/cancelar
     TIRAR_DUVIDAS = "tirar_duvidas"        # Processo de tirar dúvidas
