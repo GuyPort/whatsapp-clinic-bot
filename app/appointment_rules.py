@@ -2,14 +2,14 @@
 Regras e validações para agendamento de consultas.
 """
 from datetime import datetime, timedelta, time
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Tuple
 import logging
 
 from sqlalchemy.orm import Session
 
 from app.models import Appointment
 from app.utils import now_brazil, format_time_br, load_clinic_info, get_brazil_timezone
-from app.calendar_service import calendar_service
+# Google Calendar removido - usando apenas banco de dados
 
 logger = logging.getLogger(__name__)
 
@@ -148,13 +148,11 @@ class AppointmentRules:
         
         existing_appointments = db.query(Appointment).filter(
             Appointment.appointment_date >= day_start,
-            Appointment.appointment_date < day_end
+            Appointment.appointment_date < day_end,
+            Appointment.status == 'agendada'  # Apenas consultas ativas
         ).all()
         
-        # Buscar eventos do Google Calendar
-        calendar_events = []
-        if calendar_service.is_available():
-            calendar_events = calendar_service.get_events(day_start, day_end)
+        # Google Calendar removido - verificando apenas banco de dados
         
         # Gerar slots de 30 em 30 minutos
         current = start_time
@@ -172,7 +170,8 @@ class AppointmentRules:
                 has_conflict = False
                 
                 for appointment in existing_appointments:
-                    app_start = appointment.appointment_date
+                    # Combinar data e hora para criar datetime
+                    app_start = datetime.combine(appointment.appointment_date, appointment.appointment_time)
                     app_end = app_start + timedelta(minutes=appointment.duration_minutes + interval)
                     
                     # Verificar sobreposição
@@ -180,31 +179,7 @@ class AppointmentRules:
                         has_conflict = True
                         break
                 
-                # Verificar conflitos com Google Calendar
-                if not has_conflict:
-                    for event in calendar_events:
-                        event_start_str = event['start'].get('dateTime', event['start'].get('date'))
-                        event_end_str = event['end'].get('dateTime', event['end'].get('date'))
-                        
-                        # Parse das datas
-                        try:
-                            event_start = datetime.fromisoformat(event_start_str.replace('Z', '+00:00'))
-                            event_end = datetime.fromisoformat(event_end_str.replace('Z', '+00:00'))
-                            
-                            # Converter para timezone local
-                            event_start = event_start.astimezone(self.timezone)
-                            event_end = event_end.astimezone(self.timezone)
-                            
-                            # Adicionar intervalo
-                            event_end_with_interval = event_end + timedelta(minutes=interval)
-                            
-                            # Verificar sobreposição
-                            if not (slot_end <= event_start or current >= event_end_with_interval):
-                                has_conflict = True
-                                break
-                        except Exception as e:
-                            logger.warning(f"Erro ao parsear evento do calendar: {e}")
-                            continue
+                # Google Calendar removido - verificando apenas banco de dados
                 
                 if not has_conflict:
                     available_slots.append(current)
@@ -264,20 +239,7 @@ class AppointmentRules:
         # Como não temos mais status, assumimos que todas as consultas estão ativas
         return True, "Consulta válida."
     
-    def get_consultation_types(self) -> List[Dict[str, Any]]:
-        """Retorna tipos de consulta disponíveis"""
-        return self.clinic_info.get('tipos_consulta', [])
-    
-    def get_consultation_type_by_name(self, name: str) -> Optional[Dict[str, Any]]:
-        """Busca tipo de consulta pelo nome"""
-        types = self.get_consultation_types()
-        name_lower = name.lower()
-        
-        for consult_type in types:
-            if name_lower in consult_type.get('tipo', '').lower():
-                return consult_type
-        
-        return None
+# Funções de tipos de consulta removidas - não utilizadas
 
 
 # Instância global

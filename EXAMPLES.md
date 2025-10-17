@@ -12,17 +12,14 @@ Este documento contém exemplos práticos de como usar e interagir com o bot.
 👤 Paciente: Olá
 
 🤖 Bot: Olá! Bem-vindo à Clínica Exemplo. Como posso ajudar?
+       1 - Marcar consulta
+       2 - Remarcar/Cancelar consulta  
+       3 - Dúvidas
 
-👤 Paciente: Quanto custa uma consulta dermatológica?
+👤 Paciente: 1
 
-🤖 Bot: A consulta dermatológica custa R$ 350,00 e tem duração de 30 minutos.
-        Aceitamos particular, Unimed e Bradesco Saúde.
-        Gostaria de agendar?
-
-👤 Paciente: Sim, quero agendar
-
-🤖 Bot: Ótimo! Para agendar, preciso de algumas informações.
-        Qual é seu nome completo?
+🤖 Bot: Perfeito! Vou te ajudar a marcar uma consulta.
+        Primeiro, qual é seu nome completo?
 
 👤 Paciente: Maria Silva Santos
 

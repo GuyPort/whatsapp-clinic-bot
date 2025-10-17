@@ -1,3 +1,0 @@
-Este arquivo força o Railway a fazer rebuild completo
-Timestamp: 2025-10-15 15:07:00 - REBUILD DEFINITIVO
-VERSÃO: 2.0 - CORREÇÃO DEFINITIVA DA URL

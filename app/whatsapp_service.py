@@ -65,45 +65,7 @@ class WhatsAppService:
             logger.error(f"Exceção ao enviar mensagem: {str(e)}")
             return False
     
-    async def send_message_with_buttons(self, phone: str, message: str, buttons: list) -> bool:
-        """
-        Envia uma mensagem com botões.
-        
-        Args:
-            phone: Número do telefone
-            message: Texto da mensagem
-            buttons: Lista de botões [{"displayText": "Texto", "id": "id"}]
-            
-        Returns:
-            True se enviado com sucesso
-        """
-        try:
-            url = f"{self.base_url}/api/send-message"
-            
-            if not phone.endswith('@s.whatsapp.net'):
-                phone = f"{phone}@s.whatsapp.net"
-            
-            payload = {
-                "to": phone,
-                "text": message,
-                "buttons": buttons
-            }
-            
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                response = await client.post(url, json=payload, headers=self.headers)
-                
-                if response.status_code in [200, 201]:
-                    logger.info(f"Mensagem com botões enviada para {phone}")
-                    return True
-                else:
-                    logger.error(f"Erro ao enviar botões: {response.status_code}")
-                    # Fallback: enviar como mensagem de texto
-                    return await self.send_message(phone, message)
-                    
-        except Exception as e:
-            logger.error(f"Exceção ao enviar botões: {str(e)}")
-            # Fallback: enviar como mensagem de texto
-            return await self.send_message(phone, message)
+# send_message_with_buttons removido - não utilizado
     
     async def get_instance_status(self) -> Dict[str, Any]:
         """

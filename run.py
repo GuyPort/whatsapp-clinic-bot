@@ -13,23 +13,7 @@ def check_environment():
     # No Railway, as variáveis de ambiente são definidas diretamente, não via .env
     # Então, removemos a verificação do arquivo .env aqui.
     
-    # Verificar e criar google-credentials.json a partir da variável de ambiente
-    if not os.path.exists('google-credentials.json'):
-        google_creds_json = os.getenv("GOOGLE_CREDENTIALS")
-        if google_creds_json:
-            try:
-                # Tenta parsear para validar e depois escreve
-                json.loads(google_creds_json) 
-                with open('google-credentials.json', 'w') as f:
-                    f.write(google_creds_json)
-                print("✅ Arquivo google-credentials.json criado a partir da variável de ambiente.")
-            except json.JSONDecodeError:
-                errors.append("❌ Variável GOOGLE_CREDENTIALS inválida (não é um JSON válido).")
-        else:
-            print("⚠️  Variável GOOGLE_CREDENTIALS não encontrada.")
-            print("   O bot funcionará, mas sem integração com Google Calendar.")
-    else:
-        print("✅ Arquivo google-credentials.json encontrado.")
+    # Google Calendar removido - usando apenas banco de dados
     
     # Verificar data/clinic_info.json
     if not os.path.exists('data/clinic_info.json'):
@@ -38,7 +22,7 @@ def check_environment():
         print("✅ Arquivo data/clinic_info.json encontrado.")
 
     # Verificar variáveis de ambiente essenciais
-    required_env_vars = ["ANTHROPIC_API_KEY", "WASENDER_API_KEY", "WASENDER_URL", "WASENDER_PROJECT_NAME", "GOOGLE_CALENDAR_ID"]
+    required_env_vars = ["ANTHROPIC_API_KEY", "WASENDER_API_KEY", "WASENDER_URL", "WASENDER_PROJECT_NAME"]
     for var in required_env_vars:
         if not os.getenv(var):
             errors.append(f"❌ Variável de ambiente '{var}' não configurada.")

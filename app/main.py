@@ -3,7 +3,7 @@ Aplicação FastAPI principal com webhooks do WhatsApp.
 """
 from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
 from fastapi.responses import HTMLResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
+# StaticFiles removido - não utilizado
 from contextlib import asynccontextmanager
 import logging
 from typing import Dict, Any, List
@@ -313,13 +313,9 @@ async def status():
         # Verificar WhatsApp
         whatsapp_status = await whatsapp_service.get_instance_status()
         
-        # Verificar Google Calendar
-        calendar_available = "available" if calendar_service.is_available() else "unavailable"
-        
         return {
             "status": "operational",
             "whatsapp": whatsapp_status,
-            "google_calendar": calendar_available,
             "database": "connected"
         }
     except Exception as e:
@@ -343,9 +339,6 @@ async def reload_config():
         logger.error(f"Erro ao recarregar config: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
-
-# Importar calendar_service aqui para evitar import circular
-from app.calendar_service import calendar_service
 
 
 # ==================== ENDPOINTS DO BANCO DE DADOS ====================
@@ -453,12 +446,17 @@ async def get_scheduled_appointments():
                 formatted_appointments.append({
                     "id": apt.id,
                     "patient_name": apt.patient_name,
-                    "patient_phone": "N/A",
+                    "patient_phone": apt.patient_phone,
                     "patient_birth_date": apt.patient_birth_date,
                     "appointment_date": apt.appointment_date.isoformat(),
                     "appointment_time": apt.appointment_time.strftime("%H:%M:%S"),
-                    "status": "scheduled",
-                    "created_at": apt.created_at.isoformat()
+                    "status": apt.status.value,
+                    "duration_minutes": apt.duration_minutes,
+                    "notes": apt.notes,
+                    "cancelled_at": apt.cancelled_at.isoformat() if apt.cancelled_at else None,
+                    "cancelled_reason": apt.cancelled_reason,
+                    "created_at": apt.created_at.isoformat(),
+                    "updated_at": apt.updated_at.isoformat()
                 })
             
             return {
@@ -471,29 +469,7 @@ async def get_scheduled_appointments():
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/admin/conversations")
-async def get_conversations():
-    """Lista contextos de conversas ativas"""
-    try:
-        with get_db() as db:
-            conversations = db.query(ConversationContext).order_by(ConversationContext.last_message_at.desc()).all()
-            return {
-                "total": len(conversations),
-                "conversations": [
-                    {
-                        "id": c.id,
-                        "patient_name": c.patient.name,
-                        "patient_phone": c.patient.phone,
-                        "state": c.state.value,
-                        "last_message_at": c.last_message_at.isoformat() if c.last_message_at else None,
-                        "created_at": c.created_at.isoformat()
-                    }
-                    for c in conversations
-                ]
-            }
-    except Exception as e:
-        logger.error(f"Erro ao buscar conversas: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+# Endpoint de conversas removido - ConversationContext não existe mais
 
 
 @app.get("/admin/init-db")
@@ -538,11 +514,12 @@ async def get_dashboard():
     try:
         with get_db() as db:
             # Contadores
-            total_patients = db.query(Patient).count()
             total_appointments = db.query(Appointment).count()
-            active_conversations = db.query(ConversationContext).filter(
-                ConversationContext.state != ConversationState.IDLE
-            ).count()
+            # Contar pacientes únicos baseado nas consultas
+            unique_patients = set()
+            for apt in db.query(Appointment).all():
+                unique_patients.add(f"{apt.patient_name}_{apt.patient_birth_date}")
+            total_patients = len(unique_patients)
             
             # Consultas por status
             appointments_by_status = {}
@@ -629,9 +606,9 @@ async def dashboard():
                 font-size: 12px;
                 font-weight: bold;
             }
-            .status-scheduled { background-color: #28a745; color: white; }
-            .status-cancelled { background-color: #dc3545; color: white; }
-            .status-completed { background-color: #17a2b8; color: white; }
+            .status-agendada { background-color: #28a745; color: white; }
+            .status-cancelada { background-color: #dc3545; color: white; }
+            .status-realizada { background-color: #17a2b8; color: white; }
             .btn-refresh {
                 background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
                 border: none;
@@ -823,10 +800,12 @@ async def dashboard():
                             <thead class="table-dark">
                                 <tr>
                                     <th>Nome</th>
+                                    <th>Telefone</th>
                                     <th>Data de Nascimento</th>
                                     <th>Data da Consulta</th>
                                     <th>Horário</th>
                                     <th>Status</th>
+                                    <th>Duração</th>
                                 </tr>
                             </thead>
                             <tbody>
@@ -834,7 +813,8 @@ async def dashboard():
                                     <tr>
                                         <td>
                                             <strong>${appointment.patient_name}</strong>
-                                            <br>
+                                        </td>
+                                        <td>
                                             <small class="text-muted">📞 ${appointment.patient_phone}</small>
                                         </td>
                                         <td>${appointment.patient_birth_date}</td>
@@ -846,6 +826,9 @@ async def dashboard():
                                             <span class="status-badge status-${appointment.status}">
                                                 ${getStatusText(appointment.status)}
                                             </span>
+                                        </td>
+                                        <td>
+                                            <small class="text-muted">${appointment.duration_minutes} min</small>
                                         </td>
                                     </tr>
                                 `).join('')}
@@ -878,10 +861,9 @@ async def dashboard():
 
             function getStatusText(status) {
                 const statusMap = {
-                    'scheduled': 'Agendada',
-                    'completed': 'Realizada',
-                    'cancelled': 'Cancelada',
-                    'no_show': 'Não Compareceu'
+                    'agendada': 'Agendada',
+                    'realizada': 'Realizada',
+                    'cancelada': 'Cancelada'
                 };
                 return statusMap[status] || status;
             }
@@ -891,51 +873,7 @@ async def dashboard():
     """)
 
 
-@app.get("/admin/patient/{patient_id}")
-async def get_patient_details(patient_id: int):
-    """Detalhes de um paciente específico"""
-    try:
-        with get_db() as db:
-            patient = db.query(Patient).filter(Patient.id == patient_id).first()
-            if not patient:
-                raise HTTPException(status_code=404, detail="Paciente não encontrado")
-            
-            appointments = db.query(Appointment).filter(Appointment.patient_id == patient_id).all()
-            conversations = db.query(ConversationContext).filter(ConversationContext.patient_id == patient_id).all()
-            
-            return {
-                "patient": {
-                    "id": patient.id,
-                    "name": patient.name,
-                    "phone": patient.phone,
-                    "birth_date": patient.birth_date,
-                    "created_at": patient.created_at.isoformat()
-                },
-                "appointments": [
-                    {
-                        "id": a.id,
-                        "appointment_date": a.appointment_date,
-                        "appointment_time": a.appointment_time,
-                        "consult_type": a.consultation_type,
-                        "status": a.status.value,
-                        "notes": a.notes
-                    }
-                    for a in appointments
-                ],
-                "conversations": [
-                    {
-                        "id": c.id,
-                        "state": c.state.value,
-                        "last_message_at": c.last_message_at.isoformat() if c.last_message_at else None
-                    }
-                    for c in conversations
-                ]
-            }
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Erro ao buscar paciente: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+# Endpoint de paciente removido - dados agora estão na tabela appointments
 
 
 if __name__ == "__main__":

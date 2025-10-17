@@ -10,10 +10,9 @@ import json
 
 sys.path.insert(0, '.')
 
-from app.config import settings
+from app.simple_config import settings
 from app.database import get_db
 from app.whatsapp_service import whatsapp_service
-from app.calendar_service import calendar_service
 from app.models import Appointment, AppointmentStatus
 from app.utils import now_brazil, format_datetime_br
 
@@ -50,34 +49,19 @@ class ServiceMonitor:
             }
     
     def check_calendar(self) -> dict:
-        """Verifica status do Google Calendar"""
-        try:
-            if calendar_service.is_available():
-                return {
-                    "status": "ok",
-                    "message": "Google Calendar: Conectado",
-                    "details": None
-                }
-            else:
-                return {
-                    "status": "warning",
-                    "message": "Google Calendar: Não configurado",
-                    "details": "O bot funcionará, mas sem sincronização com calendário"
-                }
-        except Exception as e:
-            return {
-                "status": "error",
-                "message": f"Google Calendar: Erro - {str(e)}",
-                "details": None
-            }
+        """Google Calendar removido - sempre OK"""
+        return {
+            "status": "ok",
+            "message": "Google Calendar: Removido (usando apenas banco de dados)",
+            "details": None
+        }
     
     def check_database(self) -> dict:
         """Verifica status do banco de dados"""
         try:
             with get_db() as db:
                 # Tentar fazer uma query simples
-                from app.models import Patient
-                db.query(Patient).count()
+                db.query(Appointment).count()
                 
                 return {
                     "status": "ok",
@@ -102,7 +86,7 @@ class ServiceMonitor:
                 upcoming = db.query(Appointment).filter(
                     Appointment.appointment_date >= now,
                     Appointment.appointment_date <= next_24h,
-                    Appointment.status == AppointmentStatus.SCHEDULED
+                    Appointment.status == AppointmentStatus.AGENDADA
                 ).order_by(Appointment.appointment_date).all()
                 
                 if not upcoming:
@@ -115,9 +99,9 @@ class ServiceMonitor:
                 details = []
                 for apt in upcoming:
                     details.append({
-                        "patient": apt.patient.name,
+                        "patient": apt.patient_name,
                         "datetime": format_datetime_br(apt.appointment_date),
-                        "type": apt.consultation_type
+                        "phone": apt.patient_phone
                     })
                 
                 return {
@@ -145,9 +129,7 @@ class ServiceMonitor:
         if not os.path.exists('data/clinic_info.json'):
             errors.append("Arquivo clinic_info.json não encontrado")
         
-        # Verificar google credentials
-        if not os.path.exists(settings.google_service_account_file):
-            warnings.append("Google credentials não encontrado (opcional)")
+        # Google Calendar removido - não precisa verificar credentials
         
         if errors:
             return {

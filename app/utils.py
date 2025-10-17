@@ -75,71 +75,7 @@ def normalize_phone(phone: str) -> str:
     return clean
 
 
-def extract_name_from_message(message: str) -> Optional[str]:
-    """
-    Tenta extrair um nome de uma mensagem.
-    Procura por padrões como "meu nome é X" ou apenas um nome próprio.
-    """
-    message = message.strip()
-    
-    # Padrões comuns
-    patterns = [
-        r'(?:meu nome é|me chamo|sou (?:o|a)?) ([A-ZÁÀÂÃÉÈÊÍÏÓÔÕÖÚÇÑ][a-záàâãéèêíïóôõöúçñ]+(?: [A-ZÁÀÂÃÉÈÊÍÏÓÔÕÖÚÇÑ][a-záàâãéèêíïóôõöúçñ]+)+)',
-        r'^([A-ZÁÀÂÃÉÈÊÍÏÓÔÕÖÚÇÑ][a-záàâãéèêíïóôõöúçñ]+(?: [A-ZÁÀÂÃÉÈÊÍÏÓÔÕÖÚÇÑ][a-záàâãéèêíïóôõöúçñ]+)+)$',
-    ]
-    
-    for pattern in patterns:
-        match = re.search(pattern, message, re.IGNORECASE)
-        if match:
-            return match.group(1).title()
-    
-    return None
-
-
-def extract_date_from_message(message: str) -> Optional[str]:
-    """
-    Tenta extrair uma data no formato DD/MM/AAAA ou DD/MM/AA de uma mensagem.
-    """
-    # Procura por padrão de data
-    patterns = [
-        r'\b(\d{2}/\d{2}/\d{4})\b',  # DD/MM/AAAA
-        r'\b(\d{2}/\d{2}/\d{2})\b',   # DD/MM/AA
-    ]
-    
-    for pattern in patterns:
-        match = re.search(pattern, message)
-        if match:
-            return match.group(1)
-    
-    return None
-
-
-def parse_weekday_from_message(message: str) -> Optional[int]:
-    """
-    Extrai dia da semana de uma mensagem.
-    
-    Returns:
-        0-6 (segunda a domingo) ou None
-    """
-    message = message.lower()
-    
-    weekdays = {
-        'segunda': 0,
-        'terça': 1,
-        'terca': 1,
-        'quarta': 2,
-        'quinta': 3,
-        'sexta': 4,
-        'sábado': 5,
-        'sabado': 5,
-        'domingo': 6,
-    }
-    
-    for day_name, day_num in weekdays.items():
-        if day_name in message:
-            return day_num
-    
-    return None
+# Funções de extração removidas - Claude agora gerencia isso
 
 
 def is_valid_birth_date(date_str: str) -> bool:
@@ -182,60 +118,5 @@ def load_clinic_info() -> Dict[str, Any]:
         raise Exception("Erro ao ler data/clinic_info.json - JSON inválido!")
 
 
-def format_currency(value: float) -> str:
-    """Formata valor monetário para o padrão brasileiro"""
-    return f"R$ {value:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
-
-
-def calculate_age(birth_date_str: str) -> Optional[int]:
-    """Calcula idade a partir da data de nascimento"""
-    birth_date = parse_date_br(birth_date_str)
-    if not birth_date:
-        return None
-    
-    today = now_brazil().date()
-    return int((today - birth_date.date()).days / 365.25)
-
-
-def detect_frustration_keywords(message: str) -> bool:
-    """
-    Detecta palavras-chave que indicam frustração ou necessidade de escalação.
-    """
-    message_lower = message.lower()
-    
-    frustration_keywords = [
-        'não entend',
-        'não consigo',
-        'não está funcionando',
-        'falar com',
-        'atendente',
-        'humano',
-        'pessoa',
-        'não resolve',
-        'problema',
-        'reclamação',
-        'urgente',
-        'emergência',
-        'irritado',
-        'chato',
-    ]
-    
-    return any(keyword in message_lower for keyword in frustration_keywords)
-
-
-def detect_inappropriate_language(message: str) -> bool:
-    """
-    Detecta linguagem inapropriada ou ofensiva.
-    """
-    message_lower = message.lower()
-    
-    inappropriate_words = [
-        'idiota',
-        'burro',
-        'imbecil',
-        'merda',
-        # Adicione mais conforme necessário, mas com cuidado
-    ]
-    
-    return any(word in message_lower for word in inappropriate_words)
+# Funções de detecção removidas - Claude agora gerencia isso
 

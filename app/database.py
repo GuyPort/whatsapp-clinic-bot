@@ -63,18 +63,5 @@ def get_db() -> Generator[Session, None, None]:
         db.close()
 
 
-def get_db_session() -> Generator[Session, None, None]:
-    """
-    Dependency para FastAPI obter uma sessão do banco.
-    
-    Uso em rotas FastAPI:
-        @app.get("/")
-        def route(db: Session = Depends(get_db_session)):
-            ...
-    """
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
+# get_db_session removido - não utilizado
 
