@@ -7,7 +7,7 @@ import logging
 
 from sqlalchemy.orm import Session
 
-from app.models import Appointment, AppointmentStatus
+from app.models import Appointment
 from app.utils import now_brazil, format_time_br, load_clinic_info, get_brazil_timezone
 from app.calendar_service import calendar_service
 
@@ -148,8 +148,7 @@ class AppointmentRules:
         
         existing_appointments = db.query(Appointment).filter(
             Appointment.appointment_date >= day_start,
-            Appointment.appointment_date < day_end,
-            Appointment.status == AppointmentStatus.SCHEDULED
+            Appointment.appointment_date < day_end
         ).all()
         
         # Buscar eventos do Google Calendar
@@ -262,14 +261,8 @@ class AppointmentRules:
             return False, "Não é possível modificar uma consulta que já passou."
         
         # Verificar se já foi cancelada
-        if appointment.status == AppointmentStatus.CANCELLED:
-            return False, "Esta consulta já foi cancelada."
-        
-        # Verificar se já foi realizada
-        if appointment.status == AppointmentStatus.COMPLETED:
-            return False, "Esta consulta já foi realizada."
-        
-        return True, ""
+        # Como não temos mais status, assumimos que todas as consultas estão ativas
+        return True, "Consulta válida."
     
     def get_consultation_types(self) -> List[Dict[str, Any]]:
         """Retorna tipos de consulta disponíveis"""
