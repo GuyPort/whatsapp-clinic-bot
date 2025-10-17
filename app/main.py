@@ -509,6 +509,29 @@ async def init_database():
         return {"message": f"❌ Erro ao inicializar banco: {str(e)}", "status": "error"}
 
 
+@app.get("/admin/clean-db")
+@app.post("/admin/clean-db")
+async def clean_database():
+    """Remove tabelas antigas e mantém apenas appointments"""
+    try:
+        from app.database import engine
+        from sqlalchemy import text
+        
+        with engine.connect() as conn:
+            # Remover tabelas antigas se existirem
+            conn.execute(text("DROP TABLE IF EXISTS conversation_contexts CASCADE"))
+            conn.execute(text("DROP TABLE IF EXISTS patients CASCADE"))
+            conn.commit()
+            
+        return {
+            "message": "✅ Banco limpo com sucesso! Apenas a tabela 'appointments' foi mantida.", 
+            "status": "success"
+        }
+    except Exception as e:
+        logger.error(f"Erro ao limpar banco: {str(e)}")
+        return {"message": f"❌ Erro ao limpar banco: {str(e)}", "status": "error"}
+
+
 @app.get("/admin/dashboard")
 async def get_dashboard():
     """Dashboard com estatísticas gerais"""
