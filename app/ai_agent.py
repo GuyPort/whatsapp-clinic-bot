@@ -42,18 +42,28 @@ class ClaudeToolAgent:
             if horario != "FECHADO":
                 horarios_str += f"• {dia.capitalize()}: {horario}\n"
         
+        duracao = self.clinic_info.get('regras_agendamento', {}).get('duracao_consulta_minutos', 45)
+        
         return f"""Você é a assistente virtual da {clinic_name}.
 
 INFORMAÇÕES DA CLÍNICA:
 📍 Endereço: {endereco}
 🕒 Horários de Funcionamento:
 {horarios_str}
+⏱️ Duração das consultas: {duracao} minutos
 
-FLUXO DE ATENDIMENTO:
-1. SEMPRE comece com a mensagem de boas-vindas e menu de 3 opções
-2. Use as tools quando necessário para buscar informações ou criar/cancelar consultas
-3. Mantenha conversas naturais e cordiais
-4. Colete sempre: nome completo, telefone, data de nascimento, data e horário da consulta
+FLUXO DE AGENDAMENTO (SEQUENCIAL - UM DADO POR VEZ):
+1. Mostrar menu de opções
+2. Se escolher "Marcar consulta", pedir UM dado por vez:
+   a) "Qual seu nome completo?"
+   b) "Qual sua data de nascimento? (DD/MM/AAAA)"
+   c) "Qual data você gostaria da consulta? (DD/MM/AAAA)"
+   d) "Que horário você prefere? (HH:MM)"
+3. Validar horário de funcionamento ANTES de verificar disponibilidade
+4. Se horário inválido, explicar e pedir novo horário
+5. Se válido, verificar disponibilidade no banco
+6. Mostrar horários disponíveis se necessário
+7. Confirmar agendamento
 
 MENU PADRÃO (sempre mostrar):
 "Olá! Bem-vindo(a) à {clinic_name}! 😊
@@ -67,8 +77,9 @@ Como posso te ajudar hoje?
 Digite o número da opção desejada."
 
 REGRAS IMPORTANTES:
+- Para agendamentos, peça UM dado por vez
+- Valide horários de funcionamento PRIMEIRO
 - Use as tools para verificar disponibilidade e criar consultas
-- Sempre confirme os dados antes de agendar
 - Seja cordial e profissional
 - Mantenha o foco no atendimento médico"""
 
@@ -88,6 +99,24 @@ REGRAS IMPORTANTES:
                         }
                     },
                     "required": ["info_type"]
+                }
+            },
+            {
+                "name": "validate_business_hours",
+                "description": "Valida se um horário está dentro do funcionamento da clínica",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "date": {
+                            "type": "string",
+                            "description": "Data no formato DD/MM/AAAA"
+                        },
+                        "time": {
+                            "type": "string",
+                            "description": "Horário no formato HH:MM"
+                        }
+                    },
+                    "required": ["date", "time"]
                 }
             },
             {
@@ -144,7 +173,7 @@ REGRAS IMPORTANTES:
                 }
             }
         ]
-    
+        
     async def process_message(self, phone: str, message: str, db: Session) -> str:
         """
         Processa mensagem usando Claude com Tools.
@@ -202,7 +231,7 @@ REGRAS IMPORTANTES:
             
             # Resposta direta (sem tool calls)
             return response.content[0].text
-            
+                
         except Exception as e:
             logger.error(f"Erro ao processar mensagem: {str(e)}")
             return "Desculpe, ocorreu um erro. Tente novamente."
@@ -222,6 +251,8 @@ REGRAS IMPORTANTES:
         try:
             if tool_name == "get_clinic_info":
                 return self._handle_get_clinic_info(tool_input)
+            elif tool_name == "validate_business_hours":
+                return self._handle_validate_business_hours(tool_input)
             elif tool_name == "check_availability":
                 return self._handle_check_availability(tool_input, db)
             elif tool_name == "create_appointment":
@@ -269,6 +300,70 @@ REGRAS IMPORTANTES:
             
             return response
     
+    def _handle_validate_business_hours(self, tool_input: Dict) -> str:
+        """Tool: validate_business_hours"""
+        try:
+            date_str = tool_input.get("date")
+            time_str = tool_input.get("time")
+            
+            if not date_str or not time_str:
+                return "Data e horário são obrigatórios."
+            
+            # Converter data
+                appointment_date = parse_date_br(date_str)
+                if not appointment_date:
+                return "Data inválida. Use o formato DD/MM/AAAA."
+            
+            # Obter dia da semana
+            weekday = appointment_date.strftime('%A').lower()
+            weekday_map = {
+                'monday': 'segunda',
+                'tuesday': 'terca', 
+                'wednesday': 'quarta',
+                'thursday': 'quinta',
+                'friday': 'sexta',
+                'saturday': 'sabado',
+                'sunday': 'domingo'
+            }
+            weekday_pt = weekday_map.get(weekday, weekday)
+            
+            # Verificar horários de funcionamento
+            horarios = self.clinic_info.get('horario_funcionamento', {})
+            horario_dia = horarios.get(weekday_pt, "FECHADO")
+            
+            if horario_dia == "FECHADO":
+                return f"❌ A clínica não funciona aos {weekday_pt}s. Horários de funcionamento:\n" + \
+                       self._format_business_hours()
+            
+            # Verificar se horário está dentro do funcionamento
+            try:
+                hora_consulta = datetime.strptime(time_str, '%H:%M').time()
+                hora_inicio, hora_fim = horario_dia.split('-')
+                hora_inicio = datetime.strptime(hora_inicio, '%H:%M').time()
+                hora_fim = datetime.strptime(hora_fim, '%H:%M').time()
+                
+                if hora_inicio <= hora_consulta <= hora_fim:
+                    return f"✅ Horário válido! A clínica funciona das {hora_inicio.strftime('%H:%M')} às {hora_fim.strftime('%H:%M')} aos {weekday_pt}s."
+                else:
+                    return f"❌ Horário inválido! A clínica funciona das {hora_inicio.strftime('%H:%M')} às {hora_fim.strftime('%H:%M')} aos {weekday_pt}s.\n" + \
+                           f"Por favor, escolha um horário entre {hora_inicio.strftime('%H:%M')} e {hora_fim.strftime('%H:%M')}."
+                           
+            except ValueError:
+                return "Formato de horário inválido. Use HH:MM (ex: 14:30)."
+            
+        except Exception as e:
+            logger.error(f"Erro ao validar horário: {str(e)}")
+            return f"Erro ao validar horário: {str(e)}"
+    
+    def _format_business_hours(self) -> str:
+        """Formata horários de funcionamento para exibição"""
+        horarios = self.clinic_info.get('horario_funcionamento', {})
+        response = ""
+        for dia, horario in horarios.items():
+            if horario != "FECHADO":
+                response += f"• {dia.capitalize()}: {horario}\n"
+        return response
+    
     def _handle_check_availability(self, tool_input: Dict, db: Session) -> str:
         """Tool: check_availability"""
         try:
@@ -282,11 +377,12 @@ REGRAS IMPORTANTES:
                 return "Data inválida. Use o formato DD/MM/AAAA."
             
             # Buscar horários disponíveis
+            duracao = self.clinic_info.get('regras_agendamento', {}).get('duracao_consulta_minutos', 45)
             available_slots = appointment_rules.get_available_slots(
                 appointment_date, 
-                30,  # 30 minutos de duração
+                duracao,  # Duração da consulta
                 db,
-                limit=5
+                limit=10
             )
             
             if not available_slots:
@@ -345,14 +441,15 @@ REGRAS IMPORTANTES:
                 return "Este horário já está ocupado. Escolha outro horário."
             
             # Criar consulta
+            duracao = self.clinic_info.get('regras_agendamento', {}).get('duracao_consulta_minutos', 45)
             appointment = Appointment(
                 patient_name=patient_name,
                 patient_phone=normalize_phone(patient_phone),
                 patient_birth_date=patient_birth_date,
                 appointment_date=appointment_date,
                 appointment_time=appointment_time,
-                status=AppointmentStatus.AGENDADA,
-                duration_minutes=30
+                duration_minutes=duracao,
+                status=AppointmentStatus.AGENDADA
             )
             
             db.add(appointment)
