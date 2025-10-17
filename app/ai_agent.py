@@ -78,8 +78,8 @@ Quando o paciente escolher "1 - Marcar consulta", siga EXATAMENTE este fluxo:
    "Perfeito! Agora me informe o dia que gostaria de marcar a consulta (DD/MM/AAAA):"
 
 4. Após receber a data desejada:
-   - Use IMEDIATAMENTE a tool check_availability para verificar horários disponíveis
-   - Mostre os horários disponíveis para o paciente escolher
+   - Execute IMEDIATAMENTE a tool check_availability sem mensagens de confirmação
+   - Mostre diretamente os horários disponíveis para o paciente escolher
    - Se não houver horários, peça outra data
 
 5. Após o paciente escolher um horário da lista:
@@ -89,6 +89,8 @@ REGRAS IMPORTANTES:
 - SEMPRE peça UMA informação por vez
 - NUNCA peça nome, data de nascimento, data e horário na mesma mensagem
 - Use as tools disponíveis para validar horários e disponibilidade
+- NUNCA mostre mensagens de confirmação antes de executar tools
+- Execute tools automaticamente quando necessário
 - Seja sempre educada e prestativa
 - Confirme os dados antes de finalizar o agendamento
 
@@ -263,7 +265,7 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                         return tool_result
                         
             return "Desculpe, não consegui processar sua mensagem. Tente novamente."
-            
+                
         except Exception as e:
             logger.error(f"Erro ao processar mensagem: {str(e)}")
             return "Desculpe, ocorreu um erro. Tente novamente em alguns instantes."
@@ -283,7 +285,7 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                 return self._handle_search_appointments(tool_input, db)
             elif tool_name == "cancel_appointment":
                 return self._handle_cancel_appointment(tool_input, db)
-            else:
+        else:
                 return f"Tool '{tool_name}' não reconhecida."
         except Exception as e:
             logger.error(f"Erro ao executar tool {tool_name}: {str(e)}")
@@ -317,8 +319,8 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                 return "Data e horário são obrigatórios."
             
             # Converter data
-            appointment_date = parse_date_br(date_str)
-            if not appointment_date:
+                appointment_date = parse_date_br(date_str)
+                if not appointment_date:
                 return "Data inválida. Use o formato DD/MM/AAAA."
             
             # Obter dia da semana
@@ -357,7 +359,7 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                            
             except ValueError:
                 return "Formato de horário inválido. Use HH:MM (ex: 14:30)."
-                
+            
         except Exception as e:
             logger.error(f"Erro ao validar horário: {str(e)}")
             return f"Erro ao validar horário: {str(e)}"
@@ -372,7 +374,7 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                 response += f"• {dia.capitalize()}: {horario}\n"
         
         return response
-
+    
     def _handle_check_availability(self, tool_input: Dict, db: Session) -> str:
         """Tool: check_availability"""
         try:
