@@ -2,7 +2,7 @@
 Agente de IA com Claude SDK + Tools para agendamento de consultas.
 Versão completa com menu estruturado e gerenciamento de contexto.
 """
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List, Tuple
 import json
 import logging
@@ -291,7 +291,7 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                 return self._handle_search_appointments(tool_input, db)
             elif tool_name == "cancel_appointment":
                 return self._handle_cancel_appointment(tool_input, db)
-            else:
+        else:
                 logger.warning(f"❌ Tool não reconhecida: {tool_name}")
                 return f"Tool '{tool_name}' não reconhecida."
         except Exception as e:
@@ -326,8 +326,8 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                 return "Data e horário são obrigatórios."
             
             # Converter data
-            appointment_date = parse_date_br(date_str)
-            if not appointment_date:
+                appointment_date = parse_date_br(date_str)
+                if not appointment_date:
                 return "Data inválida. Use o formato DD/MM/AAAA."
             
             # Obter dia da semana
@@ -602,7 +602,7 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
             if name:
                 query = query.filter(Appointment.patient_name.ilike(f"%{name}%"))
             
-            appointments = query.order_by(Appointment.appointment_datetime.desc()).all()
+            appointments = query.order_by(Appointment.appointment_date.desc(), Appointment.appointment_time.desc()).all()
             
             if not appointments:
                 return "Nenhum agendamento encontrado."
