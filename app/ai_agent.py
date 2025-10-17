@@ -9,6 +9,7 @@ import logging
 from anthropic import Anthropic
 
 from sqlalchemy.orm import Session
+from sqlalchemy.orm.attributes import flag_modified
 
 from app.simple_config import settings
 from app.models import Appointment, AppointmentStatus, ConversationContext
@@ -281,6 +282,8 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                     context.messages = []
                     context.flow_data = {}
                     context.status = "expired"
+                    flag_modified(context, 'messages')
+                    flag_modified(context, 'flow_data')
                     
                     # Adicionar mensagem de aviso ao início
                     context.messages.append({
@@ -288,6 +291,7 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                         "content": "Olá! Como você ficou um tempo sem responder, encerramos a sessão anterior. Vamos recomeçar! 😊\n\nComo posso te ajudar hoje?\n1 Marcar consulta\n2 Remarcar/Cancelar consulta\n3 Tirar dúvidas",
                         "timestamp": datetime.utcnow().isoformat()
                     })
+                    flag_modified(context, 'messages')
                     context.last_activity = datetime.utcnow()
                     db.commit()
                     return context.messages[-1]["content"]
@@ -298,6 +302,7 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                 "content": message,
                 "timestamp": datetime.utcnow().isoformat()
             })
+            flag_modified(context, 'messages')
             
             # 4. Preparar mensagens para Claude (histórico completo)
             claude_messages = []
@@ -355,6 +360,7 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                 "content": bot_response,
                 "timestamp": datetime.utcnow().isoformat()
             })
+            flag_modified(context, 'messages')
             
             # 8. Atualizar contexto no banco
             context.last_activity = datetime.utcnow()
@@ -388,7 +394,7 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                 return self._handle_request_human_assistance(tool_input, db, phone)
             elif tool_name == "end_conversation":
                 return self._handle_end_conversation(tool_input, db, phone)
-            else:
+        else:
                 logger.warning(f"❌ Tool não reconhecida: {tool_name}")
                 return f"Tool '{tool_name}' não reconhecida."
         except Exception as e:
@@ -423,8 +429,8 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                 return "Data e horário são obrigatórios."
             
             # Converter data
-            appointment_date = parse_date_br(date_str)
-            if not appointment_date:
+                appointment_date = parse_date_br(date_str)
+                if not appointment_date:
                 return "Data inválida. Use o formato DD/MM/AAAA."
             
             # Obter dia da semana
@@ -720,9 +726,9 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                 if apt.notes:
                     response += f"   💬 {apt.notes}\n"
                 response += "\n"
-            
-            return response
-            
+        
+        return response
+    
         except Exception as e:
             logger.error(f"Erro ao buscar agendamentos: {str(e)}")
             return f"Erro ao buscar agendamentos: {str(e)}"
@@ -779,6 +785,8 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
             context.paused_until = datetime.utcnow() + timedelta(hours=2)
             context.messages = []  # Limpar contexto
             context.flow_data = {}
+            flag_modified(context, 'messages')
+            flag_modified(context, 'flow_data')
             context.last_activity = datetime.utcnow()
             db.commit()
             
