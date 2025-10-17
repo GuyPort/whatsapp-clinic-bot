@@ -273,6 +273,8 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
     def _execute_tool(self, tool_name: str, tool_input: Dict, db: Session) -> str:
         """Executa uma tool específica"""
         try:
+            logger.info(f"🔧 Executando tool: {tool_name} com input: {tool_input}")
+            
             if tool_name == "get_clinic_info":
                 return self._handle_get_clinic_info(tool_input)
             elif tool_name == "validate_business_hours":
@@ -286,6 +288,7 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
             elif tool_name == "cancel_appointment":
                 return self._handle_cancel_appointment(tool_input, db)
             else:
+                logger.warning(f"❌ Tool não reconhecida: {tool_name}")
                 return f"Tool '{tool_name}' não reconhecida."
         except Exception as e:
             logger.error(f"Erro ao executar tool {tool_name}: {str(e)}")
@@ -378,20 +381,32 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
     def _handle_check_availability(self, tool_input: Dict, db: Session) -> str:
         """Tool: check_availability"""
         try:
+            logger.info(f"🔍 Tool check_availability chamada com input: {tool_input}")
+            
             date_str = tool_input.get("date")
             if not date_str:
+                logger.warning("❌ Data não fornecida na tool check_availability")
                 return "Data é obrigatória."
+            
+            logger.info(f"📅 Verificando disponibilidade para data: {date_str}")
             
             # Converter data
             appointment_date = parse_date_br(date_str)
             if not appointment_date:
+                logger.warning(f"❌ Data inválida: {date_str}")
                 return "Data inválida. Use o formato DD/MM/AAAA."
+            
+            logger.info(f"📅 Data convertida: {appointment_date}")
             
             # Obter horários disponíveis
             duracao = self.clinic_info.get('regras_agendamento', {}).get('duracao_consulta_minutos', 45)
+            logger.info(f"⏱️ Duração da consulta: {duracao} minutos")
+            
             available_slots = appointment_rules.get_available_slots(appointment_date, duracao, db)
+            logger.info(f"📋 Slots encontrados: {len(available_slots)}")
             
             if not available_slots:
+                logger.warning(f"❌ Nenhum horário disponível para {appointment_date.strftime('%d/%m/%Y')}")
                 return f"❌ Não há horários disponíveis para {appointment_date.strftime('%d/%m/%Y')}.\n" + \
                        "Por favor, escolha outra data."
             
@@ -402,6 +417,7 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
             response += f"\n⏱️ Duração: {duracao} minutos\n"
             response += "Escolha um horário e me informe o número da opção desejada."
             
+            logger.info(f"✅ Resposta da tool: {response}")
             return response
             
         except Exception as e:
