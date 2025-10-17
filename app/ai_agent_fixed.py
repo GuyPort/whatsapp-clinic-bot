@@ -78,12 +78,13 @@ Quando o paciente escolher "1 - Marcar consulta", siga EXATAMENTE este fluxo:
    "Perfeito! Agora me informe o dia que gostaria de marcar a consulta (DD/MM/AAAA):"
 
 4. Após receber a data desejada:
-   - Use IMEDIATAMENTE a tool check_availability para verificar horários disponíveis
-   - Mostre os horários disponíveis para o paciente escolher
-   - Se não houver horários, peça outra data
+   "Ótimo! E que horário você prefere? (HH:MM - ex: 14:30):"
 
-5. Após o paciente escolher um horário da lista:
-   - Use create_appointment para criar o agendamento com os dados coletados
+5. Após receber o horário:
+   - Use a tool validate_business_hours para verificar se o horário está dentro do funcionamento
+   - Se válido, use check_availability para verificar disponibilidade
+   - Se disponível, use create_appointment para criar o agendamento
+   - Se não disponível, mostre horários alternativos
 
 REGRAS IMPORTANTES:
 - SEMPRE peça UMA informação por vez
@@ -387,7 +388,7 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
             
             # Obter horários disponíveis
             duracao = self.clinic_info.get('regras_agendamento', {}).get('duracao_consulta_minutos', 45)
-            available_slots = appointment_rules.get_available_slots(appointment_date, duracao, db)
+            available_slots = appointment_rules.get_available_slots(appointment_date, db, duracao)
             
             if not available_slots:
                 return f"❌ Não há horários disponíveis para {appointment_date.strftime('%d/%m/%Y')}.\n" + \
@@ -438,7 +439,7 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
             
             # Verificar se horário está disponível
             duracao = self.clinic_info.get('regras_agendamento', {}).get('duracao_consulta_minutos', 45)
-            available_slots = appointment_rules.get_available_slots(appointment_datetime.date(), duracao, db)
+            available_slots = appointment_rules.get_available_slots(appointment_datetime.date(), db, duracao)
             
             if appointment_datetime.time() not in [slot.time() for slot in available_slots]:
                 return f"❌ Horário {appointment_time} não está disponível. Use a tool check_availability para ver horários disponíveis."
@@ -447,9 +448,8 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
             appointment = Appointment(
                 patient_name=patient_name,
                 patient_phone=normalized_phone,
-                patient_birth_date=patient_birth_date,  # Manter como string
-                appointment_date=appointment_datetime.date(),
-                appointment_time=appointment_datetime.time(),
+                patient_birth_date=birth_date,
+                appointment_datetime=appointment_datetime,
                 duration_minutes=duracao,
                 status=AppointmentStatus.AGENDADA,
                 notes=notes
@@ -504,7 +504,7 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                 }.get(apt.status, "❓")
                 
                 response += f"{i}. {status_emoji} **{apt.patient_name}**\n"
-                response += f"   📅 {apt.appointment_date.strftime('%d/%m/%Y às')} {apt.appointment_time.strftime('%H:%M')}\n"
+                response += f"   📅 {apt.appointment_datetime.strftime('%d/%m/%Y às %H:%M')}\n"
                 response += f"   📞 {apt.patient_phone}\n"
                 response += f"   📝 Status: {apt.status.value}\n"
                 if apt.notes:
@@ -544,7 +544,7 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
             
             return f"✅ **Agendamento cancelado com sucesso!**\n\n" + \
                    f"👤 **Paciente:** {appointment.patient_name}\n" + \
-                   f"📅 **Data:** {appointment.appointment_date.strftime('%d/%m/%Y às')} {appointment.appointment_time.strftime('%H:%M')}\n" + \
+                   f"📅 **Data:** {appointment.appointment_datetime.strftime('%d/%m/%Y às %H:%M')}\n" + \
                    f"📝 **Motivo:** {reason}\n\n" + \
                    "Se precisar reagendar, estarei aqui para ajudar! 😊"
                    

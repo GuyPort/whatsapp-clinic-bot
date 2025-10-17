@@ -7,7 +7,7 @@ import logging
 
 from sqlalchemy.orm import Session
 
-from app.models import Appointment
+from app.models import Appointment, AppointmentStatus
 from app.utils import now_brazil, format_time_br, load_clinic_info, get_brazil_timezone
 # Google Calendar removido - usando apenas banco de dados
 
@@ -48,6 +48,12 @@ class AppointmentRules:
         now = now_brazil()
         
         # 1. Data não pode ser no passado
+        # Converter para timezone-aware se necessário
+        if appointment_date.tzinfo is None:
+            appointment_date = self.timezone.localize(appointment_date)
+        if now.tzinfo is None:
+            now = self.timezone.localize(now)
+            
         if appointment_date <= now:
             return False, "A data deve ser no futuro."
         
@@ -147,17 +153,17 @@ class AppointmentRules:
         day_end = day_start + timedelta(days=1)
         
         existing_appointments = db.query(Appointment).filter(
-            Appointment.appointment_date >= day_start,
-            Appointment.appointment_date < day_end,
-            Appointment.status == 'agendada'  # Apenas consultas ativas
+            Appointment.appointment_date >= day_start.date(),
+            Appointment.appointment_date < day_end.date(),
+            Appointment.status == AppointmentStatus.AGENDADA  # Apenas consultas ativas
         ).all()
         
         # Google Calendar removido - verificando apenas banco de dados
         
-        # Gerar slots de 30 em 30 minutos
+        # Gerar slots usando o intervalo configurado
         current = start_time
         interval = self.get_interval_between_appointments()
-        slot_step = 30  # Verificar a cada 30 minutos
+        slot_step = interval  # Usar o intervalo configurado (15 minutos)
         
         while current < end_time and len(available_slots) < limit:
             slot_end = current + timedelta(minutes=consultation_duration)
@@ -178,8 +184,6 @@ class AppointmentRules:
                     if not (slot_end <= app_start or current >= app_end):
                         has_conflict = True
                         break
-                
-                # Google Calendar removido - verificando apenas banco de dados
                 
                 if not has_conflict:
                     available_slots.append(current)
