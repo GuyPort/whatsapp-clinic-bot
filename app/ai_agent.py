@@ -83,9 +83,13 @@ Quando o paciente escolher "1 - Marcar consulta", siga EXATAMENTE este fluxo:
    "Ótimo! E que horário você prefere? (HH:MM - ex: 14:30):"
 
 5. Após receber o horário desejado:
-   - Use validate_and_check_availability para validar horário de funcionamento e disponibilidade
-   - Se válido e disponível, use create_appointment para marcar a consulta
-   - Se inválido ou indisponível, explique o problema e peça outro horário
+   - Execute IMEDIATAMENTE validate_and_check_availability com a data e horário fornecidos
+   - Se o resultado da tool indicar que está disponível (mensagem contém "disponível"):
+     * Execute IMEDIATAMENTE create_appointment para confirmar o agendamento
+     * NÃO avise que vai verificar, apenas execute as tools
+   - Se o resultado indicar conflito ou horário inválido:
+     * Explique o problema ao paciente
+     * Peça outro horário
 
 ENCERRAMENTO DE CONVERSAS:
 Após QUALQUER tarefa concluída (agendamento criado, cancelamento realizado, dúvida respondida):
@@ -333,8 +337,11 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                 elif content.type == "tool_use":
                     # Executar tool
                     tool_result = self._execute_tool(content.name, content.input, db, phone)
+                    logger.info(f"Tool {content.name} result: {tool_result}")
+                    logger.info(f"Tool result type: {type(tool_result)}")
+                    logger.info(f"Tool result content: {tool_result[:200] if len(tool_result) > 200 else tool_result}")
                     
-                    # Fazer follow-up com o resultado
+                    # Fazer follow-up com o resultado usando formato correto
                     follow_up = self.client.messages.create(
                         model="claude-3-5-sonnet-20241022",
                         max_tokens=1000,
@@ -342,7 +349,16 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                         system=self.system_prompt,
                         messages=claude_messages + [
                             {"role": "assistant", "content": response.content},
-                            {"role": "user", "content": f"Resultado da tool {content.name}: {tool_result}"}
+                            {
+                                "role": "user",
+                                "content": [
+                                    {
+                                        "type": "tool_result",
+                                        "tool_use_id": content.id,
+                                        "content": tool_result
+                                    }
+                                ]
+                            }
                         ]
                     )
                     
