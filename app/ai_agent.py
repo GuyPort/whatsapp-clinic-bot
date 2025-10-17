@@ -1,6 +1,7 @@
 """
 Agente de IA com Claude SDK + Tools para agendamento de consultas.
 Versão completa com menu estruturado e gerenciamento de contexto.
+Corrigido: persistência de contexto com flag_modified().
 """
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List, Tuple
