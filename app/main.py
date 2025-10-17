@@ -283,7 +283,7 @@ async def process_message_task(phone: str, message_text: str, message_id: str = 
         
         # Processar com IA
         with get_db() as db:
-            response = await ai_agent.process_message(phone, message_text, db)
+            response = ai_agent.process_message(message_text, phone, db)
         
         # Enviar resposta
         if response:
