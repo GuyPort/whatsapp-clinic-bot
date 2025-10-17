@@ -291,7 +291,7 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                 return self._handle_search_appointments(tool_input, db)
             elif tool_name == "cancel_appointment":
                 return self._handle_cancel_appointment(tool_input, db)
-            else:
+        else:
                 logger.warning(f"❌ Tool não reconhecida: {tool_name}")
                 return f"Tool '{tool_name}' não reconhecida."
         except Exception as e:
