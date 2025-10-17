@@ -78,12 +78,12 @@ Quando o paciente escolher "1 - Marcar consulta", siga EXATAMENTE este fluxo:
    "Perfeito! Agora me informe o dia que gostaria de marcar a consulta (DD/MM/AAAA):"
 
 4. Após receber a data desejada:
-   - Execute IMEDIATAMENTE a tool check_availability sem mensagens de confirmação
-   - Mostre diretamente os horários disponíveis para o paciente escolher
-   - Se não houver horários, peça outra data
+   "Ótimo! E que horário você prefere? (HH:MM - ex: 14:30):"
 
-5. Após o paciente escolher um horário da lista:
-   - Use create_appointment para criar o agendamento com os dados coletados
+5. Após receber o horário desejado:
+   - Use validate_and_check_availability para validar horário de funcionamento e disponibilidade
+   - Se válido e disponível, use create_appointment para marcar a consulta
+   - Se inválido ou indisponível, explique o problema e peça outro horário
 
 REGRAS IMPORTANTES:
 - SEMPRE peça UMA informação por vez
@@ -97,7 +97,7 @@ REGRAS IMPORTANTES:
 FERRAMENTAS DISPONÍVEIS:
 - get_clinic_info: Obter informações da clínica
 - validate_business_hours: Validar se horário está dentro do funcionamento
-- check_availability: Verificar horários disponíveis
+- validate_and_check_availability: Validar horário específico (funcionamento + disponibilidade)
 - create_appointment: Criar novo agendamento
 - search_appointments: Buscar agendamentos existentes
 - cancel_appointment: Cancelar agendamento
@@ -135,17 +135,21 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                 }
             },
             {
-                "name": "check_availability",
-                "description": "Verificar horários disponíveis para agendamento em uma data específica",
+                "name": "validate_and_check_availability",
+                "description": "Validar se um horário específico está disponível (funcionamento + conflitos)",
                 "input_schema": {
                     "type": "object",
                     "properties": {
                         "date": {
                             "type": "string",
                             "description": "Data no formato DD/MM/AAAA"
+                        },
+                        "time": {
+                            "type": "string",
+                            "description": "Horário no formato HH:MM"
                         }
                     },
-                    "required": ["date"]
+                    "required": ["date", "time"]
                 }
             },
             {
@@ -261,7 +265,7 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                     
                     if follow_up.content and follow_up.content[0].type == "text":
                         return follow_up.content[0].text
-                    else:
+            else:
                         return tool_result
                         
             return "Desculpe, não consegui processar sua mensagem. Tente novamente."
@@ -279,15 +283,15 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                 return self._handle_get_clinic_info(tool_input)
             elif tool_name == "validate_business_hours":
                 return self._handle_validate_business_hours(tool_input)
-            elif tool_name == "check_availability":
-                return self._handle_check_availability(tool_input, db)
+            elif tool_name == "validate_and_check_availability":
+                return self._handle_validate_and_check_availability(tool_input, db)
             elif tool_name == "create_appointment":
                 return self._handle_create_appointment(tool_input, db)
             elif tool_name == "search_appointments":
                 return self._handle_search_appointments(tool_input, db)
             elif tool_name == "cancel_appointment":
                 return self._handle_cancel_appointment(tool_input, db)
-            else:
+        else:
                 logger.warning(f"❌ Tool não reconhecida: {tool_name}")
                 return f"Tool '{tool_name}' não reconhecida."
         except Exception as e:
@@ -322,8 +326,8 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                 return "Data e horário são obrigatórios."
             
             # Converter data
-            appointment_date = parse_date_br(date_str)
-            if not appointment_date:
+                appointment_date = parse_date_br(date_str)
+                if not appointment_date:
                 return "Data inválida. Use o formato DD/MM/AAAA."
             
             # Obter dia da semana
@@ -377,6 +381,97 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                 response += f"• {dia.capitalize()}: {horario}\n"
         
         return response
+    
+    def _handle_validate_and_check_availability(self, tool_input: Dict, db: Session) -> str:
+        """Tool: validate_and_check_availability - Valida horário de funcionamento + disponibilidade"""
+        try:
+            logger.info(f"🔍 Tool validate_and_check_availability chamada com input: {tool_input}")
+            
+            date_str = tool_input.get("date")
+            time_str = tool_input.get("time")
+            
+            if not date_str or not time_str:
+                logger.warning("❌ Data ou horário não fornecidos")
+                return "Data e horário são obrigatórios."
+            
+            logger.info(f"📅 Validando: {date_str} às {time_str}")
+            
+            # 1. Converter data
+            appointment_date = parse_date_br(date_str)
+            if not appointment_date:
+                logger.warning(f"❌ Data inválida: {date_str}")
+                return "Data inválida. Use o formato DD/MM/AAAA."
+            
+            # 2. Validar horário de funcionamento
+            weekday = appointment_date.strftime('%A').lower()
+            weekday_map = {
+                'monday': 'segunda',
+                'tuesday': 'terca', 
+                'wednesday': 'quarta',
+                'thursday': 'quinta',
+                'friday': 'sexta',
+                'saturday': 'sabado',
+                'sunday': 'domingo'
+            }
+            weekday_pt = weekday_map.get(weekday, weekday)
+            
+            horarios = self.clinic_info.get('horario_funcionamento', {})
+            horario_dia = horarios.get(weekday_pt, "FECHADO")
+            
+            if horario_dia == "FECHADO":
+                logger.warning(f"❌ Clínica fechada aos {weekday_pt}s")
+                return f"❌ A clínica não funciona aos {weekday_pt}s. Horários de funcionamento:\n" + \
+                       self._format_business_hours()
+            
+            # 3. Verificar se horário está dentro do funcionamento
+            try:
+                hora_consulta = datetime.strptime(time_str, '%H:%M').time()
+                hora_inicio, hora_fim = horario_dia.split('-')
+                hora_inicio = datetime.strptime(hora_inicio, '%H:%M').time()
+                hora_fim = datetime.strptime(hora_fim, '%H:%M').time()
+                
+                if not (hora_inicio <= hora_consulta <= hora_fim):
+                    logger.warning(f"❌ Horário {time_str} fora do funcionamento")
+                    return f"❌ Horário inválido! A clínica funciona das {hora_inicio.strftime('%H:%M')} às {hora_fim.strftime('%H:%M')} aos {weekday_pt}s.\n" + \
+                           f"Por favor, escolha um horário entre {hora_inicio.strftime('%H:%M')} e {hora_fim.strftime('%H:%M')}."
+                           
+            except ValueError:
+                logger.warning(f"❌ Formato de horário inválido: {time_str}")
+                return "Formato de horário inválido. Use HH:MM (ex: 14:30)."
+            
+            # 4. Verificar disponibilidade no banco de dados
+            appointment_datetime = datetime.combine(appointment_date.date(), hora_consulta)
+            duracao = self.clinic_info.get('regras_agendamento', {}).get('duracao_consulta_minutos', 45)
+            interval = self.clinic_info.get('regras_agendamento', {}).get('intervalo_entre_consultas_minutos', 15)
+            
+            # Buscar consultas conflitantes
+            day_start = appointment_datetime.replace(hour=0, minute=0, second=0, microsecond=0)
+            day_end = day_start + timedelta(days=1)
+            
+            existing_appointments = db.query(Appointment).filter(
+                Appointment.appointment_date >= day_start.date(),
+                Appointment.appointment_date < day_end.date(),
+                Appointment.status == AppointmentStatus.AGENDADA
+            ).all()
+            
+            # Verificar conflitos
+            slot_end = appointment_datetime + timedelta(minutes=duracao)
+            
+            for appointment in existing_appointments:
+                app_start = datetime.combine(appointment.appointment_date, appointment.appointment_time)
+                app_end = app_start + timedelta(minutes=appointment.duration_minutes + interval)
+                
+                # Verificar sobreposição
+                if not (slot_end <= app_start or appointment_datetime >= app_end):
+                    logger.warning(f"❌ Conflito encontrado: {appointment.patient_name} das {app_start.strftime('%H:%M')} às {app_end.strftime('%H:%M')}")
+                    return f"❌ Horário {time_str} já está ocupado. Por favor, escolha outro horário."
+            
+            logger.info(f"✅ Horário {time_str} disponível!")
+            return f"✅ Horário {time_str} disponível! Pode prosseguir com o agendamento."
+            
+        except Exception as e:
+            logger.error(f"Erro ao validar disponibilidade: {str(e)}")
+            return f"Erro ao validar disponibilidade: {str(e)}"
     
     def _handle_check_availability(self, tool_input: Dict, db: Session) -> str:
         """Tool: check_availability"""
