@@ -3,7 +3,7 @@ Modelos de banco de dados para o bot da clínica.
 Versão completa com todos os campos necessários para o agente Claude.
 """
 from datetime import datetime, date, time
-from sqlalchemy import Column, Integer, String, DateTime, Date, Time, Text, Index, Enum
+from sqlalchemy import Column, Integer, String, DateTime, Date, Time, Text, Index, Enum, JSON
 from sqlalchemy.orm import declarative_base
 import enum
 
@@ -57,3 +57,32 @@ class Appointment(Base):
     
     def __repr__(self):
         return f"<Appointment(id={self.id}, patient='{self.patient_name}', date='{self.appointment_date}', time='{self.appointment_time}', status='{self.status.value}')>"
+
+
+class ConversationContext(Base):
+    """
+    Contexto de conversa para manter histórico entre mensagens do WhatsApp.
+    Permite que o bot "lembre" do que foi dito anteriormente.
+    """
+    __tablename__ = "conversation_contexts"
+    
+    # Chave primária: número de telefone do WhatsApp
+    phone = Column(String(20), primary_key=True, index=True)
+    
+    # Histórico de mensagens (JSON array)
+    messages = Column(JSON, nullable=False, default=list)  # [{role, content, timestamp}]
+    
+    # Estado atual do fluxo
+    current_flow = Column(String(50), nullable=True)  # "agendamento" | "cancelamento" | "duvidas"
+    flow_data = Column(JSON, nullable=False, default=dict)  # Dados coletados no fluxo
+    
+    # Status e controle
+    status = Column(String(20), nullable=False, default="active")  # "active" | "paused_human" | "expired"
+    paused_until = Column(DateTime, nullable=True)  # Quando a pausa para humano expira
+    
+    # Timestamps
+    last_activity = Column(DateTime, nullable=False, default=datetime.utcnow)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    
+    def __repr__(self):
+        return f"<ConversationContext(phone='{self.phone}', status='{self.status}', messages={len(self.messages)})>"

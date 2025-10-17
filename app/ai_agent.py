@@ -11,7 +11,7 @@ from anthropic import Anthropic
 from sqlalchemy.orm import Session
 
 from app.simple_config import settings
-from app.models import Appointment, AppointmentStatus
+from app.models import Appointment, AppointmentStatus, ConversationContext
 from app.utils import (
     load_clinic_info, normalize_phone, parse_date_br, 
     format_datetime_br, now_brazil, get_brazil_timezone
@@ -85,6 +85,17 @@ Quando o paciente escolher "1 - Marcar consulta", siga EXATAMENTE este fluxo:
    - Se válido e disponível, use create_appointment para marcar a consulta
    - Se inválido ou indisponível, explique o problema e peça outro horário
 
+ENCERRAMENTO DE CONVERSAS:
+Após QUALQUER tarefa concluída (agendamento criado, cancelamento realizado, dúvida respondida):
+- SEMPRE perguntar: "Posso te ajudar com mais alguma coisa?"
+- Se SIM ou usuário fizer nova pergunta: continuar com contexto
+- Se NÃO ou "não preciso de mais nada": executar tool 'end_conversation'
+
+ATENDIMENTO HUMANO:
+Se o usuário pedir para "falar com alguém", "atendente", "secretária", "humano", etc:
+- Execute IMEDIATAMENTE a tool 'request_human_assistance'
+- NÃO pergunte confirmação, execute direto
+
 REGRAS IMPORTANTES:
 - SEMPRE peça UMA informação por vez
 - NUNCA peça nome, data de nascimento, data e horário na mesma mensagem
@@ -101,6 +112,8 @@ FERRAMENTAS DISPONÍVEIS:
 - create_appointment: Criar novo agendamento
 - search_appointments: Buscar agendamentos existentes
 - cancel_appointment: Cancelar agendamento
+- request_human_assistance: Transferir para atendimento humano
+- end_conversation: Encerrar conversa quando usuário não precisa de mais nada
 
 Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
 
@@ -221,34 +234,99 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                     },
                     "required": ["appointment_id", "reason"]
                 }
+            },
+            {
+                "name": "request_human_assistance",
+                "description": "Transferir atendimento para humano quando solicitado",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {},
+                    "required": []
+                }
+            },
+            {
+                "name": "end_conversation",
+                "description": "Encerrar conversa e limpar contexto quando usuário não precisa de mais nada",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {},
+                    "required": []
+                }
             }
         ]
 
     def process_message(self, message: str, phone: str, db: Session) -> str:
-        """Processa uma mensagem do usuário e retorna a resposta"""
+        """Processa uma mensagem do usuário e retorna a resposta com contexto persistente"""
         try:
-            # Preparar mensagem para o Claude
-            user_message = f"Telefone do paciente: {phone}\n\nMensagem: {message}"
+            # 1. Carregar contexto do banco
+            context = db.query(ConversationContext).filter_by(phone=phone).first()
+            if not context:
+                # Primeira mensagem deste usuário, criar contexto novo
+                context = ConversationContext(
+                    phone=phone,
+                    messages=[],
+                    status="active"
+                )
+                db.add(context)
+                logger.info(f"🆕 Novo contexto criado para {phone}")
+            else:
+                logger.info(f"📱 Contexto carregado para {phone}: {len(context.messages)} mensagens")
             
-            # Fazer chamada para o Claude
+            # 2. Verificar timeout de inatividade (30 minutos)
+            if context.last_activity:
+                inactivity = datetime.utcnow() - context.last_activity
+                if inactivity > timedelta(minutes=30):
+                    # Contexto expirou - limpar e avisar
+                    logger.info(f"⏰ Contexto expirado por inatividade para {phone}")
+                    context.messages = []
+                    context.flow_data = {}
+                    context.status = "expired"
+                    
+                    # Adicionar mensagem de aviso ao início
+                    context.messages.append({
+                        "role": "assistant",
+                        "content": "Olá! Como você ficou um tempo sem responder, encerramos a sessão anterior. Vamos recomeçar! 😊\n\nComo posso te ajudar hoje?\n1 Marcar consulta\n2 Remarcar/Cancelar consulta\n3 Tirar dúvidas",
+                        "timestamp": datetime.utcnow().isoformat()
+                    })
+                    context.last_activity = datetime.utcnow()
+                    db.commit()
+                    return context.messages[-1]["content"]
+            
+            # 3. Adicionar mensagem do usuário ao histórico
+            context.messages.append({
+                "role": "user",
+                "content": message,
+                "timestamp": datetime.utcnow().isoformat()
+            })
+            
+            # 4. Preparar mensagens para Claude (histórico completo)
+            claude_messages = []
+            for msg in context.messages:
+                claude_messages.append({
+                    "role": msg["role"],
+                    "content": msg["content"]
+                })
+            
+            # 5. Fazer chamada para o Claude com histórico completo
+            logger.info(f"🤖 Enviando {len(claude_messages)} mensagens para Claude")
             response = self.client.messages.create(
                 model="claude-3-5-sonnet-20241022",
                 max_tokens=2000,
                 temperature=0.1,
                 system=self.system_prompt,
-                messages=[{"role": "user", "content": user_message}],
+                messages=claude_messages,  # ✅ HISTÓRICO COMPLETO!
                 tools=self.tools
             )
             
-            # Processar resposta
+            # 6. Processar resposta do Claude
             if response.content:
                 content = response.content[0]
                 
                 if content.type == "text":
-                    return content.text
+                    bot_response = content.text
                 elif content.type == "tool_use":
                     # Executar tool
-                    tool_result = self._execute_tool(content.name, content.input, db)
+                    tool_result = self._execute_tool(content.name, content.input, db, phone)
                     
                     # Fazer follow-up com o resultado
                     follow_up = self.client.messages.create(
@@ -256,25 +334,40 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                         max_tokens=1000,
                         temperature=0.1,
                         system=self.system_prompt,
-                        messages=[
-                            {"role": "user", "content": user_message},
+                        messages=claude_messages + [
                             {"role": "assistant", "content": response.content},
                             {"role": "user", "content": f"Resultado da tool {content.name}: {tool_result}"}
                         ]
                     )
                     
                     if follow_up.content and follow_up.content[0].type == "text":
-                        return follow_up.content[0].text
+                        bot_response = follow_up.content[0].text
+                    else:
+                        bot_response = tool_result
+                else:
+                    bot_response = "Desculpe, não consegui processar sua mensagem. Tente novamente."
             else:
-                        return tool_result
-                        
-            return "Desculpe, não consegui processar sua mensagem. Tente novamente."
+                bot_response = "Desculpe, não consegui processar sua mensagem. Tente novamente."
+            
+            # 7. Salvar resposta do Claude no histórico
+            context.messages.append({
+                "role": "assistant",
+                "content": bot_response,
+                "timestamp": datetime.utcnow().isoformat()
+            })
+            
+            # 8. Atualizar contexto no banco
+            context.last_activity = datetime.utcnow()
+            db.commit()
+            
+            logger.info(f"💾 Contexto salvo para {phone}: {len(context.messages)} mensagens")
+            return bot_response
                 
         except Exception as e:
             logger.error(f"Erro ao processar mensagem: {str(e)}")
             return "Desculpe, ocorreu um erro. Tente novamente em alguns instantes."
 
-    def _execute_tool(self, tool_name: str, tool_input: Dict, db: Session) -> str:
+    def _execute_tool(self, tool_name: str, tool_input: Dict, db: Session, phone: str = None) -> str:
         """Executa uma tool específica"""
         try:
             logger.info(f"🔧 Executando tool: {tool_name} com input: {tool_input}")
@@ -291,6 +384,10 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                 return self._handle_search_appointments(tool_input, db)
             elif tool_name == "cancel_appointment":
                 return self._handle_cancel_appointment(tool_input, db)
+            elif tool_name == "request_human_assistance":
+                return self._handle_request_human_assistance(tool_input, db, phone)
+            elif tool_name == "end_conversation":
+                return self._handle_end_conversation(tool_input, db, phone)
             else:
                 logger.warning(f"❌ Tool não reconhecida: {tool_name}")
                 return f"Tool '{tool_name}' não reconhecida."
@@ -665,6 +762,52 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
             logger.error(f"Erro ao cancelar agendamento: {str(e)}")
             db.rollback()
             return f"Erro ao cancelar agendamento: {str(e)}"
+
+    def _handle_request_human_assistance(self, tool_input: Dict, db: Session, phone: str) -> str:
+        """Tool: request_human_assistance - Pausar bot para atendimento humano"""
+        try:
+            logger.info(f"🛑 Tool request_human_assistance chamada para {phone}")
+            
+            # Buscar contexto pelo phone
+            context = db.query(ConversationContext).filter_by(phone=phone).first()
+            if not context:
+                context = ConversationContext(phone=phone)
+                db.add(context)
+            
+            # Pausar por 2 horas
+            context.status = "paused_human"
+            context.paused_until = datetime.utcnow() + timedelta(hours=2)
+            context.messages = []  # Limpar contexto
+            context.flow_data = {}
+            context.last_activity = datetime.utcnow()
+            db.commit()
+            
+            logger.info(f"⏸️ Bot pausado para {phone} até {context.paused_until}")
+            return "Claro! Vou transferir você para nossa equipe. Um momento! 🙋"
+            
+        except Exception as e:
+            logger.error(f"Erro ao pausar bot para humano: {str(e)}")
+            db.rollback()
+            return f"Erro ao transferir para humano: {str(e)}"
+
+    def _handle_end_conversation(self, tool_input: Dict, db: Session, phone: str) -> str:
+        """Tool: end_conversation - Encerrar conversa e limpar contexto"""
+        try:
+            logger.info(f"🔚 Tool end_conversation chamada para {phone}")
+            
+            # Buscar e deletar contexto
+            context = db.query(ConversationContext).filter_by(phone=phone).first()
+            if context:
+                db.delete(context)
+                db.commit()
+                logger.info(f"🗑️ Contexto deletado para {phone}")
+            
+            return "Foi um prazer atendê-lo(a)! Até logo! 😊"
+            
+        except Exception as e:
+            logger.error(f"Erro ao encerrar conversa: {str(e)}")
+            db.rollback()
+            return f"Erro ao encerrar conversa: {str(e)}"
 
 
 # Instância global do agente
