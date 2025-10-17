@@ -727,9 +727,9 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                 if apt.notes:
                     response += f"   💬 {apt.notes}\n"
                 response += "\n"
+            
+            return response
         
-        return response
-    
         except Exception as e:
             logger.error(f"Erro ao buscar agendamentos: {str(e)}")
             return f"Erro ao buscar agendamentos: {str(e)}"
