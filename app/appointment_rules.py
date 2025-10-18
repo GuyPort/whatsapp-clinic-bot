@@ -107,7 +107,7 @@ class AppointmentRules:
         target_date: datetime,
         consultation_duration: int,
         db: Session,
-        limit: int = 3
+        limit: int = None
     ) -> List[datetime]:
         """
         Retorna horários disponíveis para uma data específica.
@@ -162,10 +162,9 @@ class AppointmentRules:
         
         # Gerar slots usando o intervalo configurado
         current = start_time
-        interval = self.get_interval_between_appointments()
-        slot_step = interval  # Usar o intervalo configurado (15 minutos)
+        slot_step = 5  # Slots a cada 5 minutos
         
-        while current < end_time and len(available_slots) < limit:
+        while current < end_time and (limit is None or len(available_slots) < limit):
             slot_end = current + timedelta(minutes=consultation_duration)
             
             # Verificar se o slot é válido
@@ -178,7 +177,7 @@ class AppointmentRules:
                 for appointment in existing_appointments:
                     # Combinar data e hora para criar datetime
                     app_start = datetime.combine(appointment.appointment_date, appointment.appointment_time)
-                    app_end = app_start + timedelta(minutes=appointment.duration_minutes + interval)
+                    app_end = app_start + timedelta(minutes=appointment.duration_minutes)
                     
                     # Verificar sobreposição
                     if not (slot_end <= app_start or current >= app_end):
@@ -243,6 +242,56 @@ class AppointmentRules:
         # Como não temos mais status, assumimos que todas as consultas estão ativas
         return True, "Consulta válida."
     
+    def check_slot_availability(
+        self,
+        target_datetime: datetime,
+        consultation_duration: int,
+        db: Session
+    ) -> bool:
+        """
+        Verifica se um horário específico está disponível.
+        
+        Args:
+            target_datetime: Data e hora exata da consulta desejada
+            consultation_duration: Duração da consulta em minutos
+            db: Sessão do banco de dados
+            
+        Returns:
+            True se disponível, False se conflita
+        """
+        # 1. Validar se está dentro do horário de funcionamento
+        is_valid, error_msg = self.is_valid_appointment_date(target_datetime)
+        if not is_valid:
+            return False
+        
+        # 2. Validar minutos (deve ser múltiplo de 5)
+        if target_datetime.minute % 5 != 0:
+            return False
+        
+        # 3. Buscar consultas do dia
+        day_start = target_datetime.replace(hour=0, minute=0, second=0, microsecond=0)
+        day_end = day_start + timedelta(days=1)
+        
+        existing_appointments = db.query(Appointment).filter(
+            Appointment.appointment_date >= day_start.date(),
+            Appointment.appointment_date < day_end.date(),
+            Appointment.status == AppointmentStatus.AGENDADA
+        ).all()
+        
+        # 4. Calcular fim da nova consulta
+        slot_end = target_datetime + timedelta(minutes=consultation_duration)
+        
+        # 5. Verificar conflitos
+        for appointment in existing_appointments:
+            app_start = datetime.combine(appointment.appointment_date, appointment.appointment_time)
+            app_end = app_start + timedelta(minutes=appointment.duration_minutes)
+            
+            # Verificar sobreposição: novo slot NÃO deve sobrepor consulta existente
+            if not (slot_end <= app_start or target_datetime >= app_end):
+                return False
+        
+        return True
+
 # Funções de tipos de consulta removidas - não utilizadas
 
 

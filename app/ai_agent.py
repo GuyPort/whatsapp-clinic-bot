@@ -547,7 +547,7 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                 return self._handle_request_human_assistance(tool_input, db, phone)
             elif tool_name == "end_conversation":
                 return self._handle_end_conversation(tool_input, db, phone)
-            else:
+        else:
                 logger.warning(f"❌ Tool não reconhecida: {tool_name}")
                 return f"Tool '{tool_name}' não reconhecida."
         except Exception as e:
@@ -582,8 +582,8 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                 return "Data e horário são obrigatórios."
             
             # Converter data
-            appointment_date = parse_date_br(date_str)
-            if not appointment_date:
+                appointment_date = parse_date_br(date_str)
+                if not appointment_date:
                 return "Data inválida. Use o formato DD/MM/AAAA."
             
             # Obter dia da semana
@@ -686,6 +686,10 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                 hora_inicio = datetime.strptime(hora_inicio, '%H:%M').time()
                 hora_fim = datetime.strptime(hora_fim, '%H:%M').time()
                 
+                # Verificar se minuto é múltiplo de 5
+                if hora_consulta.minute % 5 != 0:
+                    return f"❌ Horário inválido! Por favor, escolha um horário em múltiplos de 5 minutos (ex: 08:00, 08:05, 08:10, 14:25, etc.)."
+                
                 if not (hora_inicio <= hora_consulta <= hora_fim):
                     logger.warning(f"❌ Horário {time_str} fora do funcionamento")
                     return f"❌ Horário inválido! A clínica funciona das {hora_inicio.strftime('%H:%M')} às {hora_fim.strftime('%H:%M')} aos {weekday_pt}s.\n" + \
@@ -697,33 +701,18 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
             
             # 4. Verificar disponibilidade no banco de dados
             appointment_datetime = datetime.combine(appointment_date.date(), hora_consulta)
-            duracao = self.clinic_info.get('regras_agendamento', {}).get('duracao_consulta_minutos', 45)
-            interval = self.clinic_info.get('regras_agendamento', {}).get('intervalo_entre_consultas_minutos', 15)
+            duracao = self.clinic_info.get('regras_agendamento', {}).get('duracao_consulta_minutos', 60)
             
-            # Buscar consultas conflitantes
-            day_start = appointment_datetime.replace(hour=0, minute=0, second=0, microsecond=0)
-            day_end = day_start + timedelta(days=1)
+            # Usar nova função para verificar disponibilidade
+            is_available = appointment_rules.check_slot_availability(appointment_datetime, duracao, db)
             
-            existing_appointments = db.query(Appointment).filter(
-                Appointment.appointment_date >= day_start.date(),
-                Appointment.appointment_date < day_end.date(),
-                Appointment.status == AppointmentStatus.AGENDADA
-            ).all()
-            
-            # Verificar conflitos
-            slot_end = appointment_datetime + timedelta(minutes=duracao)
-            
-            for appointment in existing_appointments:
-                app_start = datetime.combine(appointment.appointment_date, appointment.appointment_time)
-                app_end = app_start + timedelta(minutes=appointment.duration_minutes + interval)
-                
-                # Verificar sobreposição
-                if not (slot_end <= app_start or appointment_datetime >= app_end):
-                    logger.warning(f"❌ Conflito encontrado: {appointment.patient_name} das {app_start.strftime('%H:%M')} às {app_end.strftime('%H:%M')}")
-                    return f"❌ Horário {time_str} já está ocupado. Por favor, escolha outro horário."
-            
-            logger.info(f"✅ Horário {time_str} disponível!")
-            return f"✅ Horário {time_str} disponível! Pode prosseguir com o agendamento."
+            if is_available:
+                logger.info(f"✅ Horário {time_str} disponível!")
+                return f"✅ Horário {time_str} disponível! Pode prosseguir com o agendamento."
+            else:
+                logger.warning(f"❌ Horário {time_str} não disponível (conflito)")
+                return f"❌ Horário {time_str} não está disponível. Já existe uma consulta neste horário.\n" + \
+                       "Por favor, escolha outro horário."
             
         except Exception as e:
             logger.error(f"Erro ao validar disponibilidade: {str(e)}")
@@ -806,10 +795,10 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                 return "Formato de horário inválido. Use HH:MM."
             
             # Verificar se horário está disponível
-            duracao = self.clinic_info.get('regras_agendamento', {}).get('duracao_consulta_minutos', 45)
-            available_slots = appointment_rules.get_available_slots(appointment_datetime, duracao, db)
+            duracao = self.clinic_info.get('regras_agendamento', {}).get('duracao_consulta_minutos', 60)
+            is_available = appointment_rules.check_slot_availability(appointment_datetime, duracao, db)
             
-            if appointment_datetime.time() not in [slot.time() for slot in available_slots]:
+            if not is_available:
                 return f"❌ Horário {appointment_time} não está disponível. Use a tool check_availability para ver horários disponíveis."
             
             # Criar agendamento
