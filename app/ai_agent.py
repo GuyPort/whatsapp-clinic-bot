@@ -90,6 +90,10 @@ Quando o paciente escolher "1 - Marcar consulta", siga EXATAMENTE este fluxo:
    - Se o resultado indicar conflito ou horário inválido:
      * Explique o problema ao paciente
      * Peça outro horário
+   - Você PODE executar múltiplas tools em sequência:
+     * Exemplo: validate_and_check_availability → create_appointment
+     * NÃO retorne texto intermediário entre tools
+     * Execute todas as tools necessárias e DEPOIS retorne o texto final
 
 ENCERRAMENTO DE CONVERSAS:
 Após QUALQUER tarefa concluída (agendamento criado, cancelamento realizado, dúvida respondida):
@@ -335,37 +339,56 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                 if content.type == "text":
                     bot_response = content.text
                 elif content.type == "tool_use":
-                    # Executar tool
-                    tool_result = self._execute_tool(content.name, content.input, db, phone)
-                    logger.info(f"Tool {content.name} result: {tool_result}")
-                    logger.info(f"Tool result type: {type(tool_result)}")
-                    logger.info(f"Tool result content: {tool_result[:200] if len(tool_result) > 200 else tool_result}")
+                    # Loop para processar múltiplas tools em sequência
+                    max_iterations = 5  # Limite de segurança para evitar loops infinitos
+                    iteration = 0
+                    current_response = response
                     
-                    # Fazer follow-up com o resultado usando formato correto
-                    follow_up = self.client.messages.create(
-                        model="claude-3-5-sonnet-20241022",
-                        max_tokens=1000,
-                        temperature=0.1,
-                        system=self.system_prompt,
-                        messages=claude_messages + [
-                            {"role": "assistant", "content": response.content},
-                            {
-                                "role": "user",
-                                "content": [
+                    while iteration < max_iterations:
+                        iteration += 1
+                        content = current_response.content[0]
+                        
+                        if content.type == "text":
+                            # Claude retornou texto final, sair do loop
+                            bot_response = content.text
+                            break
+                        elif content.type == "tool_use":
+                            # Executar tool
+                            tool_result = self._execute_tool(content.name, content.input, db, phone)
+                            logger.info(f"🔧 Iteration {iteration}: Tool {content.name} result: {tool_result[:200] if len(tool_result) > 200 else tool_result}")
+                            
+                            # Fazer follow-up com o resultado
+                            current_response = self.client.messages.create(
+                                model="claude-3-5-sonnet-20241022",
+                                max_tokens=1000,
+                                temperature=0.1,
+                                system=self.system_prompt,
+                                messages=claude_messages + [
+                                    {"role": "assistant", "content": current_response.content},
                                     {
-                                        "type": "tool_result",
-                                        "tool_use_id": content.id,
-                                        "content": tool_result
+                                        "role": "user",
+                                        "content": [
+                                            {
+                                                "type": "tool_result",
+                                                "tool_use_id": content.id,
+                                                "content": tool_result
+                                            }
+                                        ]
                                     }
                                 ]
-                            }
-                        ]
-                    )
+                            )
+                            
+                            # Continuar loop para processar próxima resposta
+                        else:
+                            # Tipo desconhecido, sair do loop
+                            logger.warning(f"⚠️ Tipo de conteúdo desconhecido: {content.type}")
+                            bot_response = tool_result if 'tool_result' in locals() else "Desculpe, não consegui processar sua mensagem."
+                            break
                     
-                    if follow_up.content and follow_up.content[0].type == "text":
-                        bot_response = follow_up.content[0].text
-                    else:
-                        bot_response = tool_result
+                    # Se atingiu o limite de iterações sem retornar texto
+                    if iteration >= max_iterations:
+                        logger.error(f"❌ Limite de iterações atingido ({max_iterations})")
+                        bot_response = "Desculpe, houve um problema ao processar sua solicitação. Tente novamente."
                 else:
                     bot_response = "Desculpe, não consegui processar sua mensagem. Tente novamente."
             else:
@@ -411,7 +434,7 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                 return self._handle_request_human_assistance(tool_input, db, phone)
             elif tool_name == "end_conversation":
                 return self._handle_end_conversation(tool_input, db, phone)
-            else:
+        else:
                 logger.warning(f"❌ Tool não reconhecida: {tool_name}")
                 return f"Tool '{tool_name}' não reconhecida."
         except Exception as e:
@@ -446,8 +469,8 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                 return "Data e horário são obrigatórios."
             
             # Converter data
-            appointment_date = parse_date_br(date_str)
-            if not appointment_date:
+                appointment_date = parse_date_br(date_str)
+                if not appointment_date:
                 return "Data inválida. Use o formato DD/MM/AAAA."
             
             # Obter dia da semana
@@ -743,9 +766,9 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                 if apt.notes:
                     response += f"   💬 {apt.notes}\n"
                 response += "\n"
-            
-            return response
         
+        return response
+    
         except Exception as e:
             logger.error(f"Erro ao buscar agendamentos: {str(e)}")
             return f"Erro ao buscar agendamentos: {str(e)}"
