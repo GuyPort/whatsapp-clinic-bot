@@ -346,6 +346,17 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                     
                     while iteration < max_iterations:
                         iteration += 1
+                        
+                        # Verificar se há content na resposta
+                        if not current_response.content or len(current_response.content) == 0:
+                            logger.warning(f"⚠️ Iteration {iteration}: Claude retornou resposta vazia")
+                            # Se há tool_result anterior, usar como fallback
+                            if 'tool_result' in locals():
+                                bot_response = tool_result
+                            else:
+                                bot_response = "Desculpe, não consegui processar sua solicitação completamente."
+                            break
+                        
                         content = current_response.content[0]
                         
                         if content.type == "text":
@@ -377,6 +388,8 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                                     }
                                 ]
                             )
+                            logger.info(f"📋 Response content length: {len(current_response.content) if current_response.content else 0}")
+                            logger.info(f"📋 Response stop_reason: {current_response.stop_reason}")
                             
                             # Continuar loop para processar próxima resposta
                         else:
@@ -388,7 +401,11 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                     # Se atingiu o limite de iterações sem retornar texto
                     if iteration >= max_iterations:
                         logger.error(f"❌ Limite de iterações atingido ({max_iterations})")
-                        bot_response = "Desculpe, houve um problema ao processar sua solicitação. Tente novamente."
+                        if 'tool_result' in locals():
+                            logger.info(f"📤 Usando último tool_result como resposta")
+                            bot_response = tool_result
+                        else:
+                            bot_response = "Desculpe, houve um problema ao processar sua solicitação. Tente novamente."
                 else:
                     bot_response = "Desculpe, não consegui processar sua mensagem. Tente novamente."
             else:
