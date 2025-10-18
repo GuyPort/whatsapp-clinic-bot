@@ -82,18 +82,17 @@ Quando o paciente escolher "1 - Marcar consulta", siga EXATAMENTE este fluxo:
 4. Após receber a data desejada:
    "Ótimo! E que horário você prefere? (HH:MM - ex: 14:30):"
 
-5. Após receber o horário desejado:
-   - Execute IMEDIATAMENTE validate_and_check_availability com a data e horário fornecidos
-   - Se o resultado da tool indicar que está disponível (mensagem contém "disponível"):
-     * Execute IMEDIATAMENTE create_appointment para confirmar o agendamento
-     * NÃO avise que vai verificar, apenas execute as tools
-   - Se o resultado indicar conflito ou horário inválido:
-     * Explique o problema ao paciente
-     * Peça outro horário
-   - Você PODE executar múltiplas tools em sequência:
-     * Exemplo: validate_and_check_availability → create_appointment
-     * NÃO retorne texto intermediário entre tools
-     * Execute todas as tools necessárias e DEPOIS retorne o texto final
+5. **FLUXO CRÍTICO - Após receber horário:**
+   a) Execute validate_and_check_availability com data e hora
+   b) Leia o resultado da tool:
+      - Se contém "disponível" → Execute IMEDIATAMENTE create_appointment
+      - Se contém "não está disponível" → Explique e peça outro horário
+      - Se contém "fora do horário" → Explique e peça outro horário
+   c) NUNCA termine sem executar create_appointment quando disponível
+   d) SEMPRE retorne uma mensagem amigável ao usuário após criar agendamento
+
+REGRA IMPORTANTE: Você DEVE executar múltiplas tools em sequência quando necessário.
+NÃO retorne "end_turn" após validate_and_check_availability se o horário está disponível!
 
 ENCERRAMENTO DE CONVERSAS:
 Após QUALQUER tarefa concluída (agendamento criado, cancelamento realizado, dúvida respondida):
@@ -352,7 +351,23 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                             logger.warning(f"⚠️ Iteration {iteration}: Claude retornou resposta vazia")
                             # Se há tool_result anterior, usar como fallback
                             if 'tool_result' in locals():
-                                bot_response = tool_result
+                                # Se tool_result indica disponibilidade, tentar criar agendamento automaticamente
+                                if "disponível" in tool_result.lower() and "validate_and_check_availability" in str(locals()):
+                                    # Extrair dados do flow_data e criar agendamento diretamente
+                                    logger.warning("⚠️ Claude não criou agendamento, fazendo fallback automático")
+                                    try:
+                                        appointment_result = self._handle_create_appointment({
+                                            "patient_name": context.flow_data.get("patient_name"),
+                                            "patient_birth_date": context.flow_data.get("patient_birth_date"),
+                                            "appointment_date": context.flow_data.get("appointment_date"),
+                                            "appointment_time": context.flow_data.get("appointment_time")
+                                        }, db)
+                                        bot_response = f"Perfeito! {appointment_result}"
+                                    except Exception as e:
+                                        logger.error(f"Erro no fallback automático: {e}")
+                                        bot_response = tool_result
+                                else:
+                                    bot_response = tool_result
                             else:
                                 bot_response = "Desculpe, não consegui processar sua solicitação completamente."
                             break
@@ -366,12 +381,19 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                         elif content.type == "tool_use":
                             # Executar tool
                             tool_result = self._execute_tool(content.name, content.input, db, phone)
+                            
+                            # Verificação especial para validate_and_check_availability
+                            if content.name == "validate_and_check_availability":
+                                if "disponível" in tool_result.lower() and "não" not in tool_result.lower():
+                                    # Horário disponível, adicionar hint para Claude criar agendamento
+                                    tool_result += "\n\n[SYSTEM: Execute create_appointment agora com os dados coletados: nome, data_nascimento, data_consulta, horario_consulta]"
+                            
                             logger.info(f"🔧 Iteration {iteration}: Tool {content.name} result: {tool_result[:200] if len(tool_result) > 200 else tool_result}")
                             
                             # Fazer follow-up com o resultado
                             current_response = self.client.messages.create(
                                 model="claude-3-5-sonnet-20241022",
-                                max_tokens=1000,
+                                max_tokens=2000,
                                 temperature=0.1,
                                 system=self.system_prompt,
                                 messages=claude_messages + [
