@@ -425,6 +425,9 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                                         # Extrair dados do histórico de mensagens
                                         appointment_data = self._extract_appointment_data_from_messages(context.messages)
                                         
+                                        # Adicionar telefone do paciente (disponível no contexto phone)
+                                        appointment_data["patient_phone"] = phone
+                                        
                                         logger.info(f"📋 Dados extraídos: {appointment_data}")
                                         
                                         # Validar se todos os dados foram extraídos
