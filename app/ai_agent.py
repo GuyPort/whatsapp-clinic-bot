@@ -264,6 +264,72 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
             }
         ]
 
+    def _extract_appointment_data_from_messages(self, messages: list) -> dict:
+        """
+        Extrai dados de agendamento do histórico de mensagens.
+        Percorre as últimas mensagens para encontrar:
+        - Nome do paciente
+        - Data de nascimento
+        - Data da consulta
+        - Horário da consulta
+        """
+        data = {
+            "patient_name": None,
+            "patient_birth_date": None,
+            "appointment_date": None,
+            "appointment_time": None
+        }
+        
+        logger.info(f"🔍 Extraindo dados de {len(messages)} mensagens")
+        
+        # Percorrer mensagens do mais recente para o mais antigo
+        for i in range(len(messages) - 1, -1, -1):
+            msg = messages[i]
+            
+            # Pular mensagens do bot
+            if msg.get("role") != "user":
+                continue
+            
+            content = msg.get("content", "").strip()
+            
+            # Extrair horário (formato HH:MM)
+            if not data["appointment_time"] and ":" in content:
+                import re
+                time_match = re.match(r'^(\d{1,2}):(\d{2})$', content)
+                if time_match:
+                    data["appointment_time"] = content
+                    continue
+            
+            # Extrair data (formato DD/MM/AAAA)
+            if "/" in content:
+                import re
+                date_match = re.match(r'^(\d{2})/(\d{2})/(\d{4})$', content)
+                if date_match:
+                    # Verificar se é data de nascimento ou data da consulta
+                    day, month, year = date_match.groups()
+                    year_int = int(year)
+                    
+                    # Se ano < 2010, provavelmente é data de nascimento
+                    if year_int < 2010 and not data["patient_birth_date"]:
+                        data["patient_birth_date"] = content
+                    # Senão, é data da consulta
+                    elif not data["appointment_date"]:
+                        data["appointment_date"] = content
+                    continue
+            
+            # Extrair nome (primeira mensagem que não é número e não tem formatação específica)
+            if not data["patient_name"] and len(content) > 3 and not content.isdigit():
+                # Verificar se não é o "Olá!" inicial ou opção do menu
+                if content.lower() not in ["olá", "olá!", "oi", "oi!", "1", "2", "3"]:
+                    data["patient_name"] = content
+        
+        logger.info(f"✅ Nome extraído: {data['patient_name']}")
+        logger.info(f"✅ Data nascimento: {data['patient_birth_date']}")
+        logger.info(f"✅ Data consulta: {data['appointment_date']}")
+        logger.info(f"✅ Horário: {data['appointment_time']}")
+        
+        return data
+
     def process_message(self, message: str, phone: str, db: Session) -> str:
         """Processa uma mensagem do usuário e retorna a resposta com contexto persistente"""
         try:
@@ -353,18 +419,23 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                             if 'tool_result' in locals():
                                 # Se tool_result indica disponibilidade, tentar criar agendamento automaticamente
                                 if "disponível" in tool_result.lower() and "validate_and_check_availability" in str(locals()):
-                                    # Extrair dados do flow_data e criar agendamento diretamente
+                                    # Extrair dados das mensagens e criar agendamento diretamente
                                     logger.warning("⚠️ Claude não criou agendamento, fazendo fallback automático")
                                     try:
-                                        appointment_result = self._handle_create_appointment({
-                                            "patient_name": context.flow_data.get("patient_name"),
-                                            "patient_birth_date": context.flow_data.get("patient_birth_date"),
-                                            "appointment_date": context.flow_data.get("appointment_date"),
-                                            "appointment_time": context.flow_data.get("appointment_time")
-                                        }, db)
-                                        bot_response = f"Perfeito! {appointment_result}"
+                                        # Extrair dados do histórico de mensagens
+                                        appointment_data = self._extract_appointment_data_from_messages(context.messages)
+                                        
+                                        logger.info(f"📋 Dados extraídos: {appointment_data}")
+                                        
+                                        # Validar se todos os dados foram extraídos
+                                        if all(appointment_data.values()):
+                                            appointment_result = self._handle_create_appointment(appointment_data, db)
+                                            bot_response = f"Perfeito! {appointment_result}"
+                                        else:
+                                            logger.error(f"❌ Dados incompletos extraídos: {appointment_data}")
+                                            bot_response = "Desculpe, não consegui extrair todos os dados necessários. Vamos tentar novamente?"
                                     except Exception as e:
-                                        logger.error(f"Erro no fallback automático: {e}")
+                                        logger.error(f"Erro no fallback automático: {e}", exc_info=True)
                                         bot_response = tool_result
                                 else:
                                     bot_response = tool_result
