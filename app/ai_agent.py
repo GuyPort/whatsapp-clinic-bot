@@ -318,7 +318,7 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                     continue
             
             # Extrair nome (primeira mensagem que não é número e não tem formatação específica)
-            if not data["patient_name"] and len(content) > 3 and not content.isdigit():
+            if not data["patient_name"] and len(content) >= 2 and not content.isdigit():
                 # Verificar se não é o "Olá!" inicial ou opção do menu
                 if content.lower() not in ["olá", "olá!", "oi", "oi!", "1", "2", "3"]:
                     data["patient_name"] = content
@@ -807,7 +807,7 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
             
             # Verificar se horário está disponível
             duracao = self.clinic_info.get('regras_agendamento', {}).get('duracao_consulta_minutos', 45)
-            available_slots = appointment_rules.get_available_slots(appointment_datetime.date(), duracao, db)
+            available_slots = appointment_rules.get_available_slots(appointment_datetime, duracao, db)
             
             if appointment_datetime.time() not in [slot.time() for slot in available_slots]:
                 return f"❌ Horário {appointment_time} não está disponível. Use a tool check_availability para ver horários disponíveis."
