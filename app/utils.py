@@ -120,3 +120,17 @@ def load_clinic_info() -> Dict[str, Any]:
 
 # Funções de detecção removidas - Claude agora gerencia isso
 
+
+def round_up_to_next_5_minutes(dt: datetime) -> datetime:
+    """Arredonda para cima ao próximo múltiplo de 5 minutos, zerando segundos/micros.
+    Se já for múltiplo de 5, retorna o próprio horário normalizado.
+    """
+    minute_mod = dt.minute % 5
+    if minute_mod == 0 and dt.second == 0 and dt.microsecond == 0:
+        return dt
+    add = 0 if minute_mod == 0 else (5 - minute_mod)
+    rounded = dt.replace(second=0, microsecond=0) + timedelta(minutes=add)
+    if minute_mod == 0:
+        rounded = dt.replace(second=0, microsecond=0)
+    return rounded
+

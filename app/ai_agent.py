@@ -16,7 +16,7 @@ from app.simple_config import settings
 from app.models import Appointment, AppointmentStatus, ConversationContext
 from app.utils import (
     load_clinic_info, normalize_phone, parse_date_br, 
-    format_datetime_br, now_brazil, get_brazil_timezone
+    format_datetime_br, now_brazil, get_brazil_timezone, round_up_to_next_5_minutes
 )
 from app.appointment_rules import appointment_rules
 
@@ -681,14 +681,15 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
             
             # 3. Verificar se horário está dentro do funcionamento
             try:
-                hora_consulta = datetime.strptime(time_str, '%H:%M').time()
+                hora_consulta_original = datetime.strptime(time_str, '%H:%M').time()
                 hora_inicio, hora_fim = horario_dia.split('-')
                 hora_inicio = datetime.strptime(hora_inicio, '%H:%M').time()
                 hora_fim = datetime.strptime(hora_fim, '%H:%M').time()
                 
-                # Verificar se minuto é múltiplo de 5
-                if hora_consulta.minute % 5 != 0:
-                    return f"❌ Horário inválido! Por favor, escolha um horário em múltiplos de 5 minutos (ex: 08:00, 08:05, 08:10, 14:25, etc.)."
+                # Arredondar minuto para cima ao próximo múltiplo de 5
+                appointment_datetime_tmp = datetime.combine(appointment_date.date(), hora_consulta_original)
+                hora_consulta_dt = round_up_to_next_5_minutes(appointment_datetime_tmp)
+                hora_consulta = hora_consulta_dt.time()
                 
                 if not (hora_inicio <= hora_consulta <= hora_fim):
                     logger.warning(f"❌ Horário {time_str} fora do funcionamento")
@@ -707,8 +708,11 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
             is_available = appointment_rules.check_slot_availability(appointment_datetime, duracao, db)
             
             if is_available:
-                logger.info(f"✅ Horário {time_str} disponível!")
-                return f"✅ Horário {time_str} disponível! Pode prosseguir com o agendamento."
+                ajuste_msg = ""
+                if hora_consulta.strftime('%H:%M') != time_str:
+                    ajuste_msg = f" (ajustado para {hora_consulta.strftime('%H:%M')})"
+                logger.info(f"✅ Horário {hora_consulta.strftime('%H:%M')} disponível!{ajuste_msg}")
+                return f"✅ Horário {hora_consulta.strftime('%H:%M')} disponível!{ajuste_msg} Pode prosseguir com o agendamento."
             else:
                 logger.warning(f"❌ Horário {time_str} não disponível (conflito)")
                 return f"❌ Horário {time_str} não está disponível. Já existe uma consulta neste horário.\n" + \
@@ -787,10 +791,12 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
             if not birth_date or not appointment_datetime:
                 return "Formato de data inválido. Use DD/MM/AAAA."
             
-            # Combinar data e horário
+            # Combinar data e horário (com arredondamento para múltiplo de 5 min)
             try:
-                time_obj = datetime.strptime(appointment_time, '%H:%M').time()
-                appointment_datetime = datetime.combine(appointment_datetime.date(), time_obj)
+                time_obj_original = datetime.strptime(appointment_time, '%H:%M').time()
+                temp_dt = datetime.combine(appointment_datetime.date(), time_obj_original)
+                rounded_dt = round_up_to_next_5_minutes(temp_dt)
+                appointment_datetime = rounded_dt
             except ValueError:
                 return "Formato de horário inválido. Use HH:MM."
             
