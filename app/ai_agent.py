@@ -7,6 +7,7 @@ from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List, Tuple
 import json
 import logging
+import pytz
 from anthropic import Anthropic
 
 from sqlalchemy.orm import Session
@@ -657,8 +658,8 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                 return "Data e horário são obrigatórios."
             
             # Converter data
-            appointment_date = parse_date_br(date_str)
-            if not appointment_date:
+                appointment_date = parse_date_br(date_str)
+                if not appointment_date:
                 return "Data inválida. Use o formato DD/MM/AAAA."
             
             # Obter dia da semana
@@ -879,12 +880,17 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                 logger.info(f"   rounded_dt: {rounded_dt}")
                 logger.info(f"   rounded_dt.tzinfo: {rounded_dt.tzinfo}")
                 
-                # ADICIONAR: Localizar no timezone do Brasil para garantir data correta
+                # ADICIONAR: Converter para UTC antes de salvar no PostgreSQL
+                # PostgreSQL interpreta timezone-aware como UTC, então vamos converter explicitamente
                 tz = get_brazil_timezone()
                 if rounded_dt.tzinfo is None:
-                    appointment_datetime = tz.localize(rounded_dt)
+                    # Localizar no timezone do Brasil primeiro
+                    localized_dt = tz.localize(rounded_dt)
                 else:
-                    appointment_datetime = rounded_dt
+                    localized_dt = rounded_dt
+                
+                # Converter para UTC para evitar problemas de timezone no PostgreSQL
+                appointment_datetime = localized_dt.astimezone(pytz.UTC)
                 
                 # DEBUG: Log após localização
                 logger.info(f"🔍 DEBUG - Após localização:")
