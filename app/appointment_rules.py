@@ -8,7 +8,7 @@ import logging
 from sqlalchemy.orm import Session
 
 from app.models import Appointment, AppointmentStatus
-from app.utils import now_brazil, format_time_br, load_clinic_info, get_brazil_timezone
+from app.utils import now_brazil, format_time_br, load_clinic_info, get_brazil_timezone, parse_date_br
 # Google Calendar removido - usando apenas banco de dados
 
 logger = logging.getLogger(__name__)
@@ -268,22 +268,23 @@ class AppointmentRules:
         if target_datetime.minute % 5 != 0:
             return False
         
-        # 3. Buscar consultas do dia
-        day_start = target_datetime.replace(hour=0, minute=0, second=0, microsecond=0)
-        day_end = day_start + timedelta(days=1)
+        # 3. Buscar consultas do dia - AGORA COM STRINGS
+        target_date_str = target_datetime.strftime('%d/%m/%Y')
         
         existing_appointments = db.query(Appointment).filter(
-            Appointment.appointment_date >= day_start.date(),
-            Appointment.appointment_date < day_end.date(),
+            Appointment.appointment_date == target_date_str,
             Appointment.status == AppointmentStatus.AGENDADA
         ).all()
         
         # 4. Calcular fim da nova consulta
         slot_end = target_datetime + timedelta(minutes=consultation_duration)
         
-        # 5. Verificar conflitos
+        # 5. Verificar conflitos - CONVERTER STRINGS PARA DATETIME
         for appointment in existing_appointments:
-            app_start = datetime.combine(appointment.appointment_date, appointment.appointment_time)
+            # Converter string para datetime
+            app_date = parse_date_br(appointment.appointment_date)
+            app_time = datetime.strptime(appointment.appointment_time, '%H:%M').time()
+            app_start = datetime.combine(app_date.date(), app_time)
             app_end = app_start + timedelta(minutes=appointment.duration_minutes)
             
             # Verificar sobreposição: novo slot NÃO deve sobrepor consulta existente

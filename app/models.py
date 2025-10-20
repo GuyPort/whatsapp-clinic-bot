@@ -31,10 +31,10 @@ class Appointment(Base):
     patient_phone = Column(String(20), nullable=False, index=True)  # Telefone WhatsApp normalizado
     patient_birth_date = Column(String(10), nullable=False)  # Data de nascimento (DD/MM/AAAA)
     
-    # Dados da consulta
-    appointment_date = Column(Date, nullable=False, index=True)  # Dia da consulta
-    appointment_time = Column(Time, nullable=False)  # Horário da consulta
-    duration_minutes = Column(Integer, default=30, nullable=False)  # Duração em minutos
+    # Dados da consulta - USAR STRING para evitar problemas de timezone
+    appointment_date = Column(String(10), nullable=False, index=True)  # Data da consulta (DD/MM/AAAA)
+    appointment_time = Column(String(5), nullable=False)  # Horário da consulta (HH:MM)
+    duration_minutes = Column(Integer, default=60, nullable=False)  # Duração em minutos
     
     # Status e controle
     status = Column(Enum(AppointmentStatus), default=AppointmentStatus.AGENDADA, nullable=False, index=True)

@@ -430,7 +430,7 @@ async def get_scheduled_appointments():
         with get_db() as db:
             from datetime import datetime, timedelta
             
-            # Buscar todas as consultas ordenadas por data
+            # Buscar todas as consultas ordenadas por data - AGORA COM STRINGS
             appointments = db.query(Appointment).order_by(
                 Appointment.appointment_date, Appointment.appointment_time
             ).all()
@@ -445,19 +445,24 @@ async def get_scheduled_appointments():
             for apt in appointments:
                 unique_patients.add(f"{apt.patient_name}_{apt.patient_birth_date}")
             
+            # Calcular estatísticas com strings
+            today_str = today.strftime('%d/%m/%Y')
+            week_start_str = week_start.strftime('%d/%m/%Y')
+            week_end_str = week_end.strftime('%d/%m/%Y')
+            
             stats = {
                 "scheduled": len(appointments),
                 "total_patients": len(unique_patients),
                 "today": db.query(Appointment).filter(
-                    Appointment.appointment_date == today
+                    Appointment.appointment_date == today_str
                 ).count(),
                 "this_week": db.query(Appointment).filter(
-                    Appointment.appointment_date >= week_start,
-                    Appointment.appointment_date <= week_end
+                    Appointment.appointment_date >= week_start_str,
+                    Appointment.appointment_date <= week_end_str
                 ).count()
             }
             
-            # Formatar consultas
+            # Formatar consultas - AGORA COM STRINGS
             formatted_appointments = []
             for apt in appointments:
                 formatted_appointments.append({
@@ -465,9 +470,9 @@ async def get_scheduled_appointments():
                     "patient_name": apt.patient_name,
                     "patient_phone": apt.patient_phone,
                     "patient_birth_date": apt.patient_birth_date,
-                    "appointment_date": apt.appointment_date.isoformat(),
-                    "appointment_date_br": apt.appointment_date.strftime('%d/%m/%Y'),
-                    "appointment_time": apt.appointment_time.strftime("%H:%M:%S"),
+                    "appointment_date": apt.appointment_date,  # Já é string DD/MM/AAAA
+                    "appointment_date_br": apt.appointment_date,  # Já é string DD/MM/AAAA
+                    "appointment_time": apt.appointment_time,  # Já é string HH:MM
                     "status": apt.status.value,
                     "duration_minutes": apt.duration_minutes,
                     "notes": apt.notes,

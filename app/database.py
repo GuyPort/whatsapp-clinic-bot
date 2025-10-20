@@ -25,12 +25,16 @@ if settings.database_url.startswith("sqlite"):
     )
 else:
     # Configuração para PostgreSQL (produção Railway)
+    # ADICIONAR: Configuração de timezone para PostgreSQL
     engine = create_engine(
         settings.database_url,
         echo=settings.log_level == "DEBUG",
         pool_pre_ping=True,  # Verifica conexão antes de usar
         pool_size=10,  # Pool de conexões
-        max_overflow=20  # Máximo de conexões extras
+        max_overflow=20,  # Máximo de conexões extras
+        connect_args={
+            "options": "-c timezone=America/Sao_Paulo"  # Forçar timezone do Brasil
+        }
     )
 
 # Criar SessionLocal
