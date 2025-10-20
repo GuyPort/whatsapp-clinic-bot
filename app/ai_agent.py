@@ -1074,6 +1074,12 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
             logger.error(f"Erro ao encerrar conversa: {str(e)}")
             db.rollback()
             return f"Erro ao encerrar conversa: {str(e)}"
+    
+    def reload_clinic_info(self):
+        """Recarrega informações da clínica do arquivo JSON"""
+        logger.info("🔄 Recarregando informações da clínica...")
+        self.clinic_info = load_clinic_info()
+        logger.info("✅ Informações da clínica recarregadas!")
 
 
 # Instância global do agente
