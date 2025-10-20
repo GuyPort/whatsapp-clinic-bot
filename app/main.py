@@ -397,6 +397,24 @@ async def get_patients():
         raise HTTPException(status_code=500, detail=str(e))
 
 
+def _format_appointment_date(date_value):
+    """Converte qualquer formato de data para DD/MM/YYYY"""
+    if isinstance(date_value, str):
+        # Se for string YYYYMMDD (ex: "20251022")
+        if len(date_value) == 8 and date_value.isdigit():
+            return f"{date_value[6:8]}/{date_value[4:6]}/{date_value[0:4]}"
+        # Se for string DD-MM-YYYY (ex: "22-10-2025")
+        elif '-' in date_value:
+            return date_value.replace('-', '/')
+        # Se for string DD/MM/YYYY (ex: "22/10/2025")
+        elif '/' in date_value:
+            return date_value
+    elif hasattr(date_value, 'strftime'):
+        # Se for datetime.date ou datetime.datetime
+        return date_value.strftime('%d/%m/%Y')
+    
+    return str(date_value)
+
 @app.get("/admin/appointments")
 async def get_appointments():
     """Lista todas as consultas agendadas"""
@@ -471,7 +489,7 @@ async def get_scheduled_appointments():
                     "patient_phone": apt.patient_phone,
                     "patient_birth_date": apt.patient_birth_date,
                     "appointment_date": apt.appointment_date,  # Formato com hífen DD-MM-AAAA
-                    "appointment_date_br": f"{apt.appointment_date[6:8]}/{apt.appointment_date[4:6]}/{apt.appointment_date[0:4]}",  # "20251022" → "22/10/2025"
+                    "appointment_date_br": _format_appointment_date(apt.appointment_date),  # Converter qualquer formato para DD/MM/YYYY
                     "appointment_time": apt.appointment_time,  # String HH:MM
                     "status": apt.status.value,
                     "duration_minutes": apt.duration_minutes,
