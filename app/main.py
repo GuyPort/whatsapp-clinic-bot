@@ -445,10 +445,10 @@ async def get_scheduled_appointments():
             for apt in appointments:
                 unique_patients.add(f"{apt.patient_name}_{apt.patient_birth_date}")
             
-            # Calcular estatísticas com formato brasileiro
-            today_str = today.strftime('%d/%m/%Y')
-            week_start_str = week_start.strftime('%d/%m/%Y')
-            week_end_str = week_end.strftime('%d/%m/%Y')
+            # Calcular estatísticas com formato com hífen
+            today_str = today.strftime('%d-%m-%Y')
+            week_start_str = week_start.strftime('%d-%m-%Y')
+            week_end_str = week_end.strftime('%d-%m-%Y')
             
             stats = {
                 "scheduled": len(appointments),
@@ -462,7 +462,7 @@ async def get_scheduled_appointments():
                 ).count()
             }
             
-            # Formatar consultas - JÁ ESTÁ NO FORMATO BRASILEIRO
+            # Formatar consultas - CONVERTER HÍFEN PARA BARRA NA EXIBIÇÃO
             formatted_appointments = []
             for apt in appointments:
                 formatted_appointments.append({
@@ -470,8 +470,8 @@ async def get_scheduled_appointments():
                     "patient_name": apt.patient_name,
                     "patient_phone": apt.patient_phone,
                     "patient_birth_date": apt.patient_birth_date,
-                    "appointment_date": apt.appointment_date,  # Já é formato brasileiro DD/MM/AAAA
-                    "appointment_date_br": apt.appointment_date,  # Já é formato brasileiro DD/MM/AAAA
+                    "appointment_date": apt.appointment_date,  # Formato com hífen DD-MM-AAAA
+                    "appointment_date_br": apt.appointment_date.replace('-', '/'),  # "27-10-2025" → "27/10/2025"
                     "appointment_time": apt.appointment_time,  # String HH:MM
                     "status": apt.status.value,
                     "duration_minutes": apt.duration_minutes,

@@ -909,12 +909,12 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
             if not is_available:
                 return f"❌ Horário {appointment_time} não está disponível. Use a tool check_availability para ver horários disponíveis."
             
-            # Criar agendamento - SALVAR COMO STRING NO FORMATO BRASILEIRO para evitar conversão de timezone
+            # Criar agendamento - SALVAR COMO STRING COM HÍFEN para evitar conversão de timezone
             appointment = Appointment(
                 patient_name=patient_name,
                 patient_phone=normalized_phone,
                 patient_birth_date=patient_birth_date,  # Manter como string
-                appointment_date=appointment_date,  # Usar formato brasileiro DD/MM/AAAA - evita conversão de timezone
+                appointment_date=appointment_date.replace('/', '-'),  # "27/10/2025" → "27-10-2025"
                 appointment_time=appointment_time,  # Salvar como string HH:MM
                 duration_minutes=duracao,
                 status=AppointmentStatus.AGENDADA,
