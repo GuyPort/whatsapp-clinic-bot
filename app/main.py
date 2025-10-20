@@ -357,6 +357,27 @@ async def reload_config():
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/admin/migrate-fix-date")
+async def migrate_fix_date_admin():
+    """Endpoint admin para executar migração de data no PostgreSQL"""
+    try:
+        from migrate_railway_fix_date import migrate_railway_appointment_date
+        
+        logger.info("🚀 Executando migração de data via endpoint admin...")
+        success = migrate_railway_appointment_date()
+        
+        if success:
+            logger.info("✅ Migração executada com sucesso!")
+            return {"status": "success", "message": "Migração executada com sucesso! Coluna appointment_date alterada para VARCHAR(10)."}
+        else:
+            logger.error("❌ Erro durante migração")
+            return {"status": "error", "message": "Erro durante migração"}
+            
+    except Exception as e:
+        logger.error(f"❌ Erro ao executar migração: {str(e)}")
+        return {"status": "error", "message": f"Erro: {str(e)}"}
+
+
 
 # ==================== ENDPOINTS DO BANCO DE DADOS ====================
 
