@@ -266,12 +266,43 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
 
     def _extract_appointment_data_from_messages(self, messages: list) -> dict:
         """Extrai dados de agendamento do histórico de mensagens.
-        Percorre as últimas mensagens para encontrar:
-        - Nome do paciente
-        - Data de nascimento
-        - Data da consulta
-        - Horário da consulta
+        Percorre as últimas mensagens para encontrar nome, nascimento, data e horário.
+        Retorna sempre um dict; em erro, retorna {}.
         """
+        try:
+            data = {
+                "patient_name": None,
+                "patient_birth_date": None,
+                "appointment_date": None,
+                "appointment_time": None
+            }
+            logger.info(f"🔍 Extraindo dados de {len(messages)} mensagens")
+            import re
+            for i in range(len(messages) - 1, -1, -1):
+                msg = messages[i]
+                if msg.get("role") != "user":
+                    continue
+                content = (msg.get("content") or "").strip()
+                if not data["appointment_time"] and ":" in content and re.match(r'^(\d{1,2}):(\d{2})$', content):
+                    data["appointment_time"] = content
+                    continue
+                if "/" in content:
+                    m = re.match(r'^(\d{2})/(\d{2})/(\d{4})$', content)
+                    if m:
+                        y = int(m.group(3))
+                        if y < 2010 and not data["patient_birth_date"]:
+                            data["patient_birth_date"] = content
+                        elif not data["appointment_date"]:
+                            data["appointment_date"] = content
+                        continue
+                if not data["patient_name"] and len(content) >= 2 and not content.isdigit():
+                    if content.lower() not in ["olá", "olá!", "oi", "oi!", "1", "2", "3"]:
+                        data["patient_name"] = content
+            logger.info(f"📋 Extração concluída: {data}")
+            return data
+        except Exception as e:
+            logger.error(f"Erro ao extrair dados do histórico: {e}", exc_info=True)
+            return {}
 
     # ===== Encerramento de contexto =====
     def _should_end_context(self, context: ConversationContext, last_user_message: str) -> bool:
@@ -448,12 +479,12 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                             # Se há tool_result anterior, usar como fallback
                             if 'tool_result' in locals():
                                 # Se tool_result indica disponibilidade, tentar criar agendamento automaticamente
-                                if "disponível" in tool_result.lower() and "validate_and_check_availability" in str(locals()):
+                                if "disponível" in tool_result.lower():
                                     # Extrair dados das mensagens e criar agendamento diretamente
                                     logger.warning("⚠️ Claude não criou agendamento, fazendo fallback automático")
                                     try:
                                         # Extrair dados do histórico de mensagens
-                                        appointment_data = self._extract_appointment_data_from_messages(context.messages)
+                                        appointment_data = self._extract_appointment_data_from_messages(context.messages) or {}
                                         
                                         # Adicionar telefone do paciente (disponível no contexto phone)
                                         appointment_data["patient_phone"] = phone
@@ -461,12 +492,19 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                                         logger.info(f"📋 Dados extraídos: {appointment_data}")
                                         
                                         # Validar se todos os dados foram extraídos
-                                        if all(appointment_data.values()):
+                                        required = [
+                                            "patient_name","patient_birth_date","appointment_date","appointment_time","patient_phone"
+                                        ]
+                                        missing = [k for k in required if not appointment_data.get(k)]
+                                        if not missing:
                                             appointment_result = self._handle_create_appointment(appointment_data, db)
                                             bot_response = f"Perfeito! {appointment_result}"
                                         else:
                                             logger.error(f"❌ Dados incompletos extraídos: {appointment_data}")
-                                            bot_response = "Desculpe, não consegui extrair todos os dados necessários. Vamos tentar novamente?"
+                                            bot_response = (
+                                                "Quase lá! Preciso só de: " + ", ".join(missing) + ". "
+                                                "Por favor, me informe para concluir o agendamento."
+                                            )
                                     except Exception as e:
                                         logger.error(f"Erro no fallback automático: {e}", exc_info=True)
                                         bot_response = tool_result
