@@ -871,7 +871,14 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                 time_obj_original = datetime.strptime(appointment_time, '%H:%M').time()
                 temp_dt = datetime.combine(appointment_datetime.date(), time_obj_original)
                 rounded_dt = round_up_to_next_5_minutes(temp_dt)
-                appointment_datetime = rounded_dt
+                
+                # ADICIONAR: Localizar no timezone do Brasil para garantir data correta
+                tz = get_brazil_timezone()
+                if rounded_dt.tzinfo is None:
+                    appointment_datetime = tz.localize(rounded_dt)
+                else:
+                    appointment_datetime = rounded_dt
+                    
             except ValueError:
                 return "Formato de horário inválido. Use HH:MM."
             
