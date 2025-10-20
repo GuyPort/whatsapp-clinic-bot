@@ -295,8 +295,14 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                         elif not data["appointment_date"]:
                             data["appointment_date"] = content
                         continue
-                if not data["patient_name"] and len(content) >= 2 and not content.isdigit():
-                    if content.lower() not in ["olá", "olá!", "oi", "oi!", "1", "2", "3"]:
+                if not data["patient_name"]:
+                    # Nome deve conter letras e não conter símbolos de horário/data
+                    import re
+                    has_letters = re.search(r"[A-Za-zÀ-ÿ]", content) is not None
+                    has_bad_symbols = re.search(r"[:=/]", content) is not None
+                    is_only_digits = re.fullmatch(r"\d+", content) is not None
+                    is_menu_or_greeting = content.lower() in ["olá", "olá!", "oi", "oi!", "1", "2", "3"]
+                    if has_letters and not has_bad_symbols and not is_only_digits and not is_menu_or_greeting:
                         data["patient_name"] = content
             logger.info(f"📋 Extração concluída: {data}")
             return data
@@ -615,9 +621,10 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                 return self._handle_request_human_assistance(tool_input, db, phone)
             elif tool_name == "end_conversation":
                 return self._handle_end_conversation(tool_input, db, phone)
-            else:
-                logger.warning(f"❌ Tool não reconhecida: {tool_name}")
-                return f"Tool '{tool_name}' não reconhecida."
+            
+            # Tool não reconhecida
+            logger.warning(f"❌ Tool não reconhecida: {tool_name}")
+            return f"Tool '{tool_name}' não reconhecida."
         except Exception as e:
             logger.error(f"Erro ao executar tool {tool_name}: {str(e)}")
             return f"Erro ao executar {tool_name}: {str(e)}"
@@ -650,8 +657,8 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                 return "Data e horário são obrigatórios."
             
             # Converter data
-            appointment_date = parse_date_br(date_str)
-            if not appointment_date:
+                appointment_date = parse_date_br(date_str)
+                if not appointment_date:
                 return "Data inválida. Use o formato DD/MM/AAAA."
             
             # Obter dia da semana

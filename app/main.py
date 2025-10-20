@@ -466,6 +466,7 @@ async def get_scheduled_appointments():
                     "patient_phone": apt.patient_phone,
                     "patient_birth_date": apt.patient_birth_date,
                     "appointment_date": apt.appointment_date.isoformat(),
+                    "appointment_date_br": apt.appointment_date.strftime('%d/%m/%Y'),
                     "appointment_time": apt.appointment_time.strftime("%H:%M:%S"),
                     "status": apt.status.value,
                     "duration_minutes": apt.duration_minutes,
