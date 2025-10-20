@@ -903,12 +903,12 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
             if not is_available:
                 return f"❌ Horário {appointment_time} não está disponível. Use a tool check_availability para ver horários disponíveis."
             
-            # Criar agendamento - SALVAR COMO STRING para evitar problemas de timezone
+            # Criar agendamento - SALVAR COMO STRING NO FORMATO ISO para PostgreSQL
             appointment = Appointment(
                 patient_name=patient_name,
                 patient_phone=normalized_phone,
                 patient_birth_date=patient_birth_date,  # Manter como string
-                appointment_date=appointment_date,  # Salvar como string DD/MM/AAAA
+                appointment_date=appointment_datetime_local.strftime('%Y-%m-%d'),  # Formato ISO YYYY-MM-DD
                 appointment_time=appointment_time,  # Salvar como string HH:MM
                 duration_minutes=duracao,
                 status=AppointmentStatus.AGENDADA,

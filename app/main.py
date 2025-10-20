@@ -445,10 +445,10 @@ async def get_scheduled_appointments():
             for apt in appointments:
                 unique_patients.add(f"{apt.patient_name}_{apt.patient_birth_date}")
             
-            # Calcular estatísticas com strings
-            today_str = today.strftime('%d/%m/%Y')
-            week_start_str = week_start.strftime('%d/%m/%Y')
-            week_end_str = week_end.strftime('%d/%m/%Y')
+            # Calcular estatísticas com formato ISO
+            today_str = today.strftime('%Y-%m-%d')
+            week_start_str = week_start.strftime('%Y-%m-%d')
+            week_end_str = week_end.strftime('%Y-%m-%d')
             
             stats = {
                 "scheduled": len(appointments),
@@ -462,17 +462,24 @@ async def get_scheduled_appointments():
                 ).count()
             }
             
-            # Formatar consultas - AGORA COM STRINGS
+            # Formatar consultas - CONVERTER ISO PARA DD/MM/AAAA
             formatted_appointments = []
             for apt in appointments:
+                # Converter data ISO para formato brasileiro
+                try:
+                    date_obj = datetime.strptime(apt.appointment_date, '%Y-%m-%d')
+                    date_br = date_obj.strftime('%d/%m/%Y')
+                except:
+                    date_br = apt.appointment_date  # Fallback se já estiver no formato correto
+                
                 formatted_appointments.append({
                     "id": apt.id,
                     "patient_name": apt.patient_name,
                     "patient_phone": apt.patient_phone,
                     "patient_birth_date": apt.patient_birth_date,
-                    "appointment_date": apt.appointment_date,  # Já é string DD/MM/AAAA
-                    "appointment_date_br": apt.appointment_date,  # Já é string DD/MM/AAAA
-                    "appointment_time": apt.appointment_time,  # Já é string HH:MM
+                    "appointment_date": apt.appointment_date,  # Formato ISO YYYY-MM-DD
+                    "appointment_date_br": date_br,  # Formato brasileiro DD/MM/AAAA
+                    "appointment_time": apt.appointment_time,  # String HH:MM
                     "status": apt.status.value,
                     "duration_minutes": apt.duration_minutes,
                     "notes": apt.notes,

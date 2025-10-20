@@ -268,8 +268,8 @@ class AppointmentRules:
         if target_datetime.minute % 5 != 0:
             return False
         
-        # 3. Buscar consultas do dia - AGORA COM STRINGS
-        target_date_str = target_datetime.strftime('%d/%m/%Y')
+        # 3. Buscar consultas do dia - CONVERTER PARA FORMATO ISO
+        target_date_str = target_datetime.strftime('%Y-%m-%d')  # Formato ISO para PostgreSQL
         
         existing_appointments = db.query(Appointment).filter(
             Appointment.appointment_date == target_date_str,
