@@ -939,7 +939,8 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                    f"⏰ **Horário:** {appointment_datetime.strftime('%H:%M')}\n" + \
                    f"⏱️ **Duração:** {duracao} minutos\n" + \
                    f"📞 **Telefone:** {normalized_phone}\n\n" + \
-                   "Obrigado por escolher nossa clínica! 😊"
+                   "Obrigado por escolher nossa clínica! 😊\n\n" + \
+                   "Posso te ajudar com mais alguma coisa?"
                    
         except Exception as e:
             logger.error(f"Erro ao criar agendamento: {str(e)}")
