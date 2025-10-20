@@ -509,7 +509,7 @@ async def get_scheduled_appointments():
                     "patient_name": apt.patient_name,
                     "patient_phone": apt.patient_phone,
                     "patient_birth_date": apt.patient_birth_date,
-                    "appointment_date": apt.appointment_date,  # Formato com hífen DD-MM-AAAA
+                    "appointment_date": _format_appointment_date(apt.appointment_date),  # ← FORMATAR AQUI TAMBÉM
                     "appointment_date_br": _format_appointment_date(apt.appointment_date),  # Converter qualquer formato para DD/MM/YYYY
                     "appointment_time": apt.appointment_time,  # String HH:MM
                     "status": apt.status.value,
