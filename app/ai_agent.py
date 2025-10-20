@@ -658,8 +658,8 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                 return "Data e horário são obrigatórios."
             
             # Converter data
-            appointment_date = parse_date_br(date_str)
-            if not appointment_date:
+                appointment_date = parse_date_br(date_str)
+                if not appointment_date:
                 return "Data inválida. Use o formato DD/MM/AAAA."
             
             # Obter dia da semana
@@ -880,41 +880,36 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                 logger.info(f"   rounded_dt: {rounded_dt}")
                 logger.info(f"   rounded_dt.tzinfo: {rounded_dt.tzinfo}")
                 
-                # ADICIONAR: Converter para UTC antes de salvar no PostgreSQL
-                # PostgreSQL interpreta timezone-aware como UTC, então vamos converter explicitamente
+                # Localizar no timezone do Brasil para validação
                 tz = get_brazil_timezone()
                 if rounded_dt.tzinfo is None:
-                    # Localizar no timezone do Brasil primeiro
-                    localized_dt = tz.localize(rounded_dt)
+                    appointment_datetime_local = tz.localize(rounded_dt)
                 else:
-                    localized_dt = rounded_dt
-                
-                # Converter para UTC para evitar problemas de timezone no PostgreSQL
-                appointment_datetime = localized_dt.astimezone(pytz.UTC)
+                    appointment_datetime_local = rounded_dt
                 
                 # DEBUG: Log após localização
                 logger.info(f"🔍 DEBUG - Após localização:")
-                logger.info(f"   appointment_datetime final: {appointment_datetime}")
-                logger.info(f"   appointment_datetime.date(): {appointment_datetime.date()}")
-                logger.info(f"   appointment_datetime.time(): {appointment_datetime.time()}")
+                logger.info(f"   appointment_datetime_local: {appointment_datetime_local}")
+                logger.info(f"   appointment_datetime_local.date(): {appointment_datetime_local.date()}")
+                logger.info(f"   appointment_datetime_local.time(): {appointment_datetime_local.time()}")
                     
             except ValueError:
                 return "Formato de horário inválido. Use HH:MM."
             
             # Verificar se horário está disponível
             duracao = self.clinic_info.get('regras_agendamento', {}).get('duracao_consulta_minutos', 60)
-            is_available = appointment_rules.check_slot_availability(appointment_datetime, duracao, db)
+            is_available = appointment_rules.check_slot_availability(appointment_datetime_local, duracao, db)
             
             if not is_available:
                 return f"❌ Horário {appointment_time} não está disponível. Use a tool check_availability para ver horários disponíveis."
             
-            # Criar agendamento
+            # Criar agendamento - usar dados do timezone local para salvar corretamente
             appointment = Appointment(
                 patient_name=patient_name,
                 patient_phone=normalized_phone,
                 patient_birth_date=patient_birth_date,  # Manter como string
-                appointment_date=appointment_datetime.date(),
-                appointment_time=appointment_datetime.time(),
+                appointment_date=appointment_datetime_local.date(),
+                appointment_time=appointment_datetime_local.time(),
                 duration_minutes=duracao,
                 status=AppointmentStatus.AGENDADA,
                 notes=notes
@@ -925,8 +920,8 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
             
             return f"✅ **Agendamento realizado com sucesso!**\n\n" + \
                    f"👤 **Paciente:** {patient_name}\n" + \
-                   f"📅 **Data:** {appointment_datetime.strftime('%d/%m/%Y')}\n" + \
-                   f"⏰ **Horário:** {appointment_datetime.strftime('%H:%M')}\n" + \
+                   f"📅 **Data:** {appointment_datetime_local.strftime('%d/%m/%Y')}\n" + \
+                   f"⏰ **Horário:** {appointment_datetime_local.strftime('%H:%M')}\n" + \
                    f"⏱️ **Duração:** {duracao} minutos\n" + \
                    f"📞 **Telefone:** {normalized_phone}\n\n" + \
                    "Obrigado por escolher nossa clínica! 😊"
