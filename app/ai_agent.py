@@ -880,18 +880,24 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                 logger.info(f"   rounded_dt: {rounded_dt}")
                 logger.info(f"   rounded_dt.tzinfo: {rounded_dt.tzinfo}")
                 
-                # Localizar no timezone do Brasil para validação
+                # ADICIONAR: Localizar no timezone do Brasil para garantir data correta
                 tz = get_brazil_timezone()
                 if rounded_dt.tzinfo is None:
-                    appointment_datetime_local = tz.localize(rounded_dt)
+                    appointment_datetime = tz.localize(rounded_dt)
                 else:
-                    appointment_datetime_local = rounded_dt
+                    appointment_datetime = rounded_dt
                 
                 # DEBUG: Log após localização
                 logger.info(f"🔍 DEBUG - Após localização:")
-                logger.info(f"   appointment_datetime_local: {appointment_datetime_local}")
-                logger.info(f"   appointment_datetime_local.date(): {appointment_datetime_local.date()}")
-                logger.info(f"   appointment_datetime_local.time(): {appointment_datetime_local.time()}")
+                logger.info(f"   appointment_datetime: {appointment_datetime}")
+                logger.info(f"   appointment_datetime.date(): {appointment_datetime.date()}")
+                logger.info(f"   appointment_datetime.time(): {appointment_datetime.time()}")
+                
+                # Localizar no timezone do Brasil para validação
+                if appointment_datetime.tzinfo is None:
+                    appointment_datetime_local = tz.localize(appointment_datetime)
+                else:
+                    appointment_datetime_local = appointment_datetime
                     
             except ValueError:
                 return "Formato de horário inválido. Use HH:MM."
@@ -908,7 +914,7 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                 patient_name=patient_name,
                 patient_phone=normalized_phone,
                 patient_birth_date=patient_birth_date,  # Manter como string
-                appointment_date=appointment_datetime_local.strftime('%Y-%m-%d'),  # Formato ISO YYYY-MM-DD
+                appointment_date=appointment_datetime.strftime('%Y-%m-%d'),  # Usar appointment_datetime timezone-aware
                 appointment_time=appointment_time,  # Salvar como string HH:MM
                 duration_minutes=duracao,
                 status=AppointmentStatus.AGENDADA,
@@ -920,8 +926,8 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
             
             return f"✅ **Agendamento realizado com sucesso!**\n\n" + \
                    f"👤 **Paciente:** {patient_name}\n" + \
-                   f"📅 **Data:** {appointment_datetime_local.strftime('%d/%m/%Y')}\n" + \
-                   f"⏰ **Horário:** {appointment_datetime_local.strftime('%H:%M')}\n" + \
+                   f"📅 **Data:** {appointment_datetime.strftime('%d/%m/%Y')}\n" + \
+                   f"⏰ **Horário:** {appointment_datetime.strftime('%H:%M')}\n" + \
                    f"⏱️ **Duração:** {duracao} minutos\n" + \
                    f"📞 **Telefone:** {normalized_phone}\n\n" + \
                    "Obrigado por escolher nossa clínica! 😊"
