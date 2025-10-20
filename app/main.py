@@ -449,7 +449,7 @@ async def get_appointments():
                         "id": a.id,
                         "patient_name": a.patient_name,
                         "patient_phone": "N/A",
-                        "appointment_date": a.appointment_date,
+                        "appointment_date": _format_appointment_date(a.appointment_date),  # ← FORMATARZ AQUI
                         "appointment_time": a.appointment_time,
                         "patient_birth_date": a.patient_birth_date,
                         "created_at": a.created_at.isoformat()
