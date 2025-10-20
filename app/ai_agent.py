@@ -265,14 +265,47 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
         ]
 
     def _extract_appointment_data_from_messages(self, messages: list) -> dict:
-        """
-        Extrai dados de agendamento do histórico de mensagens.
+        """Extrai dados de agendamento do histórico de mensagens.
         Percorre as últimas mensagens para encontrar:
         - Nome do paciente
         - Data de nascimento
         - Data da consulta
         - Horário da consulta
         """
+
+    # ===== Encerramento de contexto =====
+    def _should_end_context(self, context: ConversationContext, last_user_message: str) -> bool:
+        """Decide se devemos encerrar o contexto.
+        Regras:
+        - Resposta negativa após pergunta final do bot
+        - Qualquer negativa explícita quando não há fluxo ativo
+        - Pausado para humano (tratado em main.py)
+        """
+        try:
+            if not context:
+                return False
+            text = (last_user_message or "").strip().lower()
+            negative_triggers = [
+                "nao", "não", "só isso", "so isso", "obrigado", "obrigada", "encerrar", "finalizar",
+                "nada", "por enquanto nao", "por enquanto não"
+            ]
+            is_negative = any(t in text for t in negative_triggers)
+
+            # Verificar se a última mensagem do assistente foi a pergunta final
+            last_assistant_asks_more = False
+            for msg in reversed(context.messages):
+                if msg.get("role") == "assistant":
+                    content = (msg.get("content") or "").lower()
+                    if "posso te ajudar com mais alguma coisa" in content:
+                        last_assistant_asks_more = True
+                    break
+
+            # Encerrar se negativa após pergunta final ou negativa sem fluxo ativo
+            if is_negative and (last_assistant_asks_more or not context.current_flow):
+                return True
+            return False
+        except Exception:
+            return False
         data = {
             "patient_name": None,
             "patient_birth_date": None,
@@ -347,38 +380,35 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
             else:
                 logger.info(f"📱 Contexto carregado para {phone}: {len(context.messages)} mensagens")
             
-            # 2. Verificar timeout de inatividade (30 minutos)
+            # 2. Verificar timeout de inatividade (30 minutos) -> excluir contexto
             if context.last_activity:
                 inactivity = datetime.utcnow() - context.last_activity
                 if inactivity > timedelta(minutes=30):
-                    # Contexto expirou - limpar e avisar
-                    logger.info(f"⏰ Contexto expirado por inatividade para {phone}")
-                    context.messages = []
-                    context.flow_data = {}
-                    context.status = "expired"
-                    flag_modified(context, 'messages')
-                    flag_modified(context, 'flow_data')
-                    
-                    # Adicionar mensagem de aviso ao início
-                    context.messages.append({
-                        "role": "assistant",
-                        "content": "Olá! Como você ficou um tempo sem responder, encerramos a sessão anterior. Vamos recomeçar! 😊\n\nComo posso te ajudar hoje?\n1 Marcar consulta\n2 Remarcar/Cancelar consulta\n3 Tirar dúvidas",
-                        "timestamp": datetime.utcnow().isoformat()
-                    })
-                    flag_modified(context, 'messages')
-                    context.last_activity = datetime.utcnow()
+                    logger.info(f"⏰ Contexto expirado por inatividade para {phone} — excluindo contexto")
+                    db.delete(context)
                     db.commit()
-                    return context.messages[-1]["content"]
+                    return (
+                        "Olá! Como você ficou um tempo sem responder, encerramos a sessão anterior. "
+                        "Vamos recomeçar! 😊\n\nComo posso te ajudar hoje?\n"
+                        "1 Marcar consulta\n2 Remarcar/Cancelar consulta\n3 Tirar dúvidas"
+                    )
             
-            # 3. Adicionar mensagem do usuário ao histórico
+            # 3. Decidir se deve encerrar contexto por resposta negativa
+            if self._should_end_context(context, message):
+                logger.info(f"🔚 Encerrando contexto para {phone} por resposta negativa do usuário")
+                db.delete(context)
+                db.commit()
+                return "Foi um prazer atender você! Até logo! 😊"
+
+            # 4. Adicionar mensagem do usuário ao histórico
             context.messages.append({
                 "role": "user",
                 "content": message,
                 "timestamp": datetime.utcnow().isoformat()
             })
             flag_modified(context, 'messages')
-            
-            # 4. Preparar mensagens para Claude (histórico completo)
+
+            # 5. Preparar mensagens para Claude (histórico completo)
             claude_messages = []
             for msg in context.messages:
                 claude_messages.append({
@@ -386,7 +416,7 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                     "content": msg["content"]
                 })
             
-            # 5. Fazer chamada para o Claude com histórico completo
+            # 6. Fazer chamada para o Claude com histórico completo
             logger.info(f"🤖 Enviando {len(claude_messages)} mensagens para Claude")
             response = self.client.messages.create(
                 model="claude-3-5-sonnet-20241022",
@@ -397,7 +427,7 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                 tools=self.tools
             )
             
-            # 6. Processar resposta do Claude
+            # 7. Processar resposta do Claude
             if response.content:
                 content = response.content[0]
                 
@@ -530,7 +560,7 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
         """Executa uma tool específica"""
         try:
             logger.info(f"🔧 Executando tool: {tool_name} com input: {tool_input}")
-            
+
             if tool_name == "get_clinic_info":
                 return self._handle_get_clinic_info(tool_input)
             elif tool_name == "validate_business_hours":
@@ -922,20 +952,19 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
         try:
             logger.info(f"🛑 Tool request_human_assistance chamada para {phone}")
             
-            # Buscar contexto pelo phone
-            context = db.query(ConversationContext).filter_by(phone=phone).first()
-            if not context:
-                context = ConversationContext(phone=phone)
-                db.add(context)
-            
-            # Pausar por 2 horas
+            # Excluir contexto existente (não queremos manter histórico ao transferir)
+            existing = db.query(ConversationContext).filter_by(phone=phone).first()
+            if existing:
+                db.delete(existing)
+                db.commit()
+
+            # Criar/atualizar registro mínimo apenas para pausa
+            context = ConversationContext(phone=phone)
             context.status = "paused_human"
             context.paused_until = datetime.utcnow() + timedelta(hours=2)
-            context.messages = []  # Limpar contexto
+            context.messages = []
             context.flow_data = {}
-            flag_modified(context, 'messages')
-            flag_modified(context, 'flow_data')
-            context.last_activity = datetime.utcnow()
+            db.add(context)
             db.commit()
             
             logger.info(f"⏸️ Bot pausado para {phone} até {context.paused_until}")
