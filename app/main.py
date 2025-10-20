@@ -471,7 +471,7 @@ async def get_scheduled_appointments():
             
             # Buscar todas as consultas ordenadas por data - AGORA COM STRINGS
             appointments = db.query(Appointment).order_by(
-                Appointment.appointment_date, Appointment.appointment_time
+                Appointment.created_at.desc()
             ).all()
             
             # Calcular estatísticas
