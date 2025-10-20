@@ -912,6 +912,13 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
             # Criar agendamento - SALVAR COMO STRING YYYYMMDD para evitar problemas de timezone
             appointment_datetime_formatted = appointment_datetime.strftime('%Y%m%d')  # "20251022"
             
+            # LOG DE DIAGNÓSTICO: Confirmar formato correto
+            logger.info(f"🔍 SALVANDO NO BANCO:")
+            logger.info(f"   appointment_datetime_formatted: '{appointment_datetime_formatted}'")
+            logger.info(f"   tipo: {type(appointment_datetime_formatted)}")
+            logger.info(f"   formato esperado: YYYYMMDD (ex: 20251023)")
+            logger.info(f"   data original: {appointment_datetime.strftime('%d/%m/%Y')}")
+            
             appointment = Appointment(
                 patient_name=patient_name,
                 patient_phone=normalized_phone,

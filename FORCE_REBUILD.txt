@@ -1,0 +1,16 @@
+🚀 FORCE REBUILD - 2025-10-20 18:15:00 - CORREÇÃO FORMATO DATA YYYYMMDD
+==================================================
+🔧 CORREÇÃO CRÍTICA: Implementar formato YYYYMMDD para resolver problema de timezone
+- Mudança: appointment_date salvo como string "20251023" em vez de "2025-10-23"
+- Arquivo: app/ai_agent.py linha 913
+- Motivo: PostgreSQL estava convertendo para datetime.date e aplicando timezone UTC
+- Resultado: Data sendo salva 1 dia antes do esperado
+
+📋 CHECKLIST:
+✅ Código corrigido no GitHub (formato YYYYMMDD)
+✅ Dashboard atualizado para converter YYYYMMDD → DD/MM/YYYY
+✅ Função _format_appointment_date() criada para compatibilidade
+⏳ Deploy no Railway (este rebuild)
+
+🎯 OBJETIVO: Resolver definitivamente o problema de data sendo salva 1 dia antes
+==================================================
