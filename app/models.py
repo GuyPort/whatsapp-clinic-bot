@@ -32,7 +32,7 @@ class Appointment(Base):
     patient_birth_date = Column(String(10), nullable=False)  # Data de nascimento (DD/MM/AAAA)
     
     # Dados da consulta - USAR STRING para evitar problemas de timezone
-    appointment_date = Column(String(10), nullable=False, index=True)  # Data da consulta (DD/MM/AAAA)
+    appointment_date = Column(String(10), nullable=False, index=True)  # Data da consulta (YYYYMMDD)
     appointment_time = Column(String(5), nullable=False)  # Horário da consulta (HH:MM)
     duration_minutes = Column(Integer, default=60, nullable=False)  # Duração em minutos
     
@@ -54,6 +54,12 @@ class Appointment(Base):
         Index('idx_patient_phone_status', 'patient_phone', 'status'),
         Index('idx_status_created', 'status', 'created_at'),
     )
+    
+    def __init__(self, **kwargs):
+        # Garantir que appointment_date seja sempre string
+        if 'appointment_date' in kwargs and kwargs['appointment_date']:
+            kwargs['appointment_date'] = str(kwargs['appointment_date'])
+        super().__init__(**kwargs)
     
     def __repr__(self):
         return f"<Appointment(id={self.id}, patient='{self.patient_name}', date='{self.appointment_date}', time='{self.appointment_time}', status='{self.status.value}')>"
