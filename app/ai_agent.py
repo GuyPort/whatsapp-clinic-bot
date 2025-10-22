@@ -662,6 +662,11 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
             if not appointment_date:
                 return "Data inválida. Use o formato DD/MM/AAAA."
             
+            # Verificar se está em dias_fechados
+            dias_fechados = self.clinic_info.get('dias_fechados', [])
+            if date_str in dias_fechados:
+                return f"❌ A clínica estará fechada em {date_str} por motivo especial."
+            
             # Obter dia da semana
             weekday = appointment_date.strftime('%A').lower()
             weekday_map = {
@@ -714,6 +719,64 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
         
         return response
     
+    def _is_clinic_open_now(self) -> tuple[bool, str]:
+        """
+        Verifica se a clínica está aberta AGORA.
+        
+        Returns:
+            tuple: (is_open: bool, message: str)
+        """
+        try:
+            # Obter data/hora atual do Brasil
+            now_br = now_brazil()
+            date_str = now_br.strftime('%d/%m/%Y')
+            time_str = now_br.strftime('%H:%M')
+            
+            # Verificar se está em dias_fechados
+            dias_fechados = self.clinic_info.get('dias_fechados', [])
+            if date_str in dias_fechados:
+                return False, f"❌ A clínica está fechada hoje ({date_str}) por motivo especial."
+            
+            # Obter dia da semana
+            weekday = now_br.strftime('%A').lower()
+            weekday_map = {
+                'monday': 'segunda',
+                'tuesday': 'terca', 
+                'wednesday': 'quarta',
+                'thursday': 'quinta',
+                'friday': 'sexta',
+                'saturday': 'sabado',
+                'sunday': 'domingo'
+            }
+            weekday_pt = weekday_map.get(weekday, weekday)
+            
+            # Verificar horários de funcionamento
+            horarios = self.clinic_info.get('horario_funcionamento', {})
+            horario_dia = horarios.get(weekday_pt, "FECHADO")
+            
+            if horario_dia == "FECHADO":
+                return False, f"❌ A clínica não funciona aos {weekday_pt}s. Horários de funcionamento:\n" + \
+                       self._format_business_hours()
+            
+            # Verificar se horário atual está dentro do funcionamento
+            try:
+                hora_atual = now_br.time()
+                hora_inicio, hora_fim = horario_dia.split('-')
+                hora_inicio = datetime.strptime(hora_inicio, '%H:%M').time()
+                hora_fim = datetime.strptime(hora_fim, '%H:%M').time()
+                
+                if hora_inicio <= hora_atual <= hora_fim:
+                    return True, f"✅ A clínica está aberta! Funcionamos das {hora_inicio.strftime('%H:%M')} às {hora_fim.strftime('%H:%M')} aos {weekday_pt}s."
+                else:
+                    return False, f"❌ A clínica está fechada no momento. Funcionamos das {hora_inicio.strftime('%H:%M')} às {hora_fim.strftime('%H:%M')} aos {weekday_pt}s."
+                            
+            except ValueError:
+                return False, "Erro ao verificar horário de funcionamento."
+            
+        except Exception as e:
+            logger.error(f"Erro ao verificar se clínica está aberta: {str(e)}")
+            return False, f"Erro ao verificar horário: {str(e)}"
+    
     def _handle_validate_and_check_availability(self, tool_input: Dict, db: Session) -> str:
         """Tool: validate_and_check_availability - Valida horário de funcionamento + disponibilidade"""
         try:
@@ -734,7 +797,14 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                 logger.warning(f"❌ Data inválida: {date_str}")
                 return "Data inválida. Use o formato DD/MM/AAAA."
             
-            # 2. Validar horário de funcionamento
+            # 2. Verificar se está em dias_fechados
+            dias_fechados = self.clinic_info.get('dias_fechados', [])
+            if date_str in dias_fechados:
+                logger.warning(f"❌ Clínica fechada em {date_str} (dia especial)")
+                return f"❌ A clínica estará fechada em {date_str} por motivo especial (feriado/férias).\n" + \
+                       "Por favor, escolha outra data."
+            
+            # 3. Validar horário de funcionamento
             weekday = appointment_date.strftime('%A').lower()
             weekday_map = {
                 'monday': 'segunda',
@@ -755,7 +825,7 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                 return f"❌ A clínica não funciona aos {weekday_pt}s. Horários de funcionamento:\n" + \
                        self._format_business_hours()
             
-            # 3. Verificar se horário está dentro do funcionamento
+            # 4. Verificar se horário está dentro do funcionamento
             try:
                 hora_consulta_original = datetime.strptime(time_str, '%H:%M').time()
                 hora_inicio, hora_fim = horario_dia.split('-')
@@ -776,7 +846,7 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                 logger.warning(f"❌ Formato de horário inválido: {time_str}")
                 return "Formato de horário inválido. Use HH:MM (ex: 14:30)."
             
-            # 4. Verificar disponibilidade no banco de dados
+            # 5. Verificar disponibilidade no banco de dados
             appointment_datetime = datetime.combine(appointment_date.date(), hora_consulta)
             duracao = self.clinic_info.get('regras_agendamento', {}).get('duracao_consulta_minutos', 60)
             
@@ -1034,20 +1104,31 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
         try:
             logger.info(f"🛑 Tool request_human_assistance chamada para {phone}")
             
-            # 1. Deletar contexto existente completamente
+            # 1. Verificar se a clínica está aberta AGORA
+            is_open, message = self._is_clinic_open_now()
+            
+            if not is_open:
+                # Clínica fechada - NÃO criar pausa, bot continua ativo
+                logger.info(f"🏥 Clínica fechada para {phone}: {message}")
+                return "No momento não temos atendentes disponíveis. Mas posso te ajudar! Como posso te auxiliar?"
+            
+            # 2. Clínica aberta - prosseguir com transferência
+            logger.info(f"🏥 Clínica aberta para {phone}: {message}")
+            
+            # 3. Deletar contexto existente completamente
             existing_context = db.query(ConversationContext).filter_by(phone=phone).first()
             if existing_context:
                 db.delete(existing_context)
                 logger.info(f"🗑️ Contexto deletado para {phone}")
             
-            # 2. Remover qualquer pausa anterior (se existir)
+            # 4. Remover qualquer pausa anterior (se existir)
             existing_pause = db.query(PausedContact).filter_by(phone=phone).first()
             if existing_pause:
                 db.delete(existing_pause)
                 logger.info(f"🗑️ Pausa anterior removida para {phone}")
             
-            # 3. Criar nova pausa por 2 minutos (para teste)
-            paused_until = datetime.utcnow() + timedelta(minutes=2)
+            # 5. Criar nova pausa por 2 horas
+            paused_until = datetime.utcnow() + timedelta(hours=2)
             paused_contact = PausedContact(
                 phone=phone,
                 paused_until=paused_until,
@@ -1057,7 +1138,7 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
             db.commit()
             
             logger.info(f"⏸️ Bot pausado para {phone} até {paused_until}")
-            return "Claro! Vou transferir você para nossa equipe. Um momento! 🙋"
+            return "Claro! Vou encaminhar você para um de nossos atendentes agora! Para acelerar o processo, já pode nos contar como podemos te ajudar! 😊"
             
         except Exception as e:
             logger.error(f"Erro ao pausar bot para humano: {str(e)}")

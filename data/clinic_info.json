@@ -12,6 +12,11 @@
     "domingo": "FECHADO"
   },
   
+  "dias_fechados": [
+    "25/12/2025",
+    "01/01/2025"
+  ],
+  
   
   "regras_agendamento": {
     "dias_minimos_antecedencia": 1,

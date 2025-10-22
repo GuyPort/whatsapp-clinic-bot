@@ -291,7 +291,7 @@ async def process_message_task(phone: str, message_text: str, message_id: str = 
                     logger.info(f"Bot pausado para {phone} até {paused_contact.paused_until}")
                     return
                 else:
-                    # Passou 2 minutos - reativar silenciosamente
+                    # Passou 2 horas - reativar silenciosamente
                     logger.info(f"Bot reativado automaticamente para {phone}")
                     db.delete(paused_contact)
                     db.commit()
