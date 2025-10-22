@@ -87,14 +87,24 @@ Quando o paciente escolher "1 - Marcar consulta", siga EXATAMENTE este fluxo:
 5. **FLUXO CRÍTICO - Após receber horário:**
    a) Execute validate_and_check_availability com data e hora
    b) Leia o resultado da tool:
-      - Se contém "disponível" → Execute IMEDIATAMENTE create_appointment
+      - Se contém "disponível" → A tool já vai retornar uma mensagem pedindo confirmação
       - Se contém "não está disponível" → Explique e peça outro horário
       - Se contém "fora do horário" → Explique e peça outro horário
-   c) NUNCA termine sem executar create_appointment quando disponível
-   d) SEMPRE retorne uma mensagem amigável ao usuário após criar agendamento
+   c) NÃO execute create_appointment imediatamente após validar disponibilidade
+   d) Apenas repasse a mensagem de confirmação que a tool retornou
+   e) O sistema detectará automaticamente quando usuário confirmar
 
-REGRA IMPORTANTE: Você DEVE executar múltiplas tools em sequência quando necessário.
-NÃO retorne "end_turn" após validate_and_check_availability se o horário está disponível!
+IMPORTANTE - FLUXO DE CONFIRMAÇÃO:
+1. Após validar disponibilidade com validate_and_check_availability:
+   - NÃO execute create_appointment imediatamente
+   - A tool já vai retornar uma mensagem pedindo confirmação
+   - Apenas repasse essa mensagem ao usuário
+2. O sistema vai detectar automaticamente quando usuário confirmar
+3. Você só deve executar create_appointment se o usuário:
+   - Fornecer TODOS os dados novamente explicitamente
+   - OU se já tiver confirmado previamente (verá no histórico)
+
+REGRA IMPORTANTE: O fluxo de confirmação é automático. Não interfira!
 
 ENCERRAMENTO DE CONVERSAS:
 Após QUALQUER tarefa concluída (agendamento criado, cancelamento realizado, dúvida respondida):
@@ -377,7 +387,52 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
             return False
         except Exception:
             return False
-        data = {
+
+    def _detect_confirmation_intent(self, message: str) -> str:
+        """
+        Detecta se a mensagem é uma confirmação positiva ou negativa.
+        
+        Returns:
+            "positive" - usuário confirmou
+            "negative" - usuário negou/quer mudar
+            "unclear" - não foi possível determinar
+        """
+        message_lower = message.lower().strip()
+        
+        # Palavras-chave positivas
+        positive_keywords = [
+            "sim", "pode", "confirma", "confirmar", "claro", "ok", "okay",
+            "perfeito", "isso", "certo", "exato", "vamos", "agendar",
+            "marcar", "beleza", "aceito", "tá bom", "ta bom", "show",
+            "positivo", "concordo", "fechado", "fechou"
+        ]
+        
+        # Palavras-chave negativas
+        negative_keywords = [
+            "não", "nao", "nunca", "jamais", "mudar", "alterar", "trocar",
+            "outro", "outra", "diferente", "modificar", "cancelar",
+            "desistir", "quero mudar", "prefiro", "melhor não"
+        ]
+        
+        # Verificar positivos
+        for keyword in positive_keywords:
+            if keyword in message_lower:
+                return "positive"
+        
+        # Verificar negativos
+        for keyword in negative_keywords:
+            if keyword in message_lower:
+                return "negative"
+        
+        return "unclear"
+
+    def _extract_appointment_data_from_messages(self, messages: list) -> dict:
+        """Extrai dados de agendamento do histórico de mensagens.
+        Percorre as últimas mensagens para encontrar nome, nascimento, data e horário.
+        Retorna sempre um dict; em erro, retorna {}.
+        """
+        try:
+            data = {
             "patient_name": None,
             "patient_birth_date": None,
             "appointment_date": None,
@@ -460,7 +515,76 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                 db.commit()
                 return "Foi um prazer atender você! Até logo! 😊"
 
-            # 4. Adicionar mensagem do usuário ao histórico
+            # 4. Verificar se há confirmação pendente ANTES de processar com Claude
+            if context.flow_data.get("pending_confirmation"):
+                intent = self._detect_confirmation_intent(message)
+                
+                if intent == "positive":
+                    # Usuário confirmou! Executar agendamento
+                    logger.info(f"✅ Usuário {phone} confirmou agendamento")
+                    
+                    # Extrair dados
+                    data = context.flow_data
+                    
+                    # Criar agendamento
+                    result = self._handle_create_appointment({
+                        "patient_name": data.get("patient_name"),
+                        "patient_birth_date": data.get("patient_birth_date"),
+                        "appointment_date": data.get("appointment_date"),
+                        "appointment_time": data.get("appointment_time"),
+                        "patient_phone": phone
+                    }, db, phone)
+                    
+                    # Limpar pending_confirmation
+                    context.flow_data["pending_confirmation"] = False
+                    context.messages.append({
+                        "role": "user",
+                        "content": message,
+                        "timestamp": datetime.utcnow().isoformat()
+                    })
+                    context.messages.append({
+                        "role": "assistant",
+                        "content": result,
+                        "timestamp": datetime.utcnow().isoformat()
+                    })
+                    context.last_activity = datetime.utcnow()
+                    db.commit()
+                    
+                    return result
+                
+                elif intent == "negative":
+                    # Usuário NÃO confirmou, quer mudar
+                    logger.info(f"❌ Usuário {phone} não confirmou, pedindo alteração")
+                    
+                    # Limpar pending_confirmation
+                    context.flow_data["pending_confirmation"] = False
+                    db.commit()
+                    
+                    # Perguntar o que mudar
+                    response = "Sem problemas! O que você gostaria de mudar?\n\n" \
+                               "1️⃣ Data\n" \
+                               "2️⃣ Horário\n" \
+                               "3️⃣ Ambos"
+                    
+                    context.messages.append({
+                        "role": "user",
+                        "content": message,
+                        "timestamp": datetime.utcnow().isoformat()
+                    })
+                    context.messages.append({
+                        "role": "assistant",
+                        "content": response,
+                        "timestamp": datetime.utcnow().isoformat()
+                    })
+                    context.last_activity = datetime.utcnow()
+                    db.commit()
+                    
+                    return response
+                
+                # Se unclear, processar normalmente com Claude
+                logger.info(f"⚠️ Intenção não clara, processando com Claude")
+
+            # 5. Adicionar mensagem do usuário ao histórico
             context.messages.append({
                 "role": "user",
                 "content": message,
@@ -468,7 +592,7 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
             })
             flag_modified(context, 'messages')
 
-            # 5. Preparar mensagens para Claude (histórico completo)
+            # 6. Preparar mensagens para Claude (histórico completo)
             claude_messages = []
             for msg in context.messages:
                 claude_messages.append({
@@ -880,7 +1004,29 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                 if hora_consulta.strftime('%H:%M') != time_str:
                     ajuste_msg = f" (ajustado para {hora_consulta.strftime('%H:%M')})"
                 logger.info(f"✅ Horário {hora_consulta.strftime('%H:%M')} disponível!{ajuste_msg}")
-                return f"✅ Horário {hora_consulta.strftime('%H:%M')} disponível!{ajuste_msg} Pode prosseguir com o agendamento."
+                
+                # Salvar dados no flow_data para confirmação
+                # Buscar contexto do usuário atual (precisa do phone do contexto)
+                phone = tool_input.get("patient_phone")
+                if phone:
+                    context = db.query(ConversationContext).filter_by(phone=phone).first()
+                    if context:
+                        # Salvar dados coletados no flow_data
+                        context.flow_data.update({
+                            "appointment_date": date_str,
+                            "appointment_time": hora_consulta.strftime('%H:%M'),
+                            "pending_confirmation": True
+                        })
+                        db.commit()
+                        logger.info(f"💾 Dados salvos no flow_data para confirmação: {context.flow_data}")
+                
+                # Retornar mensagem de confirmação
+                return f"✅ Horário {hora_consulta.strftime('%H:%M')} disponível!{ajuste_msg}\n\n" \
+                       f"📋 **Resumo da sua consulta:**\n" \
+                       f"👤 Nome: {tool_input.get('patient_name', 'A ser confirmado')}\n" \
+                       f"📅 Data: {date_str}\n" \
+                       f"⏰ Horário: {hora_consulta.strftime('%H:%M')}\n\n" \
+                       f"Posso confirmar sua consulta?"
             else:
                 logger.warning(f"❌ Horário {time_str} não disponível (conflito)")
                 return f"❌ Horário {time_str} não está disponível. Já existe uma consulta neste horário.\n" + \

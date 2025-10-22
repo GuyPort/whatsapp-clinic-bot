@@ -102,6 +102,14 @@ class ConversationContext(Base):
     # Estado atual do fluxo
     current_flow = Column(String(50), nullable=True)  # "agendamento" | "cancelamento" | "duvidas"
     flow_data = Column(JSON, nullable=False, default=dict)  # Dados coletados no fluxo
+    # Estrutura esperada em flow_data:
+    # {
+    #     "patient_name": "...",
+    #     "patient_birth_date": "...", 
+    #     "appointment_date": "...",
+    #     "appointment_time": "...",
+    #     "pending_confirmation": True/False  # Flag para confirmação pendente
+    # }
     
     # Status e controle
     status = Column(String(20), nullable=False, default="active")  # "active" | "expired"
