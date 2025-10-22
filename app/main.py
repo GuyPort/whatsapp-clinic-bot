@@ -904,13 +904,20 @@ async def dashboard():
             }
 
             function formatDate(dateStr) {
-                const date = new Date(dateStr);
-                return date.toLocaleDateString('pt-BR', {
-                    weekday: 'short',
-                    day: '2-digit',
-                    month: '2-digit',
-                    year: 'numeric'
-                });
+                // Converter DD/MM/YYYY para Date object corretamente
+                const parts = dateStr.split('/');
+                if (parts.length === 3) {
+                    const [day, month, year] = parts;
+                    const date = new Date(`${year}-${month}-${day}`);
+                    return date.toLocaleDateString('pt-BR', {
+                        weekday: 'short',
+                        day: '2-digit',
+                        month: '2-digit',
+                        year: 'numeric'
+                    });
+                }
+                // Fallback: retornar como está
+                return dateStr;
             }
 
             function formatDateTime(dateTimeStr) {
