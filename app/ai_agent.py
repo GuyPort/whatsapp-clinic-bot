@@ -453,7 +453,7 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                 return "Foi um prazer atender você! Até logo! 😊"
 
             # 4. Verificar se há confirmação pendente ANTES de processar com Claude
-            if context.flow_data.get("pending_confirmation"):
+            if context.flow_data and context.flow_data.get("pending_confirmation"):
                 intent = self._detect_confirmation_intent(message)
                 
                 if intent == "positive":
@@ -461,7 +461,7 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                     logger.info(f"✅ Usuário {phone} confirmou agendamento")
                     
                     # Extrair dados
-                    data = context.flow_data
+                    data = context.flow_data or {}
                     
                     # Criar agendamento
                     result = self._handle_create_appointment({
@@ -473,6 +473,8 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                     }, db, phone)
                     
                     # Limpar pending_confirmation
+                    if not context.flow_data:
+                        context.flow_data = {}
                     context.flow_data["pending_confirmation"] = False
                     context.messages.append({
                         "role": "user",
@@ -494,6 +496,8 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                     logger.info(f"❌ Usuário {phone} não confirmou, pedindo alteração")
                     
                     # Limpar pending_confirmation
+                    if not context.flow_data:
+                        context.flow_data = {}
                     context.flow_data["pending_confirmation"] = False
                     db.commit()
                     
@@ -949,6 +953,8 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                     context = db.query(ConversationContext).filter_by(phone=phone).first()
                     if context:
                         # Salvar dados coletados no flow_data
+                        if not context.flow_data:
+                            context.flow_data = {}
                         context.flow_data.update({
                             "appointment_date": date_str,
                             "appointment_time": hora_consulta.strftime('%H:%M'),
