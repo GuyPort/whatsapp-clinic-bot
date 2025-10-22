@@ -501,13 +501,16 @@ async def get_scheduled_appointments():
             # Formatar consultas - CONVERTER HÍFEN PARA BARRA NA EXIBIÇÃO
             formatted_appointments = []
             for apt in appointments:
+                formatted_date = _format_appointment_date(apt.appointment_date)
+                logger.info(f"📅 API returning appointment_date: '{formatted_date}' for apt_id={apt.id} (raw: '{apt.appointment_date}')")
+                
                 formatted_appointments.append({
                     "id": apt.id,
                     "patient_name": apt.patient_name,
                     "patient_phone": apt.patient_phone,
                     "patient_birth_date": apt.patient_birth_date,
-                    "appointment_date": _format_appointment_date(apt.appointment_date),  # ← FORMATAR AQUI TAMBÉM
-                    "appointment_date_br": _format_appointment_date(apt.appointment_date),  # Converter qualquer formato para DD/MM/YYYY
+                    "appointment_date": formatted_date,  # ← FORMATAR AQUI TAMBÉM
+                    "appointment_date_br": formatted_date,  # Converter qualquer formato para DD/MM/YYYY
                     "appointment_time": apt.appointment_time,  # String HH:MM
                     "status": apt.status.value,
                     "duration_minutes": apt.duration_minutes,

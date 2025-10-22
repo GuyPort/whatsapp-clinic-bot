@@ -1,16 +1,12 @@
-🚀 FORCE REBUILD - 2025-10-20 18:15:00 - CORREÇÃO FORMATO DATA YYYYMMDD
-==================================================
-🔧 CORREÇÃO CRÍTICA: Implementar formato YYYYMMDD para resolver problema de timezone
-- Mudança: appointment_date salvo como string "20251023" em vez de "2025-10-23"
-- Arquivo: app/ai_agent.py linha 913
-- Motivo: PostgreSQL estava convertendo para datetime.date e aplicando timezone UTC
-- Resultado: Data sendo salva 1 dia antes do esperado
+Deploy forçado em: 2025-10-22 16:35:00
+Motivo: Atualizar função formatDate no dashboard e adicionar debug logging
+Commit: 7ebd4aa + debug logging
 
-📋 CHECKLIST:
-✅ Código corrigido no GitHub (formato YYYYMMDD)
-✅ Dashboard atualizado para converter YYYYMMDD → DD/MM/YYYY
-✅ Função _format_appointment_date() criada para compatibilidade
-⏳ Deploy no Railway (este rebuild)
+Railway deve fazer rebuild completo da aplicação para aplicar:
+1. Correção da função formatDate JavaScript no dashboard
+2. Logging de debug na API para diagnosticar problema de Invalid Date
 
-🎯 OBJETIVO: Resolver definitivamente o problema de data sendo salva 1 dia antes
-==================================================
+Se o problema persistir após este deploy, verificar:
+- Cache do browser (Ctrl+Shift+R)
+- Logs da API em /api/appointments/scheduled
+- DevTools Network tab para ver resposta real da API
