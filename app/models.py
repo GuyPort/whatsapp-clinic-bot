@@ -65,6 +65,27 @@ class Appointment(Base):
         return f"<Appointment(id={self.id}, patient='{self.patient_name}', date='{self.appointment_date}', time='{self.appointment_time}', status='{self.status.value}')>"
 
 
+class PausedContact(Base):
+    """
+    Contatos pausados para atendimento humano.
+    Gerencia pausas temporárias quando usuário solicita atendimento humano.
+    """
+    __tablename__ = "paused_contacts"
+    
+    # Chave primária: número de telefone do WhatsApp
+    phone = Column(String(20), primary_key=True, index=True)
+    
+    # Controle de pausa
+    paused_until = Column(DateTime, nullable=False, index=True)  # Quando a pausa expira
+    reason = Column(String(100), nullable=True)  # Motivo da pausa (opcional)
+    
+    # Timestamps
+    paused_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    
+    def __repr__(self):
+        return f"<PausedContact(phone='{self.phone}', paused_until='{self.paused_until}')>"
+
+
 class ConversationContext(Base):
     """
     Contexto de conversa para manter histórico entre mensagens do WhatsApp.
@@ -83,8 +104,7 @@ class ConversationContext(Base):
     flow_data = Column(JSON, nullable=False, default=dict)  # Dados coletados no fluxo
     
     # Status e controle
-    status = Column(String(20), nullable=False, default="active")  # "active" | "paused_human" | "expired"
-    paused_until = Column(DateTime, nullable=True)  # Quando a pausa para humano expira
+    status = Column(String(20), nullable=False, default="active")  # "active" | "expired"
     
     # Timestamps
     last_activity = Column(DateTime, nullable=False, default=datetime.utcnow)

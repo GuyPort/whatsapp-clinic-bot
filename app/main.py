@@ -22,7 +22,7 @@ from app.database import init_db, get_db
 from app.ai_agent import ai_agent
 from app.whatsapp_service import whatsapp_service
 from app.utils import normalize_phone
-from app.models import Appointment, ConversationContext
+from app.models import Appointment, ConversationContext, PausedContact
 
 # Configurar logging
 logging.basicConfig(
@@ -283,20 +283,17 @@ async def process_message_task(phone: str, message_text: str, message_id: str = 
         
         # Verificar se bot está pausado para este telefone
         with get_db() as db:
-            context = db.query(ConversationContext).filter_by(phone=phone).first()
+            paused_contact = db.query(PausedContact).filter_by(phone=phone).first()
             
-            if context and context.status == "paused_human":
-                if context.paused_until and datetime.utcnow() < context.paused_until:
+            if paused_contact:
+                if datetime.utcnow() < paused_contact.paused_until:
                     # Ainda pausado - bot ignora mensagem
-                    logger.info(f"Bot pausado para {phone} até {context.paused_until}")
+                    logger.info(f"Bot pausado para {phone} até {paused_contact.paused_until}")
                     return
                 else:
-                    # Passou 2 horas - reativar silenciosamente
+                    # Passou 2 minutos - reativar silenciosamente
                     logger.info(f"Bot reativado automaticamente para {phone}")
-                    context.status = "active"
-                    context.paused_until = None
-                    context.messages = []
-                    context.flow_data = {}
+                    db.delete(paused_contact)
                     db.commit()
             
             # Processar com IA

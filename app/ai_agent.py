@@ -14,7 +14,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy.orm.attributes import flag_modified
 
 from app.simple_config import settings
-from app.models import Appointment, AppointmentStatus, ConversationContext
+from app.models import Appointment, AppointmentStatus, ConversationContext, PausedContact
 from app.utils import (
     load_clinic_info, normalize_phone, parse_date_br, 
     format_datetime_br, now_brazil, get_brazil_timezone, round_up_to_next_5_minutes
@@ -1034,22 +1034,29 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
         try:
             logger.info(f"🛑 Tool request_human_assistance chamada para {phone}")
             
-            # Excluir contexto existente (não queremos manter histórico ao transferir)
-            existing = db.query(ConversationContext).filter_by(phone=phone).first()
-            if existing:
-                db.delete(existing)
-                db.commit()
-
-            # Criar/atualizar registro mínimo apenas para pausa
-            context = ConversationContext(phone=phone)
-            context.status = "paused_human"
-            context.paused_until = datetime.utcnow() + timedelta(hours=2)
-            context.messages = []
-            context.flow_data = {}
-            db.add(context)
+            # 1. Deletar contexto existente completamente
+            existing_context = db.query(ConversationContext).filter_by(phone=phone).first()
+            if existing_context:
+                db.delete(existing_context)
+                logger.info(f"🗑️ Contexto deletado para {phone}")
+            
+            # 2. Remover qualquer pausa anterior (se existir)
+            existing_pause = db.query(PausedContact).filter_by(phone=phone).first()
+            if existing_pause:
+                db.delete(existing_pause)
+                logger.info(f"🗑️ Pausa anterior removida para {phone}")
+            
+            # 3. Criar nova pausa por 2 minutos (para teste)
+            paused_until = datetime.utcnow() + timedelta(minutes=2)
+            paused_contact = PausedContact(
+                phone=phone,
+                paused_until=paused_until,
+                reason="user_requested_human_assistance"
+            )
+            db.add(paused_contact)
             db.commit()
             
-            logger.info(f"⏸️ Bot pausado para {phone} até {context.paused_until}")
+            logger.info(f"⏸️ Bot pausado para {phone} até {paused_until}")
             return "Claro! Vou transferir você para nossa equipe. Um momento! 🙋"
             
         except Exception as e:
