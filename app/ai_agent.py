@@ -281,32 +281,63 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
             }
             logger.info(f"🔍 Extraindo dados de {len(messages)} mensagens")
             import re
+            
             for i in range(len(messages) - 1, -1, -1):
                 msg = messages[i]
                 if msg.get("role") != "user":
                     continue
                 content = (msg.get("content") or "").strip()
-                if not data["appointment_time"] and ":" in content and re.match(r'^(\d{1,2}):(\d{2})$', content):
-                    data["appointment_time"] = content
-                    continue
-                if "/" in content:
-                    m = re.match(r'^(\d{2})/(\d{2})/(\d{4})$', content)
-                    if m:
-                        y = int(m.group(3))
-                        if y < 2010 and not data["patient_birth_date"]:
-                            data["patient_birth_date"] = content
-                        elif not data["appointment_date"]:
-                            data["appointment_date"] = content
+                
+                # 1. EXTRAÇÃO DE HORÁRIOS - Buscar em qualquer parte da mensagem
+                if not data["appointment_time"]:
+                    time_pattern = r'(\d{1,2}):(\d{2})'
+                    time_match = re.search(time_pattern, content)
+                    if time_match:
+                        hour, minute = time_match.groups()
+                        data["appointment_time"] = f"{hour.zfill(2)}:{minute}"
                         continue
+                
+                # 2. EXTRAÇÃO DE DATAS - Buscar em qualquer parte da mensagem
+                date_pattern = r'(\d{1,2})/(\d{1,2})/(\d{4})'
+                date_matches = re.findall(date_pattern, content)
+                for match in date_matches:
+                    day, month, year = match
+                    full_date = f"{day.zfill(2)}/{month.zfill(2)}/{year}"
+                    y = int(year)
+                    if y < 2010 and not data["patient_birth_date"]:
+                        data["patient_birth_date"] = full_date
+                    elif y >= 2010 and not data["appointment_date"]:
+                        data["appointment_date"] = full_date
+                
+                # 3. EXTRAÇÃO DE NOMES - Remover prefixos comuns
                 if not data["patient_name"]:
-                    # Nome deve conter letras e não conter símbolos de horário/data
-                    import re
-                    has_letters = re.search(r"[A-Za-zÀ-ÿ]", content) is not None
-                    has_bad_symbols = re.search(r"[:=/]", content) is not None
-                    is_only_digits = re.fullmatch(r"\d+", content) is not None
-                    is_menu_or_greeting = content.lower() in ["olá", "olá!", "oi", "oi!", "1", "2", "3"]
-                    if has_letters and not has_bad_symbols and not is_only_digits and not is_menu_or_greeting:
-                        data["patient_name"] = content
+                    # Prefixos comuns que devem ser removidos
+                    name_prefixes = [
+                        r'meu nome [eé] ',
+                        r'eu sou ',
+                        r'me chamo ',
+                        r'eu me chamo ',
+                        r'sou o ',
+                        r'sou a '
+                    ]
+                    
+                    # Limpar conteúdo removendo prefixos
+                    cleaned_content = content
+                    for prefix in name_prefixes:
+                        cleaned_content = re.sub(prefix, '', cleaned_content, flags=re.IGNORECASE)
+                    
+                    # Remover pontuação final e espaços extras
+                    cleaned_content = re.sub(r'[!.?,;]+$', '', cleaned_content).strip()
+                    
+                    # Verificar se é um nome válido
+                    has_letters = re.search(r"[A-Za-zÀ-ÿ]", cleaned_content) is not None
+                    has_bad_symbols = re.search(r"[:=/]", cleaned_content) is not None
+                    is_only_digits = re.fullmatch(r"\d+", cleaned_content) is not None
+                    is_menu_or_greeting = cleaned_content.lower() in ["olá", "olá!", "oi", "oi!", "1", "2", "3"]
+                    
+                    if has_letters and not has_bad_symbols and not is_only_digits and not is_menu_or_greeting and len(cleaned_content) > 1:
+                        data["patient_name"] = cleaned_content
+            
             logger.info(f"📋 Extração concluída: {data}")
             return data
         except Exception as e:
