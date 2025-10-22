@@ -420,18 +420,7 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
             else:
                 logger.info(f"📱 Contexto carregado para {phone}: {len(context.messages)} mensagens")
             
-            # 2. Verificar timeout de inatividade (30 minutos) -> excluir contexto
-            if context.last_activity:
-                inactivity = datetime.utcnow() - context.last_activity
-                if inactivity > timedelta(minutes=30):
-                    logger.info(f"⏰ Contexto expirado por inatividade para {phone} — excluindo contexto")
-                    db.delete(context)
-                    db.commit()
-                    return (
-                        "Olá! Como você ficou um tempo sem responder, encerramos a sessão anterior. "
-                        "Vamos recomeçar! 😊\n\nComo posso te ajudar hoje?\n"
-                        "1 Marcar consulta\n2 Remarcar/Cancelar consulta\n3 Tirar dúvidas"
-                    )
+            # 2. Verificação de timeout removida - agora é proativa via scheduler
             
             # 3. Decidir se deve encerrar contexto por resposta negativa
             if self._should_end_context(context, message):

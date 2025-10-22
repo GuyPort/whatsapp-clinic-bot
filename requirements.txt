@@ -10,4 +10,5 @@ httpx==0.25.2
 # Google Calendar removido - usando apenas banco de dados
 python-multipart==0.0.6
 pytz==2023.3
+apscheduler==3.10.4
 
