@@ -1118,8 +1118,8 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                 db.delete(existing_pause)
                 logger.info(f"🗑️ Pausa anterior removida para {phone}")
             
-            # 5. Criar nova pausa por 2 horas
-            paused_until = datetime.utcnow() + timedelta(hours=2)
+            # 5. Criar nova pausa por 1 minuto (para teste)
+            paused_until = datetime.utcnow() + timedelta(minutes=1)
             paused_contact = PausedContact(
                 phone=phone,
                 paused_until=paused_until,

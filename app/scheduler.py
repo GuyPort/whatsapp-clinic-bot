@@ -16,8 +16,8 @@ async def check_inactive_contexts():
     """Verifica e encerra contextos inativos"""
     try:
         with get_db() as db:
-            # Buscar contextos inativos há mais de 30 minutos
-            cutoff_time = datetime.utcnow() - timedelta(minutes=30)
+            # Buscar contextos inativos há mais de 1 minuto (para teste)
+            cutoff_time = datetime.utcnow() - timedelta(minutes=1)
             inactive_contexts = db.query(ConversationContext).filter(
                 ConversationContext.last_activity < cutoff_time
             ).all()
@@ -60,11 +60,11 @@ def start_scheduler():
     scheduler.add_job(
         run_check,
         'interval',
-        minutes=5,  # Executar a cada 5 minutos
+        seconds=30,  # Executar a cada 30 segundos (para teste)
         id='check_inactive_contexts'
     )
     scheduler.start()
-    logger.info("✅ Scheduler de timeout iniciado (verificação a cada 5 min)")
+    logger.info("✅ Scheduler de timeout iniciado (verificação a cada 30 segundos)")
 
 def stop_scheduler():
     """Para o scheduler"""
