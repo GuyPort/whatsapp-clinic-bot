@@ -966,7 +966,6 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                 # Retornar mensagem de confirmação
                 return f"✅ Horário {hora_consulta.strftime('%H:%M')} disponível!{ajuste_msg}\n\n" \
                        f"📋 **Resumo da sua consulta:**\n" \
-                       f"👤 Nome: {tool_input.get('patient_name', 'A ser confirmado')}\n" \
                        f"📅 Data: {date_str}\n" \
                        f"⏰ Horário: {hora_consulta.strftime('%H:%M')}\n\n" \
                        f"Posso confirmar sua consulta?"
