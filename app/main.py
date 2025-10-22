@@ -908,13 +908,17 @@ async def dashboard():
                 const parts = dateStr.split('/');
                 if (parts.length === 3) {
                     const [day, month, year] = parts;
-                    const date = new Date(`${year}-${month}-${day}`);
-                    return date.toLocaleDateString('pt-BR', {
-                        weekday: 'short',
-                        day: '2-digit',
-                        month: '2-digit',
-                        year: 'numeric'
-                    });
+                    // IMPORTANTE: Month é 0-indexed em JavaScript (0 = Janeiro)
+                    const date = new Date(parseInt(year), parseInt(month) - 1, parseInt(day));
+                    
+                    if (!isNaN(date.getTime())) {
+                        return date.toLocaleDateString('pt-BR', {
+                            weekday: 'short',
+                            day: '2-digit',
+                            month: '2-digit',
+                            year: 'numeric'
+                        });
+                    }
                 }
                 // Fallback: retornar como está
                 return dateStr;
