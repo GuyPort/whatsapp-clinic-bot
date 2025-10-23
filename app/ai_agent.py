@@ -106,6 +106,25 @@ IMPORTANTE - FLUXO DE CONFIRMAÇÃO:
 
 REGRA IMPORTANTE: O fluxo de confirmação é automático. Não interfira!
 
+CICLO DE ATENDIMENTO CONTÍNUO:
+1. Após QUALQUER tarefa concluída (agendamento, cancelamento, resposta a dúvida):
+   - SEMPRE perguntar: "Posso te ajudar com mais alguma coisa?"
+   
+2. Se usuário responder "sim" ou fizer nova pergunta:
+   - Responder adequadamente usando as tools necessárias
+   - Voltar ao passo 1 (perguntar novamente se pode ajudar)
+   
+3. Se usuário responder "não", "só isso", "obrigado", etc:
+   - Execute tool 'end_conversation' para encerrar contexto
+   - Enviar mensagem de despedida
+
+IMPORTANTE - PERGUNTAS SOBRE A CLÍNICA:
+Quando usuário perguntar QUALQUER COISA sobre a clínica (horários, dias de funcionamento, endereço, telefone, especialidades, etc):
+- Execute IMEDIATAMENTE 'get_clinic_info'
+- Responda com as informações formatadas
+- SEMPRE perguntar: "Posso te ajudar com mais alguma coisa?"
+- NUNCA diga "vou verificar" sem executar a tool imediatamente!
+
 ENCERRAMENTO DE CONVERSAS:
 Após QUALQUER tarefa concluída (agendamento criado, cancelamento realizado, dúvida respondida):
 - SEMPRE perguntar: "Posso te ajudar com mais alguma coisa?"
@@ -144,7 +163,7 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
         return [
             {
                 "name": "get_clinic_info",
-                "description": "Obter informações da clínica (horários, endereço, etc.)",
+                "description": "Obter TODAS as informações da clínica (nome, endereço, telefone, horários de funcionamento, dias fechados, especialidades). Use esta tool para responder QUALQUER pergunta sobre a clínica.",
                 "input_schema": {
                     "type": "object",
                     "properties": {},
@@ -763,22 +782,55 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
             return f"Erro ao executar {tool_name}: {str(e)}"
 
     def _handle_get_clinic_info(self, tool_input: Dict) -> str:
-        """Tool: get_clinic_info"""
+        """Tool: get_clinic_info - Retorna informações da clínica formatadas de forma completa"""
         try:
-            clinic_name = self.clinic_info.get('nome_clinica', 'Clínica')
-            endereco = self.clinic_info.get('endereco', 'Endereço não informado')
-            telefone = self.clinic_info.get('telefone', 'Não informado')
+            # Retornar TODAS as informações da clínica formatadas
+            response = ""
             
-            response = f"🏥 **{clinic_name}**\n\n"
-            response += f"📍 **Endereço:** {endereco}\n"
-            response += f"📞 **Telefone:** {telefone}\n\n"
-            response += "⏰ **Horários de funcionamento:**\n"
-            response += self._format_business_hours()
+            # Nome da clínica
+            response += f"🏥 **{self.clinic_info.get('nome_clinica', 'Clínica')}**\n\n"
+            
+            # Endereço
+            response += f"📍 **Endereço:**\n{self.clinic_info.get('endereco', 'Não informado')}\n\n"
+            
+            # Telefone
+            response += f"📞 **Telefone:**\n{self.clinic_info.get('telefone', 'Não informado')}\n\n"
+            
+            # Horários de funcionamento
+            response += "📅 **Horários de Funcionamento:**\n"
+            horarios = self.clinic_info.get('horario_funcionamento', {})
+            dias_ordenados = ['segunda', 'terca', 'quarta', 'quinta', 'sexta', 'sabado', 'domingo']
+            
+            for dia in dias_ordenados:
+                if dia in horarios:
+                    horario = horarios[dia]
+                    dia_formatado = dia.replace('terca', 'terça').replace('sabado', 'sábado')
+                    if horario != "FECHADO":
+                        response += f"• {dia_formatado.capitalize()}: {horario}\n"
+                    else:
+                        response += f"• {dia_formatado.capitalize()}: FECHADO\n"
+            
+            # Dias especiais fechados
+            dias_fechados = self.clinic_info.get('dias_fechados', [])
+            if dias_fechados:
+                response += f"\n🚫 **Dias Especiais Fechados (Feriados/Férias):**\n"
+                for dia in dias_fechados:
+                    response += f"• {dia}\n"
+            
+            # Informações adicionais
+            info_adicionais = self.clinic_info.get('informacoes_adicionais', {})
+            if info_adicionais:
+                response += f"\n💡 **Informações Adicionais:**\n"
+                if 'duracao_consulta' in info_adicionais:
+                    response += f"• Duração da consulta: {info_adicionais['duracao_consulta']}\n"
+                if 'especialidades' in info_adicionais:
+                    response += f"• Especialidades: {info_adicionais['especialidades']}\n"
             
             return response
+            
         except Exception as e:
-            logger.error(f"Erro ao obter informações da clínica: {str(e)}")
-            return f"Erro ao obter informações: {str(e)}"
+            logger.error(f"Erro ao obter info da clínica: {str(e)}")
+            return f"Erro ao buscar informações: {str(e)}"
 
     def _handle_validate_business_hours(self, tool_input: Dict) -> str:
         """Tool: validate_business_hours"""
