@@ -75,33 +75,6 @@ def normalize_phone(phone: str) -> str:
     return clean
 
 
-# Funções de extração removidas - Claude agora gerencia isso
-
-
-def is_valid_birth_date(date_str: str) -> bool:
-    """
-    Valida se a data de nascimento é válida e razoável.
-    Deve ser uma data passada e a pessoa deve ter entre 0 e 120 anos.
-    """
-    date = parse_date_br(date_str)
-    if not date:
-        return False
-    
-    today = now_brazil().date()
-    birth_date = date.date()
-    
-    # Data não pode ser no futuro
-    if birth_date > today:
-        return False
-    
-    # Idade deve ser razoável (0-120 anos)
-    age = (today - birth_date).days / 365.25
-    if age < 0 or age > 120:
-        return False
-    
-    return True
-
-
 def load_clinic_info() -> Dict[str, Any]:
     """
     Carrega informações da clínica do arquivo JSON.
@@ -116,9 +89,6 @@ def load_clinic_info() -> Dict[str, Any]:
         raise Exception("Arquivo data/clinic_info.json não encontrado!")
     except json.JSONDecodeError:
         raise Exception("Erro ao ler data/clinic_info.json - JSON inválido!")
-
-
-# Funções de detecção removidas - Claude agora gerencia isso
 
 
 def round_up_to_next_5_minutes(dt: datetime) -> datetime:

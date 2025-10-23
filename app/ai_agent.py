@@ -1103,25 +1103,12 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                 temp_dt = datetime.combine(appointment_datetime.date(), time_obj_original)
                 rounded_dt = round_up_to_next_5_minutes(temp_dt)
                 
-                # DEBUG: Log antes da localização
-                logger.info(f"🔍 DEBUG - Antes da localização:")
-                logger.info(f"   appointment_date input: {appointment_date}")
-                logger.info(f"   appointment_datetime parsed: {appointment_datetime}")
-                logger.info(f"   rounded_dt: {rounded_dt}")
-                logger.info(f"   rounded_dt.tzinfo: {rounded_dt.tzinfo}")
-                
-                # ADICIONAR: Localizar no timezone do Brasil para garantir data correta
+                # Localizar no timezone do Brasil para garantir data correta
                 tz = get_brazil_timezone()
                 if rounded_dt.tzinfo is None:
                     appointment_datetime = tz.localize(rounded_dt)
                 else:
                     appointment_datetime = rounded_dt
-                
-                # DEBUG: Log após localização
-                logger.info(f"🔍 DEBUG - Após localização:")
-                logger.info(f"   appointment_datetime: {appointment_datetime}")
-                logger.info(f"   appointment_datetime.date(): {appointment_datetime.date()}")
-                logger.info(f"   appointment_datetime.time(): {appointment_datetime.time()}")
                 
                 # Localizar no timezone do Brasil para validação
                 if appointment_datetime.tzinfo is None:
@@ -1141,13 +1128,6 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
             
             # Criar agendamento - SALVAR COMO STRING YYYYMMDD para evitar problemas de timezone
             appointment_datetime_formatted = str(appointment_datetime.strftime('%Y%m%d'))  # "20251022" - GARANTIR STRING
-            
-            # LOG DE DIAGNÓSTICO: Confirmar formato correto
-            logger.info(f"🔍 SALVANDO NO BANCO:")
-            logger.info(f"   appointment_datetime_formatted: '{appointment_datetime_formatted}'")
-            logger.info(f"   tipo: {type(appointment_datetime_formatted)}")
-            logger.info(f"   formato esperado: YYYYMMDD (ex: 20251023)")
-            logger.info(f"   data original: {appointment_datetime.strftime('%d/%m/%Y')}")
             
             appointment = Appointment(
                 patient_name=patient_name,

@@ -3,7 +3,6 @@ Aplicação FastAPI principal com webhooks do WhatsApp.
 """
 from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
 from fastapi.responses import HTMLResponse, JSONResponse
-# StaticFiles removido - não utilizado
 from contextlib import asynccontextmanager
 import logging
 from typing import Dict, Any, List
@@ -11,18 +10,11 @@ from datetime import datetime, date
 
 from app.simple_config import settings
 
-# Debug: Log das configurações no startup
-logger = logging.getLogger(__name__)
-logger.info("=== STARTUP DEBUG ===")
-logger.info(f"Evolution API URL: {settings.evolution_api_url}")
-logger.info(f"Instance Name: {settings.evolution_instance_name}")
-logger.info(f"API Key: {settings.evolution_api_key[:10] if settings.evolution_api_key else 'None'}...")
-logger.info("===================")
 from app.database import init_db, get_db
 from app.ai_agent import ai_agent
 from app.whatsapp_service import whatsapp_service
 from app.utils import normalize_phone
-from app.models import Appointment, ConversationContext, PausedContact
+from app.models import Appointment, ConversationContext, PausedContact, AppointmentStatus
 from app.scheduler import start_scheduler, stop_scheduler
 
 # Configurar logging
@@ -357,28 +349,6 @@ async def reload_config():
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/admin/migrate-fix-date")
-async def migrate_fix_date_admin():
-    """Endpoint admin para executar migração de data no PostgreSQL"""
-    try:
-        from migrate_railway_fix_date import migrate_railway_appointment_date
-        
-        logger.info("🚀 Executando migração de data via endpoint admin...")
-        success = migrate_railway_appointment_date()
-        
-        if success:
-            logger.info("✅ Migração executada com sucesso!")
-            return {"status": "success", "message": "Migração executada com sucesso! Coluna appointment_date alterada para VARCHAR(10)."}
-        else:
-            logger.error("❌ Erro durante migração")
-            return {"status": "error", "message": "Erro durante migração"}
-            
-    except Exception as e:
-        logger.error(f"❌ Erro ao executar migração: {str(e)}")
-        return {"status": "error", "message": f"Erro: {str(e)}"}
-
-
-
 # ==================== ENDPOINTS DO BANCO DE DADOS ====================
 
 @app.get("/admin/patients")
@@ -531,9 +501,6 @@ async def get_scheduled_appointments():
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# Endpoint de conversas removido - ConversationContext não existe mais
-
-
 @app.get("/admin/init-db")
 @app.post("/admin/init-db")
 async def init_database():
@@ -600,7 +567,6 @@ async def get_dashboard():
                 "summary": {
                     "total_patients": total_patients,
                     "total_appointments": total_appointments,
-                    "active_conversations": active_conversations,
                     "recent_appointments": recent_appointments
                 },
                 "appointments_by_status": appointments_by_status
@@ -944,9 +910,6 @@ async def dashboard():
     </body>
     </html>
     """)
-
-
-# Endpoint de paciente removido - dados agora estão na tabela appointments
 
 
 if __name__ == "__main__":
