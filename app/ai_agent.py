@@ -79,12 +79,23 @@ Quando o paciente escolher "1" ou "1️⃣", siga EXATAMENTE este fluxo:
    "Obrigado! Agora me informe sua data de nascimento (DD/MM/AAAA):"
 
 3. Após receber a data de nascimento:
-   "Perfeito! Agora me informe o dia que gostaria de marcar a consulta (DD/MM/AAAA):"
+   "Perfeito! Agora me informe qual tipo de consulta você deseja:
+   
+   1️⃣ Clínica Geral - R$ 300
+   2️⃣ Geriatria Clínica e Preventiva - R$ 300
+   3️⃣ Atendimento Domiciliar ao Paciente Idoso - R$ 500
+   
+   Digite o número da opção desejada:"
 
-4. Após receber a data desejada:
+4. Após receber o tipo (1, 2 ou 3):
+   "Ótimo! [Tipo selecionado]
+   
+   Agora me informe o dia que gostaria de marcar a consulta (DD/MM/AAAA):"
+
+5. Após receber a data desejada:
    "Ótimo! E que horário você prefere? (HH:MM - ex: 14:30):"
 
-5. **FLUXO CRÍTICO - Após receber horário:**
+6. **FLUXO CRÍTICO - Após receber horário:**
    a) Execute validate_and_check_availability com data e hora
    b) Leia o resultado da tool:
       - Se contém "disponível" → A tool já vai retornar uma mensagem pedindo confirmação
@@ -235,6 +246,10 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                         "notes": {
                             "type": "string",
                             "description": "Observações adicionais (opcional)"
+                        },
+                        "consultation_type": {
+                            "type": "string",
+                            "description": "Tipo de consulta: clinica_geral | geriatria | domiciliar"
                         }
                     },
                     "required": ["patient_name", "patient_phone", "patient_birth_date", "appointment_date", "appointment_time"]
@@ -306,7 +321,8 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                 "patient_name": None,
                 "patient_birth_date": None,
                 "appointment_date": None,
-                "appointment_time": None
+                "appointment_time": None,
+                "consultation_type": None
             }
             logger.info(f"🔍 Extraindo dados de {len(messages)} mensagens")
             import re
@@ -338,7 +354,15 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                     elif y >= 2010 and not data["appointment_date"]:
                         data["appointment_date"] = full_date
                 
-                # 3. EXTRAÇÃO DE NOMES - Remover prefixos comuns
+                # 3. EXTRAÇÃO DE TIPO DE CONSULTA - Detectar escolha numérica
+                if not data["consultation_type"]:
+                    # Se mensagem é só "1", "2" ou "3" (escolha de tipo)
+                    if content in ["1", "2", "3"]:
+                        type_map = {"1": "clinica_geral", "2": "geriatria", "3": "domiciliar"}
+                        data["consultation_type"] = type_map[content]
+                        continue
+                
+                # 4. EXTRAÇÃO DE NOMES - Remover prefixos comuns
                 if not data["patient_name"]:
                     # Prefixos comuns que devem ser removidos
                     name_prefixes = [
@@ -741,6 +765,10 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                 context.flow_data["appointment_time"] = extracted["appointment_time"]
                 logger.info(f"💾 Horário consulta salvo no flow_data: {extracted['appointment_time']}")
             
+            if extracted.get("consultation_type") and not context.flow_data.get("consultation_type"):
+                context.flow_data["consultation_type"] = extracted["consultation_type"]
+                logger.info(f"💾 Tipo consulta salvo no flow_data: {extracted['consultation_type']}")
+            
             # 8. Atualizar contexto no banco
             context.last_activity = datetime.utcnow()
             db.commit()
@@ -1065,9 +1093,21 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                         db.commit()
                         logger.info(f"💾 Dados salvos no flow_data para confirmação: {context.flow_data}")
                 
+                # Buscar tipo do flow_data se disponível
+                tipo_info = ""
+                if context and context.flow_data:
+                    tipo = context.flow_data.get("consultation_type")
+                    if tipo:
+                        tipos_consulta = self.clinic_info.get('tipos_consulta', {})
+                        tipo_data = tipos_consulta.get(tipo, {})
+                        tipo_nome = tipo_data.get('nome', '')
+                        tipo_valor = tipo_data.get('valor', 0)
+                        tipo_info = f"💼 Tipo: {tipo_nome}\n💰 Valor: R$ {tipo_valor}\n"
+                
                 # Retornar mensagem de confirmação
                 return f"✅ Horário {hora_consulta.strftime('%H:%M')} disponível!{ajuste_msg}\n\n" \
                        f"📋 *Resumo da sua consulta:*\n" \
+                       f"{tipo_info}" \
                        f"📅 Data: {date_str}\n" \
                        f"⏰ Horário: {hora_consulta.strftime('%H:%M')}\n\n" \
                        f"Posso confirmar sua consulta?"
@@ -1135,6 +1175,12 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
             appointment_date = tool_input.get("appointment_date")
             appointment_time = tool_input.get("appointment_time")
             notes = tool_input.get("notes", "")
+            consultation_type = tool_input.get("consultation_type", "clinica_geral")
+            
+            # Validar tipo de consulta
+            valid_types = ["clinica_geral", "geriatria", "domiciliar"]
+            if consultation_type not in valid_types:
+                consultation_type = "clinica_geral"  # Fallback
             
             if not all([patient_name, patient_phone, patient_birth_date, appointment_date, appointment_time]):
                 return "Todos os campos obrigatórios devem ser preenchidos."
@@ -1188,6 +1234,7 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                 appointment_date=appointment_datetime_formatted,  # "20251022" - STRING EXPLÍCITA
                 appointment_time=appointment_time,  # Salvar como string HH:MM
                 duration_minutes=duracao,
+                consultation_type=consultation_type,
                 status=AppointmentStatus.AGENDADA,
                 notes=notes
             )
@@ -1195,8 +1242,16 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
             db.add(appointment)
             db.commit()
             
+            # Buscar informações do tipo de consulta
+            tipos_consulta = self.clinic_info.get('tipos_consulta', {})
+            tipo_info = tipos_consulta.get(consultation_type, {})
+            tipo_nome = tipo_info.get('nome', 'Clínica Geral')
+            tipo_valor = tipo_info.get('valor', 300)
+            
             return f"✅ **Agendamento realizado com sucesso!**\n\n" + \
                    f"👤 **Paciente:** {patient_name}\n" + \
+                   f"💼 **Tipo:** {tipo_nome}\n" + \
+                   f"💰 **Valor:** R$ {tipo_valor}\n" + \
                    f"📅 **Data:** {appointment_datetime.strftime('%d/%m/%Y')}\n" + \
                    f"⏰ **Horário:** {appointment_datetime.strftime('%H:%M')}\n" + \
                    f"⏱️ **Duração:** {duracao} minutos\n" + \
