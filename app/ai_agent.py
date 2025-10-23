@@ -790,7 +790,7 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
             elif tool_name == "validate_business_hours":
                 return self._handle_validate_business_hours(tool_input)
             elif tool_name == "validate_and_check_availability":
-                return self._handle_validate_and_check_availability(tool_input, db)
+                return self._handle_validate_and_check_availability(tool_input, db, phone)
             elif tool_name == "create_appointment":
                 return self._handle_create_appointment(tool_input, db)
             elif tool_name == "search_appointments":
@@ -989,7 +989,7 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
             logger.error(f"Erro ao verificar se clínica está aberta: {str(e)}")
             return False, f"Erro ao verificar horário: {str(e)}"
     
-    def _handle_validate_and_check_availability(self, tool_input: Dict, db: Session) -> str:
+    def _handle_validate_and_check_availability(self, tool_input: Dict, db: Session, phone: str = None) -> str:
         """Tool: validate_and_check_availability - Valida horário de funcionamento + disponibilidade"""
         try:
             logger.info(f"🔍 Tool validate_and_check_availability chamada com input: {tool_input}")
@@ -1072,8 +1072,8 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                 logger.info(f"✅ Horário {hora_consulta.strftime('%H:%M')} disponível!{ajuste_msg}")
                 
                 # Salvar dados no flow_data para confirmação
-                # Buscar contexto do usuário atual (precisa do phone do contexto)
-                phone = tool_input.get("patient_phone")
+                # Buscar contexto do usuário atual usando phone recebido
+                context = None
                 if phone:
                     context = db.query(ConversationContext).filter_by(phone=phone).first()
                     if context:
