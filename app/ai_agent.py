@@ -435,7 +435,7 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
             logger.error(f"Erro ao extrair dados do histórico: {e}", exc_info=True)
             return {}
 
-    def process_message(self, message: str, phone: str) -> str:
+    def process_message(self, message: str, phone: str, db: Session) -> str:
         """Processa uma mensagem do usuário e retorna resposta do bot"""
         try:
             logger.info(f"📱 Processando mensagem de {phone}: {message}")
