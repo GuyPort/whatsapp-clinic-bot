@@ -820,7 +820,7 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
             elif tool_name == "validate_and_check_availability":
                 return self._handle_validate_and_check_availability(tool_input, db, phone)
             elif tool_name == "create_appointment":
-                return self._handle_create_appointment(tool_input, db)
+                return self._handle_create_appointment(tool_input, db, phone)
             elif tool_name == "search_appointments":
                 return self._handle_search_appointments(tool_input, db)
             elif tool_name == "cancel_appointment":
@@ -1202,17 +1202,29 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
             logger.error(f"Erro ao verificar disponibilidade: {str(e)}")
             return f"Erro ao verificar disponibilidade: {str(e)}"
 
-    def _handle_create_appointment(self, tool_input: Dict, db: Session) -> str:
+    def _handle_create_appointment(self, tool_input: Dict, db: Session, phone: str = None) -> str:
         """Tool: create_appointment"""
         try:
             patient_name = tool_input.get("patient_name")
-            patient_phone = tool_input.get("patient_phone")
+            patient_phone = tool_input.get("patient_phone") or phone  # Usar phone do contexto se não fornecido
             patient_birth_date = tool_input.get("patient_birth_date")
             appointment_date = tool_input.get("appointment_date")
             appointment_time = tool_input.get("appointment_time")
             notes = tool_input.get("notes", "")
             consultation_type = tool_input.get("consultation_type", "clinica_geral")
             insurance_plan = tool_input.get("insurance_plan", "particular")
+            
+            # Buscar dados do contexto se não fornecidos na tool
+            if phone:
+                context = db.query(ConversationContext).filter_by(phone=phone).first()
+                if context and context.flow_data:
+                    # Usar dados do contexto como fallback
+                    if not patient_phone:
+                        patient_phone = context.flow_data.get("patient_phone") or phone
+                    if not consultation_type or consultation_type == "clinica_geral":
+                        consultation_type = context.flow_data.get("consultation_type") or consultation_type
+                    if not insurance_plan or insurance_plan == "particular":
+                        insurance_plan = context.flow_data.get("insurance_plan") or insurance_plan
             
             # Validar tipo de consulta
             valid_types = ["clinica_geral", "geriatria", "domiciliar"]
