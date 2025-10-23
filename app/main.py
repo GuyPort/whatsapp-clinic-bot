@@ -483,6 +483,7 @@ async def get_scheduled_appointments():
                     "appointment_date_br": _format_appointment_date(apt.appointment_date),  # Converter qualquer formato para DD/MM/YYYY
                     "appointment_time": apt.appointment_time,  # String HH:MM
                     "consultation_type": apt.consultation_type,
+                    "insurance_plan": apt.insurance_plan,
                     "status": apt.status.value,
                     "duration_minutes": apt.duration_minutes,
                     "notes": apt.notes,
@@ -545,6 +546,22 @@ async def migrate_add_consultation_type():
         from migrate_add_consultation_type import migrate_add_consultation_type
         
         result = migrate_add_consultation_type()
+        
+        if result.get("success"):
+            return {"success": True, "message": result.get("message", "Migração executada com sucesso")}
+        else:
+            return {"success": False, "error": result.get("error", "Erro desconhecido")}
+            
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+@app.post("/admin/migrate-add-insurance-plan")
+async def migrate_add_insurance_plan():
+    """Endpoint para executar migração que adiciona coluna insurance_plan"""
+    try:
+        from migrate_add_insurance_plan import migrate_add_insurance_plan
+        
+        result = migrate_add_insurance_plan()
         
         if result.get("success"):
             return {"success": True, "message": result.get("message", "Migração executada com sucesso")}
@@ -850,6 +867,7 @@ async def dashboard():
                                     <th>Data da Consulta</th>
                                     <th>Horário</th>
                                     <th>Tipo de Consulta</th>
+                                    <th>Convênio</th>
                                     <th>Status</th>
                                     <th>Duração</th>
                                 </tr>
@@ -871,6 +889,11 @@ async def dashboard():
                                         <td>
                                             <span class="badge bg-info text-white">
                                                 ${getConsultationTypeText(appointment.consultation_type)}
+                                            </span>
+                                        </td>
+                                        <td>
+                                            <span class="badge bg-success text-white">
+                                                ${getInsurancePlanText(appointment.insurance_plan)}
                                             </span>
                                         </td>
                                         <td>
@@ -928,6 +951,15 @@ async def dashboard():
                     'domiciliar': 'Atendimento Domiciliar'
                 };
                 return typeMap[type] || 'Clínica Geral';
+            }
+
+            function getInsurancePlanText(plan) {
+                const planMap = {
+                    'CABERGS': 'CABERGS',
+                    'IPE': 'IPE',
+                    'particular': 'Particular'
+                };
+                return planMap[plan] || 'Particular';
             }
 
             function getStatusText(status) {

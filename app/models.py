@@ -36,6 +36,7 @@ class Appointment(Base):
     appointment_time = Column(String(5), nullable=False)  # Horário da consulta (HH:MM)
     duration_minutes = Column(Integer, default=60, nullable=False)  # Duração em minutos
     consultation_type = Column(String(50), nullable=True)  # Tipo de consulta (clinica_geral, geriatria, domiciliar)
+    insurance_plan = Column(String(50), nullable=True)  # Convênio (CABERGS, IPE, particular)
     
     # Status e controle
     status = Column(Enum(AppointmentStatus), default=AppointmentStatus.AGENDADA, nullable=False, index=True)

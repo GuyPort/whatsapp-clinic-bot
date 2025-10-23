@@ -40,6 +40,21 @@
     }
   },
   
+  "convenios_aceitos": {
+    "CABERGS": {
+      "nome": "CABERGS",
+      "codigo": "CABERGS"
+    },
+    "IPE": {
+      "nome": "IPE",
+      "codigo": "IPE"
+    },
+    "particular": {
+      "nome": "Particular",
+      "codigo": "particular"
+    }
+  },
+  
   "informacoes_adicionais": {
     "formas_pagamento": ["Dinheiro", "Cartão de crédito", "Cartão de débito", "Pix"],
     "politica_cancelamento": "Cancelamentos devem ser feitos com no mínimo 24 horas de antecedência",

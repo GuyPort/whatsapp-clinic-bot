@@ -90,12 +90,23 @@ Quando o paciente escolher "1" ou "1️⃣", siga EXATAMENTE este fluxo:
 4. Após receber o tipo (1, 2 ou 3):
    "Ótimo! [Tipo selecionado]
    
+   Agora me informe qual convênio você possui:
+   
+   1️⃣ CABERGS
+   2️⃣ IPE
+   3️⃣ Particular
+   
+   Digite o número da opção desejada:"
+
+5. Após receber o convênio (1, 2 ou 3):
+   "Perfeito! [Convênio selecionado]
+   
    Agora me informe o dia que gostaria de marcar a consulta (DD/MM/AAAA):"
 
-5. Após receber a data desejada:
+6. Após receber a data desejada:
    "Ótimo! E que horário você prefere? (HH:MM - ex: 14:30):"
 
-6. **FLUXO CRÍTICO - Após receber horário:**
+7. **FLUXO CRÍTICO - Após receber horário:**
    a) Execute validate_and_check_availability com data e hora
    b) Leia o resultado da tool:
       - Se contém "disponível" → A tool já vai retornar uma mensagem pedindo confirmação
@@ -250,6 +261,10 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                         "consultation_type": {
                             "type": "string",
                             "description": "Tipo de consulta: clinica_geral | geriatria | domiciliar"
+                        },
+                        "insurance_plan": {
+                            "type": "string",
+                            "description": "Convênio: CABERGS | IPE | particular"
                         }
                     },
                     "required": ["patient_name", "patient_phone", "patient_birth_date", "appointment_date", "appointment_time"]
@@ -322,7 +337,8 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                 "patient_birth_date": None,
                 "appointment_date": None,
                 "appointment_time": None,
-                "consultation_type": None
+                "consultation_type": None,
+                "insurance_plan": None
             }
             logger.info(f"🔍 Extraindo dados de {len(messages)} mensagens")
             import re
@@ -362,7 +378,15 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                         data["consultation_type"] = type_map[content]
                         continue
                 
-                # 4. EXTRAÇÃO DE NOMES - Remover prefixos comuns
+                # 4. EXTRAÇÃO DE CONVÊNIO - Detectar escolha numérica
+                if not data["insurance_plan"]:
+                    # Se mensagem é só "1", "2" ou "3" (escolha de convênio)
+                    if content in ["1", "2", "3"]:
+                        insurance_map = {"1": "CABERGS", "2": "IPE", "3": "particular"}
+                        data["insurance_plan"] = insurance_map[content]
+                        continue
+                
+                # 5. EXTRAÇÃO DE NOMES - Remover prefixos comuns
                 if not data["patient_name"]:
                     # Prefixos comuns que devem ser removidos
                     name_prefixes = [
@@ -769,6 +793,10 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                 context.flow_data["consultation_type"] = extracted["consultation_type"]
                 logger.info(f"💾 Tipo consulta salvo no flow_data: {extracted['consultation_type']}")
             
+            if extracted.get("insurance_plan") and not context.flow_data.get("insurance_plan"):
+                context.flow_data["insurance_plan"] = extracted["insurance_plan"]
+                logger.info(f"💾 Convênio salvo no flow_data: {extracted['insurance_plan']}")
+            
             # 8. Atualizar contexto no banco
             context.last_activity = datetime.utcnow()
             db.commit()
@@ -1093,16 +1121,24 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                         db.commit()
                         logger.info(f"💾 Dados salvos no flow_data para confirmação: {context.flow_data}")
                 
-                # Buscar tipo do flow_data se disponível
+                # Buscar tipo e convênio do flow_data se disponível
                 tipo_info = ""
                 if context and context.flow_data:
                     tipo = context.flow_data.get("consultation_type")
+                    convenio = context.flow_data.get("insurance_plan")
+                    
                     if tipo:
                         tipos_consulta = self.clinic_info.get('tipos_consulta', {})
                         tipo_data = tipos_consulta.get(tipo, {})
                         tipo_nome = tipo_data.get('nome', '')
                         tipo_valor = tipo_data.get('valor', 0)
                         tipo_info = f"💼 Tipo: {tipo_nome}\n💰 Valor: R$ {tipo_valor}\n"
+                    
+                    if convenio:
+                        convenios_aceitos = self.clinic_info.get('convenios_aceitos', {})
+                        convenio_data = convenios_aceitos.get(convenio, {})
+                        convenio_nome = convenio_data.get('nome', '')
+                        tipo_info += f"💳 Convênio: {convenio_nome}\n"
                 
                 # Retornar mensagem de confirmação
                 return f"✅ Horário {hora_consulta.strftime('%H:%M')} disponível!{ajuste_msg}\n\n" \
@@ -1176,11 +1212,17 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
             appointment_time = tool_input.get("appointment_time")
             notes = tool_input.get("notes", "")
             consultation_type = tool_input.get("consultation_type", "clinica_geral")
+            insurance_plan = tool_input.get("insurance_plan", "particular")
             
             # Validar tipo de consulta
             valid_types = ["clinica_geral", "geriatria", "domiciliar"]
             if consultation_type not in valid_types:
                 consultation_type = "clinica_geral"  # Fallback
+            
+            # Validar convênio
+            valid_insurance = ["CABERGS", "IPE", "particular"]
+            if insurance_plan not in valid_insurance:
+                insurance_plan = "particular"  # Fallback
             
             if not all([patient_name, patient_phone, patient_birth_date, appointment_date, appointment_time]):
                 return "Todos os campos obrigatórios devem ser preenchidos."
@@ -1235,6 +1277,7 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                 appointment_time=appointment_time,  # Salvar como string HH:MM
                 duration_minutes=duracao,
                 consultation_type=consultation_type,
+                insurance_plan=insurance_plan,
                 status=AppointmentStatus.AGENDADA,
                 notes=notes
             )
@@ -1242,15 +1285,20 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
             db.add(appointment)
             db.commit()
             
-            # Buscar informações do tipo de consulta
+            # Buscar informações do tipo de consulta e convênio
             tipos_consulta = self.clinic_info.get('tipos_consulta', {})
             tipo_info = tipos_consulta.get(consultation_type, {})
             tipo_nome = tipo_info.get('nome', 'Clínica Geral')
             tipo_valor = tipo_info.get('valor', 300)
             
+            convenios_aceitos = self.clinic_info.get('convenios_aceitos', {})
+            convenio_info = convenios_aceitos.get(insurance_plan, {})
+            convenio_nome = convenio_info.get('nome', 'Particular')
+            
             return f"✅ **Agendamento realizado com sucesso!**\n\n" + \
                    f"👤 **Paciente:** {patient_name}\n" + \
                    f"💼 **Tipo:** {tipo_nome}\n" + \
+                   f"💳 **Convênio:** {convenio_nome}\n" + \
                    f"💰 **Valor:** R$ {tipo_valor}\n" + \
                    f"📅 **Data:** {appointment_datetime.strftime('%d/%m/%Y')}\n" + \
                    f"⏰ **Horário:** {appointment_datetime.strftime('%H:%M')}\n" + \
