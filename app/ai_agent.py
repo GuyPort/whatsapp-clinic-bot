@@ -1,44 +1,52 @@
 """
-Agente Claude para bot da clínica.
+Agente de IA com Claude SDK + Tools para agendamento de consultas.
 Versão completa com menu estruturado e gerenciamento de contexto.
+Corrigido: persistência de contexto + loop de processamento de tools.
 """
-import logging
-from typing import Dict, List
 from datetime import datetime, timedelta
-from sqlalchemy.orm import Session
-from anthropic import Anthropic
+from typing import Optional, Dict, Any, List, Tuple
 import json
-import os
+import logging
+import pytz
+from anthropic import Anthropic
 
-from app.database import get_db
-from app.models import Appointment, ConversationContext, PausedContact, AppointmentStatus
+from sqlalchemy.orm import Session
+from sqlalchemy.orm.attributes import flag_modified
+
+from app.simple_config import settings
+from app.models import Appointment, AppointmentStatus, ConversationContext, PausedContact
 from app.utils import (
     load_clinic_info, normalize_phone, parse_date_br, 
-    now_brazil, get_brazil_timezone, round_up_to_next_5_minutes
+    format_datetime_br, now_brazil, get_brazil_timezone, round_up_to_next_5_minutes
 )
-from app import appointment_rules
+from app.appointment_rules import appointment_rules
 
 logger = logging.getLogger(__name__)
 
+
 class ClaudeToolAgent:
-    """Agente Claude com tools para gerenciar consultas da clínica"""
+    """Agente de IA com Claude SDK + Tools para agendamento de consultas"""
     
     def __init__(self):
+        self.client = Anthropic(api_key=settings.anthropic_api_key)
         self.clinic_info = load_clinic_info()
-        self.anthropic = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+        self.timezone = get_brazil_timezone()
+        self.tools = self._define_tools()
+        self.system_prompt = self._create_system_prompt()
         
     def _create_system_prompt(self) -> str:
-        """Cria o prompt do sistema com informações da clínica"""
+        """Cria o prompt do sistema para o Claude"""
         clinic_name = self.clinic_info.get('nome_clinica', 'Clínica')
         endereco = self.clinic_info.get('endereco', 'Endereço não informado')
-        duracao = self.clinic_info.get('regras_agendamento', {}).get('duracao_consulta_minutos', 60)
-        
-        # Formatar horários de funcionamento
         horarios = self.clinic_info.get('horario_funcionamento', {})
+        
         horarios_str = ""
         for dia, horario in horarios.items():
             if horario != "FECHADO":
                 horarios_str += f"• {dia.capitalize()}: {horario}\n"
+        
+        duracao = self.clinic_info.get('regras_agendamento', {}).get('duracao_consulta_minutos', 45)
+        secretaria = self.clinic_info.get('informacoes_adicionais', {}).get('secretaria', 'Beatriz')
         
         return f"""Você é a Beatriz, secretária da {clinic_name}.
 
@@ -71,21 +79,12 @@ Quando o paciente escolher "1" ou "1️⃣", siga EXATAMENTE este fluxo:
    "Obrigado! Agora me informe sua data de nascimento (DD/MM/AAAA):"
 
 3. Após receber a data de nascimento:
-   "Qual tipo de consulta você deseja?
-   
-   1️⃣ Clínica Geral - R$ 300
-   2️⃣ Geriatria Clínica e Preventiva - R$ 300
-   3️⃣ Atendimento Domiciliar ao Paciente Idoso - R$ 500
-   
-   Digite o número da opção desejada."
-
-4. Após receber o tipo de consulta:
    "Perfeito! Agora me informe o dia que gostaria de marcar a consulta (DD/MM/AAAA):"
 
-5. Após receber a data desejada:
+4. Após receber a data desejada:
    "Ótimo! E que horário você prefere? (HH:MM - ex: 14:30):"
 
-6. **FLUXO CRÍTICO - Após receber horário:**
+5. **FLUXO CRÍTICO - Após receber horário:**
    a) Execute validate_and_check_availability com data e hora
    b) Leia o resultado da tool:
       - Se contém "disponível" → A tool já vai retornar uma mensagem pedindo confirmação
@@ -233,10 +232,6 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                             "type": "string",
                             "description": "Horário da consulta no formato HH:MM"
                         },
-                        "consultation_type": {
-                            "type": "string",
-                            "description": "Tipo de consulta: clinica_geral, geriatria ou domiciliar"
-                        },
                         "notes": {
                             "type": "string",
                             "description": "Observações adicionais (opcional)"
@@ -253,11 +248,11 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                     "properties": {
                         "phone": {
                             "type": "string",
-                            "description": "Telefone do paciente"
+                            "description": "Telefone do paciente para buscar"
                         },
                         "name": {
                             "type": "string",
-                            "description": "Nome do paciente"
+                            "description": "Nome do paciente para buscar"
                         }
                     },
                     "required": []
@@ -270,7 +265,7 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                     "type": "object",
                     "properties": {
                         "appointment_id": {
-                            "type": "string",
+                            "type": "integer",
                             "description": "ID do agendamento a ser cancelado"
                         },
                         "reason": {
@@ -283,7 +278,7 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
             },
             {
                 "name": "request_human_assistance",
-                "description": "Transferir para atendimento humano",
+                "description": "Transferir atendimento para humano quando solicitado",
                 "input_schema": {
                     "type": "object",
                     "properties": {},
@@ -292,7 +287,7 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
             },
             {
                 "name": "end_conversation",
-                "description": "Encerrar conversa e limpar contexto",
+                "description": "Encerrar conversa e limpar contexto quando usuário não precisa de mais nada",
                 "input_schema": {
                     "type": "object",
                     "properties": {},
@@ -300,54 +295,6 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                 }
             }
         ]
-
-    def _detect_confirmation_intent(self, message: str) -> str:
-        """Detecta intenção de confirmação (positiva/negativa) de forma flexível"""
-        message_lower = message.lower().strip()
-        
-        # Palavras-chave positivas
-        positive_keywords = [
-            "sim", "pode", "confirma", "confirmar", "claro", "ok", "okay",
-            "perfeito", "isso", "certo", "exato", "vamos", "agendar",
-            "marcar", "beleza", "aceito", "tá bom", "ta bom", "show",
-            "positivo", "concordo", "fechado", "fechou"
-        ]
-        
-        # Palavras-chave negativas
-        negative_keywords = [
-            "não", "nao", "nunca", "jamais", "mudar", "alterar", "trocar",
-            "outro", "outra", "diferente", "modificar", "cancelar",
-            "desistir", "quero mudar", "prefiro", "melhor não"
-        ]
-        
-        # Verificar positivas
-        for keyword in positive_keywords:
-            if keyword in message_lower:
-                return "positive"
-        
-        # Verificar negativas
-        for keyword in negative_keywords:
-            if keyword in message_lower:
-                return "negative"
-        
-        return "unclear"
-
-    def _should_end_context(self, message: str) -> bool:
-        """Detecta se usuário quer encerrar a conversa"""
-        message_lower = message.lower().strip()
-        
-        end_keywords = [
-            "não", "nao", "só isso", "so isso", "obrigado", "obrigada",
-            "valeu", "tchau", "até logo", "ate logo", "adeus", "flw",
-            "não preciso", "nao preciso", "tá bom", "ta bom",
-            "está bem", "esta bem", "ok tchau", "beleza tchau"
-        ]
-        
-        for keyword in end_keywords:
-            if keyword in message_lower:
-                return True
-        
-        return False
 
     def _extract_appointment_data_from_messages(self, messages: list) -> dict:
         """Extrai dados de agendamento do histórico de mensagens.
@@ -359,8 +306,7 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                 "patient_name": None,
                 "patient_birth_date": None,
                 "appointment_date": None,
-                "appointment_time": None,
-                "consultation_type": None
+                "appointment_time": None
             }
             logger.info(f"🔍 Extraindo dados de {len(messages)} mensagens")
             import re
@@ -380,20 +326,7 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                         data["appointment_time"] = f"{hour.zfill(2)}:{minute}"
                         continue
                 
-                # 2. EXTRAÇÃO DE TIPO DE CONSULTA - Detectar escolha (1, 2, 3)
-                if not data["consultation_type"]:
-                    # Verificar se é uma escolha de tipo de consulta
-                    if content.strip() in ["1", "1️⃣"]:
-                        data["consultation_type"] = "clinica_geral"
-                        continue
-                    elif content.strip() in ["2", "2️⃣"]:
-                        data["consultation_type"] = "geriatria"
-                        continue
-                    elif content.strip() in ["3", "3️⃣"]:
-                        data["consultation_type"] = "domiciliar"
-                        continue
-                
-                # 3. EXTRAÇÃO DE DATAS - Buscar em qualquer parte da mensagem
+                # 2. EXTRAÇÃO DE DATAS - Buscar em qualquer parte da mensagem
                 date_pattern = r'(\d{1,2})/(\d{1,2})/(\d{4})'
                 date_matches = re.findall(date_pattern, content)
                 for match in date_matches:
@@ -405,7 +338,7 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                     elif y >= 2010 and not data["appointment_date"]:
                         data["appointment_date"] = full_date
                 
-                # 4. EXTRAÇÃO DE NOMES - Remover prefixos comuns
+                # 3. EXTRAÇÃO DE NOMES - Remover prefixos comuns
                 if not data["patient_name"]:
                     # Prefixos comuns que devem ser removidos
                     name_prefixes = [
@@ -447,216 +380,373 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
             
             logger.info(f"📋 Extração concluída: {data}")
             return data
-            
         except Exception as e:
             logger.error(f"Erro ao extrair dados do histórico: {e}", exc_info=True)
             return {}
 
-    def process_message(self, message: str, phone: str, db: Session) -> str:
-        """Processa uma mensagem do usuário e retorna resposta do bot"""
+    # ===== Encerramento de contexto =====
+    def _should_end_context(self, context: ConversationContext, last_user_message: str) -> bool:
+        """Decide se devemos encerrar o contexto.
+        Regras:
+        - Resposta negativa após pergunta final do bot
+        - Qualquer negativa explícita quando não há fluxo ativo
+        - Pausado para humano (tratado em main.py)
+        """
         try:
-            logger.info(f"📱 Processando mensagem de {phone}: {message}")
-            
-            # 1. Verificar se contato está pausado
-            with get_db() as db:
-                paused_contact = db.query(PausedContact).filter_by(phone=phone).first()
-                if paused_contact and paused_contact.paused_until > datetime.utcnow():
-                    logger.info(f"⏸️ Contato {phone} está pausado até {paused_contact.paused_until}")
-                    return "Olá! No momento você está sendo atendido por nossa equipe. Aguarde um instante! 😊"
-                
-                # 2. Carregar ou criar contexto
-                context = db.query(ConversationContext).filter_by(phone=phone).first()
-                if not context:
-                    context = ConversationContext(phone=phone, messages=[])
-                    db.add(context)
-                    logger.info(f"🆕 Novo contexto criado para {phone}")
-                
-                # 3. Verificar se deve encerrar conversa
-                if self._should_end_context(message):
-                    return self._handle_end_conversation({}, db, phone)
-                
-                # 4. Verificar se há confirmação pendente ANTES de processar com Claude
-                if context.flow_data and context.flow_data.get("pending_confirmation"):
-                    intent = self._detect_confirmation_intent(message)
-                    
-                    if intent == "positive":
-                        # Usuário confirmou! Executar agendamento
-                        logger.info(f"✅ Usuário {phone} confirmou agendamento")
-                        
-                        # Usar dados do flow_data (NÃO re-extrair do histórico)
-                        data = context.flow_data or {}
-                        
-                        # Se faltar dados, extrair do histórico APENAS UMA VEZ
-                        if not data.get("patient_name") or not data.get("patient_birth_date") or not data.get("consultation_type"):
-                            logger.info(f"🔍 Dados incompletos no flow_data, extraindo do histórico: {data}")
-                            extracted = self._extract_appointment_data_from_messages(context.messages)
-                            data["patient_name"] = data.get("patient_name") or extracted.get("patient_name")
-                            data["patient_birth_date"] = data.get("patient_birth_date") or extracted.get("patient_birth_date")
-                            data["consultation_type"] = data.get("consultation_type") or extracted.get("consultation_type")
-                            logger.info(f"🔍 Dados após extração: {data}")
-                        
-                        # Criar agendamento
-                        result = self._handle_create_appointment({
-                            "patient_name": data.get("patient_name"),
-                            "patient_birth_date": data.get("patient_birth_date"),
-                            "consultation_type": data.get("consultation_type"),
-                            "appointment_date": data.get("appointment_date"),
-                            "appointment_time": data.get("appointment_time"),
-                            "patient_phone": phone
-                        }, db, phone)
-                        
-                        # Limpar pending_confirmation
-                        if not context.flow_data:
-                            context.flow_data = {}
-                        context.flow_data["pending_confirmation"] = False
-                        
-                        # Adicionar mensagens ao histórico
-                        context.messages.append({"role": "user", "content": message})
-                        context.messages.append({"role": "assistant", "content": result})
-                        
-                        # Atualizar contexto
-                        context.last_activity = datetime.utcnow()
-                        db.commit()
-                        
-                        logger.info(f"💾 Contexto salvo para {phone}: {len(context.messages)} mensagens")
-                        return result
-                    
-                    elif intent == "negative":
-                        logger.info(f"❌ Usuário {phone} não confirmou, pedindo alteração")
-                        if not context.flow_data:
-                            context.flow_data = {}
-                        context.flow_data["pending_confirmation"] = False
-                        db.commit()
-                        
-                        response = "Sem problemas! O que você gostaria de mudar?\n\n" \
-                                   "1️⃣ Data\n" \
-                                   "2️⃣ Horário\n" \
-                                   "3️⃣ Ambos"
-                        
-                        # Adicionar mensagens ao histórico
-                        context.messages.append({"role": "user", "content": message})
-                        context.messages.append({"role": "assistant", "content": response})
-                        
-                        # Atualizar contexto
-                        context.last_activity = datetime.utcnow()
-                        db.commit()
-                        
-                        logger.info(f"💾 Contexto salvo para {phone}: {len(context.messages)} mensagens")
-                        return response
-                    
-                    logger.info(f"⚠️ Intenção não clara, processando com Claude")
+            if not context:
+                return False
+            text = (last_user_message or "").strip().lower()
+            negative_triggers = [
+                "nao", "não", "só isso", "so isso", "obrigado", "obrigada", "encerrar", "finalizar",
+                "nada", "por enquanto nao", "por enquanto não"
+            ]
+            is_negative = any(t in text for t in negative_triggers)
 
-                # 5. Adicionar mensagem do usuário ao histórico
-                context.messages.append({"role": "user", "content": message})
-                
-                # 6. Enviar para Claude
-                response = self.anthropic.messages.create(
-                    model="claude-3-5-sonnet-20241022",
-                    max_tokens=4000,
-                    system=self._create_system_prompt(),
-                    messages=context.messages,
-                    tools=self._define_tools()
+            # Verificar se a última mensagem do assistente foi a pergunta final
+            last_assistant_asks_more = False
+            for msg in reversed(context.messages):
+                if msg.get("role") == "assistant":
+                    content = (msg.get("content") or "").lower()
+                    if "posso te ajudar com mais alguma coisa" in content:
+                        last_assistant_asks_more = True
+                    break
+
+            # Encerrar se negativa após pergunta final ou negativa sem fluxo ativo
+            if is_negative and (last_assistant_asks_more or not context.current_flow):
+                return True
+            return False
+        except Exception:
+            return False
+
+    def _detect_confirmation_intent(self, message: str) -> str:
+        """
+        Detecta se a mensagem é uma confirmação positiva ou negativa.
+        
+        Returns:
+            "positive" - usuário confirmou
+            "negative" - usuário negou/quer mudar
+            "unclear" - não foi possível determinar
+        """
+        message_lower = message.lower().strip()
+        
+        # Palavras-chave positivas
+        positive_keywords = [
+            "sim", "pode", "confirma", "confirmar", "claro", "ok", "okay",
+            "perfeito", "isso", "certo", "exato", "vamos", "agendar",
+            "marcar", "beleza", "aceito", "tá bom", "ta bom", "show",
+            "positivo", "concordo", "fechado", "fechou"
+        ]
+        
+        # Palavras-chave negativas
+        negative_keywords = [
+            "não", "nao", "nunca", "jamais", "mudar", "alterar", "trocar",
+            "outro", "outra", "diferente", "modificar", "cancelar",
+            "desistir", "quero mudar", "prefiro", "melhor não"
+        ]
+        
+        # Verificar positivos
+        for keyword in positive_keywords:
+            if keyword in message_lower:
+                return "positive"
+        
+        # Verificar negativos
+        for keyword in negative_keywords:
+            if keyword in message_lower:
+                return "negative"
+        
+        return "unclear"
+
+    def process_message(self, message: str, phone: str, db: Session) -> str:
+        """Processa uma mensagem do usuário e retorna a resposta com contexto persistente"""
+        try:
+            # 1. Carregar contexto do banco
+            context = db.query(ConversationContext).filter_by(phone=phone).first()
+            if not context:
+                # Primeira mensagem deste usuário, criar contexto novo
+                context = ConversationContext(
+                    phone=phone,
+                    messages=[],
+                    status="active"
                 )
-                
-                logger.info(f"🤖 Enviando {len(context.messages)} mensagens para Claude")
-                
-                # 7. Processar resposta do Claude
-                bot_response = ""
-                current_response = response
-                max_iterations = 5
-                iteration = 0
-                
-                while iteration < max_iterations:
-                    iteration += 1
-                    
-                    if current_response.stop_reason == "tool_use":
-                        # Claude quer usar uma tool
-                        tool_use = current_response.content[0]
-                        tool_name = tool_use.name
-                        tool_input = tool_use.input
-                        
-                        logger.info(f"🔧 Executando tool: {tool_name} com input: {tool_input}")
-                        
-                        # Executar tool
-                        tool_result = self._execute_tool(tool_name, tool_input, db, phone)
-                        
-                        # Adicionar tool use e result ao contexto
-                        context.messages.append({
-                            "role": "assistant", 
-                            "content": [{"type": "tool_use", "name": tool_name, "input": tool_input}]
-                        })
-                        context.messages.append({
-                            "role": "user", 
-                            "content": [{"type": "tool_result", "tool_use_id": tool_use.id, "content": tool_result}]
-                        })
-                        
-                        # Continuar conversa com Claude
-                        current_response = self.anthropic.messages.create(
-                            model="claude-3-5-sonnet-20241022",
-                            max_tokens=4000,
-                            system=self._create_system_prompt(),
-                            messages=context.messages,
-                            tools=self._define_tools()
-                        )
-                        
-                        logger.info(f"🔧 Iteration {iteration}: Tool {tool_name} result: {tool_result}")
-                        
-                        if current_response.stop_reason == "end_turn":
-                            # Claude terminou, pegar resposta final
-                            if current_response.content and current_response.content[0].type == "text":
-                                bot_response = current_response.content[0].text
-                            break
-                        elif current_response.stop_reason == "tool_use":
-                            # Claude quer usar outra tool, continuar loop
-                            continue
-                        else:
-                            # Outro motivo de parada
-                            bot_response = "Desculpe, não consegui processar sua solicitação completamente."
-                            break
-                    else:
-                        # Claude retornou texto direto
-                        if current_response.content and current_response.content[0].type == "text":
-                            bot_response = current_response.content[0].text
-                        else:
-                            bot_response = "Desculpe, não consegui processar sua solicitação."
-                        break
-                
-                # 7.5. Persistir dados incrementalmente no flow_data
-                if not context.flow_data:
-                    context.flow_data = {}
-                
-                extracted = self._extract_appointment_data_from_messages(context.messages)
-                
-                if extracted.get("patient_name") and not context.flow_data.get("patient_name"):
-                    context.flow_data["patient_name"] = extracted["patient_name"]
-                    logger.info(f"💾 Nome salvo no flow_data: {extracted['patient_name']}")
-                
-                if extracted.get("patient_birth_date") and not context.flow_data.get("patient_birth_date"):
-                    context.flow_data["patient_birth_date"] = extracted["patient_birth_date"]
-                    logger.info(f"💾 Data nascimento salva no flow_data: {extracted['patient_birth_date']}")
-                
-                if extracted.get("appointment_date") and not context.flow_data.get("appointment_date"):
-                    context.flow_data["appointment_date"] = extracted["appointment_date"]
-                    logger.info(f"💾 Data consulta salva no flow_data: {extracted['appointment_date']}")
-                
-                if extracted.get("appointment_time") and not context.flow_data.get("appointment_time"):
-                    context.flow_data["appointment_time"] = extracted["appointment_time"]
-                    logger.info(f"💾 Horário consulta salvo no flow_data: {extracted['appointment_time']}")
-                
-                if extracted.get("consultation_type") and not context.flow_data.get("consultation_type"):
-                    context.flow_data["consultation_type"] = extracted["consultation_type"]
-                    logger.info(f"💾 Tipo consulta salvo no flow_data: {extracted['consultation_type']}")
-                
-                # 8. Adicionar resposta do bot ao contexto
-                if bot_response:
-                    context.messages.append({"role": "assistant", "content": bot_response})
-                
-                # 9. Atualizar contexto no banco
-                context.last_activity = datetime.utcnow()
+                db.add(context)
+                logger.info(f"🆕 Novo contexto criado para {phone}")
+            else:
+                logger.info(f"📱 Contexto carregado para {phone}: {len(context.messages)} mensagens")
+            
+            # 2. Verificação de timeout removida - agora é proativa via scheduler
+            
+            # 3. Decidir se deve encerrar contexto por resposta negativa
+            if self._should_end_context(context, message):
+                logger.info(f"🔚 Encerrando contexto para {phone} por resposta negativa do usuário")
+                db.delete(context)
                 db.commit()
+                return "Foi um prazer atender você! Até logo! 😊"
+
+            # 4. Verificar se há confirmação pendente ANTES de processar com Claude
+            if context.flow_data and context.flow_data.get("pending_confirmation"):
+                intent = self._detect_confirmation_intent(message)
                 
-                logger.info(f"💾 Contexto salvo para {phone}: {len(context.messages)} mensagens")
-                return bot_response
+                if intent == "positive":
+                    # Usuário confirmou! Executar agendamento
+                    logger.info(f"✅ Usuário {phone} confirmou agendamento")
+                    
+                    # Usar dados do flow_data (NÃO re-extrair do histórico)
+                    data = context.flow_data or {}
+                    
+                    # Se faltar nome ou data de nascimento, extrair do histórico APENAS UMA VEZ
+                    if not data.get("patient_name") or not data.get("patient_birth_date"):
+                        logger.info(f"🔍 Dados incompletos no flow_data, extraindo do histórico: {data}")
+                        extracted = self._extract_appointment_data_from_messages(context.messages)
+                        data["patient_name"] = data.get("patient_name") or extracted.get("patient_name")
+                        data["patient_birth_date"] = data.get("patient_birth_date") or extracted.get("patient_birth_date")
+                        logger.info(f"🔍 Dados após extração: {data}")
+                    
+                    # Criar agendamento
+                    result = self._handle_create_appointment({
+                        "patient_name": data.get("patient_name"),
+                        "patient_birth_date": data.get("patient_birth_date"),
+                        "appointment_date": data.get("appointment_date"),
+                        "appointment_time": data.get("appointment_time"),
+                        "patient_phone": phone
+                    }, db, phone)
+                    
+                    # Limpar pending_confirmation
+                    if not context.flow_data:
+                        context.flow_data = {}
+                    context.flow_data["pending_confirmation"] = False
+                    context.messages.append({
+                        "role": "user",
+                        "content": message,
+                        "timestamp": datetime.utcnow().isoformat()
+                    })
+                    context.messages.append({
+                        "role": "assistant",
+                        "content": result,
+                        "timestamp": datetime.utcnow().isoformat()
+                    })
+                    context.last_activity = datetime.utcnow()
+                    db.commit()
+                    
+                    return result
+                
+                elif intent == "negative":
+                    # Usuário NÃO confirmou, quer mudar
+                    logger.info(f"❌ Usuário {phone} não confirmou, pedindo alteração")
+                    
+                    # Limpar pending_confirmation
+                    if not context.flow_data:
+                        context.flow_data = {}
+                    context.flow_data["pending_confirmation"] = False
+                    db.commit()
+                    
+                    # Perguntar o que mudar
+                    response = "Sem problemas! O que você gostaria de mudar?\n\n" \
+                               "1️⃣ Data\n" \
+                               "2️⃣ Horário\n" \
+                               "3️⃣ Ambos"
+                    
+                    context.messages.append({
+                        "role": "user",
+                        "content": message,
+                        "timestamp": datetime.utcnow().isoformat()
+                    })
+                    context.messages.append({
+                        "role": "assistant",
+                        "content": response,
+                        "timestamp": datetime.utcnow().isoformat()
+                    })
+                    context.last_activity = datetime.utcnow()
+                    db.commit()
+                    
+                    return response
+                
+                # Se unclear, processar normalmente com Claude
+                logger.info(f"⚠️ Intenção não clara, processando com Claude")
+
+            # 5. Adicionar mensagem do usuário ao histórico
+            context.messages.append({
+                "role": "user",
+                "content": message,
+                "timestamp": datetime.utcnow().isoformat()
+            })
+            flag_modified(context, 'messages')
+
+            # 6. Preparar mensagens para Claude (histórico completo)
+            claude_messages = []
+            for msg in context.messages:
+                claude_messages.append({
+                    "role": msg["role"],
+                    "content": msg["content"]
+                })
+            
+            # 6. Fazer chamada para o Claude com histórico completo
+            logger.info(f"🤖 Enviando {len(claude_messages)} mensagens para Claude")
+            response = self.client.messages.create(
+                model="claude-3-5-sonnet-20241022",
+                max_tokens=2000,
+                temperature=0.1,
+                system=self.system_prompt,
+                messages=claude_messages,  # ✅ HISTÓRICO COMPLETO!
+                tools=self.tools
+            )
+            
+            # 7. Processar resposta do Claude
+            if response.content:
+                content = response.content[0]
+                
+                if content.type == "text":
+                    bot_response = content.text
+                elif content.type == "tool_use":
+                    # Loop para processar múltiplas tools em sequência
+                    max_iterations = 5  # Limite de segurança para evitar loops infinitos
+                    iteration = 0
+                    current_response = response
+                    
+                    while iteration < max_iterations:
+                        iteration += 1
+                        
+                        # Verificar se há content na resposta
+                        if not current_response.content or len(current_response.content) == 0:
+                            logger.warning(f"⚠️ Iteration {iteration}: Claude retornou resposta vazia")
+                            # Se há tool_result anterior, usar como fallback
+                            if 'tool_result' in locals():
+                                # Se tool_result indica disponibilidade, tentar criar agendamento automaticamente
+                                if "disponível" in tool_result.lower():
+                                    # Extrair dados das mensagens e criar agendamento diretamente
+                                    logger.warning("⚠️ Claude não criou agendamento, fazendo fallback automático")
+                                    try:
+                                        # Extrair dados do histórico de mensagens
+                                        appointment_data = self._extract_appointment_data_from_messages(context.messages) or {}
+                                        
+                                        # Adicionar telefone do paciente (disponível no contexto phone)
+                                        appointment_data["patient_phone"] = phone
+                                        
+                                        logger.info(f"📋 Dados extraídos: {appointment_data}")
+                                        
+                                        # Validar se todos os dados foram extraídos
+                                        required = [
+                                            "patient_name","patient_birth_date","appointment_date","appointment_time","patient_phone"
+                                        ]
+                                        missing = [k for k in required if not appointment_data.get(k)]
+                                        if not missing:
+                                            appointment_result = self._handle_create_appointment(appointment_data, db)
+                                            bot_response = f"Perfeito! {appointment_result}"
+                                        else:
+                                            logger.error(f"❌ Dados incompletos extraídos: {appointment_data}")
+                                            bot_response = (
+                                                "Quase lá! Preciso só de: " + ", ".join(missing) + ". "
+                                                "Por favor, me informe para concluir o agendamento."
+                                            )
+                                    except Exception as e:
+                                        logger.error(f"Erro no fallback automático: {e}", exc_info=True)
+                                        bot_response = tool_result
+                                else:
+                                    bot_response = tool_result
+                            else:
+                                bot_response = "Desculpe, não consegui processar sua solicitação completamente."
+                            break
+                        
+                        content = current_response.content[0]
+                        
+                        if content.type == "text":
+                            # Claude retornou texto final, sair do loop
+                            bot_response = content.text
+                            break
+                        elif content.type == "tool_use":
+                            # Executar tool
+                            tool_result = self._execute_tool(content.name, content.input, db, phone)
+                            
+                            # Verificação especial para validate_and_check_availability
+                            if content.name == "validate_and_check_availability":
+                                if "disponível" in tool_result.lower() and "não" not in tool_result.lower():
+                                    # Horário disponível, adicionar hint para Claude criar agendamento
+                                    tool_result += "\n\n[SYSTEM: Execute create_appointment agora com os dados coletados: nome, data_nascimento, data_consulta, horario_consulta]"
+                            
+                            logger.info(f"🔧 Iteration {iteration}: Tool {content.name} result: {tool_result[:200] if len(tool_result) > 200 else tool_result}")
+                            
+                            # Fazer follow-up com o resultado
+                            current_response = self.client.messages.create(
+                                model="claude-3-5-sonnet-20241022",
+                                max_tokens=2000,
+                                temperature=0.1,
+                                system=self.system_prompt,
+                                messages=claude_messages + [
+                                    {"role": "assistant", "content": current_response.content},
+                                    {
+                                        "role": "user",
+                                        "content": [
+                                            {
+                                                "type": "tool_result",
+                                                "tool_use_id": content.id,
+                                                "content": tool_result
+                                            }
+                                        ]
+                                    }
+                                ]
+                            )
+                            logger.info(f"📋 Response content length: {len(current_response.content) if current_response.content else 0}")
+                            logger.info(f"📋 Response stop_reason: {current_response.stop_reason}")
+                            
+                            # Continuar loop para processar próxima resposta
+                        else:
+                            # Tipo desconhecido, sair do loop
+                            logger.warning(f"⚠️ Tipo de conteúdo desconhecido: {content.type}")
+                            bot_response = tool_result if 'tool_result' in locals() else "Desculpe, não consegui processar sua mensagem."
+                            break
+                    
+                    # Se atingiu o limite de iterações sem retornar texto
+                    if iteration >= max_iterations:
+                        logger.error(f"❌ Limite de iterações atingido ({max_iterations})")
+                        if 'tool_result' in locals():
+                            logger.info(f"📤 Usando último tool_result como resposta")
+                            bot_response = tool_result
+                        else:
+                            bot_response = "Desculpe, houve um problema ao processar sua solicitação. Tente novamente."
+                else:
+                    bot_response = "Desculpe, não consegui processar sua mensagem. Tente novamente."
+            else:
+                bot_response = "Desculpe, não consegui processar sua mensagem. Tente novamente."
+            
+            # 7. Salvar resposta do Claude no histórico
+            context.messages.append({
+                "role": "assistant",
+                "content": bot_response,
+                "timestamp": datetime.utcnow().isoformat()
+            })
+            flag_modified(context, 'messages')
+            
+            # 7.5. Persistir dados incrementalmente no flow_data
+            # Após cada resposta do Claude, verificar se coletou nome ou data nascimento
+            # e salvar no flow_data imediatamente (não sobrescrever dados existentes)
+            if not context.flow_data:
+                context.flow_data = {}
+            
+            # Extrair dados do histórico
+            extracted = self._extract_appointment_data_from_messages(context.messages)
+            
+            # Salvar no flow_data APENAS os campos que ainda não existem
+            if extracted.get("patient_name") and not context.flow_data.get("patient_name"):
+                context.flow_data["patient_name"] = extracted["patient_name"]
+                logger.info(f"💾 Nome salvo no flow_data: {extracted['patient_name']}")
+            
+            if extracted.get("patient_birth_date") and not context.flow_data.get("patient_birth_date"):
+                context.flow_data["patient_birth_date"] = extracted["patient_birth_date"]
+                logger.info(f"💾 Data nascimento salva no flow_data: {extracted['patient_birth_date']}")
+            
+            if extracted.get("appointment_date") and not context.flow_data.get("appointment_date"):
+                context.flow_data["appointment_date"] = extracted["appointment_date"]
+                logger.info(f"💾 Data consulta salva no flow_data: {extracted['appointment_date']}")
+            
+            if extracted.get("appointment_time") and not context.flow_data.get("appointment_time"):
+                context.flow_data["appointment_time"] = extracted["appointment_time"]
+                logger.info(f"💾 Horário consulta salvo no flow_data: {extracted['appointment_time']}")
+            
+            # 8. Atualizar contexto no banco
+            context.last_activity = datetime.utcnow()
+            db.commit()
+            
+            logger.info(f"💾 Contexto salvo para {phone}: {len(context.messages)} mensagens")
+            return bot_response
                 
         except Exception as e:
             logger.error(f"Erro ao processar mensagem: {str(e)}")
@@ -683,8 +773,10 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                 return self._handle_request_human_assistance(tool_input, db, phone)
             elif tool_name == "end_conversation":
                 return self._handle_end_conversation(tool_input, db, phone)
-            else:
-                return f"Tool '{tool_name}' não reconhecida."
+            
+            # Tool não reconhecida
+            logger.warning(f"❌ Tool não reconhecida: {tool_name}")
+            return f"Tool '{tool_name}' não reconhecida."
         except Exception as e:
             logger.error(f"Erro ao executar tool {tool_name}: {str(e)}")
             return f"Erro ao executar {tool_name}: {str(e)}"
@@ -754,7 +846,12 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
             if not appointment_date:
                 return "Data inválida. Use o formato DD/MM/AAAA."
             
-            # Verificar dia da semana
+            # Verificar se está em dias_fechados
+            dias_fechados = self.clinic_info.get('dias_fechados', [])
+            if date_str in dias_fechados:
+                return f"❌ A clínica estará fechada em {date_str} por motivo especial."
+            
+            # Obter dia da semana
             weekday = appointment_date.strftime('%A').lower()
             weekday_map = {
                 'monday': 'segunda',
@@ -767,6 +864,7 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
             }
             weekday_pt = weekday_map.get(weekday, weekday)
             
+            # Verificar horários de funcionamento
             horarios = self.clinic_info.get('horario_funcionamento', {})
             horario_dia = horarios.get(weekday_pt, "FECHADO")
             
@@ -776,19 +874,20 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
             
             # Verificar se horário está dentro do funcionamento
             try:
-                time_obj = datetime.strptime(time_str, '%H:%M').time()
-                start_time, end_time = horario_dia.split('-')
-                start_obj = datetime.strptime(start_time, '%H:%M').time()
-                end_obj = datetime.strptime(end_time, '%H:%M').time()
+                hora_consulta = datetime.strptime(time_str, '%H:%M').time()
+                hora_inicio, hora_fim = horario_dia.split('-')
+                hora_inicio = datetime.strptime(hora_inicio, '%H:%M').time()
+                hora_fim = datetime.strptime(hora_fim, '%H:%M').time()
                 
-                if start_obj <= time_obj <= end_obj:
-                    return f"✅ Horário {time_str} está dentro do funcionamento da clínica."
+                if hora_inicio <= hora_consulta <= hora_fim:
+                    return f"✅ Horário válido! A clínica funciona das {hora_inicio.strftime('%H:%M')} às {hora_fim.strftime('%H:%M')} aos {weekday_pt}s."
                 else:
-                    return f"❌ Horário {time_str} está fora do funcionamento. Horário de funcionamento: {horario_dia}"
-                    
+                    return f"❌ Horário inválido! A clínica funciona das {hora_inicio.strftime('%H:%M')} às {hora_fim.strftime('%H:%M')} aos {weekday_pt}s.\n" + \
+                           f"Por favor, escolha um horário entre {hora_inicio.strftime('%H:%M')} e {hora_fim.strftime('%H:%M')}."
+                           
             except ValueError:
-                return "Formato de horário inválido. Use HH:MM."
-                
+                return "Formato de horário inválido. Use HH:MM (ex: 14:30)."
+            
         except Exception as e:
             logger.error(f"Erro ao validar horário: {str(e)}")
             return f"Erro ao validar horário: {str(e)}"
@@ -835,32 +934,33 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
             }
             weekday_pt = weekday_map.get(weekday, weekday)
             
-            # Verificar horário de funcionamento
+            # Verificar horários de funcionamento
             horarios = self.clinic_info.get('horario_funcionamento', {})
             horario_dia = horarios.get(weekday_pt, "FECHADO")
             
             if horario_dia == "FECHADO":
-                return False, f"❌ A clínica não funciona aos {weekday_pt}s."
+                return False, f"❌ A clínica não funciona aos {weekday_pt}s. Horários de funcionamento:\n" + \
+                       self._format_business_hours()
             
-            # Verificar se está dentro do horário
+            # Verificar se horário atual está dentro do funcionamento
             try:
-                time_obj = datetime.strptime(time_str, '%H:%M').time()
-                start_time, end_time = horario_dia.split('-')
-                start_obj = datetime.strptime(start_time, '%H:%M').time()
-                end_obj = datetime.strptime(end_time, '%H:%M').time()
+                hora_atual = now_br.time()
+                hora_inicio, hora_fim = horario_dia.split('-')
+                hora_inicio = datetime.strptime(hora_inicio, '%H:%M').time()
+                hora_fim = datetime.strptime(hora_fim, '%H:%M').time()
                 
-                if start_obj <= time_obj <= end_obj:
-                    return True, f"✅ A clínica está aberta agora ({time_str})."
+                if hora_inicio <= hora_atual <= hora_fim:
+                    return True, f"✅ A clínica está aberta! Funcionamos das {hora_inicio.strftime('%H:%M')} às {hora_fim.strftime('%H:%M')} aos {weekday_pt}s."
                 else:
-                    return False, f"❌ A clínica está fechada agora ({time_str}). Funciona das {start_time} às {end_time}."
-                    
+                    return False, f"❌ A clínica está fechada no momento. Funcionamos das {hora_inicio.strftime('%H:%M')} às {hora_fim.strftime('%H:%M')} aos {weekday_pt}s."
+                            
             except ValueError:
-                return False, "❌ Erro ao verificar horário de funcionamento."
-                
+                return False, "Erro ao verificar horário de funcionamento."
+            
         except Exception as e:
             logger.error(f"Erro ao verificar se clínica está aberta: {str(e)}")
-            return False, f"❌ Erro ao verificar horário: {str(e)}"
-
+            return False, f"Erro ao verificar horário: {str(e)}"
+    
     def _handle_validate_and_check_availability(self, tool_input: Dict, db: Session) -> str:
         """Tool: validate_and_check_availability - Valida horário de funcionamento + disponibilidade"""
         try:
@@ -911,42 +1011,40 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
             
             # 4. Verificar se horário está dentro do funcionamento
             try:
-                time_obj = datetime.strptime(time_str, '%H:%M').time()
-                start_time, end_time = horario_dia.split('-')
-                start_obj = datetime.strptime(start_time, '%H:%M').time()
-                end_obj = datetime.strptime(end_time, '%H:%M').time()
+                hora_consulta_original = datetime.strptime(time_str, '%H:%M').time()
+                hora_inicio, hora_fim = horario_dia.split('-')
+                hora_inicio = datetime.strptime(hora_inicio, '%H:%M').time()
+                hora_fim = datetime.strptime(hora_fim, '%H:%M').time()
                 
-                if not (start_obj <= time_obj <= end_obj):
+                # Arredondar minuto para cima ao próximo múltiplo de 5
+                appointment_datetime_tmp = datetime.combine(appointment_date.date(), hora_consulta_original)
+                hora_consulta_dt = round_up_to_next_5_minutes(appointment_datetime_tmp)
+                hora_consulta = hora_consulta_dt.time()
+                
+                if not (hora_inicio <= hora_consulta <= hora_fim):
                     logger.warning(f"❌ Horário {time_str} fora do funcionamento")
-                    return f"❌ Horário {time_str} está fora do funcionamento. Horário de funcionamento: {horario_dia}"
-                    
+                    return f"❌ Horário inválido! A clínica funciona das {hora_inicio.strftime('%H:%M')} às {hora_fim.strftime('%H:%M')} aos {weekday_pt}s.\n" + \
+                           f"Por favor, escolha um horário entre {hora_inicio.strftime('%H:%M')} e {hora_fim.strftime('%H:%M')}."
+                           
             except ValueError:
                 logger.warning(f"❌ Formato de horário inválido: {time_str}")
-                return "Formato de horário inválido. Use HH:MM."
+                return "Formato de horário inválido. Use HH:MM (ex: 14:30)."
             
-            # 5. Verificar disponibilidade do horário
+            # 5. Verificar disponibilidade no banco de dados
+            appointment_datetime = datetime.combine(appointment_date.date(), hora_consulta)
             duracao = self.clinic_info.get('regras_agendamento', {}).get('duracao_consulta_minutos', 60)
             
-            # Combinar data e horário
-            hora_consulta = datetime.combine(appointment_date.date(), time_obj)
-            
-            # Arredondar para múltiplo de 5 minutos
-            hora_consulta = round_up_to_next_5_minutes(hora_consulta)
-            
-            # Localizar no timezone do Brasil
-            tz = get_brazil_timezone()
-            if hora_consulta.tzinfo is None:
-                hora_consulta = tz.localize(hora_consulta)
-            
-            # Verificar disponibilidade
-            is_available = appointment_rules.check_slot_availability(hora_consulta, duracao, db)
+            # Usar nova função para verificar disponibilidade
+            is_available = appointment_rules.check_slot_availability(appointment_datetime, duracao, db)
             
             if is_available:
                 ajuste_msg = ""
                 if hora_consulta.strftime('%H:%M') != time_str:
                     ajuste_msg = f" (ajustado para {hora_consulta.strftime('%H:%M')})"
                 logger.info(f"✅ Horário {hora_consulta.strftime('%H:%M')} disponível!{ajuste_msg}")
-
+                
+                # Salvar dados no flow_data para confirmação
+                # Buscar contexto do usuário atual (precisa do phone do contexto)
                 phone = tool_input.get("patient_phone")
                 if phone:
                     context = db.query(ConversationContext).filter_by(phone=phone).first()
@@ -960,14 +1058,14 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                         context.flow_data.update({
                             "patient_name": context.flow_data.get("patient_name") or extracted.get("patient_name"),
                             "patient_birth_date": context.flow_data.get("patient_birth_date") or extracted.get("patient_birth_date"),
-                            "consultation_type": context.flow_data.get("consultation_type") or extracted.get("consultation_type"),
                             "appointment_date": date_str,
                             "appointment_time": hora_consulta.strftime('%H:%M'),
                             "pending_confirmation": True
                         })
                         db.commit()
                         logger.info(f"💾 Dados salvos no flow_data para confirmação: {context.flow_data}")
-
+                
+                # Retornar mensagem de confirmação
                 return f"✅ Horário {hora_consulta.strftime('%H:%M')} disponível!{ajuste_msg}\n\n" \
                        f"📋 *Resumo da sua consulta:*\n" \
                        f"📅 Data: {date_str}\n" \
@@ -1036,7 +1134,6 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
             patient_birth_date = tool_input.get("patient_birth_date")
             appointment_date = tool_input.get("appointment_date")
             appointment_time = tool_input.get("appointment_time")
-            consultation_type = tool_input.get("consultation_type")
             notes = tool_input.get("notes", "")
             
             if not all([patient_name, patient_phone, patient_birth_date, appointment_date, appointment_time]):
@@ -1081,12 +1178,6 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
             if not is_available:
                 return f"❌ Horário {appointment_time} não está disponível. Use a tool check_availability para ver horários disponíveis."
             
-            # Buscar informações do tipo de consulta
-            tipos_consulta = self.clinic_info.get('tipos_consulta', {})
-            tipo_info = tipos_consulta.get(consultation_type or 'clinica_geral', {})
-            tipo_nome = tipo_info.get('nome', 'Clínica Geral')
-            tipo_valor = tipo_info.get('valor', 300)
-            
             # Criar agendamento - SALVAR COMO STRING YYYYMMDD para evitar problemas de timezone
             appointment_datetime_formatted = str(appointment_datetime.strftime('%Y%m%d'))  # "20251022" - GARANTIR STRING
             
@@ -1097,7 +1188,6 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                 appointment_date=appointment_datetime_formatted,  # "20251022" - STRING EXPLÍCITA
                 appointment_time=appointment_time,  # Salvar como string HH:MM
                 duration_minutes=duracao,
-                consultation_type=consultation_type or 'clinica_geral',
                 status=AppointmentStatus.AGENDADA,
                 notes=notes
             )
@@ -1107,8 +1197,6 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
             
             return f"✅ **Agendamento realizado com sucesso!**\n\n" + \
                    f"👤 **Paciente:** {patient_name}\n" + \
-                   f"🩺 **Tipo:** {tipo_nome}\n" + \
-                   f"💰 **Valor:** R$ {tipo_valor}\n" + \
                    f"📅 **Data:** {appointment_datetime.strftime('%d/%m/%Y')}\n" + \
                    f"⏰ **Horário:** {appointment_datetime.strftime('%H:%M')}\n" + \
                    f"⏱️ **Duração:** {duracao} minutos\n" + \
