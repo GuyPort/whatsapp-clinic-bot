@@ -555,8 +555,7 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                     max_tokens=4000,
                     system=self._create_system_prompt(),
                     messages=context.messages,
-                    tools=self._define_tools(),
-                    tool_choice="auto"
+                    tools=self._define_tools()
                 )
                 
                 logger.info(f"🤖 Enviando {len(context.messages)} mensagens para Claude")
@@ -599,8 +598,7 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                             max_tokens=4000,
                             system=self._create_system_prompt(),
                             messages=context.messages,
-                            tools=self._define_tools(),
-                            tool_choice="auto"
+                            tools=self._define_tools()
                         )
                         
                         logger.info(f"🔧 Iteration {iteration}: Tool {tool_name} result: {tool_result}")
