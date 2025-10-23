@@ -35,6 +35,7 @@ class Appointment(Base):
     appointment_date = Column(String(10), nullable=False, index=True)  # Data da consulta (YYYYMMDD)
     appointment_time = Column(String(5), nullable=False)  # Horário da consulta (HH:MM)
     duration_minutes = Column(Integer, default=60, nullable=False)  # Duração em minutos
+    consultation_type = Column(String(50), nullable=True)  # Tipo de consulta (clinica_geral, geriatria, domiciliar)
     
     # Status e controle
     status = Column(Enum(AppointmentStatus), default=AppointmentStatus.AGENDADA, nullable=False, index=True)
@@ -108,6 +109,7 @@ class ConversationContext(Base):
     #     "patient_birth_date": "...", 
     #     "appointment_date": "...",
     #     "appointment_time": "...",
+    #     "consultation_type": "...",  # Tipo de consulta (clinica_geral, geriatria, domiciliar)
     #     "pending_confirmation": True/False  # Flag para confirmação pendente
     # }
     

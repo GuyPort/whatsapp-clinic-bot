@@ -25,6 +25,21 @@
     "duracao_consulta_minutos": 60
   },
   
+  "tipos_consulta": {
+    "clinica_geral": {
+      "nome": "Clínica Geral",
+      "valor": 300
+    },
+    "geriatria": {
+      "nome": "Geriatria Clínica e Preventiva",
+      "valor": 300
+    },
+    "domiciliar": {
+      "nome": "Atendimento Domiciliar ao Paciente Idoso",
+      "valor": 500
+    }
+  },
+  
   "informacoes_adicionais": {
     "formas_pagamento": ["Dinheiro", "Cartão de crédito", "Cartão de débito", "Pix"],
     "politica_cancelamento": "Cancelamentos devem ser feitos com no mínimo 24 horas de antecedência",

@@ -482,6 +482,7 @@ async def get_scheduled_appointments():
                     "appointment_date": _format_appointment_date(apt.appointment_date),  # ← FORMATAR AQUI TAMBÉM
                     "appointment_date_br": _format_appointment_date(apt.appointment_date),  # Converter qualquer formato para DD/MM/YYYY
                     "appointment_time": apt.appointment_time,  # String HH:MM
+                    "consultation_type": apt.consultation_type,
                     "status": apt.status.value,
                     "duration_minutes": apt.duration_minutes,
                     "notes": apt.notes,
@@ -536,6 +537,22 @@ async def clean_database():
         logger.error(f"Erro ao limpar banco: {str(e)}")
         return {"message": f"❌ Erro ao limpar banco: {str(e)}", "status": "error"}
 
+
+@app.post("/admin/migrate-add-consultation-type")
+async def migrate_add_consultation_type():
+    """Endpoint para executar migração que adiciona coluna consultation_type"""
+    try:
+        from migrate_add_consultation_type import migrate_add_consultation_type
+        
+        result = migrate_add_consultation_type()
+        
+        if result.get("success"):
+            return {"success": True, "message": result.get("message", "Migração executada com sucesso")}
+        else:
+            return {"success": False, "error": result.get("error", "Erro desconhecido")}
+            
+    except Exception as e:
+        return {"success": False, "error": str(e)}
 
 @app.get("/admin/dashboard")
 async def get_dashboard():
@@ -832,6 +849,7 @@ async def dashboard():
                                     <th>Data de Nascimento</th>
                                     <th>Data da Consulta</th>
                                     <th>Horário</th>
+                                    <th>Tipo de Consulta</th>
                                     <th>Status</th>
                                     <th>Duração</th>
                                 </tr>
@@ -849,6 +867,11 @@ async def dashboard():
                                         <td>${formatDate(appointment.appointment_date)}</td>
                                         <td>
                                             <strong class="text-primary">${formatTime(appointment.appointment_time)}</strong>
+                                        </td>
+                                        <td>
+                                            <span class="badge bg-info text-white">
+                                                ${getConsultationTypeText(appointment.consultation_type)}
+                                            </span>
                                         </td>
                                         <td>
                                             <span class="status-badge status-${appointment.status}">
@@ -896,6 +919,15 @@ async def dashboard():
             function formatDateTime(dateTimeStr) {
                 const date = new Date(dateTimeStr);
                 return date.toLocaleString('pt-BR');
+            }
+
+            function getConsultationTypeText(type) {
+                const typeMap = {
+                    'clinica_geral': 'Clínica Geral',
+                    'geriatria': 'Geriatria Clínica e Preventiva',
+                    'domiciliar': 'Atendimento Domiciliar'
+                };
+                return typeMap[type] || 'Clínica Geral';
             }
 
             function getStatusText(status) {
