@@ -339,13 +339,24 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                     # Remover pontuação final e espaços extras
                     cleaned_content = re.sub(r'[!.?,;]+$', '', cleaned_content).strip()
                     
+                    # Lista de frases que NÃO são nomes
+                    invalid_name_phrases = [
+                        "por favor", "pode verificar", "tá bom", "está bem", 
+                        "confirma", "confirmado", "sim por favor", "pode ser",
+                        "perfeito", "obrigado", "obrigada", "valeu", "verificar",
+                        "confirmar", "pode", "sim", "não", "nao"
+                    ]
+                    
+                    # Verificar se contém frases inválidas
+                    contains_invalid_phrase = any(phrase in cleaned_content.lower() for phrase in invalid_name_phrases)
+                    
                     # Verificar se é um nome válido
                     has_letters = re.search(r"[A-Za-zÀ-ÿ]", cleaned_content) is not None
                     has_bad_symbols = re.search(r"[:=/]", cleaned_content) is not None
                     is_only_digits = re.fullmatch(r"\d+", cleaned_content) is not None
                     is_menu_or_greeting = cleaned_content.lower() in ["olá", "olá!", "oi", "oi!", "1", "2", "3"]
                     
-                    if has_letters and not has_bad_symbols and not is_only_digits and not is_menu_or_greeting and len(cleaned_content) > 1:
+                    if has_letters and not has_bad_symbols and not is_only_digits and not is_menu_or_greeting and len(cleaned_content) > 1 and not contains_invalid_phrase:
                         data["patient_name"] = cleaned_content
             
             logger.info(f"📋 Extração concluída: {data}")
@@ -460,8 +471,16 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                     # Usuário confirmou! Executar agendamento
                     logger.info(f"✅ Usuário {phone} confirmou agendamento")
                     
-                    # Extrair dados
+                    # Usar dados do flow_data (NÃO re-extrair do histórico)
                     data = context.flow_data or {}
+                    
+                    # Se faltar nome ou data de nascimento, extrair do histórico APENAS UMA VEZ
+                    if not data.get("patient_name") or not data.get("patient_birth_date"):
+                        logger.info(f"🔍 Dados incompletos no flow_data, extraindo do histórico: {data}")
+                        extracted = self._extract_appointment_data_from_messages(context.messages)
+                        data["patient_name"] = data.get("patient_name") or extracted.get("patient_name")
+                        data["patient_birth_date"] = data.get("patient_birth_date") or extracted.get("patient_birth_date")
+                        logger.info(f"🔍 Dados após extração: {data}")
                     
                     # Criar agendamento
                     result = self._handle_create_appointment({
@@ -676,6 +695,32 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                 "timestamp": datetime.utcnow().isoformat()
             })
             flag_modified(context, 'messages')
+            
+            # 7.5. Persistir dados incrementalmente no flow_data
+            # Após cada resposta do Claude, verificar se coletou nome ou data nascimento
+            # e salvar no flow_data imediatamente (não sobrescrever dados existentes)
+            if not context.flow_data:
+                context.flow_data = {}
+            
+            # Extrair dados do histórico
+            extracted = self._extract_appointment_data_from_messages(context.messages)
+            
+            # Salvar no flow_data APENAS os campos que ainda não existem
+            if extracted.get("patient_name") and not context.flow_data.get("patient_name"):
+                context.flow_data["patient_name"] = extracted["patient_name"]
+                logger.info(f"💾 Nome salvo no flow_data: {extracted['patient_name']}")
+            
+            if extracted.get("patient_birth_date") and not context.flow_data.get("patient_birth_date"):
+                context.flow_data["patient_birth_date"] = extracted["patient_birth_date"]
+                logger.info(f"💾 Data nascimento salva no flow_data: {extracted['patient_birth_date']}")
+            
+            if extracted.get("appointment_date") and not context.flow_data.get("appointment_date"):
+                context.flow_data["appointment_date"] = extracted["appointment_date"]
+                logger.info(f"💾 Data consulta salva no flow_data: {extracted['appointment_date']}")
+            
+            if extracted.get("appointment_time") and not context.flow_data.get("appointment_time"):
+                context.flow_data["appointment_time"] = extracted["appointment_time"]
+                logger.info(f"💾 Horário consulta salvo no flow_data: {extracted['appointment_time']}")
             
             # 8. Atualizar contexto no banco
             context.last_activity = datetime.utcnow()
@@ -952,10 +997,15 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                 if phone:
                     context = db.query(ConversationContext).filter_by(phone=phone).first()
                     if context:
-                        # Salvar dados coletados no flow_data
+                        # Extrair dados do histórico ANTES de salvar no flow_data
+                        extracted = self._extract_appointment_data_from_messages(context.messages)
+                        
+                        # Preservar dados já existentes, adicionar novos
                         if not context.flow_data:
                             context.flow_data = {}
                         context.flow_data.update({
+                            "patient_name": context.flow_data.get("patient_name") or extracted.get("patient_name"),
+                            "patient_birth_date": context.flow_data.get("patient_birth_date") or extracted.get("patient_birth_date"),
                             "appointment_date": date_str,
                             "appointment_time": hora_consulta.strftime('%H:%M'),
                             "pending_confirmation": True
@@ -965,7 +1015,7 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                 
                 # Retornar mensagem de confirmação
                 return f"✅ Horário {hora_consulta.strftime('%H:%M')} disponível!{ajuste_msg}\n\n" \
-                       f"📋 **Resumo da sua consulta:**\n" \
+                       f"📋 *Resumo da sua consulta:*\n" \
                        f"📅 Data: {date_str}\n" \
                        f"⏰ Horário: {hora_consulta.strftime('%H:%M')}\n\n" \
                        f"Posso confirmar sua consulta?"
