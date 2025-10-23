@@ -511,8 +511,8 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                         context.flow_data["pending_confirmation"] = False
                         
                         # Adicionar mensagens ao histórico
-                        context.messages.append({"role": "user", "content": message, "timestamp": datetime.utcnow().isoformat()})
-                        context.messages.append({"role": "assistant", "content": result, "timestamp": datetime.utcnow().isoformat()})
+                        context.messages.append({"role": "user", "content": message})
+                        context.messages.append({"role": "assistant", "content": result})
                         
                         # Atualizar contexto
                         context.last_activity = datetime.utcnow()
@@ -534,8 +534,8 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                                    "3️⃣ Ambos"
                         
                         # Adicionar mensagens ao histórico
-                        context.messages.append({"role": "user", "content": message, "timestamp": datetime.utcnow().isoformat()})
-                        context.messages.append({"role": "assistant", "content": response, "timestamp": datetime.utcnow().isoformat()})
+                        context.messages.append({"role": "user", "content": message})
+                        context.messages.append({"role": "assistant", "content": response})
                         
                         # Atualizar contexto
                         context.last_activity = datetime.utcnow()
@@ -547,7 +547,7 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                     logger.info(f"⚠️ Intenção não clara, processando com Claude")
 
                 # 5. Adicionar mensagem do usuário ao histórico
-                context.messages.append({"role": "user", "content": message, "timestamp": datetime.utcnow().isoformat()})
+                context.messages.append({"role": "user", "content": message})
                 
                 # 6. Enviar para Claude
                 response = self.anthropic.messages.create(
@@ -583,13 +583,11 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                         # Adicionar tool use e result ao contexto
                         context.messages.append({
                             "role": "assistant", 
-                            "content": [{"type": "tool_use", "name": tool_name, "input": tool_input}],
-                            "timestamp": datetime.utcnow().isoformat()
+                            "content": [{"type": "tool_use", "name": tool_name, "input": tool_input}]
                         })
                         context.messages.append({
                             "role": "user", 
-                            "content": [{"type": "tool_result", "tool_use_id": tool_use.id, "content": tool_result}],
-                            "timestamp": datetime.utcnow().isoformat()
+                            "content": [{"type": "tool_result", "tool_use_id": tool_use.id, "content": tool_result}]
                         })
                         
                         # Continuar conversa com Claude
