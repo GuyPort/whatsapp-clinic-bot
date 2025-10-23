@@ -332,6 +332,23 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
         
         return "unclear"
 
+    def _should_end_context(self, message: str) -> bool:
+        """Detecta se usuário quer encerrar a conversa"""
+        message_lower = message.lower().strip()
+        
+        end_keywords = [
+            "não", "nao", "só isso", "so isso", "obrigado", "obrigada",
+            "valeu", "tchau", "até logo", "ate logo", "adeus", "flw",
+            "não preciso", "nao preciso", "tá bom", "ta bom",
+            "está bem", "esta bem", "ok tchau", "beleza tchau"
+        ]
+        
+        for keyword in end_keywords:
+            if keyword in message_lower:
+                return True
+        
+        return False
+
     def _extract_appointment_data_from_messages(self, messages: list) -> dict:
         """Extrai dados de agendamento do histórico de mensagens.
         Percorre as últimas mensagens para encontrar nome, nascimento, data e horário.
