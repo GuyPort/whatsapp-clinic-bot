@@ -88,9 +88,7 @@ Quando o paciente escolher "1" ou "1️⃣", siga EXATAMENTE este fluxo:
    Digite o número da opção desejada:"
 
 4. Após receber o tipo (1, 2 ou 3):
-   "Ótimo! [Tipo selecionado]
-   
-   Agora me informe qual convênio você possui:
+   "Agora me informe qual convênio você possui:
    
    1️⃣ CABERGS
    2️⃣ IPE
@@ -99,9 +97,7 @@ Quando o paciente escolher "1" ou "1️⃣", siga EXATAMENTE este fluxo:
    Digite o número da opção desejada:"
 
 5. Após receber o convênio (1, 2 ou 3):
-   "Perfeito! [Convênio selecionado]
-   
-   Agora me informe o dia que gostaria de marcar a consulta (DD/MM/AAAA):"
+   "Agora me informe o dia que gostaria de marcar a consulta (DD/MM/AAAA):"
 
 6. Após receber a data desejada:
    "Ótimo! E que horário você prefere? (HH:MM - ex: 14:30):"
