@@ -647,7 +647,11 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                     context.flow_data["consultation_type"] = extracted["consultation_type"]
                     logger.info(f"💾 Tipo consulta salvo no flow_data: {extracted['consultation_type']}")
                 
-                # 8. Atualizar contexto no banco
+                # 8. Adicionar resposta do bot ao contexto
+                if bot_response:
+                    context.messages.append({"role": "assistant", "content": bot_response})
+                
+                # 9. Atualizar contexto no banco
                 context.last_activity = datetime.utcnow()
                 db.commit()
                 
