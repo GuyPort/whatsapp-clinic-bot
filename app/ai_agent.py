@@ -93,13 +93,34 @@ Quando o paciente escolher "1" ou "1️⃣", siga EXATAMENTE este fluxo:
    - Se nome tiver apenas 1 palavra: "Para o cadastro médico, preciso do nome completo (nome e sobrenome)"
    - Se data incompleta: "Preciso da data completa (dia, mês e ano). Ex: 07/08/2003"
 
-   VALIDAÇÃO DE DATA:
-   - Você apenas EXTRAI a data da mensagem do usuário
-   - A função Python valida automaticamente se é válida (não futura)
-   - Você apenas COMUNICA o resultado:
-     • Se houver erro_data → Peça a data correta
-     • Se não houver erro_data → Aceite e continue
-   - NUNCA faça validação manual de datas
+   ⛔ VALIDAÇÃO DE DATA - REGRA ABSOLUTA:
+   
+   A função Python JÁ VALIDOU a data automaticamente.
+   Você APENAS verifica se "erro_data" está presente ou ausente.
+   
+   SE erro_data AUSENTE (null/None):
+     → A data é 100% VÁLIDA
+     → ACEITE imediatamente
+     → Continue para próxima etapa
+     → NUNCA mencione "futuro", "passado" ou "incorreta"
+   
+   SE erro_data PRESENTE:
+     → Peça a data correta
+     → Use a mensagem de erro fornecida
+   
+   PROIBIDO ABSOLUTAMENTE:
+     ❌ Comparar datas manualmente
+     ❌ Pensar se a data "parece estranha"
+     ❌ Rejeitar datas quando erro_data = null
+     ❌ Mencionar "futuro" quando erro_data = null
+   
+   EXEMPLO CORRETO:
+     Extração: {{"data": "12/10/2025", "erro_data": null}}
+     Você: "Perfeito! Agora escolha o tipo de consulta..."
+     
+   EXEMPLO ERRADO:
+     Extração: {{"data": "12/10/2025", "erro_data": null}}
+     Você: "Data está no futuro..." ← NUNCA FAÇA ISSO!
 
 3. Após receber a data de nascimento:
    "Perfeito! Agora me informe qual tipo de consulta você deseja:
@@ -400,6 +421,12 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                 # 2. EXTRAÇÃO DE NOME E DATA - Usar nova função robusta
                 resultado = self._extrair_nome_e_data_robusto(content)
                 
+                # Validação explícita para debug
+                if resultado["data"] and not resultado.get("erro_data"):
+                    logger.info(f"🎯 DATA PASSOU NA VALIDAÇÃO: {resultado['data']} - Claude DEVE aceitar")
+                elif resultado.get("erro_data"):
+                    logger.warning(f"⚠️ DATA REJEITADA PELO PYTHON: {resultado.get('erro_data')}")
+                
                 # Atualizar nome se extraído com sucesso
                 if resultado["nome"] and not data["patient_name"]:
                     data["patient_name"] = resultado["nome"]
@@ -495,11 +522,13 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                         f"A data {dia}/{mes}/{ano} está no futuro. "
                         f"Por favor, informe sua data de nascimento (não pode ser futura)."
                     )
+                    logger.warning(f"❌ DATA FUTURA REJEITADA: {dia}/{mes}/{ano} > {datetime.now().strftime('%d/%m/%Y')}")
                 # Validar idade máxima (120 anos)
                 elif (datetime.now() - data_obj).days / 365.25 > 120:
                     resultado["erro_data"] = "Data de nascimento parece incorreta (mais de 120 anos)"
                 else:
                     resultado["data"] = f"{dia}/{mes}/{ano}"
+                    logger.info(f"✅ DATA VÁLIDA APROVADA: {dia}/{mes}/{ano} (hoje: {datetime.now().strftime('%d/%m/%Y')})")
             except ValueError:
                 resultado["erro_data"] = "Data inválida. Use formato DD/MM/AAAA"
         
@@ -524,11 +553,13 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                             f"A data {dia}/{mes}/{ano} está no futuro. "
                             f"Por favor, informe sua data de nascimento (não pode ser futura)."
                         )
+                        logger.warning(f"❌ DATA FUTURA REJEITADA: {dia}/{mes}/{ano} > {datetime.now().strftime('%d/%m/%Y')}")
                     # Validar idade máxima (120 anos)
                     elif (datetime.now() - data_obj).days / 365.25 > 120:
                         resultado["erro_data"] = "Data de nascimento parece incorreta (mais de 120 anos)"
                     else:
                         resultado["data"] = f"{dia}/{mes}/{ano}"
+                        logger.info(f"✅ DATA VÁLIDA APROVADA: {dia}/{mes}/{ano} (hoje: {datetime.now().strftime('%d/%m/%Y')})")
                 except ValueError:
                     # Se não conseguir parsear, não é uma data válida
                     pass
@@ -568,11 +599,13 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                                 f"A data {dia}/{mes}/{ano} está no futuro. "
                                 f"Por favor, informe sua data de nascimento (não pode ser futura)."
                             )
+                            logger.warning(f"❌ DATA FUTURA REJEITADA: {dia}/{mes}/{ano} > {datetime.now().strftime('%d/%m/%Y')}")
                         # Validar idade máxima (120 anos)
                         elif (datetime.now() - data_obj).days / 365.25 > 120:
                             resultado["erro_data"] = "Data de nascimento parece incorreta (mais de 120 anos)"
                         else:
                             resultado["data"] = f"{dia}/{mes_num}/{ano}"
+                            logger.info(f"✅ DATA VÁLIDA APROVADA: {dia}/{mes_num}/{ano} (hoje: {datetime.now().strftime('%d/%m/%Y')})")
                     except ValueError:
                         resultado["erro_data"] = "Data inválida"
             
@@ -596,11 +629,13 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                                     f"A data {dia}/{mes}/{ano} está no futuro. "
                                     f"Por favor, informe sua data de nascimento (não pode ser futura)."
                                 )
+                                logger.warning(f"❌ DATA FUTURA REJEITADA: {dia}/{mes}/{ano} > {datetime.now().strftime('%d/%m/%Y')}")
                             # Validar idade máxima (120 anos)
                             elif (datetime.now() - data_obj).days / 365.25 > 120:
                                 resultado["erro_data"] = "Data de nascimento parece incorreta (mais de 120 anos)"
                             else:
                                 resultado["data"] = f"{dia}/{mes_num}/{ano}"
+                                logger.info(f"✅ DATA VÁLIDA APROVADA: {dia}/{mes_num}/{ano} (hoje: {datetime.now().strftime('%d/%m/%Y')})")
                         except ValueError:
                             resultado["erro_data"] = "Data inválida"
         
