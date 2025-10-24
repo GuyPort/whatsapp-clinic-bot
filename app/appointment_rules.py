@@ -326,6 +326,7 @@ class AppointmentRules:
         return True
 
 # Funções de tipos de consulta removidas - não utilizadas
+# Deploy fix: Forçar novo deploy no Railway
 
 
 # Instância global
