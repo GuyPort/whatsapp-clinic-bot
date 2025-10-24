@@ -6,10 +6,10 @@ Bot inteligente de WhatsApp para automatização de agendamentos e atendimento d
 
 - ✅ **Responder dúvidas** sobre valores, horários, endereço e convênios
 - ✅ **Agendar consultas** automaticamente com validação de horários
-- ✅ **Cancelar e remarcar** consultas com verificação de identidade
+- ✅ **Cancelar e remarcar**  com verificação de identidade
 - ✅ **Integração com Google Calendar** para sincronização de agendamentos
 - ✅ **Operação 24/7** com respostas instantâneas
-- ✅ **Escalação inteligente** para atendimento humano quando necessário
+- ✅ **Escalação inteligente** para atendimento humano quando necesconsultassário
 - ✅ **Regras de agendamento** configuráveis (antecedência mínima, bloqueio de horários, etc)
 - ✅ **Tom cordial e profissional** em português brasileiro
 
