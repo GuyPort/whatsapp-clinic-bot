@@ -466,6 +466,33 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
             except ValueError:
                 resultado["erro_data"] = "Data inválida. Use formato DD/MM/AAAA"
         
+        # Padrão 1.5: DDMMAAAA (sem separadores) - ex: 07082003
+        if not resultado["data"] and not resultado["erro_data"]:
+            padrao_sem_separador = r'\b(\d{8})\b'
+            match = re.search(padrao_sem_separador, mensagem)
+            
+            if match:
+                data_str = match.group(1)
+                try:
+                    # Tentar parsear como DDMMAAAA
+                    dia = data_str[:2]
+                    mes = data_str[2:4]
+                    ano = data_str[4:8]
+                    
+                    data_obj = datetime.strptime(f"{dia}/{mes}/{ano}", '%d/%m/%Y')
+                    
+                    # Validar idade (1-120 anos)
+                    idade = datetime.now().year - data_obj.year
+                    if idade < 1:
+                        resultado["erro_data"] = "Data de nascimento não pode ser no futuro"
+                    elif idade > 120:
+                        resultado["erro_data"] = "Data de nascimento parece incorreta"
+                    else:
+                        resultado["data"] = f"{dia}/{mes}/{ano}"
+                except ValueError:
+                    # Se não conseguir parsear, não é uma data válida
+                    pass
+        
         # Padrão 2: "7 de agosto de 2003" ou "07 de agosto de 2003"
         if not resultado["data"] and not resultado["erro_data"]:
             meses = {
