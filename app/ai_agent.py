@@ -93,15 +93,13 @@ Quando o paciente escolher "1" ou "1️⃣", siga EXATAMENTE este fluxo:
    - Se nome tiver apenas 1 palavra: "Para o cadastro médico, preciso do nome completo (nome e sobrenome)"
    - Se data incompleta: "Preciso da data completa (dia, mês e ano). Ex: 07/08/2003"
 
-   IMPORTANTE: VALIDAÇÃO DE DATA JÁ É FEITA AUTOMATICAMENTE!
-   - A função de extração Python JÁ valida se a data é futura ou inválida
-   - Se a data foi extraída com sucesso (sem erro_data), ela é VÁLIDA
-   - NÃO faça validação adicional de datas
-   - NÃO assuma que datas "recentes" (como 2024) são incorretas
-   - Apenas peça correção se erro_data estiver presente na extração
-   - Datas de 2024 são VÁLIDAS se estamos em 2025
-   - REGRA: Aceitar qualquer data não futura (incluindo hoje ou ontem)
-   - EXEMPLO: Bebê nascido ontem pode ter consulta marcada
+   VALIDAÇÃO DE DATA:
+   - Você apenas EXTRAI a data da mensagem do usuário
+   - A função Python valida automaticamente se é válida (não futura)
+   - Você apenas COMUNICA o resultado:
+     • Se houver erro_data → Peça a data correta
+     • Se não houver erro_data → Aceite e continue
+   - NUNCA faça validação manual de datas
 
 3. Após receber a data de nascimento:
    "Perfeito! Agora me informe qual tipo de consulta você deseja:
@@ -493,7 +491,10 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                 
                 # Validar se data é futura
                 if data_obj.date() > datetime.now().date():
-                    resultado["erro_data"] = "Data de nascimento não pode ser no futuro"
+                    resultado["erro_data"] = (
+                        f"A data {dia}/{mes}/{ano} está no futuro. "
+                        f"Por favor, informe sua data de nascimento (não pode ser futura)."
+                    )
                 # Validar idade máxima (120 anos)
                 elif (datetime.now() - data_obj).days / 365.25 > 120:
                     resultado["erro_data"] = "Data de nascimento parece incorreta (mais de 120 anos)"
@@ -519,7 +520,10 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                     
                     # Validar se data é futura
                     if data_obj.date() > datetime.now().date():
-                        resultado["erro_data"] = "Data de nascimento não pode ser no futuro"
+                        resultado["erro_data"] = (
+                            f"A data {dia}/{mes}/{ano} está no futuro. "
+                            f"Por favor, informe sua data de nascimento (não pode ser futura)."
+                        )
                     # Validar idade máxima (120 anos)
                     elif (datetime.now() - data_obj).days / 365.25 > 120:
                         resultado["erro_data"] = "Data de nascimento parece incorreta (mais de 120 anos)"
@@ -560,7 +564,10 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                         
                         # Validar se data é futura
                         if data_obj.date() > datetime.now().date():
-                            resultado["erro_data"] = "Data de nascimento não pode ser no futuro"
+                            resultado["erro_data"] = (
+                                f"A data {dia}/{mes}/{ano} está no futuro. "
+                                f"Por favor, informe sua data de nascimento (não pode ser futura)."
+                            )
                         # Validar idade máxima (120 anos)
                         elif (datetime.now() - data_obj).days / 365.25 > 120:
                             resultado["erro_data"] = "Data de nascimento parece incorreta (mais de 120 anos)"
@@ -585,7 +592,10 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                             
                             # Validar se data é futura
                             if data_obj.date() > datetime.now().date():
-                                resultado["erro_data"] = "Data de nascimento não pode ser no futuro"
+                                resultado["erro_data"] = (
+                                    f"A data {dia}/{mes}/{ano} está no futuro. "
+                                    f"Por favor, informe sua data de nascimento (não pode ser futura)."
+                                )
                             # Validar idade máxima (120 anos)
                             elif (datetime.now() - data_obj).days / 365.25 > 120:
                                 resultado["erro_data"] = "Data de nascimento parece incorreta (mais de 120 anos)"
