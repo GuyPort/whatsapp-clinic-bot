@@ -283,8 +283,14 @@ class AppointmentRules:
         had_errors = False
         for appointment in existing_appointments:
             try:
+                # Converter appointment_date para formato DD/MM/YYYY
+                app_date_str = appointment.appointment_date
+                if len(app_date_str) == 8 and app_date_str.isdigit():
+                    # Formato YYYYMMDD -> DD/MM/YYYY
+                    app_date_str = f"{app_date_str[6:8]}/{app_date_str[4:6]}/{app_date_str[:4]}"
+                
                 # Converter string para datetime
-                app_date = parse_date_br(appointment.appointment_date)
+                app_date = parse_date_br(app_date_str)
                 
                 # Garantir conversão correta de appointment_time
                 if isinstance(appointment.appointment_time, time):
