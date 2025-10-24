@@ -1070,10 +1070,24 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
             
             # 4. Verificar se horário está dentro do funcionamento
             try:
+                # Garantir que time_str é string
+                if not isinstance(time_str, str):
+                    logger.error(f"❌ time_str não é string: {type(time_str)} - {time_str}")
+                    time_str = str(time_str)
+                
                 hora_consulta_original = datetime.strptime(time_str, '%H:%M').time()
                 hora_inicio, hora_fim = horario_dia.split('-')
-                hora_inicio = datetime.strptime(hora_inicio, '%H:%M').time()
-                hora_fim = datetime.strptime(hora_fim, '%H:%M').time()
+                
+                # Garantir que são strings antes de fazer strptime
+                if not isinstance(hora_inicio, str):
+                    logger.error(f"❌ hora_inicio não é string: {type(hora_inicio)}")
+                    hora_inicio = str(hora_inicio)
+                if not isinstance(hora_fim, str):
+                    logger.error(f"❌ hora_fim não é string: {type(hora_fim)}")
+                    hora_fim = str(hora_fim)
+                
+                hora_inicio = datetime.strptime(hora_inicio.strip(), '%H:%M').time()
+                hora_fim = datetime.strptime(hora_fim.strip(), '%H:%M').time()
                 
                 # Arredondar minuto para cima ao próximo múltiplo de 5
                 appointment_datetime_tmp = datetime.combine(appointment_date.date(), hora_consulta_original)
@@ -1085,7 +1099,13 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                     return f"❌ Horário inválido! A clínica funciona das {hora_inicio.strftime('%H:%M')} às {hora_fim.strftime('%H:%M')} aos {weekday_pt}s.\n" + \
                            f"Por favor, escolha um horário entre {hora_inicio.strftime('%H:%M')} e {hora_fim.strftime('%H:%M')}."
                            
-            except ValueError:
+            except ValueError as ve:
+                logger.error(f"❌ ValueError ao processar horário: {str(ve)}")
+                logger.error(f"   time_str={time_str} (type: {type(time_str)})")
+                logger.error(f"   horario_dia={horario_dia}")
+                return "Formato de horário inválido. Use HH:MM (ex: 14:30)."
+            except Exception as e:
+                logger.error(f"❌ Erro inesperado ao processar horário: {str(e)}", exc_info=True)
                 logger.warning(f"❌ Formato de horário inválido: {time_str}")
                 return "Formato de horário inválido. Use HH:MM (ex: 14:30)."
             

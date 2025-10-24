@@ -281,15 +281,27 @@ class AppointmentRules:
         
         # 5. Verificar conflitos - CONVERTER STRINGS PARA DATETIME
         for appointment in existing_appointments:
-            # Converter string para datetime
-            app_date = parse_date_br(appointment.appointment_date)
-            app_time = datetime.strptime(appointment.appointment_time, '%H:%M').time()
-            app_start = datetime.combine(app_date.date(), app_time)
-            app_end = app_start + timedelta(minutes=appointment.duration_minutes)
-            
-            # Verificar sobreposição: novo slot NÃO deve sobrepor consulta existente
-            if not (slot_end <= app_start or target_datetime >= app_end):
-                return False
+            try:
+                # Converter string para datetime
+                app_date = parse_date_br(appointment.appointment_date)
+                
+                # Garantir que appointment_time é string antes de strptime
+                app_time_str = appointment.appointment_time
+                if not isinstance(app_time_str, str):
+                    app_time_str = str(app_time_str)
+                
+                app_time = datetime.strptime(app_time_str, '%H:%M').time()
+                app_start = datetime.combine(app_date.date(), app_time)
+                app_end = app_start + timedelta(minutes=appointment.duration_minutes)
+                
+                # Verificar sobreposição: novo slot NÃO deve sobrepor consulta existente
+                if not (slot_end <= app_start or target_datetime >= app_end):
+                    logger.info(f"⚠️ Conflito encontrado: Nova consulta {target_datetime.strftime('%H:%M')} conflita com consulta existente {app_start.strftime('%H:%M')}-{app_end.strftime('%H:%M')}")
+                    return False
+            except Exception as e:
+                logger.error(f"Erro ao verificar conflito de agendamento: {str(e)}")
+                logger.error(f"  appointment_time: {appointment.appointment_time} (type: {type(appointment.appointment_time)})")
+                continue  # Pular este agendamento e continuar verificando os outros
         
         return True
 
