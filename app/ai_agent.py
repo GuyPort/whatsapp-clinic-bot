@@ -113,7 +113,7 @@ Quando o paciente escolher "1" ou "1️⃣", siga EXATAMENTE este fluxo:
    IMPORTANTE SOBRE DETECÇÃO DE CONVÊNIO:
    - Se responder "CABERGS" ou "cabergs" → insurance_plan = "CABERGS"
    - Se responder "IPE" ou "ipe" → insurance_plan = "IPE"
-   - Se responder "não", "nao", "não tenho", "não possuo", "sem convênio" → insurance_plan = "particular"
+   - Se responder "não", "nao", "não tenho", "não possuo", "sem convênio", "nenhum convênio", "não tenho nenhum convênio" → insurance_plan = "particular"
    - Se responder "sim", "tenho", "possuo" → Perguntar: "Qual convênio você possui? CABERGS ou IPE?"
    - Se responder "1" → insurance_plan = "CABERGS" (compatibilidade)
    - Se responder "2" → insurance_plan = "IPE" (compatibilidade)
@@ -420,7 +420,12 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                         data["insurance_plan"] = "IPE"
                         continue
                     # Respostas negativas (não tem convênio)
-                    elif any(word in content_lower for word in ["não", "nao", "não tenho", "não possuo", "sem convênio", "sem convenio", "particular"]):
+                    elif any(word in content_lower for word in [
+                        "não", "nao", "não tenho", "não possuo", "sem convênio", "sem convenio", "particular",
+                        "nenhum convênio", "nenhum convenio", "não tenho nenhum", "não possuo nenhum",
+                        "não tenho convênio", "não possuo convênio", "não tenho convenio", "não possuo convenio",
+                        "não tenho nenhum convênio", "não possuo nenhum convênio", "não tenho nenhum convenio", "não possuo nenhum convenio"
+                    ]):
                         data["insurance_plan"] = "particular"
                         continue
                     # Respostas numéricas (compatibilidade)
