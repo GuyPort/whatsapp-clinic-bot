@@ -79,9 +79,7 @@ Quando o paciente escolher "1" ou "1️⃣", siga EXATAMENTE este fluxo:
    Pode enviar da forma que preferir:
    • Tudo junto: 'João Silva, 07/08/2003'
    • Separado: envie o nome primeiro, depois a data
-   • Natural: 'Sou João Silva, nasci em 07/08/2003'
-   
-   Como você prefere?"
+   • Natural: 'Sou João Silva, nasci em 07/08/2003'"
 
 2. IMPORTANTE SOBRE EXTRAÇÃO:
    - Se receber AMBOS (nome + data completa): extraia e confirme, depois vá para tipo de consulta
@@ -106,6 +104,7 @@ Quando o paciente escolher "1" ou "1️⃣", siga EXATAMENTE este fluxo:
 
 4. Após receber o tipo (1, 2 ou 3):
    "Ótimo! Possui convênio médico?
+   
    • CABERGS
    • IPE
    
@@ -475,12 +474,12 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
             try:
                 data_obj = datetime.strptime(f"{dia}/{mes}/{ano}", '%d/%m/%Y')
                 
-                # Validar idade (1-120 anos)
-                idade = datetime.now().year - data_obj.year
-                if idade < 1:
+                # Validar se data é futura
+                if data_obj.date() > datetime.now().date():
                     resultado["erro_data"] = "Data de nascimento não pode ser no futuro"
-                elif idade > 120:
-                    resultado["erro_data"] = "Data de nascimento parece incorreta"
+                # Validar idade máxima (120 anos)
+                elif (datetime.now() - data_obj).days / 365.25 > 120:
+                    resultado["erro_data"] = "Data de nascimento parece incorreta (mais de 120 anos)"
                 else:
                     resultado["data"] = f"{dia}/{mes}/{ano}"
             except ValueError:
@@ -501,12 +500,12 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                     
                     data_obj = datetime.strptime(f"{dia}/{mes}/{ano}", '%d/%m/%Y')
                     
-                    # Validar idade (1-120 anos)
-                    idade = datetime.now().year - data_obj.year
-                    if idade < 1:
+                    # Validar se data é futura
+                    if data_obj.date() > datetime.now().date():
                         resultado["erro_data"] = "Data de nascimento não pode ser no futuro"
-                    elif idade > 120:
-                        resultado["erro_data"] = "Data de nascimento parece incorreta"
+                    # Validar idade máxima (120 anos)
+                    elif (datetime.now() - data_obj).days / 365.25 > 120:
+                        resultado["erro_data"] = "Data de nascimento parece incorreta (mais de 120 anos)"
                     else:
                         resultado["data"] = f"{dia}/{mes}/{ano}"
                 except ValueError:
@@ -541,12 +540,13 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                     dia = dia.zfill(2)
                     try:
                         data_obj = datetime.strptime(f"{dia}/{mes_num}/{ano}", '%d/%m/%Y')
-                        idade = datetime.now().year - data_obj.year
                         
-                        if idade < 1:
+                        # Validar se data é futura
+                        if data_obj.date() > datetime.now().date():
                             resultado["erro_data"] = "Data de nascimento não pode ser no futuro"
-                        elif idade > 120:
-                            resultado["erro_data"] = "Data de nascimento parece incorreta"
+                        # Validar idade máxima (120 anos)
+                        elif (datetime.now() - data_obj).days / 365.25 > 120:
+                            resultado["erro_data"] = "Data de nascimento parece incorreta (mais de 120 anos)"
                         else:
                             resultado["data"] = f"{dia}/{mes_num}/{ano}"
                     except ValueError:
@@ -565,12 +565,13 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                         dia = dia.zfill(2)
                         try:
                             data_obj = datetime.strptime(f"{dia}/{mes_num}/{ano}", '%d/%m/%Y')
-                            idade = datetime.now().year - data_obj.year
                             
-                            if idade < 1:
+                            # Validar se data é futura
+                            if data_obj.date() > datetime.now().date():
                                 resultado["erro_data"] = "Data de nascimento não pode ser no futuro"
-                            elif idade > 120:
-                                resultado["erro_data"] = "Data de nascimento parece incorreta"
+                            # Validar idade máxima (120 anos)
+                            elif (datetime.now() - data_obj).days / 365.25 > 120:
+                                resultado["erro_data"] = "Data de nascimento parece incorreta (mais de 120 anos)"
                             else:
                                 resultado["data"] = f"{dia}/{mes_num}/{ano}"
                         except ValueError:
