@@ -93,6 +93,16 @@ Quando o paciente escolher "1" ou "1️⃣", siga EXATAMENTE este fluxo:
    - Se nome tiver apenas 1 palavra: "Para o cadastro médico, preciso do nome completo (nome e sobrenome)"
    - Se data incompleta: "Preciso da data completa (dia, mês e ano). Ex: 07/08/2003"
 
+   IMPORTANTE: VALIDAÇÃO DE DATA JÁ É FEITA AUTOMATICAMENTE!
+   - A função de extração Python JÁ valida se a data é futura ou inválida
+   - Se a data foi extraída com sucesso (sem erro_data), ela é VÁLIDA
+   - NÃO faça validação adicional de datas
+   - NÃO assuma que datas "recentes" (como 2024) são incorretas
+   - Apenas peça correção se erro_data estiver presente na extração
+   - Datas de 2024 são VÁLIDAS se estamos em 2025
+   - REGRA: Aceitar qualquer data não futura (incluindo hoje ou ontem)
+   - EXEMPLO: Bebê nascido ontem pode ter consulta marcada
+
 3. Após receber a data de nascimento:
    "Perfeito! Agora me informe qual tipo de consulta você deseja:
    
