@@ -105,13 +105,20 @@ Quando o paciente escolher "1" ou "1️⃣", siga EXATAMENTE este fluxo:
    Digite o número da opção desejada:"
 
 4. Após receber o tipo (1, 2 ou 3):
-   "Agora me informe qual convênio você possui:
+   "Ótimo! Possui convênio médico?
+   • CABERGS
+   • IPE
    
-   1️⃣ CABERGS
-   2️⃣ IPE
-   3️⃣ Particular
+   Digite o nome do convênio ou 'não' se não tiver."
    
-   Digite o número da opção desejada:"
+   IMPORTANTE SOBRE DETECÇÃO DE CONVÊNIO:
+   - Se responder "CABERGS" ou "cabergs" → insurance_plan = "CABERGS"
+   - Se responder "IPE" ou "ipe" → insurance_plan = "IPE"
+   - Se responder "não", "nao", "não tenho", "não possuo", "sem convênio" → insurance_plan = "particular"
+   - Se responder "sim", "tenho", "possuo" → Perguntar: "Qual convênio você possui? CABERGS ou IPE?"
+   - Se responder "1" → insurance_plan = "CABERGS" (compatibilidade)
+   - Se responder "2" → insurance_plan = "IPE" (compatibilidade)
+   - Qualquer outra resposta → "Não entendi. Você possui CABERGS, IPE ou não possui convênio?"
 
 5. Após receber o convênio (1, 2 ou 3):
    "Agora me informe o dia que gostaria de marcar a consulta (DD/MM/AAAA - ex: 25/11/2025):"
@@ -402,11 +409,24 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                         data["consultation_type"] = type_map[content]
                         continue
                 
-                # 5. EXTRAÇÃO DE CONVÊNIO - Detectar escolha numérica
+                # 5. EXTRAÇÃO DE CONVÊNIO - Detecção flexível (texto ou número)
                 if not data["insurance_plan"]:
-                    # Se mensagem é só "1", "2" ou "3" (escolha de convênio)
-                    if content in ["1", "2", "3"]:
-                        insurance_map = {"1": "CABERGS", "2": "IPE", "3": "particular"}
+                    content_lower = content.lower().strip()
+                    
+                    # Respostas diretas com nome do convênio
+                    if "cabergs" in content_lower:
+                        data["insurance_plan"] = "CABERGS"
+                        continue
+                    elif "ipe" in content_lower:
+                        data["insurance_plan"] = "IPE"
+                        continue
+                    # Respostas negativas (não tem convênio)
+                    elif any(word in content_lower for word in ["não", "nao", "não tenho", "não possuo", "sem convênio", "sem convenio", "particular"]):
+                        data["insurance_plan"] = "particular"
+                        continue
+                    # Respostas numéricas (compatibilidade)
+                    elif content in ["1", "2"]:
+                        insurance_map = {"1": "CABERGS", "2": "IPE"}
                         data["insurance_plan"] = insurance_map[content]
                         continue
             
