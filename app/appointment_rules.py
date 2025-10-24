@@ -176,7 +176,7 @@ class AppointmentRules:
                 
                 for appointment in existing_appointments:
                     # Combinar data e hora para criar datetime
-                    app_start = datetime.combine(appointment.appointment_date, appointment.appointment_time)
+                    app_start = datetime.combine(appointment.appointment_date, appointment.appointment_time).replace(tzinfo=None)
                     app_end = app_start + timedelta(minutes=appointment.duration_minutes)
                     
                     # Verificar sobreposição
@@ -304,7 +304,7 @@ class AppointmentRules:
                         app_time_str = ':'.join(app_time_str.split(':')[:2])
                     app_time = datetime.strptime(app_time_str, '%H:%M').time()
                 
-                app_start = datetime.combine(app_date.date(), app_time)
+                app_start = datetime.combine(app_date.date(), app_time).replace(tzinfo=None)
                 app_end = app_start + timedelta(minutes=appointment.duration_minutes)
                 
                 # Verificar sobreposição: novo slot NÃO deve sobrepor consulta existente

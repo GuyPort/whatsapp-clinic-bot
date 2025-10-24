@@ -1090,7 +1090,7 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                 hora_fim = datetime.strptime(hora_fim.strip(), '%H:%M').time()
                 
                 # Arredondar minuto para cima ao próximo múltiplo de 5
-                appointment_datetime_tmp = datetime.combine(appointment_date.date(), hora_consulta_original)
+                appointment_datetime_tmp = datetime.combine(appointment_date.date(), hora_consulta_original).replace(tzinfo=None)
                 hora_consulta_dt = round_up_to_next_5_minutes(appointment_datetime_tmp)
                 hora_consulta = hora_consulta_dt.time()
                 
@@ -1110,7 +1110,7 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                 return "Formato de horário inválido. Use HH:MM (ex: 14:30)."
             
             # 5. Verificar disponibilidade no banco de dados
-            appointment_datetime = datetime.combine(appointment_date.date(), hora_consulta)
+            appointment_datetime = datetime.combine(appointment_date.date(), hora_consulta).replace(tzinfo=None)
             duracao = self.clinic_info.get('regras_agendamento', {}).get('duracao_consulta_minutos', 60)
             
             # Usar nova função para verificar disponibilidade
@@ -1252,10 +1252,11 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                     # Usar dados do contexto como fallback
                     if not patient_phone:
                         patient_phone = context.flow_data.get("patient_phone") or phone
-                    if not consultation_type or consultation_type == "clinica_geral":
-                        consultation_type = context.flow_data.get("consultation_type") or consultation_type
-                    if not insurance_plan or insurance_plan == "particular":
-                        insurance_plan = context.flow_data.get("insurance_plan") or insurance_plan
+                    # Priorizar dados do flow_data se disponíveis
+                    if context.flow_data.get("consultation_type"):
+                        consultation_type = context.flow_data.get("consultation_type")
+                    if context.flow_data.get("insurance_plan"):
+                        insurance_plan = context.flow_data.get("insurance_plan")
             
             # Validar tipo de consulta
             valid_types = ["clinica_geral", "geriatria", "domiciliar"]
@@ -1283,7 +1284,7 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
             # Combinar data e horário (com arredondamento para múltiplo de 5 min)
             try:
                 time_obj_original = datetime.strptime(appointment_time, '%H:%M').time()
-                temp_dt = datetime.combine(appointment_datetime.date(), time_obj_original)
+                temp_dt = datetime.combine(appointment_datetime.date(), time_obj_original).replace(tzinfo=None)
                 rounded_dt = round_up_to_next_5_minutes(temp_dt)
                 
                 # Localizar no timezone do Brasil para garantir data correta
