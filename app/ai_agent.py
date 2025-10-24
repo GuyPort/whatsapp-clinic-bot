@@ -120,14 +120,27 @@ Quando o paciente escolher "1" ou "1️⃣", siga EXATAMENTE este fluxo:
    
    Digite o nome do convênio ou 'não' se não tiver."
    
-   IMPORTANTE SOBRE DETECÇÃO DE CONVÊNIO:
-   - Se responder "CABERGS" ou "cabergs" → insurance_plan = "CABERGS"
-   - Se responder "IPE" ou "ipe" → insurance_plan = "IPE"
-   - Se responder "não", "nao", "não tenho", "não possuo", "sem convênio", "nenhum convênio", "não tenho nenhum convênio" → insurance_plan = "particular"
-   - Se responder "sim", "tenho", "possuo" → Perguntar: "Qual convênio você possui? CABERGS ou IPE?"
-   - Se responder "1" → insurance_plan = "CABERGS" (compatibilidade)
-   - Se responder "2" → insurance_plan = "IPE" (compatibilidade)
-   - Qualquer outra resposta → "Não entendi. Você possui CABERGS, IPE ou não possui convênio?"
+   IMPORTANTE: CLASSIFICAÇÃO DE RESPOSTA SOBRE CONVÊNIO
+   
+   Ao receber resposta sobre convênio, CLASSIFIQUE a intenção:
+   
+   1. NEGATIVA (usuário NÃO tem convênio):
+      - Exemplos: "não", "não tenho", "não possuo", "sem convênio", "nenhum", "Não, eu não possuo nenhum convênio!"
+      - Ação: insurance_plan = "particular" → Continue para próxima etapa (data)
+      
+   2. POSITIVA ESPECÍFICA (tem convênio E especificou qual):
+      - Exemplos: "CABERGS", "IPE", "tenho IPE", "possuo CABERGS", "1", "2"
+      - Ação: insurance_plan = nome do convênio → Continue para próxima etapa
+      
+   3. POSITIVA GENÉRICA (tem convênio MAS não especificou):
+      - Exemplos: "sim", "tenho", "possuo", "tenho convênio sim"
+      - Ação: Perguntar: "Qual convênio você possui? CABERGS ou IPE?"
+      
+   4. AMBÍGUA (não está claro):
+      - Exemplos: respostas confusas ou irrelevantes
+      - Ação: "Não entendi. Você possui convênio médico (CABERGS ou IPE) ou não possui?"
+   
+   REGRA CRÍTICA: Use seu entendimento de linguagem natural para classificar a INTENÇÃO, não apenas palavras específicas!
 
 5. Após receber o convênio (1, 2 ou 3):
    "Agora me informe o dia que gostaria de marcar a consulta (DD/MM/AAAA - ex: 25/11/2025):"
@@ -385,7 +398,6 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                     if time_match:
                         hour, minute = time_match.groups()
                         data["appointment_time"] = f"{hour.zfill(2)}:{minute}"
-                        continue
                 
                 # 2. EXTRAÇÃO DE NOME E DATA - Usar nova função robusta
                 resultado = self._extrair_nome_e_data_robusto(content)
@@ -416,33 +428,23 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                     if content in ["1", "2", "3"]:
                         type_map = {"1": "clinica_geral", "2": "geriatria", "3": "domiciliar"}
                         data["consultation_type"] = type_map[content]
-                        continue
                 
-                # 5. EXTRAÇÃO DE CONVÊNIO - Detecção flexível (texto ou número)
+                # 5. EXTRAÇÃO DE CONVÊNIO - Casos óbvios (o resto o Claude decide)
                 if not data["insurance_plan"]:
                     content_lower = content.lower().strip()
                     
-                    # Respostas diretas com nome do convênio
+                    # Apenas detectar menções diretas de convênios específicos
                     if "cabergs" in content_lower:
                         data["insurance_plan"] = "CABERGS"
-                        continue
                     elif "ipe" in content_lower:
                         data["insurance_plan"] = "IPE"
-                        continue
-                    # Respostas negativas (não tem convênio)
-                    elif any(word in content_lower for word in [
-                        "não", "nao", "não tenho", "não possuo", "sem convênio", "sem convenio", "particular",
-                        "nenhum convênio", "nenhum convenio", "não tenho nenhum", "não possuo nenhum",
-                        "não tenho convênio", "não possuo convênio", "não tenho convenio", "não possuo convenio",
-                        "não tenho nenhum convênio", "não possuo nenhum convênio", "não tenho nenhum convenio", "não possuo nenhum convenio"
-                    ]):
-                        data["insurance_plan"] = "particular"
-                        continue
-                    # Respostas numéricas (compatibilidade)
+                    # Compatibilidade numérica (quando usuário responde só "1" ou "2")
                     elif content in ["1", "2"]:
                         insurance_map = {"1": "CABERGS", "2": "IPE"}
                         data["insurance_plan"] = insurance_map[content]
-                        continue
+                    
+                    # Para tudo mais (incluindo respostas negativas), deixar Claude classificar
+                    # Claude vai entender a intenção e agir conforme instruções do system prompt
             
             logger.info(f"📋 Extração concluída: {data}")
             return data
