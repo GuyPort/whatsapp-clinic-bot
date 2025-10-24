@@ -280,17 +280,24 @@ class AppointmentRules:
         slot_end = target_datetime + timedelta(minutes=consultation_duration)
         
         # 5. Verificar conflitos - CONVERTER STRINGS PARA DATETIME
+        had_errors = False
         for appointment in existing_appointments:
             try:
                 # Converter string para datetime
                 app_date = parse_date_br(appointment.appointment_date)
                 
-                # Garantir que appointment_time é string antes de strptime
-                app_time_str = appointment.appointment_time
-                if not isinstance(app_time_str, str):
-                    app_time_str = str(app_time_str)
+                # Garantir conversão correta de appointment_time
+                if isinstance(appointment.appointment_time, time):
+                    # Já é time object, usar direto
+                    app_time = appointment.appointment_time
+                else:
+                    # É string - remover segundos se existir (ex: "15:00:00" → "15:00")
+                    app_time_str = str(appointment.appointment_time)
+                    if app_time_str.count(':') == 2:
+                        # Tem segundos, remover
+                        app_time_str = ':'.join(app_time_str.split(':')[:2])
+                    app_time = datetime.strptime(app_time_str, '%H:%M').time()
                 
-                app_time = datetime.strptime(app_time_str, '%H:%M').time()
                 app_start = datetime.combine(app_date.date(), app_time)
                 app_end = app_start + timedelta(minutes=appointment.duration_minutes)
                 
@@ -298,10 +305,17 @@ class AppointmentRules:
                 if not (slot_end <= app_start or target_datetime >= app_end):
                     logger.info(f"⚠️ Conflito encontrado: Nova consulta {target_datetime.strftime('%H:%M')} conflita com consulta existente {app_start.strftime('%H:%M')}-{app_end.strftime('%H:%M')}")
                     return False
+                    
             except Exception as e:
                 logger.error(f"Erro ao verificar conflito de agendamento: {str(e)}")
                 logger.error(f"  appointment_time: {appointment.appointment_time} (type: {type(appointment.appointment_time)})")
-                continue  # Pular este agendamento e continuar verificando os outros
+                had_errors = True
+                # NÃO fazer continue - marcar erro mas continuar verificando
+        
+        # Se houve erros, rejeitar por segurança
+        if had_errors:
+            logger.error("⛔ Rejeitando horário por segurança devido a erros na verificação")
+            return False
         
         return True
 
