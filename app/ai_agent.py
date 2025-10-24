@@ -73,17 +73,27 @@ FLUXO DE AGENDAMENTO (SEQUENCIAL):
 Quando o paciente escolher "1" ou "1️⃣", siga EXATAMENTE este fluxo:
 
 1. "Perfeito! Vamos marcar sua consulta. 😊
-   Primeiro, me informe seu nome completo:"
-
-2. Após receber o nome:
-   "Obrigado! Agora me informe sua data de nascimento:"
    
-   IMPORTANTE SOBRE DATA DE NASCIMENTO:
-   - Aceite QUALQUER formato de data (ex: "07 de agosto de 2003", "07/08/2003", "7-8-2003")
-   - Se conseguir extrair a data em formato não-padrão, confirme: "Perfeito! Confirmo que sua data de nascimento é [DD/MM/AAAA]?"
-   - Se o usuário confirmar, continue para o próximo passo
-   - APENAS se NÃO conseguir extrair a data, peça: "Desculpe, não consegui entender. Por favor, informe no formato DD/MM/AAAA (exemplo: 07/08/2003):"
-   - NUNCA peça novamente se já conseguiu extrair a data corretamente
+   Para começar, preciso do seu nome completo e data de nascimento.
+   
+   Pode enviar da forma que preferir:
+   • Tudo junto: 'João Silva, 07/08/2003'
+   • Separado: envie o nome primeiro, depois a data
+   • Natural: 'Sou João Silva, nasci em 07/08/2003'
+   
+   Como você prefere?"
+
+2. IMPORTANTE SOBRE EXTRAÇÃO:
+   - Se receber AMBOS (nome + data completa): extraia e confirme, depois vá para tipo de consulta
+   - Se receber APENAS NOME: agradeça e peça "E sua data de nascimento (DD/MM/AAAA)?"
+   - Se receber APENAS DATA: agradeça e peça "E seu nome completo?"
+   - Se NENHUM for extraído: "Não consegui entender. Por favor, me informe seu nome completo."
+   
+   VALIDAÇÕES OBRIGATÓRIAS:
+   - NOME: Deve ter no mínimo 2 palavras (nome + sobrenome)
+   - DATA: Deve ser completa (dia + mês + ano) no formato DD/MM/AAAA
+   - Se nome tiver apenas 1 palavra: "Para o cadastro médico, preciso do nome completo (nome e sobrenome)"
+   - Se data incompleta: "Preciso da data completa (dia, mês e ano). Ex: 07/08/2003"
 
 3. Após receber a data de nascimento:
    "Perfeito! Agora me informe qual tipo de consulta você deseja:
@@ -361,19 +371,30 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                         data["appointment_time"] = f"{hour.zfill(2)}:{minute}"
                         continue
                 
-                # 2. EXTRAÇÃO DE DATAS - Buscar em qualquer parte da mensagem
+                # 2. EXTRAÇÃO DE NOME E DATA - Usar nova função robusta
+                resultado = self._extrair_nome_e_data_robusto(content)
+                
+                # Atualizar nome se extraído com sucesso
+                if resultado["nome"] and not data["patient_name"]:
+                    data["patient_name"] = resultado["nome"]
+                    logger.info(f"📝 Nome extraído: {resultado['nome']}")
+                
+                # Atualizar data nascimento se extraída com sucesso
+                if resultado["data"] and not data["patient_birth_date"]:
+                    data["patient_birth_date"] = resultado["data"]
+                    logger.info(f"📅 Data nascimento extraída: {resultado['data']}")
+                
+                # 3. EXTRAÇÃO DE DATAS DE CONSULTA - Buscar em qualquer parte da mensagem
                 date_pattern = r'(\d{1,2})/(\d{1,2})/(\d{4})'
                 date_matches = re.findall(date_pattern, content)
                 for match in date_matches:
                     day, month, year = match
                     full_date = f"{day.zfill(2)}/{month.zfill(2)}/{year}"
                     y = int(year)
-                    if y < 2010 and not data["patient_birth_date"]:
-                        data["patient_birth_date"] = full_date
-                    elif y >= 2010 and not data["appointment_date"]:
+                    if y >= 2010 and not data["appointment_date"]:
                         data["appointment_date"] = full_date
                 
-                # 3. EXTRAÇÃO DE TIPO DE CONSULTA - Detectar escolha numérica
+                # 4. EXTRAÇÃO DE TIPO DE CONSULTA - Detectar escolha numérica
                 if not data["consultation_type"]:
                     # Se mensagem é só "1", "2" ou "3" (escolha de tipo)
                     if content in ["1", "2", "3"]:
@@ -381,59 +402,188 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                         data["consultation_type"] = type_map[content]
                         continue
                 
-                # 4. EXTRAÇÃO DE CONVÊNIO - Detectar escolha numérica
+                # 5. EXTRAÇÃO DE CONVÊNIO - Detectar escolha numérica
                 if not data["insurance_plan"]:
                     # Se mensagem é só "1", "2" ou "3" (escolha de convênio)
                     if content in ["1", "2", "3"]:
                         insurance_map = {"1": "CABERGS", "2": "IPE", "3": "particular"}
                         data["insurance_plan"] = insurance_map[content]
                         continue
-                
-                # 5. EXTRAÇÃO DE NOMES - Remover prefixos comuns
-                if not data["patient_name"]:
-                    # Prefixos comuns que devem ser removidos
-                    name_prefixes = [
-                        r'meu nome [eé] ',
-                        r'eu sou ',
-                        r'me chamo ',
-                        r'eu me chamo ',
-                        r'sou o ',
-                        r'sou a '
-                    ]
-                    
-                    # Limpar conteúdo removendo prefixos
-                    cleaned_content = content
-                    for prefix in name_prefixes:
-                        cleaned_content = re.sub(prefix, '', cleaned_content, flags=re.IGNORECASE)
-                    
-                    # Remover pontuação final e espaços extras
-                    cleaned_content = re.sub(r'[!.?,;]+$', '', cleaned_content).strip()
-                    
-                    # Lista de frases que NÃO são nomes
-                    invalid_name_phrases = [
-                        "por favor", "pode verificar", "tá bom", "está bem", 
-                        "confirma", "confirmado", "sim por favor", "pode ser",
-                        "perfeito", "obrigado", "obrigada", "valeu", "verificar",
-                        "confirmar", "pode", "sim", "não", "nao"
-                    ]
-                    
-                    # Verificar se contém frases inválidas
-                    contains_invalid_phrase = any(phrase in cleaned_content.lower() for phrase in invalid_name_phrases)
-                    
-                    # Verificar se é um nome válido
-                    has_letters = re.search(r"[A-Za-zÀ-ÿ]", cleaned_content) is not None
-                    has_bad_symbols = re.search(r"[:=/]", cleaned_content) is not None
-                    is_only_digits = re.fullmatch(r"\d+", cleaned_content) is not None
-                    is_menu_or_greeting = cleaned_content.lower() in ["olá", "olá!", "oi", "oi!", "1", "2", "3"]
-                    
-                    if has_letters and not has_bad_symbols and not is_only_digits and not is_menu_or_greeting and len(cleaned_content) > 1 and not contains_invalid_phrase:
-                        data["patient_name"] = cleaned_content
             
             logger.info(f"📋 Extração concluída: {data}")
             return data
         except Exception as e:
             logger.error(f"Erro ao extrair dados do histórico: {e}", exc_info=True)
             return {}
+
+    def _extrair_nome_e_data_robusto(self, mensagem: str) -> Dict[str, Any]:
+        """
+        Extrai nome completo e data de nascimento de forma robusta
+        
+        Returns:
+            {
+                "nome": str | None,
+                "data": str | None,
+                "erro_nome": str | None,
+                "erro_data": str | None
+            }
+        """
+        import re
+        from datetime import datetime
+        
+        resultado = {
+            "nome": None,
+            "data": None,
+            "erro_nome": None,
+            "erro_data": None
+        }
+        
+        # ========== EXTRAÇÃO DE DATA (REGEX) ==========
+        
+        # Padrão 1: DD/MM/AAAA ou DD-MM-AAAA
+        padrao_numerico = r'\b(\d{1,2})[/-](\d{1,2})[/-](\d{4})\b'
+        padrao_texto = r'\b(\d{1,2})\s+de\s+(\w+)\s+de\s+(\d{4})\b'
+        
+        match = re.search(padrao_numerico, mensagem)
+        
+        if match:
+            dia, mes, ano = match.groups()
+            dia = dia.zfill(2)
+            mes = mes.zfill(2)
+            
+            # Validar formato
+            try:
+                data_obj = datetime.strptime(f"{dia}/{mes}/{ano}", '%d/%m/%Y')
+                
+                # Validar idade (1-120 anos)
+                idade = datetime.now().year - data_obj.year
+                if idade < 1:
+                    resultado["erro_data"] = "Data de nascimento não pode ser no futuro"
+                elif idade > 120:
+                    resultado["erro_data"] = "Data de nascimento parece incorreta"
+                else:
+                    resultado["data"] = f"{dia}/{mes}/{ano}"
+            except ValueError:
+                resultado["erro_data"] = "Data inválida. Use formato DD/MM/AAAA"
+        
+        # Padrão 2: "7 de agosto de 2003" ou "07 de agosto de 2003"
+        if not resultado["data"] and not resultado["erro_data"]:
+            meses = {
+                'janeiro': '01', 'jan': '01',
+                'fevereiro': '02', 'fev': '02',
+                'março': '03', 'mar': '03', 'marco': '03',
+                'abril': '04', 'abr': '04',
+                'maio': '05', 'mai': '05',
+                'junho': '06', 'jun': '06',
+                'julho': '07', 'jul': '07',
+                'agosto': '08', 'ago': '08',
+                'setembro': '09', 'set': '09',
+                'outubro': '10', 'out': '10',
+                'novembro': '11', 'nov': '11',
+                'dezembro': '12', 'dez': '12'
+            }
+            
+            # Padrão completo: "7 de agosto de 2003"
+            match = re.search(padrao_texto, mensagem, re.IGNORECASE)
+            
+            if match:
+                dia, mes_nome, ano = match.groups()
+                mes_num = meses.get(mes_nome.lower())
+                
+                if mes_num:
+                    dia = dia.zfill(2)
+                    try:
+                        data_obj = datetime.strptime(f"{dia}/{mes_num}/{ano}", '%d/%m/%Y')
+                        idade = datetime.now().year - data_obj.year
+                        
+                        if idade < 1:
+                            resultado["erro_data"] = "Data de nascimento não pode ser no futuro"
+                        elif idade > 120:
+                            resultado["erro_data"] = "Data de nascimento parece incorreta"
+                        else:
+                            resultado["data"] = f"{dia}/{mes_num}/{ano}"
+                    except ValueError:
+                        resultado["erro_data"] = "Data inválida"
+            
+            # Padrão abreviado: "7 ago 2003" ou "7/ago/2003"
+            if not resultado["data"] and not resultado["erro_data"]:
+                padrao_abreviado = r'\b(\d{1,2})\s+(ago|set|out|nov|dez|jan|fev|mar|abr|mai|jun|jul)\s+(\d{4})\b'
+                match = re.search(padrao_abreviado, mensagem, re.IGNORECASE)
+                
+                if match:
+                    dia, mes_abrev, ano = match.groups()
+                    mes_num = meses.get(mes_abrev.lower())
+                    
+                    if mes_num:
+                        dia = dia.zfill(2)
+                        try:
+                            data_obj = datetime.strptime(f"{dia}/{mes_num}/{ano}", '%d/%m/%Y')
+                            idade = datetime.now().year - data_obj.year
+                            
+                            if idade < 1:
+                                resultado["erro_data"] = "Data de nascimento não pode ser no futuro"
+                            elif idade > 120:
+                                resultado["erro_data"] = "Data de nascimento parece incorreta"
+                            else:
+                                resultado["data"] = f"{dia}/{mes_num}/{ano}"
+                        except ValueError:
+                            resultado["erro_data"] = "Data inválida"
+        
+        # ========== EXTRAÇÃO DE NOME ==========
+        
+        # Remover a data da mensagem para facilitar extração do nome
+        mensagem_sem_data = mensagem
+        if resultado["data"]:
+            mensagem_sem_data = re.sub(padrao_numerico, '', mensagem_sem_data)
+            mensagem_sem_data = re.sub(padrao_texto, '', mensagem_sem_data, flags=re.IGNORECASE)
+        
+        # Remover palavras comuns que não são nome
+        palavras_ignorar = [
+            'meu', 'nome', 'é', 'sou', 'me', 'chamo', 'chama', 'conhecido', 'como',
+            'nasci', 'nascido', 'em', 'dia', 'data', 'nascimento', 'de', 'e', 'a', 'o',
+            ',', '.', '!', '?', 'oi', 'olá', 'bom', 'dia', 'tarde', 'noite',
+            # Meses e abreviações
+            'janeiro', 'jan', 'fevereiro', 'fev', 'março', 'mar', 'marco',
+            'abril', 'abr', 'maio', 'mai', 'junho', 'jun', 'julho', 'jul',
+            'agosto', 'ago', 'setembro', 'set', 'outubro', 'out', 'novembro', 'nov', 'dezembro', 'dez'
+        ]
+        
+        # Extrair possível nome
+        palavras = mensagem_sem_data.split()
+        nome_candidato = []
+        
+        # Detectar se há apelido na mensagem original
+        tem_apelido = any(phrase in mensagem.lower() for phrase in ['me chama', 'conhecido como', 'pode chamar', 'chama de'])
+        
+        for palavra in palavras:
+            palavra_limpa = palavra.strip(',.!?')
+            if palavra_limpa and palavra_limpa.lower() not in palavras_ignorar:
+                # Verificar se é texto (não número)
+                if not palavra_limpa.isdigit():
+                    # Se tem apelido na mensagem, parar no primeiro nome completo encontrado
+                    if tem_apelido and len(nome_candidato) >= 2:
+                        break
+                    nome_candidato.append(palavra_limpa)
+        
+        if nome_candidato:
+            nome_completo = ' '.join(nome_candidato)
+            
+            # Validar nome
+            # 1. Apenas letras, espaços, hífens, acentos
+            if re.match(r"^[a-zA-ZÀ-ÿ\s\-']+$", nome_completo):
+                # 2. Remover preposições e contar palavras
+                preposicoes = ['de', 'da', 'do', 'dos', 'das']
+                palavras_validas = [p for p in nome_completo.split() if p.lower() not in preposicoes]
+                
+                if len(palavras_validas) >= 2:
+                    # Nome válido!
+                    resultado["nome"] = nome_completo.title()
+                elif len(palavras_validas) == 1:
+                    resultado["erro_nome"] = "Para o cadastro médico, preciso do nome completo (nome e sobrenome)"
+            else:
+                resultado["erro_nome"] = "Nome contém caracteres inválidos"
+        
+        return resultado
 
     # ===== Encerramento de contexto =====
     def _should_end_context(self, context: ConversationContext, last_user_message: str) -> bool:
