@@ -435,8 +435,12 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                         hour, minute = time_match.groups()
                         data["appointment_time"] = f"{hour.zfill(2)}:{minute}"
                 
+                # SALVAR o estado ANTES de processar a mensagem
+                had_birth_date_before = data["patient_birth_date"] is not None
+                
                 # 2. EXTRAÇÃO DE NOME E DATA - Apenas se ainda não temos data de nascimento
-                if not data["patient_birth_date"]:
+                # E não temos data de consulta (para evitar confusão)
+                if not data["patient_birth_date"] and not data["appointment_date"]:
                     resultado = self._extrair_nome_e_data_robusto(content)
                     
                     # Validação explícita para debug
@@ -454,18 +458,19 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                     if resultado["data"] and not data["patient_birth_date"]:
                         data["patient_birth_date"] = resultado["data"]
                         logger.info(f"📅 Data nascimento extraída: {resultado['data']}")
+                else:
+                    # Se já temos alguma data, NÃO extrair novamente
+                    if data["patient_birth_date"]:
+                        logger.info(f"🔒 Data nascimento já existe ({data['patient_birth_date']}), pulando extração")
+                    if data["appointment_date"]:
+                        logger.info(f"🔒 Data consulta já existe ({data['appointment_date']}), pulando extração")
                 
                 # 3. EXTRAÇÃO DE DATA DE CONSULTA - Apenas se já temos data de nascimento
-                # Verificar se já tínhamos data de nascimento ANTES desta mensagem
-                had_birth_date_before = data["patient_birth_date"] is not None
-                
-                logger.info(f"🔍 DEBUG: had_birth_date_before={had_birth_date_before}, current_appointment_date={data['appointment_date']}")
-                
+                # Usar o estado SALVO (não o atual)
                 if had_birth_date_before and not data["appointment_date"]:
                     # Agora extrair data como data de CONSULTA (não nascimento)
                     date_pattern = r'(\d{1,2})/(\d{1,2})/(\d{4})'
                     date_matches = re.findall(date_pattern, content)
-                    logger.info(f"🔍 DEBUG: Encontradas {len(date_matches)} datas na mensagem: {date_matches}")
                     for match in date_matches:
                         day, month, year = match
                         full_date = f"{day.zfill(2)}/{month.zfill(2)}/{year}"
@@ -837,7 +842,9 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                         logger.info(f"🔍 Dados incompletos no flow_data, extraindo do histórico: {data}")
                         extracted = self._extract_appointment_data_from_messages(context.messages)
                         data["patient_name"] = data.get("patient_name") or extracted.get("patient_name")
-                        data["patient_birth_date"] = data.get("patient_birth_date") or extracted.get("patient_birth_date")
+                        # NÃO sobrescrever patient_birth_date se já existir no flow_data
+                        if not data.get("patient_birth_date"):
+                            data["patient_birth_date"] = extracted.get("patient_birth_date")
                         logger.info(f"🔍 Dados após extração: {data}")
                     
                     # Criar agendamento
