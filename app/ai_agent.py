@@ -122,6 +122,23 @@ Quando o paciente escolher "1" ou "1️⃣", siga EXATAMENTE este fluxo:
      Extração: {{"data": "12/10/2025", "erro_data": null}}
      Você: "Data está no futuro..." ← NUNCA FAÇA ISSO!
 
+⚠️ IMPORTANTE: DUAS DATAS DIFERENTES
+
+Você acabou de coletar a DATA DE NASCIMENTO.
+Agora você vai coletar informações da consulta.
+
+Quando perguntar "qual data deseja marcar a consulta?":
+- Essa será a DATA DA CONSULTA (appointment_date)
+- NÃO confunda com data de nascimento (patient_birth_date)
+- São campos DIFERENTES!
+
+FLUXO:
+1. ✅ Nome + data nascimento (JÁ COLETADO)
+2. → Tipo de consulta
+3. → Convênio  
+4. → Data CONSULTA ← Aqui é appointment_date!
+5. → Horário
+
 3. Após receber a data de nascimento:
    "Perfeito! Agora me informe qual tipo de consulta você deseja:
    
@@ -418,34 +435,45 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                         hour, minute = time_match.groups()
                         data["appointment_time"] = f"{hour.zfill(2)}:{minute}"
                 
-                # 2. EXTRAÇÃO DE NOME E DATA - Usar nova função robusta
-                resultado = self._extrair_nome_e_data_robusto(content)
+                # 2. EXTRAÇÃO DE NOME E DATA - Apenas se ainda não temos data de nascimento
+                if not data["patient_birth_date"]:
+                    resultado = self._extrair_nome_e_data_robusto(content)
+                    
+                    # Validação explícita para debug
+                    if resultado["data"] and not resultado.get("erro_data"):
+                        logger.info(f"🎯 DATA PASSOU NA VALIDAÇÃO: {resultado['data']} - Claude DEVE aceitar")
+                    elif resultado.get("erro_data"):
+                        logger.warning(f"⚠️ DATA REJEITADA PELO PYTHON: {resultado.get('erro_data')}")
+                    
+                    # Atualizar nome se extraído com sucesso
+                    if resultado["nome"] and not data["patient_name"]:
+                        data["patient_name"] = resultado["nome"]
+                        logger.info(f"📝 Nome extraído: {resultado['nome']}")
+                    
+                    # Atualizar data nascimento se extraída com sucesso
+                    if resultado["data"] and not data["patient_birth_date"]:
+                        data["patient_birth_date"] = resultado["data"]
+                        logger.info(f"📅 Data nascimento extraída: {resultado['data']}")
                 
-                # Validação explícita para debug
-                if resultado["data"] and not resultado.get("erro_data"):
-                    logger.info(f"🎯 DATA PASSOU NA VALIDAÇÃO: {resultado['data']} - Claude DEVE aceitar")
-                elif resultado.get("erro_data"):
-                    logger.warning(f"⚠️ DATA REJEITADA PELO PYTHON: {resultado.get('erro_data')}")
+                # 3. EXTRAÇÃO DE DATA DE CONSULTA - Apenas se já temos data de nascimento
+                # Verificar se já tínhamos data de nascimento ANTES desta mensagem
+                had_birth_date_before = data["patient_birth_date"] is not None
                 
-                # Atualizar nome se extraído com sucesso
-                if resultado["nome"] and not data["patient_name"]:
-                    data["patient_name"] = resultado["nome"]
-                    logger.info(f"📝 Nome extraído: {resultado['nome']}")
+                logger.info(f"🔍 DEBUG: had_birth_date_before={had_birth_date_before}, current_appointment_date={data['appointment_date']}")
                 
-                # Atualizar data nascimento se extraída com sucesso
-                if resultado["data"] and not data["patient_birth_date"]:
-                    data["patient_birth_date"] = resultado["data"]
-                    logger.info(f"📅 Data nascimento extraída: {resultado['data']}")
-                
-                # 3. EXTRAÇÃO DE DATAS DE CONSULTA - Buscar em qualquer parte da mensagem
-                date_pattern = r'(\d{1,2})/(\d{1,2})/(\d{4})'
-                date_matches = re.findall(date_pattern, content)
-                for match in date_matches:
-                    day, month, year = match
-                    full_date = f"{day.zfill(2)}/{month.zfill(2)}/{year}"
-                    y = int(year)
-                    if y >= 2010 and not data["appointment_date"]:
-                        data["appointment_date"] = full_date
+                if had_birth_date_before and not data["appointment_date"]:
+                    # Agora extrair data como data de CONSULTA (não nascimento)
+                    date_pattern = r'(\d{1,2})/(\d{1,2})/(\d{4})'
+                    date_matches = re.findall(date_pattern, content)
+                    logger.info(f"🔍 DEBUG: Encontradas {len(date_matches)} datas na mensagem: {date_matches}")
+                    for match in date_matches:
+                        day, month, year = match
+                        full_date = f"{day.zfill(2)}/{month.zfill(2)}/{year}"
+                        y = int(year)
+                        if y >= 2010:
+                            data["appointment_date"] = full_date
+                            logger.info(f"📅 Data CONSULTA extraída (não nascimento): {data['appointment_date']}")
+                            break
                 
                 # 4. EXTRAÇÃO DE TIPO DE CONSULTA - Detectar escolha numérica
                 if not data["consultation_type"]:
