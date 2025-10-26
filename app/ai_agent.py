@@ -167,7 +167,13 @@ FLUXO:
    • CABERGS
    • IPE
    
-   Digite o nome do convênio ou 'não' se não tiver."
+   Digite o nome do convênio ou responda 'não' se for particular."
+   
+   ⚠️ IMPORTANTE: Se usuário responder negativamente (não tenho, sem convênio, etc):
+         - Python marcará automaticamente como "Particular"
+         - Continue para próxima etapa (data da consulta)
+         - NÃO encerre a conversa
+         - NÃO pergunte se precisa de mais alguma coisa
    
    IMPORTANTE: CLASSIFICAÇÃO DE RESPOSTA SOBRE CONVÊNIO
    
@@ -504,7 +510,7 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                 if not data["insurance_plan"]:
                     content_lower = content.lower().strip()
                     
-                    # Apenas detectar menções diretas de convênios específicos
+                    # Detectar menções diretas de convênios específicos
                     if "cabergs" in content_lower:
                         data["insurance_plan"] = "CABERGS"
                     elif "ipe" in content_lower:
@@ -514,8 +520,17 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                         insurance_map = {"1": "CABERGS", "2": "IPE"}
                         data["insurance_plan"] = insurance_map[content]
                     
-                    # Para tudo mais (incluindo respostas negativas), deixar Claude classificar
-                    # Claude vai entender a intenção e agir conforme instruções do system prompt
+                    # Detectar respostas negativas → Marcar como Particular
+                    negative_insurance = [
+                        "não tenho", "nao tenho", "não possuo", "nao possuo",
+                        "sem convênio", "sem convenio", "não tenho convênio", "nao tenho convenio",
+                        "não possuo convênio", "nao possuo convenio",
+                        "particular", "prefiro particular", "quero particular"
+                    ]
+                    
+                    if any(phrase in content_lower for phrase in negative_insurance):
+                        data["insurance_plan"] = "Particular"
+                        logger.info(f"💳 Convênio marcado como Particular (resposta negativa detectada)")
             
             logger.info(f"📋 Extração concluída: {data}")
             return data
@@ -753,9 +768,18 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
             if not context:
                 return False
             text = (last_user_message or "").strip().lower()
+            # Triggers ESPECÍFICOS para evitar encerramentos prematuros
             negative_triggers = [
-                "nao", "não", "só isso", "so isso", "obrigado", "obrigada", "encerrar", "finalizar",
-                "nada", "por enquanto nao", "por enquanto não"
+                "só isso mesmo",
+                "só isso",
+                "pode encerrar",
+                "pode finalizar",
+                "não preciso de mais nada",
+                "não preciso mais",
+                "obrigado tchau",
+                "obrigada tchau",
+                "até logo",
+                "até mais"
             ]
             is_negative = any(t in text for t in negative_triggers)
 
@@ -768,9 +792,18 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                         last_assistant_asks_more = True
                     break
 
-            # Encerrar se negativa após pergunta final ou negativa sem fluxo ativo
-            if is_negative and (last_assistant_asks_more or not context.current_flow):
+            # NUNCA encerrar se estamos no meio de um fluxo ativo
+            if context.current_flow == "booking":
+                logger.info(f"❌ NÃO encerrando - fluxo de agendamento ativo")
+                return False
+            
+            # Encerrar APENAS se:
+            # 1. Bot perguntou "posso te ajudar com mais alguma coisa?"
+            # 2. E usuário respondeu negativamente
+            if is_negative and last_assistant_asks_more:
+                logger.info(f"✅ Encerrando - ação completa + usuário não precisa mais")
                 return True
+            
             return False
         except Exception:
             return False
