@@ -553,6 +553,36 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
         import re
         from datetime import datetime
         
+        # Lista de frases curtas que devem ser ignoradas (não são nomes)
+        FRASES_IGNORAR = [
+            "sim", "não", "nao", "tudo bem", "obrigado", "obrigada",
+            "por favor", "claro", "ok", "pode", "confirma", "beleza",
+            "perfeito", "certo", "exato", "isso", "show", "obrigado",
+            "prazer", "impeça", "adicione", "venha", "vir", "está"
+        ]
+        
+        # Validar se mensagem não é apenas uma frase de confirmação
+        mensagem_lower = mensagem.lower().strip()
+        if any(frase in mensagem_lower for frase in FRASES_IGNORAR):
+            if len(mensagem.split()) <= 2:  # Ignorar se tem 2 palavras ou menos
+                logger.info(f"🔍 Ignorando mensagem curta de confirmação: {mensagem}")
+                return {
+                    "nome": None,
+                    "data": None,
+                    "erro_nome": None,
+                    "erro_data": None
+                }
+        
+        # Ignorar mensagens muito curtas (< 8 caracteres)
+        if len(mensagem) < 8:
+            logger.info(f"🔍 Ignorando mensagem muito curta: {mensagem}")
+            return {
+                "nome": None,
+                "data": None,
+                "erro_nome": None,
+                "erro_data": None
+            }
+        
         resultado = {
             "nome": None,
             "data": None,
@@ -880,18 +910,20 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                     # Usuário confirmou! Executar agendamento
                     logger.info(f"✅ Usuário {phone} confirmou agendamento")
                     
-                    # Usar dados do flow_data (NÃO re-extrair do histórico)
+                    # Usar dados do flow_data como fonte primária
                     data = context.flow_data or {}
                     
-                    # Se faltar nome ou data de nascimento, extrair do histórico APENAS UMA VEZ
+                    # Apenas extrair do histórico se flow_data estiver completamente vazio
                     if not data.get("patient_name") or not data.get("patient_birth_date"):
-                        logger.info(f"🔍 Dados incompletos no flow_data, extraindo do histórico: {data}")
+                        logger.warning(f"⚠️ Dados ausentes no flow_data, extraindo do histórico")
+                        logger.warning(f"   flow_data atual: {data}")
                         extracted = self._extract_appointment_data_from_messages(context.messages)
                         data["patient_name"] = data.get("patient_name") or extracted.get("patient_name")
-                        # NÃO sobrescrever patient_birth_date se já existir no flow_data
                         if not data.get("patient_birth_date"):
                             data["patient_birth_date"] = extracted.get("patient_birth_date")
-                        logger.info(f"🔍 Dados após extração: {data}")
+                        logger.info(f"   Dados após extração: {data}")
+                    else:
+                        logger.info(f"✅ Usando dados do flow_data: {data}")
                     
                     # Criar agendamento
                     result = self._handle_create_appointment({
@@ -1116,10 +1148,16 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
             # Extrair dados do histórico
             extracted = self._extract_appointment_data_from_messages(context.messages)
             
-            # Salvar no flow_data APENAS os campos que ainda não existem
+            # CRÍTICO: Nunca sobrescrever nome e data de nascimento se já existem
+            # Esses dados são fornecidos uma única vez no início
             if extracted.get("patient_name") and not context.flow_data.get("patient_name"):
-                context.flow_data["patient_name"] = extracted["patient_name"]
-                logger.info(f"💾 Nome salvo no flow_data: {extracted['patient_name']}")
+                # Validar que não é frase de confirmação antes de salvar
+                nome = extracted["patient_name"]
+                if len(nome) >= 8 and " " in nome:
+                    context.flow_data["patient_name"] = nome
+                    logger.info(f"💾 Nome salvo no flow_data: {nome}")
+                else:
+                    logger.warning(f"⚠️ Nome rejeitado por ser muito curto ou sem espaço: {nome}")
             
             if extracted.get("patient_birth_date") and not context.flow_data.get("patient_birth_date"):
                 context.flow_data["patient_birth_date"] = extracted["patient_birth_date"]
@@ -1469,19 +1507,39 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                 if phone:
                     context = db.query(ConversationContext).filter_by(phone=phone).first()
                     if context:
-                        # Extrair dados do histórico ANTES de salvar no flow_data
-                        extracted = self._extract_appointment_data_from_messages(context.messages)
-                        
-                        # Preservar dados já existentes, adicionar novos
+                        # CRÍTICO: Não sobrescrever dados já salvos no flow_data
                         if not context.flow_data:
                             context.flow_data = {}
-                        context.flow_data.update({
-                            "patient_name": context.flow_data.get("patient_name") or extracted.get("patient_name"),
-                            "patient_birth_date": context.flow_data.get("patient_birth_date") or extracted.get("patient_birth_date"),
-                            "appointment_date": date_str,
-                            "appointment_time": hora_consulta.strftime('%H:%M'),
-                            "pending_confirmation": True
-                        })
+                        
+                        # Atualizar APENAS campos vazios (não sobrescrever)
+                        if not context.flow_data.get("patient_name"):
+                            extracted = self._extract_appointment_data_from_messages(context.messages)
+                            if extracted.get("patient_name"):
+                                context.flow_data["patient_name"] = extracted.get("patient_name")
+                        
+                        if not context.flow_data.get("patient_birth_date"):
+                            if 'extracted' not in locals():
+                                extracted = self._extract_appointment_data_from_messages(context.messages)
+                            if extracted.get("patient_birth_date"):
+                                context.flow_data["patient_birth_date"] = extracted.get("patient_birth_date")
+                        
+                        if not context.flow_data.get("consultation_type"):
+                            if 'extracted' not in locals():
+                                extracted = self._extract_appointment_data_from_messages(context.messages)
+                            if extracted.get("consultation_type"):
+                                context.flow_data["consultation_type"] = extracted.get("consultation_type")
+                        
+                        if not context.flow_data.get("insurance_plan"):
+                            if 'extracted' not in locals():
+                                extracted = self._extract_appointment_data_from_messages(context.messages)
+                            if extracted.get("insurance_plan"):
+                                context.flow_data["insurance_plan"] = extracted.get("insurance_plan")
+                        
+                        # Sempre atualizar data/hora da consulta (podem mudar)
+                        context.flow_data["appointment_date"] = date_str
+                        context.flow_data["appointment_time"] = hora_consulta.strftime('%H:%M')
+                        context.flow_data["pending_confirmation"] = True
+                        
                         db.commit()
                         logger.info(f"💾 Dados salvos no flow_data para confirmação: {context.flow_data}")
                 
@@ -1609,7 +1667,18 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
             if insurance_plan not in valid_insurance:
                 insurance_plan = "particular"  # Fallback
             
+            # Log detalhado antes da validação
+            logger.info(f"🔍 Validando dados para criar agendamento:")
+            logger.info(f"   patient_name: {patient_name}")
+            logger.info(f"   patient_phone: {patient_phone}")
+            logger.info(f"   patient_birth_date: {patient_birth_date}")
+            logger.info(f"   appointment_date: {appointment_date}")
+            logger.info(f"   appointment_time: {appointment_time}")
+            logger.info(f"   consultation_type: {consultation_type}")
+            logger.info(f"   insurance_plan: {insurance_plan}")
+            
             if not all([patient_name, patient_phone, patient_birth_date, appointment_date, appointment_time]):
+                logger.error(f"❌ VALIDAÇÃO FALHOU - Dados incompletos")
                 return "Todos os campos obrigatórios devem ser preenchidos."
             
             # Normalizar telefone
@@ -1669,6 +1738,7 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
             
             db.add(appointment)
             db.commit()
+            logger.info(f"✅ AGENDAMENTO SALVO NO BANCO - ID: {appointment.id}")
             
             # Buscar informações do tipo de consulta e convênio
             tipos_consulta = self.clinic_info.get('tipos_consulta', {})
