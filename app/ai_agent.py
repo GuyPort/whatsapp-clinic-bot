@@ -242,12 +242,17 @@ FLUXO:
 
 6. **FLUXO CRÍTICO - Após receber a data desejada:**
    a) Execute validate_date_and_show_slots com a data
-   b) Esta tool vai:
-      - Validar se a data está disponível (dia da semana + dias fechados)
-      - Mostrar TODOS os horários disponíveis daquele dia
-      - Formatar bonitinho com o dia da semana e horário de funcionamento
-   c) Se houver horários: "Qual horário você prefere?"
-   d) Se NÃO houver horários: "Não há horários disponíveis. Escolha outra data."
+   b) Esta tool vai retornar uma mensagem COMPLETA com:
+      - Confirmação da data e dia da semana
+      - Horário de funcionamento
+      - Lista completa de horários disponíveis
+      - Texto "Qual horário você prefere?"
+   
+   REGRA CRÍTICA: Você DEVE repassar a mensagem COMPLETA da tool ao usuário.
+   NÃO resuma. NÃO adicione textos extras. Apenas copie e envie a mensagem exata.
+   
+   c) Se houver horários: repasse a mensagem COMPLETA
+   d) Se NÃO houver horários: repasse a mensagem COMPLETA
 
 7. **FLUXO CRÍTICO - Após usuário escolher um horário:**
    
