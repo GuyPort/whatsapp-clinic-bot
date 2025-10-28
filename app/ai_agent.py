@@ -1746,7 +1746,7 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
             fim_time = datetime.strptime(fim_str, '%H:%M').time()
             
             # Buscar consultas já agendadas nesse dia
-            date_str_formatted = date_str.replace('/', '')  # YYYYMMDD
+            date_str_formatted = appointment_date.strftime('%Y%m%d')  # YYYYMMDD
             existing_appointments = db.query(Appointment).filter(
                 Appointment.appointment_date == date_str_formatted,
                 Appointment.status == AppointmentStatus.AGENDADA
