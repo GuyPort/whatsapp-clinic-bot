@@ -250,15 +250,28 @@ FLUXO:
    d) Se NÃO houver horários: "Não há horários disponíveis. Escolha outra data."
 
 7. **FLUXO CRÍTICO - Após usuário escolher um horário:**
-   a) Execute confirm_time_slot com data e hora escolhida
-   b) Esta tool vai:
+   
+   QUANDO DETECTAR MENSAGEM COM HORÁRIO (HH:MM):
+   - Exemplos: "17:00", "14:00", "09:00", "08:00", etc.
+   - Formato: 2 dígitos, dois pontos, 2 dígitos
+   
+   AÇÃO OBRIGATÓRIA:
+   a) Execute IMEDIATAMENTE confirm_time_slot com:
+      - date: a data que foi validada anteriormente (appointment_date)
+      - time: o horário que o usuário acabou de escolher
+   
+   b) Esta tool vai automaticamente:
       - Verificar se é horário inteiro (só aceita 08:00, 09:00, etc)
       - Verificar disponibilidade final (segurança contra race condition)
       - Mostrar resumo da consulta (nome, data, hora, tipo, convênio)
       - Pedir confirmação: "Posso confirmar o agendamento?"
+   
    c) NÃO execute create_appointment imediatamente
    d) Apenas repasse a mensagem da tool ao usuário
    e) Aguarde confirmação do usuário ("sim", "confirma", "quero", etc)
+   
+   REGRA CRÍTICA: Se o usuário enviar QUALQUER mensagem no formato HH:MM,
+   você DEVE executar confirm_time_slot IMEDIATAMENTE, sem exceção.
 
 8. **FLUXO CRÍTICO - Após confirmação do usuário:**
    a) Execute create_appointment com TODOS os dados
@@ -1209,7 +1222,32 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                 context.flow_data["insurance_plan"] = extracted["insurance_plan"]
                 logger.info(f"💾 Convênio salvo no flow_data: {extracted['insurance_plan']}")
             
-            # 8. Atualizar contexto no banco
+            # 8. FALLBACK: Verificar se Claude deveria ter chamado confirm_time_slot mas não chamou
+            # Isso acontece quando: temos data + horário, mas não tem pending_confirmation
+            if (context.flow_data.get("appointment_date") and 
+                context.flow_data.get("appointment_time") and 
+                not context.flow_data.get("pending_confirmation")):
+                
+                logger.info("🔄 FALLBACK: Claude não chamou confirm_time_slot, chamando manualmente...")
+                logger.info(f"   Data: {context.flow_data['appointment_date']}")
+                logger.info(f"   Horário: {context.flow_data['appointment_time']}")
+                
+                # Chamar a tool manualmente
+                try:
+                    confirmation_msg = self._handle_confirm_time_slot({
+                        "date": context.flow_data["appointment_date"],
+                        "time": context.flow_data["appointment_time"]
+                    }, db, phone)
+                    
+                    # Substituir resposta do Claude pela confirmação
+                    bot_response = confirmation_msg
+                    logger.info("✅ Tool confirm_time_slot executada com sucesso via fallback")
+                    
+                except Exception as e:
+                    logger.error(f"❌ Erro ao executar fallback de confirm_time_slot: {str(e)}")
+                    # Manter resposta original do Claude
+            
+            # 9. Atualizar contexto no banco
             context.last_activity = datetime.utcnow()
             db.commit()
             
