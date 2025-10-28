@@ -1055,7 +1055,7 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
             # 6. Fazer chamada para o Claude com histórico completo
             logger.info(f"🤖 Enviando {len(claude_messages)} mensagens para Claude")
             response = self.client.messages.create(
-                model="claude-3-5-sonnet-20241022",
+                model="claude-3-5-sonnet-20240620",
                 max_tokens=2000,
                 temperature=0.1,
                 system=self.system_prompt,
@@ -1110,7 +1110,7 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                             
                             # Fazer follow-up com o resultado
                             current_response = self.client.messages.create(
-                                model="claude-3-5-sonnet-20241022",
+                                model="claude-3-5-sonnet-20240620",
                                 max_tokens=2000,
                                 temperature=0.1,
                                 system=self.system_prompt,
