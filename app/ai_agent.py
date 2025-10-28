@@ -240,30 +240,36 @@ FLUXO:
 5. Após receber o convênio (1, 2 ou 3):
    "Agora me informe o dia que gostaria de marcar a consulta (DD/MM/AAAA - ex: 25/11/2025):"
 
-6. Após receber a data desejada:
-   "Ótimo! E que horário você prefere? (HH:MM - ex: 14:30):"
+6. **FLUXO CRÍTICO - Após receber a data desejada:**
+   a) Execute validate_date_and_show_slots com a data
+   b) Esta tool vai:
+      - Validar se a data está disponível (dia da semana + dias fechados)
+      - Mostrar TODOS os horários disponíveis daquele dia
+      - Formatar bonitinho com o dia da semana e horário de funcionamento
+   c) Se houver horários: "Qual horário você prefere?"
+   d) Se NÃO houver horários: "Não há horários disponíveis. Escolha outra data."
 
-7. **FLUXO CRÍTICO - Após receber horário:**
-   a) Execute validate_and_check_availability com data e hora
-   b) Leia o resultado da tool:
-      - Se contém "disponível" → A tool já vai retornar uma mensagem pedindo confirmação
-      - Se contém "não está disponível" → Explique e peça outro horário
-      - Se contém "fora do horário" → Explique e peça outro horário
-   c) NÃO execute create_appointment imediatamente após validar disponibilidade
-   d) Apenas repasse a mensagem de confirmação que a tool retornou
-   e) O sistema detectará automaticamente quando usuário confirmar
+7. **FLUXO CRÍTICO - Após usuário escolher um horário:**
+   a) Execute confirm_time_slot com data e hora escolhida
+   b) Esta tool vai:
+      - Verificar se é horário inteiro (só aceita 08:00, 09:00, etc)
+      - Verificar disponibilidade final (segurança contra race condition)
+      - Mostrar resumo da consulta (nome, data, hora, tipo, convênio)
+      - Pedir confirmação: "Posso confirmar o agendamento?"
+   c) NÃO execute create_appointment imediatamente
+   d) Apenas repasse a mensagem da tool ao usuário
+   e) Aguarde confirmação do usuário ("sim", "confirma", "quero", etc)
 
-IMPORTANTE - FLUXO DE CONFIRMAÇÃO:
-1. Após validar disponibilidade com validate_and_check_availability:
-   - NÃO execute create_appointment imediatamente
-   - A tool já vai retornar uma mensagem pedindo confirmação
-   - Apenas repasse essa mensagem ao usuário
-2. O sistema vai detectar automaticamente quando usuário confirmar
-3. Você só deve executar create_appointment se o usuário:
-   - Fornecer TODOS os dados novamente explicitamente
-   - OU se já tiver confirmado previamente (verá no histórico)
+8. **FLUXO CRÍTICO - Após confirmação do usuário:**
+   a) Execute create_appointment com TODOS os dados
+   b) Os dados vêm do flow_data (já foram salvos nas etapas anteriores)
+   c) Se sucesso: "Agendamento realizado com suค่ะcesso! Posso te ajudar com mais alguma coisa?"
 
-REGRA IMPORTANTE: O fluxo de confirmação é automático. Não interfira!
+IMPORTANTE - FLUXO DE CONFirmaÇÃO:
+1. O fluxo é: validate_date_and_show_slots → confirm_time_slot → create_appointment
+2. NÃO pule etapas
+3. NÃO tente criar o agendamento antes de confirmar o horário
+4. Use confirm_time_slot APENAS quando o usuário escolher um horário específico
 
 CICLO DE ATENDIMENTO CONTÍNUO:
 1. Após QUALQUER tarefa concluída (agendamento, cancelamento, resposta a dúvida):
@@ -307,8 +313,8 @@ REGRAS IMPORTANTES:
 
 FERRAMENTAS DISPONÍVEIS:
 - get_clinic_info: Obter informações da clínica
-- validate_business_hours: Validar se horário está dentro do funcionamento
-- validate_and_check_availability: Validar horário específico (funcionamento + disponibilidade)
+- validate_date_and_show_slots: Validar data e mostrar TODOS os horários disponíveis do dia
+- confirm_time_slot: Confirmar horário escolhido pelo paciente
 - create_appointment: Criar novo agendamento
 - search_appointments: Buscar agendamentos existentes
 - cancel_appointment: Cancelar agendamento
