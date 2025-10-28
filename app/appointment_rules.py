@@ -148,13 +148,11 @@ class AppointmentRules:
             h, m = map(int, ultima_hora_sabado.split(':'))
             end_time = target_date.replace(hour=h, minute=m, second=0, microsecond=0)
         
-        # Buscar consultas já agendadas no banco
-        day_start = target_date.replace(hour=0, minute=0, second=0, microsecond=0)
-        day_end = day_start + timedelta(days=1)
+        # Buscar consultas já agendadas no banco - USAR FORMATO STRING
+        target_date_str = target_date.strftime('%Y%m%d')  # "20251015"
         
         existing_appointments = db.query(Appointment).filter(
-            Appointment.appointment_date >= day_start.date(),
-            Appointment.appointment_date < day_end.date(),
+            Appointment.appointment_date == target_date_str,  # Comparação STRING
             Appointment.status == AppointmentStatus.AGENDADA  # Apenas consultas ativas
         ).all()
         
@@ -175,8 +173,17 @@ class AppointmentRules:
                 has_conflict = False
                 
                 for appointment in existing_appointments:
-                    # Combinar data e hora para criar datetime
-                    app_start = datetime.combine(appointment.appointment_date, appointment.appointment_time).replace(tzinfo=None)
+                    # Converter STRING para datetime
+                    app_date_str = appointment.appointment_date
+                    app_date = datetime.strptime(app_date_str, '%Y%m%d').date()
+                    
+                    # Converter time string para time object
+                    if isinstance(appointment.appointment_time, str):
+                        app_time = datetime.strptime(appointment.appointment_time, '%H:%M').time()
+                    else:
+                        app_time = appointment.appointment_time
+                    
+                    app_start = datetime.combine(app_date, app_time).replace(tzinfo=None)
                     app_end = app_start + timedelta(minutes=appointment.duration_minutes)
                     
                     # Verificar sobreposição
@@ -192,12 +199,13 @@ class AppointmentRules:
         
         return available_slots
     
-    def format_available_slots_message(self, slots: List[datetime]) -> str:
+    def format_available_slots_message(self, slots: List[datetime], target_date: datetime = None) -> str:
         """
         Formata lista de horários disponíveis em mensagem amigável.
         
         Args:
             slots: Lista de datetime
+            target_date: Data alvo para adicionar contexto (opcional)
             
         Returns:
             Mensagem formatada
@@ -205,12 +213,71 @@ class AppointmentRules:
         if not slots:
             return "Infelizmente não há horários disponíveis para esse dia. Poderia me informar outra data?"
         
-        message = "Horários disponíveis:\n\n"
-        for i, slot in enumerate(slots, 1):
-            message += f"{i}. {format_time_br(slot)}\n"
+        message = ""
         
-        message += "\nPor favor, escolha o número do horário desejado."
+        # Adicionar contexto do dia se fornecido
+        if target_date:
+            dias_semana = ['segunda-feira', 'terça-feira', 'quarta-feira', 
+                           'quinta-feira', 'sexta-feira', 'sábado', 'domingo']
+            dia_nome = dias_semana[target_date.weekday()]
+            
+            # Buscar horário de funcionamento
+            horarios = self.clinic_info.get('horario_funcionamento', {})
+            dias_semana_key = ['segunda', 'terca', 'quarta', 'quinta', 'sexta', 'sabado', 'domingo']
+            horario_dia = horarios.get(dias_semana_key[target_date.weekday()], "FECHADO")
+            
+            message += f"📅 {target_date.strftime('%d/%m/%Y')} é {dia_nome}\n"
+            message += f"🕒 Horário de funcionamento: {horario_dia}\n"
+            message += f"⏱️ Duração da consulta: 1 hora\n\n"
+        
+        message += "✅ Horários disponíveis:\n\n"
+        
+        # Agrupar horários consecutivos em faixas
+        grouped_slots = self._group_consecutive_slots(slots)
+        
+        for i, (start, end) in enumerate(grouped_slots, 1):
+            if start == end:
+                message += f"{i}. {start.strftime('%H:%M')}\n"
+            else:
+                message += f"{i}. {start.strftime('%H:%M')} às {end.strftime('%H:%M')}\n"
+        
+        message += "\nEscolha o horário desejado informando o número da opção."
         return message
+    
+    def _group_consecutive_slots(self, slots: List[datetime]) -> List[Tuple[datetime, datetime]]:
+        """
+        Agrupa horários consecutivos em faixas.
+        
+        Exemplo:
+        [08:00, 08:05, 08:10, 08:15] → [(08:00, 08:15)]
+        [08:00, 08:05, 10:00, 10:05] → [(08:00, 08:05), (10:00, 10:05)]
+        
+        Args:
+            slots: Lista de datetime ordenada
+            
+        Returns:
+            Lista de tuplas (início, fim) das faixas
+        """
+        if not slots:
+            return []
+        
+        grouped = []
+        current_start = slots[0]
+        current_end = slots[0]
+        
+        for i in range(1, len(slots)):
+            # Se o próximo slot é 5 min após o atual, estender faixa
+            if slots[i] == current_end + timedelta(minutes=5):
+                current_end = slots[i]
+            else:
+                # Nova faixa
+                grouped.append((current_start, current_end))
+                current_start = slots[i]
+                current_end = slots[i]
+        
+        # Adicionar última faixa
+        grouped.append((current_start, current_end))
+        return grouped
     
     def can_modify_appointment(
         self,

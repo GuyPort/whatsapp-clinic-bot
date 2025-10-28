@@ -326,6 +326,20 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                 }
             },
             {
+                "name": "validate_date_and_show_slots",
+                "description": "Validar data e mostrar automaticamente TODOS os horários disponíveis do dia",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "date": {
+                            "type": "string",
+                            "description": "Data no formato DD/MM/AAAA"
+                        }
+                    },
+                    "required": ["date"]
+                }
+            },
+            {
                 "name": "create_appointment",
                 "description": "Criar um novo agendamento de consulta",
                 "input_schema": {
@@ -1201,6 +1215,8 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                 return self._handle_validate_business_hours(tool_input)
             elif tool_name == "validate_and_check_availability":
                 return self._handle_validate_and_check_availability(tool_input, db, phone)
+            elif tool_name == "validate_date_and_show_slots":
+                return self._handle_validate_date_and_show_slots(tool_input, db)
             elif tool_name == "create_appointment":
                 return self._handle_create_appointment(tool_input, db, phone)
             elif tool_name == "search_appointments":
@@ -1631,6 +1647,45 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
         except Exception as e:
             logger.error(f"Erro ao verificar disponibilidade: {str(e)}")
             return f"Erro ao verificar disponibilidade: {str(e)}"
+
+    def _handle_validate_date_and_show_slots(self, tool_input: Dict, db: Session) -> str:
+        """
+        Valida data e mostra horários disponíveis automaticamente.
+        Combina validação + listagem em uma única etapa.
+        """
+        try:
+            date_str = tool_input.get("date")
+            
+            if not date_str:
+                return "Data é obrigatória. Informe no formato DD/MM/AAAA."
+            
+            # Validar data
+            appointment_date = parse_date_br(date_str)
+            if not appointment_date:
+                return "Data inválida. Use formato DD/MM/AAAA."
+            
+            logger.info(f"📅 Validando data e buscando slots: {date_str}")
+            
+            # Verificar dias fechados
+            dias_fechados = self.clinic_info.get('dias_fechados', [])
+            if date_str in dias_fechados:
+                return f"❌ A clínica estará fechada em {date_str} (feriado/férias).\nPor favor, escolha outra data."
+            
+            # Validar dia da semana e horário
+            is_valid, error_msg = appointment_rules.is_valid_appointment_date(appointment_date)
+            if not is_valid:
+                return f"❌ {error_msg}\nPor favor, escolha outra data."
+            
+            # Buscar horários disponíveis
+            duracao = self.clinic_info.get('regras_agendamento', {}).get('duracao_consulta_minutos', 60)
+            available_slots = appointment_rules.get_available_slots(appointment_date, duracao, db, limit=20)
+            
+            # Formatar mensagem com contexto
+            return appointment_rules.format_available_slots_message(available_slots, appointment_date)
+            
+        except Exception as e:
+            logger.error(f"Erro ao validar data e mostrar slots: {str(e)}")
+            return f"Erro ao buscar horários disponíveis: {str(e)}"
 
     def _handle_create_appointment(self, tool_input: Dict, db: Session, phone: str = None) -> str:
         """Tool: create_appointment"""
