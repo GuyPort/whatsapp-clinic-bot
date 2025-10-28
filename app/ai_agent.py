@@ -500,7 +500,8 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
             logger.info(f"🔍 Extraindo dados de {len(messages)} mensagens")
             import re
             
-            for i in range(len(messages) - 1, -1, -1):
+            # Processar em ORDEM CRONOLÓGICA (primeira mensagem primeiro)
+            for i in range(0, len(messages)):
                 msg = messages[i]
                 if msg.get("role") != "user":
                     continue
