@@ -574,8 +574,26 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
             "prazer", "impeça", "adicione", "venha", "vir", "está"
         ]
         
+        # Lista de palavras ofensivas a serem ignoradas
+        PALAVRAS_OFENSIVAS = [
+            "puta", "pinto", "buceta", "caralho", "cacete", "porra", "merda",
+            "cu", "foda", "fodas", "foder", "chupa", "viado", "veado",
+            "sua mãe", "sua mãe", "filho da puta", "filha da puta"
+        ]
+        
         # Validar se mensagem não é apenas uma frase de confirmação
         mensagem_lower = mensagem.lower().strip()
+        
+        # Ignorar mensagens com palavras ofensivas
+        if any(palavra in mensagem_lower for palavra in PALAVRAS_OFENSIVAS):
+            logger.info(f"🔍 Ignorando mensagem com palavra ofensiva: {mensagem}")
+            return {
+                "nome": None,
+                "data": None,
+                "erro_nome": None,
+                "erro_data": None
+            }
+        
         if any(frase in mensagem_lower for frase in FRASES_IGNORAR):
             if len(mensagem.split()) <= 2:  # Ignorar se tem 2 palavras ou menos
                 logger.info(f"🔍 Ignorando mensagem curta de confirmação: {mensagem}")
@@ -620,15 +638,8 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
             try:
                 data_obj = datetime.strptime(f"{dia}/{mes}/{ano}", '%d/%m/%Y')
                 
-                # Validar se data é futura
-                if data_obj.date() > datetime.now().date():
-                    resultado["erro_data"] = (
-                        f"A data {dia}/{mes}/{ano} está no futuro. "
-                        f"Por favor, informe sua data de nascimento (não pode ser futura)."
-                    )
-                    logger.warning(f"❌ DATA FUTURA REJEITADA: {dia}/{mes}/{ano} > {datetime.now().strftime('%d/%m/%Y')}")
                 # Validar idade máxima (120 anos)
-                elif (datetime.now() - data_obj).days / 365.25 > 120:
+                if (datetime.now() - data_obj).days / 365.25 > 120:
                     resultado["erro_data"] = "Data de nascimento parece incorreta (mais de 120 anos)"
                 else:
                     resultado["data"] = f"{dia}/{mes}/{ano}"
@@ -651,15 +662,8 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                     
                     data_obj = datetime.strptime(f"{dia}/{mes}/{ano}", '%d/%m/%Y')
                     
-                    # Validar se data é futura
-                    if data_obj.date() > datetime.now().date():
-                        resultado["erro_data"] = (
-                            f"A data {dia}/{mes}/{ano} está no futuro. "
-                            f"Por favor, informe sua data de nascimento (não pode ser futura)."
-                        )
-                        logger.warning(f"❌ DATA FUTURA REJEITADA: {dia}/{mes}/{ano} > {datetime.now().strftime('%d/%m/%Y')}")
                     # Validar idade máxima (120 anos)
-                    elif (datetime.now() - data_obj).days / 365.25 > 120:
+                    if (datetime.now() - data_obj).days / 365.25 > 120:
                         resultado["erro_data"] = "Data de nascimento parece incorreta (mais de 120 anos)"
                     else:
                         resultado["data"] = f"{dia}/{mes}/{ano}"
@@ -697,15 +701,8 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                     try:
                         data_obj = datetime.strptime(f"{dia}/{mes_num}/{ano}", '%d/%m/%Y')
                         
-                        # Validar se data é futura
-                        if data_obj.date() > datetime.now().date():
-                            resultado["erro_data"] = (
-                                f"A data {dia}/{mes}/{ano} está no futuro. "
-                                f"Por favor, informe sua data de nascimento (não pode ser futura)."
-                            )
-                            logger.warning(f"❌ DATA FUTURA REJEITADA: {dia}/{mes}/{ano} > {datetime.now().strftime('%d/%m/%Y')}")
                         # Validar idade máxima (120 anos)
-                        elif (datetime.now() - data_obj).days / 365.25 > 120:
+                        if (datetime.now() - data_obj).days / 365.25 > 120:
                             resultado["erro_data"] = "Data de nascimento parece incorreta (mais de 120 anos)"
                         else:
                             resultado["data"] = f"{dia}/{mes_num}/{ano}"
@@ -727,15 +724,8 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                         try:
                             data_obj = datetime.strptime(f"{dia}/{mes_num}/{ano}", '%d/%m/%Y')
                             
-                            # Validar se data é futura
-                            if data_obj.date() > datetime.now().date():
-                                resultado["erro_data"] = (
-                                    f"A data {dia}/{mes}/{ano} está no futuro. "
-                                    f"Por favor, informe sua data de nascimento (não pode ser futura)."
-                                )
-                                logger.warning(f"❌ DATA FUTURA REJEITADA: {dia}/{mes}/{ano} > {datetime.now().strftime('%d/%m/%Y')}")
                             # Validar idade máxima (120 anos)
-                            elif (datetime.now() - data_obj).days / 365.25 > 120:
+                            if (datetime.now() - data_obj).days / 365.25 > 120:
                                 resultado["erro_data"] = "Data de nascimento parece incorreta (mais de 120 anos)"
                             else:
                                 resultado["data"] = f"{dia}/{mes_num}/{ano}"
@@ -1526,10 +1516,17 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                             context.flow_data = {}
                         
                         # Atualizar APENAS campos vazios (não sobrescrever)
-                        if not context.flow_data.get("patient_name"):
+                        nome_atual = context.flow_data.get("patient_name")
+                        logger.info(f"🔍 DEBUG: Nome atual no flow_data: {nome_atual}")
+                        
+                        if not nome_atual:
+                            logger.info(f"🔍 DEBUG: Nome está vazio, extraindo do histórico")
                             extracted = self._extract_appointment_data_from_messages(context.messages)
                             if extracted.get("patient_name"):
+                                logger.info(f"🔍 DEBUG: Nome extraído: {extracted.get('patient_name')}")
                                 context.flow_data["patient_name"] = extracted.get("patient_name")
+                        else:
+                            logger.info(f"🔍 DEBUG: Nome já existe ({nome_atual}), NÃO sobrescrevendo")
                         
                         if not context.flow_data.get("patient_birth_date"):
                             if 'extracted' not in locals():
