@@ -1763,12 +1763,9 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                 for apt in existing_appointments:
                     apt_time = datetime.strptime(apt.appointment_time, '%H:%M').time()
                     apt_datetime = datetime.combine(appointment_date.date(), apt_time)
-                    apt_end_datetime = apt_datetime + timedelta(hours=1)
-                    slot_end_datetime = slot_datetime + timedelta(hours=1)
                     
-                    # Verificar se há sobreposição (consulta dura 1 hora)
-                    # Conflito se: slot começa antes do fim da consulta existente E termina depois do início
-                    if (slot_datetime < apt_end_datetime and slot_end_datetime > apt_datetime):
+                    # Verificar se há sobreposição - se o horário é exatamente o mesmo
+                    if slot_datetime == apt_datetime:
                         tem_conflito = True
                         break
                 
