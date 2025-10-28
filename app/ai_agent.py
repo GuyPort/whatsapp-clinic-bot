@@ -1957,8 +1957,10 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                 return "Formato de horário inválido. Use HH:MM."
             
             # Verificar se horário está disponível
+            # IMPORTANTE: Remover timezone para compatibilidade com check_slot_availability
+            appointment_datetime_naive = appointment_datetime_local.replace(tzinfo=None)
             duracao = self.clinic_info.get('regras_agendamento', {}).get('duracao_consulta_minutos', 60)
-            is_available = appointment_rules.check_slot_availability(appointment_datetime_local, duracao, db)
+            is_available = appointment_rules.check_slot_availability(appointment_datetime_naive, duracao, db)
             
             if not is_available:
                 return f"❌ Horário {appointment_time} não está disponível. Use a tool check_availability para ver horários disponíveis."
