@@ -26,10 +26,6 @@ class AppointmentRules:
         self.clinic_info = load_clinic_info()
         self.rules = self.clinic_info.get('regras_agendamento', {})
     
-    def get_min_days_advance(self) -> int:
-        """Retorna número mínimo de dias de antecedência"""
-        return self.rules.get('dias_minimos_antecedencia', 2)
-    
     def get_interval_between_appointments(self) -> int:
         """Retorna intervalo mínimo entre consultas em minutos"""
         return self.rules.get('intervalo_entre_consultas_minutos', 15)
@@ -56,13 +52,7 @@ class AppointmentRules:
         if appointment_date <= now:
             return False, "A data deve ser no futuro."
         
-        # 2. Verificar mínimo de dias de antecedência
-        min_days = self.get_min_days_advance()
-        min_date = now + timedelta(days=min_days)
-        if appointment_date.date() < min_date.date():
-            return False, f"É necessário agendar com pelo menos {min_days} dias de antecedência."
-        
-        # 3. Verificar dia da semana
+        # 2. Verificar dia da semana
         weekday = appointment_date.weekday()  # 0=segunda, 6=domingo
         
         # Domingo sempre fechado

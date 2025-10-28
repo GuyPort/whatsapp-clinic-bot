@@ -20,7 +20,6 @@
   
   
   "regras_agendamento": {
-    "dias_minimos_antecedencia": 1,
     "intervalo_entre_consultas_minutos": 0,
     "duracao_consulta_minutos": 60
   },
