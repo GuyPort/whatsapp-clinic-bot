@@ -1083,37 +1083,9 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                             logger.warning(f"⚠️ Iteration {iteration}: Claude retornou resposta vazia")
                             # Se há tool_result anterior, usar como fallback
                             if 'tool_result' in locals():
-                                # Se tool_result indica disponibilidade, tentar criar agendamento automaticamente
-                                if "disponível" in tool_result.lower():
-                                    # Extrair dados das mensagens e criar agendamento diretamente
-                                    logger.warning("⚠️ Claude não criou agendamento, fazendo fallback automático")
-                                    try:
-                                        # Extrair dados do histórico de mensagens
-                                        appointment_data = self._extract_appointment_data_from_messages(context.messages) or {}
-                                        
-                                        # Adicionar telefone do paciente (disponível no contexto phone)
-                                        appointment_data["patient_phone"] = phone
-                                        
-                                        logger.info(f"📋 Dados extraídos: {appointment_data}")
-                                        
-                                        required = [
-                                            "patient_name","patient_birth_date","appointment_date","appointment_time","patient_phone"
-                                        ]
-                                        missing = [k for k in required if not appointment_data.get(k)]
-                                        if not missing:
-                                            appointment_result = self._handle_create_appointment(appointment_data, db)
-                                            bot_response = f"Perfeito! {appointment_result}"
-                                        else:
-                                            logger.error(f"❌ Dados incompletos extraídos: {appointment_data}")
-                                            bot_response = (
-                                                "Quase lá! Preciso só de: " + ", ".join(missing) + ". "
-                                                "Por favor, me informe para concluir o agendamento."
-                                            )
-                                    except Exception as e:
-                                        logger.error(f"Erro no fallback automático: {e}", exc_info=True)
-                                        bot_response = tool_result
-                                else:
-                                    bot_response = tool_result
+                                # Usar diretamente o resultado da tool como resposta
+                                bot_response = tool_result
+                                logger.info("📤 Usando tool_result como resposta (Claude retornou vazio)")
                             else:
                                 bot_response = "Desculpe, não consegui processar sua solicitação completamente."
                             break
