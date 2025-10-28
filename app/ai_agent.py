@@ -290,42 +290,6 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                 }
             },
             {
-                "name": "validate_business_hours",
-                "description": "Validar se um horário está dentro do funcionamento da clínica",
-                "input_schema": {
-                    "type": "object",
-                    "properties": {
-                        "date": {
-                            "type": "string",
-                            "description": "Data no formato DD/MM/AAAA"
-                        },
-                        "time": {
-                            "type": "string", 
-                            "description": "Horário no formato HH:MM"
-                        }
-                    },
-                    "required": ["date", "time"]
-                }
-            },
-            {
-                "name": "validate_and_check_availability",
-                "description": "Validar se um horário específico está disponível (funcionamento + conflitos)",
-                "input_schema": {
-                    "type": "object",
-                    "properties": {
-                        "date": {
-                            "type": "string",
-                            "description": "Data no formato DD/MM/AAAA"
-                        },
-                        "time": {
-                            "type": "string",
-                            "description": "Horário no formato HH:MM"
-                        }
-                    },
-                    "required": ["date", "time"]
-                }
-            },
-            {
                 "name": "validate_date_and_show_slots",
                 "description": "Validar data e mostrar automaticamente TODOS os horários disponíveis do dia",
                 "input_schema": {
@@ -1199,10 +1163,6 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
 
             if tool_name == "get_clinic_info":
                 return self._handle_get_clinic_info(tool_input)
-            elif tool_name == "validate_business_hours":
-                return self._handle_validate_business_hours(tool_input)
-            elif tool_name == "validate_and_check_availability":
-                return self._handle_validate_and_check_availability(tool_input, db, phone)
             elif tool_name == "validate_date_and_show_slots":
                 return self._handle_validate_date_and_show_slots(tool_input, db)
             elif tool_name == "create_appointment":
