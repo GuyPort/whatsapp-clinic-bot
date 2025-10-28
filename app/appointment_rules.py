@@ -9,7 +9,6 @@ from sqlalchemy.orm import Session
 
 from app.models import Appointment, AppointmentStatus
 from app.utils import now_brazil, format_time_br, load_clinic_info, get_brazil_timezone, parse_date_br
-# Google Calendar removido - usando apenas banco de dados
 
 logger = logging.getLogger(__name__)
 
@@ -155,8 +154,6 @@ class AppointmentRules:
             Appointment.appointment_date == target_date_str,  # Comparação STRING
             Appointment.status == AppointmentStatus.AGENDADA  # Apenas consultas ativas
         ).all()
-        
-        # Google Calendar removido - verificando apenas banco de dados
         
         # Gerar slots usando o intervalo configurado
         current = start_time
@@ -391,10 +388,6 @@ class AppointmentRules:
             return False
         
         return True
-
-# Funções de tipos de consulta removidas - não utilizadas
-# Deploy fix: Forçar novo deploy no Railway
-
 
 # Instância global
 appointment_rules = AppointmentRules()

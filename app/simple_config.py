@@ -1,6 +1,5 @@
 """
 Configurações simples sem Pydantic para evitar problemas de cache.
-VERSÃO: 2025-10-15 15:07:00 - REBUILD DEFINITIVO
 """
 import os
 
@@ -30,7 +29,6 @@ class Settings:
     evolution_api_url = EVOLUTION_API_URL
     evolution_api_key = EVOLUTION_API_KEY
     evolution_instance_name = EVOLUTION_INSTANCE_NAME
-    # Google Calendar removido
     database_url = DATABASE_URL
     environment = ENVIRONMENT
     log_level = LOG_LEVEL

@@ -10,11 +10,6 @@ def check_environment():
     """Verifica se o ambiente está configurado corretamente para Railway."""
     errors = []
     
-    # No Railway, as variáveis de ambiente são definidas diretamente, não via .env
-    # Então, removemos a verificação do arquivo .env aqui.
-    
-    # Google Calendar removido - usando apenas banco de dados
-    
     # Verificar data/clinic_info.json
     if not os.path.exists('data/clinic_info.json'):
         errors.append("❌ Arquivo data/clinic_info.json não encontrado!")
@@ -42,18 +37,9 @@ def check_environment():
 if __name__ == "__main__":
     print("🤖 WhatsApp Clinic Bot")
     print("=" * 50)
-    print("🚀 FORCE REBUILD - 2025-10-15 15:07:00 - REBUILD DEFINITIVO")
-    print("=" * 50)
     
     print("🔍 Verificando ambiente...")
     check_environment()
-    
-    # Debug: Mostrar configurações
-    print("🔧 CONFIGURAÇÕES DEBUG:")
-    print(f"WASENDER_URL: {os.getenv('WASENDER_URL', 'NÃO DEFINIDO')}")
-    print(f"WASENDER_API_KEY: {os.getenv('WASENDER_API_KEY', 'NÃO DEFINIDO')[:10]}...")
-    print(f"WASENDER_PROJECT_NAME: {os.getenv('WASENDER_PROJECT_NAME', 'NÃO DEFINIDO')}")
-    print("=" * 50)
     
     print("🚀 Iniciando servidor Uvicorn...")
     try:

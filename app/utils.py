@@ -65,7 +65,6 @@ def normalize_phone(phone: str) -> str:
     Returns:
         Número limpo (apenas dígitos) com código do país
     """
-    # Remove tudo que não é dígito
     clean = re.sub(r'\D', '', phone)
     
     # Garantir que tem código do país (55) para Brasil

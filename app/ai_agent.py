@@ -476,7 +476,6 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                 if not data["patient_birth_date"] and not data["appointment_date"]:
                     resultado = self._extrair_nome_e_data_robusto(content)
                     
-                    # Validação explícita para debug
                     if resultado["data"] and not resultado.get("erro_data"):
                         logger.info(f"🎯 DATA PASSOU NA VALIDAÇÃO: {resultado['data']} - Claude DEVE aceitar")
                     elif resultado.get("erro_data"):
@@ -1061,7 +1060,6 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                                         
                                         logger.info(f"📋 Dados extraídos: {appointment_data}")
                                         
-                                        # Validar se todos os dados foram extraídos
                                         required = [
                                             "patient_name","patient_birth_date","appointment_date","appointment_time","patient_phone"
                                         ]
