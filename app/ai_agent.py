@@ -24,6 +24,46 @@ from app.appointment_rules import appointment_rules
 logger = logging.getLogger(__name__)
 
 
+def format_closed_days(dias_fechados: List[str]) -> str:
+    """Agrupa dias consecutivos e formata bonito"""
+    if not dias_fechados:
+        return ""
+    
+    from datetime import datetime
+    
+    # Converter para datetime e ordenar
+    dates = []
+    for d in dias_fechados:
+        try:
+            dates.append(datetime.strptime(d, '%d/%m/%Y'))
+        except:
+            continue
+    
+    dates.sort()
+    
+    # Agrupar consecutivos
+    groups = []
+    current_group = [dates[0]]
+    
+    for i in range(1, len(dates)):
+        if (dates[i] - current_group[-1]).days == 1:
+            current_group.append(dates[i])
+        else:
+            groups.append(current_group)
+            current_group = [dates[i]]
+    groups.append(current_group)
+    
+    # Formatar
+    result = ""
+    for group in groups:
+        if len(group) == 1:
+            result += f"• {group[0].strftime('%d/%m/%Y')}\n"
+        else:
+            result += f"• {group[0].strftime('%d/%m')} a {group[-1].strftime('%d/%m/%Y')}\n"
+    
+    return result
+
+
 class ClaudeToolAgent:
     """Agente de IA com Claude SDK + Tools para agendamento de consultas"""
     
