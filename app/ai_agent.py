@@ -1979,6 +1979,17 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
             db.commit()
             logger.info(f"✅ AGENDAMENTO SALVO NO BANCO - ID: {appointment.id}")
             
+            # Limpar appointment_date, appointment_time e pending_confirmation do flow_data
+            # para evitar loop infinito do fallback
+            if phone:
+                context = db.query(ConversationContext).filter_by(phone=phone).first()
+                if context and context.flow_data:
+                    context.flow_data.pop("appointment_date", None)
+                    context.flow_data.pop("appointment_time", None)
+                    context.flow_data.pop("pending_confirmation", None)
+                    db.commit()
+                    logger.info("🧹 Limpeza do flow_data: appointment_date, appointment_time e pending_confirmation removidos")
+            
             # Buscar informações do tipo de consulta e convênio
             tipos_consulta = self.clinic_info.get('tipos_consulta', {})
             tipo_info = tipos_consulta.get(consultation_type, {})
