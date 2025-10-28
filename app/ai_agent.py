@@ -1202,9 +1202,30 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
             
             # 8. FALLBACK: Verificar se Claude deveria ter chamado confirm_time_slot mas não chamou
             # Isso acontece quando: temos data + horário, mas não tem pending_confirmation
+            # IMPORTANTE: NÃO executar se acabou de criar um agendamento com sucesso
+            
+            # Verificar se a última resposta do assistente indica que já criou agendamento
+            should_skip_fallback = False
+            if context.messages:
+                last_assistant_msg = None
+                for msg in reversed(context.messages):
+                    if msg.get("role") == "assistant":
+                        last_assistant_msg = msg.get("content", "")
+                        break
+                
+                # Se a última mensagem contém sucesso de agendamento, pular fallback
+                if last_assistant_msg and any(phrase in last_assistant_msg for phrase in [
+                    "Agendamento realizado com sucesso",
+                    "realizado com sucesso",
+                    "agendado com sucesso"
+                ]):
+                    should_skip_fallback = True
+                    logger.info("⏭️ Pulando fallback - agendamento já foi criado com sucesso")
+            
             if (context.flow_data.get("appointment_date") and 
                 context.flow_data.get("appointment_time") and 
-                not context.flow_data.get("pending_confirmation")):
+                not context.flow_data.get("pending_confirmation") and
+                not should_skip_fallback):
                 
                 logger.info("🔄 FALLBACK: Claude não chamou confirm_time_slot, chamando manualmente...")
                 logger.info(f"   Data: {context.flow_data['appointment_date']}")
