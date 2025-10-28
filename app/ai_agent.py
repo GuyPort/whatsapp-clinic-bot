@@ -1761,7 +1761,12 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                 tem_conflito = False
                 
                 for apt in existing_appointments:
-                    apt_time = datetime.strptime(apt.appointment_time, '%H:%M').time()
+                    # Converter appointment_time para time object (pode ser string ou time)
+                    if isinstance(apt.appointment_time, str):
+                        apt_time = datetime.strptime(apt.appointment_time, '%H:%M').time()
+                    else:
+                        apt_time = apt.appointment_time
+                    
                     apt_datetime = datetime.combine(appointment_date.date(), apt_time)
                     
                     # Verificar se há sobreposição - se o horário é exatamente o mesmo
@@ -2042,7 +2047,12 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                 }.get(apt.status, "❓")
                 
                 response += f"{i}. {status_emoji} **{apt.patient_name}**\n"
-                response += f"   📅 {apt.appointment_date.strftime('%d/%m/%Y às')} {apt.appointment_time.strftime('%H:%M')}\n"
+                
+                # Formatar appointment_date (string YYYYMMDD) e appointment_time (string HH:MM)
+                app_date_formatted = f"{apt.appointment_date[6:8]}/{apt.appointment_date[4:6]}/{apt.appointment_date[:4]}"
+                app_time_str = apt.appointment_time if isinstance(apt.appointment_time, str) else apt.appointment_time.strftime('%H:%M')
+                
+                response += f"   📅 {app_date_formatted} às {app_time_str}\n"
                 response += f"   📞 {apt.patient_phone}\n"
                 response += f"   📝 Status: {apt.status.value}\n"
                 if apt.notes:
@@ -2080,9 +2090,13 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
             
             db.commit()
             
+            # Formatar appointment_date (string YYYYMMDD) e appointment_time (string HH:MM)
+            app_date_formatted = f"{appointment.appointment_date[6:8]}/{appointment.appointment_date[4:6]}/{appointment.appointment_date[:4]}"
+            app_time_str = appointment.appointment_time if isinstance(appointment.appointment_time, str) else appointment.appointment_time.strftime('%H:%M')
+            
             return f"✅ **Agendamento cancelado com sucesso!**\n\n" + \
                    f"👤 **Paciente:** {appointment.patient_name}\n" + \
-                   f"📅 **Data:** {appointment.appointment_date.strftime('%d/%m/%Y às')} {appointment.appointment_time.strftime('%H:%M')}\n" + \
+                   f"📅 **Data:** {app_date_formatted} às {app_time_str}\n" + \
                    f"📝 **Motivo:** {reason}\n\n" + \
                    "Se precisar reagendar, estarei aqui para ajudar! 😊"
                    
