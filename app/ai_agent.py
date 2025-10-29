@@ -1195,8 +1195,18 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                 logger.info(f"💾 Data consulta salva no flow_data: {extracted['appointment_date']}")
             
             if extracted.get("appointment_time") and not context.flow_data.get("appointment_time"):
-                context.flow_data["appointment_time"] = extracted["appointment_time"]
-                logger.info(f"💾 Horário consulta salvo no flow_data: {extracted['appointment_time']}")
+                # Validar horário antes de salvar: deve ser formato HH:MM com minutos == 00
+                time_str = extracted["appointment_time"]
+                import re
+                if re.match(r'^\d{2}:\d{2}$', time_str):
+                    hour, minute = time_str.split(':')
+                    if minute == '00':
+                        context.flow_data["appointment_time"] = time_str
+                        logger.info(f"💾 Horário consulta salvo no flow_data: {time_str}")
+                    else:
+                        logger.warning(f"⚠️ Horário inválido (não inteiro) rejeitado: {time_str}")
+                else:
+                    logger.warning(f"⚠️ Horário inválido (formato incorreto) rejeitado: {time_str}")
             
             if extracted.get("consultation_type") and not context.flow_data.get("consultation_type"):
                 context.flow_data["consultation_type"] = extracted["consultation_type"]
@@ -1233,24 +1243,38 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                 not context.flow_data.get("pending_confirmation") and
                 not should_skip_fallback):
                 
-                logger.info("🔄 FALLBACK: Claude não chamou confirm_time_slot, chamando manualmente...")
-                logger.info(f"   Data: {context.flow_data['appointment_date']}")
-                logger.info(f"   Horário: {context.flow_data['appointment_time']}")
+                # Validar horário antes de executar fallback
+                time_str = context.flow_data["appointment_time"]
+                import re
+                is_valid = False
+                if re.match(r'^\d{2}:\d{2}$', time_str):
+                    hour, minute = time_str.split(':')
+                    if minute == '00':
+                        is_valid = True
                 
-                # Chamar a tool manualmente
-                try:
-                    confirmation_msg = self._handle_confirm_time_slot({
-                        "date": context.flow_data["appointment_date"],
-                        "time": context.flow_data["appointment_time"]
-                    }, db, phone)
+                if not is_valid:
+                    logger.warning(f"⚠️ FALLBACK bloqueado: horário inválido no flow_data ({time_str})")
+                    # Limpar horário inválido
+                    context.flow_data["appointment_time"] = None
+                    db.commit()
+                else:
+                    logger.info("🔄 FALLBACK: Claude não chamou confirm_time_slot, chamando manualmente...")
+                    logger.info(f"   Data: {context.flow_data['appointment_date']}")
+                    logger.info(f"   Horário: {context.flow_data['appointment_time']}")
                     
-                    # Substituir resposta do Claude pela confirmação
-                    bot_response = confirmation_msg
-                    logger.info("✅ Tool confirm_time_slot executada com sucesso via fallback")
-                    
-                except Exception as e:
-                    logger.error(f"❌ Erro ao executar fallback de confirm_time_slot: {str(e)}")
-                    # Manter resposta original do Claude
+                    # Chamar a tool manualmente
+                    try:
+                        confirmation_msg = self._handle_confirm_time_slot({
+                            "date": context.flow_data["appointment_date"],
+                            "time": context.flow_data["appointment_time"]
+                        }, db, phone)
+                        
+                        # Substituir resposta do Claude pela confirmação
+                        bot_response = confirmation_msg
+                        logger.info("✅ Tool confirm_time_slot executada com sucesso via fallback")
+                    except Exception as e:
+                        logger.error(f"❌ Erro ao executar fallback de confirm_time_slot: {str(e)}")
+                        # Manter resposta original do Claude
             
             # 9. Atualizar contexto no banco
             context.last_activity = datetime.utcnow()
@@ -1839,11 +1863,25 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
             
             # Validar formato
             if not re.match(r'^\d{2}:\d{2}$', time_str):
+                # Limpar appointment_time do flow_data se existir
+                if phone:
+                    context = db.query(ConversationContext).filter_by(phone=phone).first()
+                    if context and context.flow_data and context.flow_data.get("appointment_time"):
+                        context.flow_data["appointment_time"] = None
+                        db.commit()
+                        logger.info(f"🧹 Horário inválido removido do flow_data (formato incorreto)")
                 return "❌ Formato de horário inválido. Use HH:MM (exemplo: 14:00)"
             
             # Validar se é hora inteira
             hour, minute = time_str.split(':')
             if minute != '00':
+                # Limpar appointment_time do flow_data se existir
+                if phone:
+                    context = db.query(ConversationContext).filter_by(phone=phone).first()
+                    if context and context.flow_data and context.flow_data.get("appointment_time"):
+                        context.flow_data["appointment_time"] = None
+                        db.commit()
+                        logger.info(f"🧹 Horário inválido removido do flow_data (não inteiro)")
                 # Sugerir horário inteiro mais próximo
                 hour_int = int(hour)
                 return (f"❌ Por favor, escolha um horário inteiro.\n"
