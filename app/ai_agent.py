@@ -1882,10 +1882,73 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                         context.flow_data["appointment_time"] = None
                         db.commit()
                         logger.info(f"🧹 Horário inválido removido do flow_data (não inteiro)")
-                # Sugerir horário inteiro mais próximo
-                hour_int = int(hour)
-                return (f"❌ Por favor, escolha um horário inteiro.\n"
-                        f"Sugestões: {hour_int:02d}:00 ou {hour_int+1:02d}:00")
+                
+                # Buscar todos os horários disponíveis para aquela data
+                appointment_date = parse_date_br(date_str)
+                if not appointment_date:
+                    return "❌ Data inválida. Use formato DD/MM/AAAA."
+                
+                # Validar dia da semana
+                weekday = appointment_date.weekday()
+                dias_semana_pt = ['segunda', 'terca', 'quarta', 'quinta', 'sexta', 'sabado', 'domingo']
+                dia_nome = dias_semana_pt[weekday]
+                
+                horarios = self.clinic_info.get('horario_funcionamento', {})
+                horario_dia = horarios.get(dia_nome, "FECHADO")
+                
+                if horario_dia == "FECHADO":
+                    return f"❌ A clínica não atende em {dia_nome.capitalize()}. Por favor, escolha outra data."
+                
+                # Calcular slots disponíveis
+                inicio_str, fim_str = horario_dia.split('-')
+                inicio_time = datetime.strptime(inicio_str, '%H:%M').time()
+                fim_time = datetime.strptime(fim_str, '%H:%M').time()
+                
+                # Buscar consultas já agendadas nesse dia
+                date_str_formatted = appointment_date.strftime('%Y%m%d')  # YYYYMMDD
+                existing_appointments = db.query(Appointment).filter(
+                    Appointment.appointment_date == date_str_formatted,
+                    Appointment.status == AppointmentStatus.AGENDADA
+                ).all()
+                
+                # Gerar slots disponíveis (apenas horários INTEIROS)
+                available_slots = []
+                current_time = inicio_time
+                while current_time < fim_time:
+                    # Verificar se tem consulta nesse horário
+                    slot_datetime = datetime.combine(appointment_date.date(), current_time)
+                    tem_conflito = False
+                    
+                    for apt in existing_appointments:
+                        # Converter appointment_time para time object (pode ser string ou time)
+                        if isinstance(apt.appointment_time, str):
+                            apt_time = datetime.strptime(apt.appointment_time, '%H:%M').time()
+                        else:
+                            apt_time = apt.appointment_time
+                        
+                        apt_datetime = datetime.combine(appointment_date.date(), apt_time)
+                        
+                        # Verificar se há sobreposição - se o horário é exatamente o mesmo
+                        if slot_datetime == apt_datetime:
+                            tem_conflito = True
+                            break
+                    
+                    if not tem_conflito:
+                        available_slots.append(current_time.strftime('%H:%M'))
+                    
+                    # Avançar 1 hora (apenas horários inteiros)
+                    current_time = (datetime.combine(appointment_date.date(), current_time) + 
+                                    timedelta(hours=1)).time()
+                
+                # Montar mensagem com todos os horários disponíveis
+                if available_slots:
+                    msg = "❌ Por favor, escolha um horário inteiro.\n\n"
+                    msg += "Esses são os únicos horários disponíveis para esta data:\n"
+                    for slot in available_slots:
+                        msg += f"• {slot}\n"
+                    return msg
+                else:
+                    return "❌ Por favor, escolha um horário inteiro.\n\nNão há horários disponíveis para esta data."
             
             # Verificar disponibilidade no banco (segurança contra race condition)
             appointment_date = parse_date_br(date_str)
