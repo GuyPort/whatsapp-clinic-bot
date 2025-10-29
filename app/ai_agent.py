@@ -121,14 +121,20 @@ Quando o paciente escolher "1" ou "1️⃣", siga EXATAMENTE este fluxo:
    • Separado: envie o nome primeiro, depois a data
    • Natural: 'Sou João Silva, nasci em 07/08/2003'"
 
-2. IMPORTANTE SOBRE EXTRAÇÃO:
-   - Se receber AMBOS (nome + data completa): extraia e confirme, depois vá para tipo de consulta
-   - Se receber APENAS NOME: agradeça e peça "E sua data de nascimento (DD/MM/AAAA)?"
-   - Se receber APENAS DATA: agradeça e peça "E seu nome completo?"
-   - Se NENHUM for extraído: "Não consegui entender. Por favor, me informe seu nome completo."
+2. IMPORTANTE SOBRE EXTRAÇÃO DE DADOS:
+   
+   Para extrair dados do paciente do histórico de mensagens, use a tool 'extract_patient_data':
+   - Use esta tool quando precisar identificar o nome REAL do paciente (não frases de pedido)
+   - Use quando flow_data não tiver nome válido ou estiver incompleto
+   - Esta tool valida automaticamente se um texto é nome real ou frase de solicitação
+   
+   Se receber AMBOS (nome + data completa): extraia e confirme, depois vá para tipo de consulta
+   Se receber APENAS NOME: agradeça e peça "E sua data de nascimento (DD/MM/AAAA)?"
+   Se receber APENAS DATA: agradeça e peça "E seu nome completo?"
+   Se NENHUM for extraído: use tool extract_patient_data para buscar no histórico ou peça novamente
    
    VALIDAÇÕES OBRIGATÓRIAS:
-   - NOME: Deve ter no mínimo 2 palavras (nome + sobrenome)
+   - NOME: Deve ter no mínimo 2 palavras (nome + sobrenome), deve ser nome REAL (não frase como "Eu Preciso Marcar Uma Consulta")
    - DATA: Deve ser completa (dia + mês + ano) no formato DD/MM/AAAA
    - Se nome tiver apenas 1 palavra: "Para o cadastro médico, preciso do nome completo (nome e sobrenome)"
    - Se data incompleta: "Preciso da data completa (dia, mês e ano). Ex: 07/08/2003"
@@ -473,6 +479,15 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                 }
             },
             {
+                "name": "extract_patient_data",
+                "description": "Extrair dados do paciente do histórico de mensagens. Use esta tool quando precisar identificar nome completo real do paciente (não frases de pedido como 'Eu Preciso Marcar Uma Consulta'), data de nascimento, tipo de consulta e convênio. Esta tool valida automaticamente se um texto é um nome real ou apenas uma frase de solicitação de agendamento.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {},
+                    "required": []
+                }
+            },
+            {
                 "name": "end_conversation",
                 "description": "Encerrar conversa e limpar contexto quando usuário não precisa de mais nada",
                 "input_schema": {
@@ -484,21 +499,22 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
         ]
 
     def _extract_appointment_data_from_messages(self, messages: list) -> dict:
-        """Extrai dados de agendamento do histórico de mensagens.
-        Percorre as últimas mensagens para encontrar nome, nascimento, data e horário.
-        Retorna sempre um dict; em erro, retorna {}.
+        """Extrai dados básicos de agendamento do histórico de mensagens.
+        Versão simplificada: apenas detecção rápida de datas, horários e escolhas numéricas.
+        Para extração de nome, confiar no Claude via tool extract_patient_data.
         """
         try:
             data = {
-                "patient_name": None,
+                "patient_name": None,  # NÃO extrair aqui - deixar Claude fazer
                 "patient_birth_date": None,
                 "appointment_date": None,
                 "appointment_time": None,
                 "consultation_type": None,
                 "insurance_plan": None
             }
-            logger.info(f"🔍 Extraindo dados de {len(messages)} mensagens")
+            logger.info(f"🔍 Extraindo dados básicos de {len(messages)} mensagens (versão simplificada)")
             import re
+            from datetime import datetime
             
             # Processar em ORDEM CRONOLÓGICA (primeira mensagem primeiro)
             for i in range(0, len(messages)):
@@ -515,49 +531,29 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                         hour, minute = time_match.groups()
                         data["appointment_time"] = f"{hour.zfill(2)}:{minute}"
                 
-                # SALVAR o estado ANTES de processar a mensagem
-                had_birth_date_before = data["patient_birth_date"] is not None
-                
-                # 2. EXTRAÇÃO DE NOME E DATA - Apenas se ainda não temos data de nascimento
-                # E não temos data de consulta (para evitar confusão)
-                if not data["patient_birth_date"] and not data["appointment_date"]:
-                    resultado = self._extrair_nome_e_data_robusto(content)
-                    
-                    if resultado["data"] and not resultado.get("erro_data"):
-                        logger.info(f"🎯 DATA PASSOU NA VALIDAÇÃO: {resultado['data']} - Claude DEVE aceitar")
-                    elif resultado.get("erro_data"):
-                        logger.warning(f"⚠️ DATA REJEITADA PELO PYTHON: {resultado.get('erro_data')}")
-                    
-                    # Atualizar nome se extraído com sucesso
-                    if resultado["nome"] and not data["patient_name"]:
-                        data["patient_name"] = resultado["nome"]
-                        logger.info(f"📝 Nome extraído: {resultado['nome']}")
-                    
-                    # Atualizar data nascimento se extraída com sucesso
-                    if resultado["data"] and not data["patient_birth_date"]:
-                        data["patient_birth_date"] = resultado["data"]
-                        logger.info(f"📅 Data nascimento extraída: {resultado['data']}")
-                else:
-                    # Se já temos alguma data, NÃO extrair novamente
-                    if data["patient_birth_date"]:
-                        logger.info(f"🔒 Data nascimento já existe ({data['patient_birth_date']}), pulando extração")
-                    if data["appointment_date"]:
-                        logger.info(f"🔒 Data consulta já existe ({data['appointment_date']}), pulando extração")
-                
-                # 3. EXTRAÇÃO DE DATA DE CONSULTA - Apenas se já temos data de nascimento
-                # Usar o estado SALVO (não o atual)
-                if had_birth_date_before and not data["appointment_date"]:
-                    # Agora extrair data como data de CONSULTA (não nascimento)
+                # 2. EXTRAÇÃO BÁSICA DE DATAS - Apenas por regex simples
+                # Tentar identificar se é data de nascimento (< 2010) ou consulta (>= 2010)
+                if not data["patient_birth_date"] or not data["appointment_date"]:
                     date_pattern = r'(\d{1,2})/(\d{1,2})/(\d{4})'
                     date_matches = re.findall(date_pattern, content)
                     for match in date_matches:
                         day, month, year = match
                         full_date = f"{day.zfill(2)}/{month.zfill(2)}/{year}"
-                        y = int(year)
-                        if y >= 2010:
-                            data["appointment_date"] = full_date
-                            logger.info(f"📅 Data CONSULTA extraída (não nascimento): {data['appointment_date']}")
-                            break
+                        try:
+                            # Validar data
+                            date_obj = datetime.strptime(full_date, '%d/%m/%Y')
+                            y = int(year)
+                            
+                            if not data["patient_birth_date"] and y < 2010:
+                                # Provavelmente data de nascimento
+                                data["patient_birth_date"] = full_date
+                                logger.info(f"📅 Data nascimento extraída (regex): {full_date}")
+                            elif not data["appointment_date"] and y >= 2010:
+                                # Provavelmente data de consulta
+                                data["appointment_date"] = full_date
+                                logger.info(f"📅 Data consulta extraída (regex): {full_date}")
+                        except ValueError:
+                            pass
                 
                 # 4. EXTRAÇÃO DE TIPO DE CONSULTA - SEMPRE atualizar quando escolha explícita
                 # Se mensagem é só "1", "2" ou "3" (escolha explícita de tipo)
@@ -1231,28 +1227,9 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
             # Extrair dados do histórico
             extracted = self._extract_appointment_data_from_messages(context.messages)
             
-            # ATUALIZAR nome se não existe OU se novo nome é melhor (mais palavras, mais claro)
-            if extracted.get("patient_name"):
-                novo_nome = extracted["patient_name"]
-                nome_atual = context.flow_data.get("patient_name")
-                
-                qualidade_novo = self._evaluate_name_quality(novo_nome)
-                
-                if not nome_atual:
-                    # Se não tem nome, salvar se válido
-                    if qualidade_novo > 0:
-                        context.flow_data["patient_name"] = novo_nome
-                        logger.info(f"💾 Nome salvo no flow_data: {novo_nome}")
-                    else:
-                        logger.warning(f"⚠️ Nome rejeitado por ser inválido: {novo_nome}")
-                else:
-                    # Se já tem nome, comparar qualidade
-                    qualidade_atual = self._evaluate_name_quality(nome_atual)
-                    if qualidade_novo > qualidade_atual:
-                        context.flow_data["patient_name"] = novo_nome
-                        logger.info(f"💾 Nome ATUALIZADO no flow_data: {nome_atual} → {novo_nome} (qualidade: {qualidade_atual} → {qualidade_novo})")
-                    else:
-                        logger.info(f"🔒 Nome mantido no flow_data: {nome_atual} (qualidade: {qualidade_atual} >= {qualidade_novo})")
+            # NÃO extrair nome aqui - deixar Claude fazer via tool extract_patient_data
+            # Extração manual de nome foi removida pois causava erros (ex: "Eu Preciso Marcar Uma Consulta")
+            # Se precisar do nome, Claude deve chamar tool extract_patient_data
             
             if extracted.get("patient_birth_date") and not context.flow_data.get("patient_birth_date"):
                 context.flow_data["patient_birth_date"] = extracted["patient_birth_date"]
@@ -1384,6 +1361,8 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                 return self._handle_cancel_appointment(tool_input, db)
             elif tool_name == "request_human_assistance":
                 return self._handle_request_human_assistance(tool_input, db, phone)
+            elif tool_name == "extract_patient_data":
+                return self._handle_extract_patient_data(tool_input, db, phone)
             elif tool_name == "end_conversation":
                 return self._handle_end_conversation(tool_input, db, phone)
             
@@ -2064,24 +2043,11 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                 tipo = context.flow_data.get("consultation_type", "clinica_geral")
                 convenio = context.flow_data.get("insurance_plan", "particular")
             
-            # Se flow_data está incompleto ou incorreto, tentar extrair do histórico
-            precisa_extrair = False
-            if not nome or self._evaluate_name_quality(nome) == 0:
-                precisa_extrair = True
-                logger.info(f"🔍 flow_data não tem nome válido, buscando no histórico...")
-            elif tipo == "clinica_geral" or not convenio or convenio == "particular":
-                precisa_extrair = True
-                logger.info(f"🔍 flow_data incompleto (tipo/convênio), buscando no histórico...")
-            
-            if precisa_extrair and context and context.messages:
+            # Se flow_data está incompleto, extrair dados básicos do histórico (mas não nome)
+            # Para nome, preferir que Claude use tool extract_patient_data, mas aqui fazemos fallback básico
+            if (not nome or tipo == "clinica_geral" or not convenio or convenio == "particular") and context and context.messages:
+                logger.info(f"🔍 flow_data incompleto, buscando dados básicos no histórico...")
                 extracted = self._extract_appointment_data_from_messages(context.messages)
-                
-                # Atualizar nome se não tem ou é inválido
-                if (not nome or self._evaluate_name_quality(nome) == 0) and extracted.get("patient_name"):
-                    qualidade_novo = self._evaluate_name_quality(extracted["patient_name"])
-                    if qualidade_novo > 0:
-                        nome = extracted["patient_name"]
-                        logger.info(f"✅ Nome encontrado no histórico: {nome}")
                 
                 # Atualizar tipo se não tem ou é padrão
                 if tipo == "clinica_geral" and extracted.get("consultation_type"):
@@ -2092,6 +2058,24 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                 if (not convenio or convenio == "particular") and extracted.get("insurance_plan"):
                     convenio = extracted["insurance_plan"]
                     logger.info(f"✅ Convênio encontrado no histórico: {convenio}")
+                
+                # Se nome estiver faltando ou parecer inválido (frases como "Eu Preciso Marcar Uma Consulta"),
+                # tentar extrair usando Claude diretamente
+                if not nome or any(phrase in nome.lower() for phrase in ["preciso", "quero", "marcar", "consulta", "agendamento", "tudo bem"]):
+                    logger.warning(f"⚠️ Nome suspeito/inválido detectado: '{nome}'. Tentando extrair com Claude...")
+                    try:
+                        # Chamar função auxiliar para extrair dados diretamente
+                        extracted_data = self._extract_patient_data_with_claude(context)
+                        if extracted_data and extracted_data.get("patient_name"):
+                            novo_nome = extracted_data["patient_name"]
+                            if novo_nome and novo_nome != nome:
+                                nome = novo_nome
+                                # Atualizar também no flow_data
+                                context.flow_data["patient_name"] = novo_nome
+                                db.commit()
+                                logger.info(f"✅ Nome corrigido pelo Claude: {nome}")
+                    except Exception as e:
+                        logger.error(f"Erro ao tentar extrair nome com Claude: {e}")
             
             # Retornar resumo para confirmação
             msg = f"✅ Horário {time_str} disponível!\n\n"
@@ -2401,6 +2385,149 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
             logger.error(f"Erro ao pausar bot para humano: {str(e)}")
             db.rollback()
             return f"Erro ao transferir para humano: {str(e)}"
+
+    def _extract_patient_data_with_claude(self, context: ConversationContext, return_dict: bool = False) -> Dict[str, Any]:
+        """Usa Claude para extrair dados do paciente do histórico (função auxiliar interna)"""
+        try:
+            if not context or not context.messages:
+                return {}
+            
+            # Preparar mensagens para Claude (apenas mensagens do usuário relevantes)
+            user_messages = []
+            for msg in context.messages:
+                if msg.get("role") == "user":
+                    content = msg.get("content", "")
+                    # Ignorar mensagens muito curtas ou apenas números
+                    if len(content.strip()) > 3 and content.strip() not in ["1", "2", "3", "sim", "não", "nao"]:
+                        user_messages.append(content)
+            
+            if not user_messages:
+                return {}
+            
+            # Criar prompt para Claude extrair dados
+            messages_text = "\n".join([f"Mensagem {i+1}: {msg}" for i, msg in enumerate(user_messages)])
+            
+            extraction_prompt = f"""Analise as seguintes mensagens do usuário e extraia APENAS dados reais de paciente. IGNORE frases de pedido de agendamento.
+
+Mensagens do usuário:
+{messages_text}
+
+Extraia e retorne APENAS se encontrar:
+1. Nome completo REAL do paciente (não frases como "Eu Preciso Marcar Uma Consulta", "Quero Agendamento", etc)
+2. Data de nascimento (formato DD/MM/AAAA)
+3. Data da consulta desejada (formato DD/MM/AAAA, apenas se mencionada)
+4. Horário da consulta (formato HH:MM, apenas se mencionado)
+5. Tipo de consulta (clinica_geral, geriatria, domiciliar)
+6. Convênio (CABERGS, IPE, particular)
+
+Retorne um JSON válido com este formato (use null para campos não encontrados):
+{{
+    "patient_name": "nome completo aqui ou null",
+    "patient_birth_date": "DD/MM/AAAA ou null",
+    "appointment_date": "DD/MM/AAAA ou null",
+    "appointment_time": "HH:MM ou null",
+    "consultation_type": "clinica_geral/geriatria/domiciliar ou null",
+    "insurance_plan": "CABERGS/IPE/particular ou null"
+}}
+
+IMPORTANTE: Se identificar que "patient_name" é uma frase de pedido (ex: "Eu Preciso Marcar Uma Consulta"), retorne null para esse campo."""
+
+            # Chamar Claude para extrair
+            response = self.client.messages.create(
+                model="claude-sonnet-4-20250514",
+                max_tokens=500,
+                temperature=0.1,
+                messages=[
+                    {"role": "user", "content": extraction_prompt}
+                ]
+            )
+            
+            # Extrair resposta do Claude
+            claude_response = ""
+            if response.content:
+                for content_block in response.content:
+                    if hasattr(content_block, 'text'):
+                        claude_response += content_block.text
+            
+            # Tentar parsear JSON da resposta
+            import json
+            import re
+            
+            # Buscar JSON na resposta (pode estar entre markdown code blocks ou direto)
+            json_match = re.search(r'\{[^{}]*"patient_name"[^{}]*\}', claude_response, re.DOTALL)
+            if not json_match:
+                # Tentar encontrar qualquer JSON válido
+                json_match = re.search(r'\{.*\}', claude_response, re.DOTALL)
+            
+            if json_match:
+                try:
+                    extracted_data = json.loads(json_match.group(0))
+                    logger.info(f"✅ Dados extraídos pelo Claude: {extracted_data}")
+                    return extracted_data
+                except json.JSONDecodeError as e:
+                    logger.error(f"Erro ao parsear JSON da resposta do Claude: {e}")
+                    return {}
+            else:
+                logger.warning(f"⚠️ Claude não retornou JSON válido na resposta")
+                return {}
+            
+        except Exception as e:
+            logger.error(f"Erro ao extrair dados com Claude: {str(e)}")
+            return {}
+
+    def _handle_extract_patient_data(self, tool_input: Dict, db: Session, phone: str) -> str:
+        """Tool: extract_patient_data - Usa Claude para extrair dados do paciente do histórico"""
+        try:
+            logger.info(f"🔍 Tool extract_patient_data chamada para {phone}")
+            
+            # Buscar contexto e histórico
+            context = db.query(ConversationContext).filter_by(phone=phone).first()
+            if not context:
+                return "Nenhum histórico de mensagens disponível."
+            
+            # Usar função auxiliar para extrair dados
+            extracted_data = self._extract_patient_data_with_claude(context)
+            
+            if not extracted_data:
+                return "Nenhuma mensagem relevante encontrada no histórico."
+            
+            # Atualizar flow_data com dados extraídos
+            if not context.flow_data:
+                context.flow_data = {}
+            
+            # Atualizar apenas campos válidos (não None/null)
+            if extracted_data.get("patient_name"):
+                context.flow_data["patient_name"] = extracted_data["patient_name"]
+                logger.info(f"💾 Nome atualizado no flow_data: {extracted_data['patient_name']}")
+            
+            if extracted_data.get("patient_birth_date"):
+                context.flow_data["patient_birth_date"] = extracted_data["patient_birth_date"]
+            
+            if extracted_data.get("appointment_date"):
+                context.flow_data["appointment_date"] = extracted_data["appointment_date"]
+            
+            if extracted_data.get("appointment_time"):
+                # Validar formato HH:MM antes de salvar
+                import re
+                if re.match(r'^\d{2}:\d{2}$', extracted_data["appointment_time"]):
+                    hour, minute = extracted_data["appointment_time"].split(':')
+                    if minute == '00':
+                        context.flow_data["appointment_time"] = extracted_data["appointment_time"]
+            
+            if extracted_data.get("consultation_type"):
+                context.flow_data["consultation_type"] = extracted_data["consultation_type"]
+            
+            if extracted_data.get("insurance_plan"):
+                context.flow_data["insurance_plan"] = extracted_data["insurance_plan"]
+            
+            db.commit()
+            
+            return f"Dados extraídos com sucesso:\nNome: {extracted_data.get('patient_name', 'Não encontrado')}\nData nascimento: {extracted_data.get('patient_birth_date', 'Não encontrada')}\nTipo consulta: {extracted_data.get('consultation_type', 'Não encontrado')}\nConvênio: {extracted_data.get('insurance_plan', 'Não encontrado')}"
+            
+        except Exception as e:
+            logger.error(f"Erro ao extrair dados com Claude: {str(e)}")
+            db.rollback()
+            return f"Erro ao extrair dados: {str(e)}"
 
     def _handle_end_conversation(self, tool_input: Dict, db: Session, phone: str) -> str:
         """Tool: end_conversation - Encerrar conversa e limpar contexto"""
