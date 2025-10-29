@@ -1101,6 +1101,12 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                             # Executar tool
                             tool_result = self._execute_tool(content.name, content.input, db, phone)
                             
+                            # CRÍTICO: Se end_conversation foi executado, retornar imediatamente
+                            # sem continuar processamento para evitar fallback executar
+                            if content.name == "end_conversation":
+                                logger.info("🔚 end_conversation executado - retornando imediatamente sem continuar processamento")
+                                return tool_result
+                            
                             # Verificação especial para validate_and_check_availability
                             if content.name == "validate_and_check_availability":
                                 if "disponível" in tool_result.lower() and "não" not in tool_result.lower():
