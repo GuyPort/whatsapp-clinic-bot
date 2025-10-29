@@ -559,38 +559,41 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                             logger.info(f"📅 Data CONSULTA extraída (não nascimento): {data['appointment_date']}")
                             break
                 
-                # 4. EXTRAÇÃO DE TIPO DE CONSULTA - Detectar escolha numérica
-                if not data["consultation_type"]:
-                    # Se mensagem é só "1", "2" ou "3" (escolha de tipo)
-                    if content in ["1", "2", "3"]:
-                        type_map = {"1": "clinica_geral", "2": "geriatria", "3": "domiciliar"}
-                        data["consultation_type"] = type_map[content]
+                # 4. EXTRAÇÃO DE TIPO DE CONSULTA - SEMPRE atualizar quando escolha explícita
+                # Se mensagem é só "1", "2" ou "3" (escolha explícita de tipo)
+                if content in ["1", "2", "3"]:
+                    type_map = {"1": "clinica_geral", "2": "geriatria", "3": "domiciliar"}
+                    # Sempre atualizar (sobrescrever) quando usuário escolhe explicitamente
+                    data["consultation_type"] = type_map[content]
+                    logger.info(f"💾 Tipo de consulta atualizado (escolha explícita): {data['consultation_type']}")
                 
-                # 5. EXTRAÇÃO DE CONVÊNIO - Casos óbvios (o resto o Claude decide)
-                if not data["insurance_plan"]:
-                    content_lower = content.lower().strip()
-                    
-                    # Detectar menções diretas de convênios específicos
-                    if "cabergs" in content_lower:
-                        data["insurance_plan"] = "CABERGS"
-                    elif "ipe" in content_lower:
-                        data["insurance_plan"] = "IPE"
-                    # Compatibilidade numérica (quando usuário responde só "1" ou "2")
-                    elif content in ["1", "2"]:
-                        insurance_map = {"1": "CABERGS", "2": "IPE"}
-                        data["insurance_plan"] = insurance_map[content]
-                    
-                    # Detectar respostas negativas → Marcar como Particular
-                    negative_insurance = [
-                        "não tenho", "nao tenho", "não possuo", "nao possuo",
-                        "sem convênio", "sem convenio", "não tenho convênio", "nao tenho convenio",
-                        "não possuo convênio", "nao possuo convenio",
-                        "particular", "prefiro particular", "quero particular"
-                    ]
-                    
-                    if any(phrase in content_lower for phrase in negative_insurance):
-                        data["insurance_plan"] = "Particular"
-                        logger.info(f"💳 Convênio marcado como Particular (resposta negativa detectada)")
+                # 5. EXTRAÇÃO DE CONVÊNIO - SEMPRE atualizar quando escolha explícita
+                content_lower = content.lower().strip()
+                
+                # Detectar menções diretas de convênios específicos (sempre atualizar)
+                if "cabergs" in content_lower:
+                    data["insurance_plan"] = "CABERGS"
+                    logger.info(f"💾 Convênio atualizado (menção direta): CABERGS")
+                elif "ipe" in content_lower:
+                    data["insurance_plan"] = "IPE"
+                    logger.info(f"💾 Convênio atualizado (menção direta): IPE")
+                # Compatibilidade numérica (quando usuário responde só "1" ou "2")
+                elif content in ["1", "2"]:
+                    insurance_map = {"1": "CABERGS", "2": "IPE"}
+                    data["insurance_plan"] = insurance_map[content]
+                    logger.info(f"💾 Convênio atualizado (escolha numérica): {data['insurance_plan']}")
+                
+                # Detectar respostas negativas → Marcar como Particular (sempre atualizar)
+                negative_insurance = [
+                    "não tenho", "nao tenho", "não possuo", "nao possuo",
+                    "sem convênio", "sem convenio", "não tenho convênio", "nao tenho convenio",
+                    "não possuo convênio", "nao possuo convenio",
+                    "particular", "prefiro particular", "quero particular"
+                ]
+                
+                if any(phrase in content_lower for phrase in negative_insurance):
+                    data["insurance_plan"] = "Particular"
+                    logger.info(f"💳 Convênio atualizado como Particular (resposta negativa detectada)")
             
             logger.info(f"📋 Extração concluída: {data}")
             return data
@@ -598,6 +601,41 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
             logger.error(f"Erro ao extrair dados do histórico: {e}", exc_info=True)
             return {}
 
+    def _evaluate_name_quality(self, name: str) -> int:
+        """Avalia qualidade de um nome (quanto maior, melhor)
+        
+        Retorna:
+            - 0: Nome inválido ou muito fraco
+            - 1-10: Pontuação baseada em:
+                - Número de palavras (mais palavras = maior pontuação)
+                - Tamanho mínimo das palavras
+                - Presença de capitalização adequada
+        """
+        if not name or len(name.strip()) < 8:
+            return 0
+        
+        # Verificar se não é frase comum
+        name_lower = name.lower()
+        frases_invalidas = ['tudo bem', 'tudo bom', 'ok tudo', 'beleza tudo']
+        if any(frase in name_lower for frase in frases_invalidas):
+            return 0
+        
+        palavras = name.split()
+        palavras_validas = [p for p in palavras if len(p) > 2 and p.lower() not in ['de', 'da', 'do', 'dos', 'das']]
+        
+        # Mínimo 2 palavras válidas
+        if len(palavras_validas) < 2:
+            return 0
+        
+        # Pontuação baseada em número de palavras válidas
+        # 2 palavras = 5 pontos, 3 palavras = 8 pontos, 4+ palavras = 10 pontos
+        if len(palavras_validas) >= 4:
+            return 10
+        elif len(palavras_validas) == 3:
+            return 8
+        else:
+            return 5
+    
     def _extrair_nome_e_data_robusto(self, mensagem: str) -> Dict[str, Any]:
         """
         Extrai nome completo e data de nascimento de forma robusta
@@ -634,6 +672,16 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
         # Ignorar mensagens com palavras ofensivas
         if any(palavra in mensagem_lower for palavra in PALAVRAS_OFENSIVAS):
             logger.info(f"🔍 Ignorando mensagem com palavra ofensiva: {mensagem}")
+            return {
+                "nome": None,
+                "data": None,
+                "erro_nome": None,
+                "erro_data": None
+            }
+        
+        # Detectar especificamente "tudo bem" mesmo em frases maiores
+        if "tudo bem" in mensagem_lower or "tudo bom" in mensagem_lower:
+            logger.info(f"🔍 Ignorando mensagem com 'tudo bem/bom': {mensagem}")
             return {
                 "nome": None,
                 "data": None,
@@ -793,6 +841,8 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
             'meu', 'nome', 'é', 'sou', 'me', 'chamo', 'chama', 'conhecido', 'como',
             'nasci', 'nascido', 'em', 'dia', 'data', 'nascimento', 'de', 'e', 'a', 'o',
             ',', '.', '!', '?', 'oi', 'olá', 'bom', 'dia', 'tarde', 'noite',
+            # Palavras que não podem ser nomes
+            'tudo', 'bem', 'tudo bem', 'beleza', 'ok', 'sim', 'não', 'nao',
             # Meses e abreviações
             'janeiro', 'jan', 'fevereiro', 'fev', 'março', 'mar', 'marco',
             'abril', 'abr', 'maio', 'mai', 'junho', 'jun', 'julho', 'jul',
@@ -826,7 +876,13 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                 preposicoes = ['de', 'da', 'do', 'dos', 'das']
                 palavras_validas = [p for p in nome_completo.split() if p.lower() not in preposicoes]
                 
-                if len(palavras_validas) >= 2:
+                # Verificar se não é frase comum como "Tudo Bem"
+                nome_lower = nome_completo.lower()
+                frases_invalidas = ['tudo bem', 'tudo bom', 'ok tudo', 'beleza tudo']
+                if any(frase in nome_lower for frase in frases_invalidas):
+                    logger.info(f"🔍 Ignorando frase comum como nome: {nome_completo}")
+                    resultado["erro_nome"] = "Frase comum detectada, não é um nome"
+                elif len(palavras_validas) >= 2:
                     # Nome válido!
                     resultado["nome"] = nome_completo.title()
                 elif len(palavras_validas) == 1:
@@ -1175,16 +1231,28 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
             # Extrair dados do histórico
             extracted = self._extract_appointment_data_from_messages(context.messages)
             
-            # CRÍTICO: Nunca sobrescrever nome e data de nascimento se já existem
-            # Esses dados são fornecidos uma única vez no início
-            if extracted.get("patient_name") and not context.flow_data.get("patient_name"):
-                # Validar que não é frase de confirmação antes de salvar
-                nome = extracted["patient_name"]
-                if len(nome) >= 8 and " " in nome:
-                    context.flow_data["patient_name"] = nome
-                    logger.info(f"💾 Nome salvo no flow_data: {nome}")
+            # ATUALIZAR nome se não existe OU se novo nome é melhor (mais palavras, mais claro)
+            if extracted.get("patient_name"):
+                novo_nome = extracted["patient_name"]
+                nome_atual = context.flow_data.get("patient_name")
+                
+                qualidade_novo = self._evaluate_name_quality(novo_nome)
+                
+                if not nome_atual:
+                    # Se não tem nome, salvar se válido
+                    if qualidade_novo > 0:
+                        context.flow_data["patient_name"] = novo_nome
+                        logger.info(f"💾 Nome salvo no flow_data: {novo_nome}")
+                    else:
+                        logger.warning(f"⚠️ Nome rejeitado por ser inválido: {novo_nome}")
                 else:
-                    logger.warning(f"⚠️ Nome rejeitado por ser muito curto ou sem espaço: {nome}")
+                    # Se já tem nome, comparar qualidade
+                    qualidade_atual = self._evaluate_name_quality(nome_atual)
+                    if qualidade_novo > qualidade_atual:
+                        context.flow_data["patient_name"] = novo_nome
+                        logger.info(f"💾 Nome ATUALIZADO no flow_data: {nome_atual} → {novo_nome} (qualidade: {qualidade_atual} → {qualidade_novo})")
+                    else:
+                        logger.info(f"🔒 Nome mantido no flow_data: {nome_atual} (qualidade: {qualidade_atual} >= {qualidade_novo})")
             
             if extracted.get("patient_birth_date") and not context.flow_data.get("patient_birth_date"):
                 context.flow_data["patient_birth_date"] = extracted["patient_birth_date"]
@@ -1208,13 +1276,23 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                 else:
                     logger.warning(f"⚠️ Horário inválido (formato incorreto) rejeitado: {time_str}")
             
-            if extracted.get("consultation_type") and not context.flow_data.get("consultation_type"):
+            # SEMPRE atualizar tipo de consulta quando extraído (permite correção)
+            if extracted.get("consultation_type"):
+                tipo_anterior = context.flow_data.get("consultation_type")
                 context.flow_data["consultation_type"] = extracted["consultation_type"]
-                logger.info(f"💾 Tipo consulta salvo no flow_data: {extracted['consultation_type']}")
+                if tipo_anterior:
+                    logger.info(f"💾 Tipo consulta ATUALIZADO no flow_data: {tipo_anterior} → {extracted['consultation_type']}")
+                else:
+                    logger.info(f"💾 Tipo consulta salvo no flow_data: {extracted['consultation_type']}")
             
-            if extracted.get("insurance_plan") and not context.flow_data.get("insurance_plan"):
+            # SEMPRE atualizar convênio quando extraído (permite correção)
+            if extracted.get("insurance_plan"):
+                convenio_anterior = context.flow_data.get("insurance_plan")
                 context.flow_data["insurance_plan"] = extracted["insurance_plan"]
-                logger.info(f"💾 Convênio salvo no flow_data: {extracted['insurance_plan']}")
+                if convenio_anterior:
+                    logger.info(f"💾 Convênio ATUALIZADO no flow_data: {convenio_anterior} → {extracted['insurance_plan']}")
+                else:
+                    logger.info(f"💾 Convênio salvo no flow_data: {extracted['insurance_plan']}")
             
             # 8. FALLBACK: Verificar se Claude deveria ter chamado confirm_time_slot mas não chamou
             # Isso acontece quando: temos data + horário, mas não tem pending_confirmation
@@ -1974,11 +2052,46 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                     context.flow_data["pending_confirmation"] = True
                     db.commit()
             
-            # Buscar dados do paciente
-            nome = context.flow_data.get("patient_name", "") if context and context.flow_data else ""
-            nascimento = context.flow_data.get("patient_birth_date", "") if context and context.flow_data else ""
-            tipo = context.flow_data.get("consultation_type", "clinica_geral") if context and context.flow_data else "clinica_geral"
-            convenio = context.flow_data.get("insurance_plan", "particular") if context and context.flow_data else "particular"
+            # Buscar dados do paciente - priorizar flow_data, mas usar histórico como fallback
+            nome = ""
+            nascimento = ""
+            tipo = "clinica_geral"
+            convenio = "particular"
+            
+            if context and context.flow_data:
+                nome = context.flow_data.get("patient_name", "")
+                nascimento = context.flow_data.get("patient_birth_date", "")
+                tipo = context.flow_data.get("consultation_type", "clinica_geral")
+                convenio = context.flow_data.get("insurance_plan", "particular")
+            
+            # Se flow_data está incompleto ou incorreto, tentar extrair do histórico
+            precisa_extrair = False
+            if not nome or self._evaluate_name_quality(nome) == 0:
+                precisa_extrair = True
+                logger.info(f"🔍 flow_data não tem nome válido, buscando no histórico...")
+            elif tipo == "clinica_geral" or not convenio or convenio == "particular":
+                precisa_extrair = True
+                logger.info(f"🔍 flow_data incompleto (tipo/convênio), buscando no histórico...")
+            
+            if precisa_extrair and context and context.messages:
+                extracted = self._extract_appointment_data_from_messages(context.messages)
+                
+                # Atualizar nome se não tem ou é inválido
+                if (not nome or self._evaluate_name_quality(nome) == 0) and extracted.get("patient_name"):
+                    qualidade_novo = self._evaluate_name_quality(extracted["patient_name"])
+                    if qualidade_novo > 0:
+                        nome = extracted["patient_name"]
+                        logger.info(f"✅ Nome encontrado no histórico: {nome}")
+                
+                # Atualizar tipo se não tem ou é padrão
+                if tipo == "clinica_geral" and extracted.get("consultation_type"):
+                    tipo = extracted["consultation_type"]
+                    logger.info(f"✅ Tipo encontrado no histórico: {tipo}")
+                
+                # Atualizar convênio se não tem ou é padrão
+                if (not convenio or convenio == "particular") and extracted.get("insurance_plan"):
+                    convenio = extracted["insurance_plan"]
+                    logger.info(f"✅ Convênio encontrado no histórico: {convenio}")
             
             # Retornar resumo para confirmação
             msg = f"✅ Horário {time_str} disponível!\n\n"
@@ -2017,17 +2130,24 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
             insurance_plan = tool_input.get("insurance_plan", "particular")
             
             # Buscar dados do contexto se não fornecidos na tool
+            # CRÍTICO: Priorizar tool_input (dados do Claude) sobre flow_data (fallback)
             if phone:
                 context = db.query(ConversationContext).filter_by(phone=phone).first()
                 if context and context.flow_data:
-                    # Usar dados do contexto como fallback
+                    # Usar dados do contexto apenas como fallback se tool_input não tiver
                     if not patient_phone:
                         patient_phone = context.flow_data.get("patient_phone") or phone
-                    # Priorizar dados do flow_data se disponíveis
-                    if context.flow_data.get("consultation_type"):
-                        consultation_type = context.flow_data.get("consultation_type")
-                    if context.flow_data.get("insurance_plan"):
-                        insurance_plan = context.flow_data.get("insurance_plan")
+                    
+                    # Usar flow_data APENAS se tool_input não forneceu o dado
+                    if not consultation_type or consultation_type == "clinica_geral":  # valor padrão
+                        if context.flow_data.get("consultation_type"):
+                            consultation_type = context.flow_data.get("consultation_type")
+                            logger.info(f"📋 Usando consultation_type do flow_data (fallback): {consultation_type}")
+                    
+                    if not insurance_plan or insurance_plan == "particular":  # valor padrão
+                        if context.flow_data.get("insurance_plan"):
+                            insurance_plan = context.flow_data.get("insurance_plan")
+                            logger.info(f"📋 Usando insurance_plan do flow_data (fallback): {insurance_plan}")
             
             # Validar tipo de consulta
             valid_types = ["clinica_geral", "geriatria", "domiciliar"]
