@@ -549,7 +549,7 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                         try:
                             # Validar data
                             date_obj = datetime.strptime(full_date, '%d/%m/%Y')
-                        y = int(year)
+                            y = int(year)
                             
                             if not data["patient_birth_date"] and y < 2010:
                                 # Provavelmente data de nascimento
@@ -557,45 +557,45 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                                 logger.info(f"📅 Data nascimento extraída (regex): {full_date}")
                             elif not data["appointment_date"] and y >= 2010:
                                 # Provavelmente data de consulta
-                            data["appointment_date"] = full_date
+                                data["appointment_date"] = full_date
                                 logger.info(f"📅 Data consulta extraída (regex): {full_date}")
                         except ValueError:
                             pass
                 
                 # 4. EXTRAÇÃO DE TIPO DE CONSULTA - SEMPRE atualizar quando escolha explícita
                 # Se mensagem é só "1", "2" ou "3" (escolha explícita de tipo)
-                    if content in ["1", "2", "3"]:
-                        type_map = {"1": "clinica_geral", "2": "geriatria", "3": "domiciliar"}
+                if content in ["1", "2", "3"]:
+                    type_map = {"1": "clinica_geral", "2": "geriatria", "3": "domiciliar"}
                     # Sempre atualizar (sobrescrever) quando usuário escolhe explicitamente
-                        data["consultation_type"] = type_map[content]
+                    data["consultation_type"] = type_map[content]
                     logger.info(f"💾 Tipo de consulta atualizado (escolha explícita): {data['consultation_type']}")
                 
                 # 5. EXTRAÇÃO DE CONVÊNIO - SEMPRE atualizar quando escolha explícita
-                    content_lower = content.lower().strip()
-                    
+                content_lower = content.lower().strip()
+                
                 # Detectar menções diretas de convênios específicos (sempre atualizar)
-                    if "cabergs" in content_lower:
-                        data["insurance_plan"] = "CABERGS"
+                if "cabergs" in content_lower:
+                    data["insurance_plan"] = "CABERGS"
                     logger.info(f"💾 Convênio atualizado (menção direta): CABERGS")
-                    elif "ipe" in content_lower:
-                        data["insurance_plan"] = "IPE"
+                elif "ipe" in content_lower:
+                    data["insurance_plan"] = "IPE"
                     logger.info(f"💾 Convênio atualizado (menção direta): IPE")
-                    # Compatibilidade numérica (quando usuário responde só "1" ou "2")
-                    elif content in ["1", "2"]:
-                        insurance_map = {"1": "CABERGS", "2": "IPE"}
-                        data["insurance_plan"] = insurance_map[content]
+                # Compatibilidade numérica (quando usuário responde só "1" ou "2")
+                elif content in ["1", "2"]:
+                    insurance_map = {"1": "CABERGS", "2": "IPE"}
+                    data["insurance_plan"] = insurance_map[content]
                     logger.info(f"💾 Convênio atualizado (escolha numérica): {data['insurance_plan']}")
                     
                 # Detectar respostas negativas → Marcar como Particular (sempre atualizar)
-                    negative_insurance = [
-                        "não tenho", "nao tenho", "não possuo", "nao possuo",
-                        "sem convênio", "sem convenio", "não tenho convênio", "nao tenho convenio",
-                        "não possuo convênio", "nao possuo convenio",
-                        "particular", "prefiro particular", "quero particular"
-                    ]
-                    
-                    if any(phrase in content_lower for phrase in negative_insurance):
-                        data["insurance_plan"] = "Particular"
+                negative_insurance = [
+                    "não tenho", "nao tenho", "não possuo", "nao possuo",
+                    "sem convênio", "sem convenio", "não tenho convênio", "nao tenho convenio",
+                    "não possuo convênio", "nao possuo convenio",
+                    "particular", "prefiro particular", "quero particular"
+                ]
+                
+                if any(phrase in content_lower for phrase in negative_insurance):
+                    data["insurance_plan"] = "Particular"
                     logger.info(f"💳 Convênio atualizado como Particular (resposta negativa detectada)")
             
             logger.info(f"📋 Extração concluída: {data}")
@@ -1283,7 +1283,7 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                 if convenio_anterior:
                     logger.info(f"💾 Convênio ATUALIZADO no flow_data: {convenio_anterior} → {extracted['insurance_plan']}")
                 else:
-                logger.info(f"💾 Convênio salvo no flow_data: {extracted['insurance_plan']}")
+                    logger.info(f"💾 Convênio salvo no flow_data: {extracted['insurance_plan']}")
             
             # 8. FALLBACK: Verificar se Claude deveria ter chamado confirm_time_slot mas não chamou
             # Isso acontece quando: temos data + horário, mas não tem pending_confirmation
@@ -2153,13 +2153,13 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                     
                     # Usar flow_data APENAS se tool_input não forneceu o dado
                     if not consultation_type or consultation_type == "clinica_geral":  # valor padrão
-                    if context.flow_data.get("consultation_type"):
-                        consultation_type = context.flow_data.get("consultation_type")
+                        if context.flow_data.get("consultation_type"):
+                            consultation_type = context.flow_data.get("consultation_type")
                             logger.info(f"📋 Usando consultation_type do flow_data (fallback): {consultation_type}")
                     
                     if not insurance_plan or insurance_plan == "particular":  # valor padrão
-                    if context.flow_data.get("insurance_plan"):
-                        insurance_plan = context.flow_data.get("insurance_plan")
+                        if context.flow_data.get("insurance_plan"):
+                            insurance_plan = context.flow_data.get("insurance_plan")
                             logger.info(f"📋 Usando insurance_plan do flow_data (fallback): {insurance_plan}")
             
             # Validar tipo de consulta
