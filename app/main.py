@@ -808,6 +808,10 @@ async def dashboard():
             }
             
             .appointment-time {
+                display: flex;
+                flex-direction: column;
+                align-items: center;
+                justify-content: center;
                 text-align: center;
                 padding: 1rem;
                 background: linear-gradient(135deg, var(--primary) 0%, #6366F1 100%);
@@ -1150,9 +1154,12 @@ async def dashboard():
                     groups[date].push(appointment);
                 });
 
-                // Ordenar datas
+                // Ordenar datas (mais próxima primeiro - crescente)
                 const sortedDates = Object.keys(groups).sort((a, b) => {
-                    return a.localeCompare(b, 'pt-BR', { numeric: true });
+                    // Converter DD/MM/YYYY para YYYYMMDD para ordenação correta
+                    const dateA = a.split('/').reverse().join('');
+                    const dateB = b.split('/').reverse().join('');
+                    return dateA.localeCompare(dateB);
                 });
 
                 const sortedGroups = {};
