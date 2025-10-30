@@ -300,8 +300,15 @@ CICLO DE ATENDIMENTO CONTÍNUO:
    - SEMPRE perguntar: "Posso te ajudar com mais alguma coisa?"
    
 2. Se usuário responder "sim" ou fizer nova pergunta:
-   - Responder adequadamente usando as tools necessárias
-   - Voltar ao passo 1 (perguntar novamente se pode ajudar)
+   - Se responder apenas "sim" sem contexto claro:
+     * Responder: "Claro! Como posso ajudar você hoje?" e aguardar resposta do usuário
+   - Se fizer pergunta/pedido claro:
+     * Responder adequadamente usando as tools necessárias
+     * Após resolver, perguntar novamente: "Posso te ajudar com mais alguma coisa?"
+   - Se mensagem for ambígua/confusa:
+     * Perguntar: "Como posso te ajudar? Você pode me dizer o que precisa?"
+   - Manter TODO o contexto histórico (nome, data nascimento, etc.) durante o ciclo
+   - Voltar ao passo 1 após resolver cada pedido
    
 3. Se usuário responder "não", "só isso", "obrigado", etc:
    - Execute tool 'end_conversation' para encerrar contexto
@@ -542,7 +549,7 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                         try:
                             # Validar data
                             date_obj = datetime.strptime(full_date, '%d/%m/%Y')
-                            y = int(year)
+                        y = int(year)
                             
                             if not data["patient_birth_date"] and y < 2010:
                                 # Provavelmente data de nascimento
@@ -550,45 +557,45 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                                 logger.info(f"📅 Data nascimento extraída (regex): {full_date}")
                             elif not data["appointment_date"] and y >= 2010:
                                 # Provavelmente data de consulta
-                                data["appointment_date"] = full_date
+                            data["appointment_date"] = full_date
                                 logger.info(f"📅 Data consulta extraída (regex): {full_date}")
                         except ValueError:
                             pass
                 
                 # 4. EXTRAÇÃO DE TIPO DE CONSULTA - SEMPRE atualizar quando escolha explícita
                 # Se mensagem é só "1", "2" ou "3" (escolha explícita de tipo)
-                if content in ["1", "2", "3"]:
-                    type_map = {"1": "clinica_geral", "2": "geriatria", "3": "domiciliar"}
+                    if content in ["1", "2", "3"]:
+                        type_map = {"1": "clinica_geral", "2": "geriatria", "3": "domiciliar"}
                     # Sempre atualizar (sobrescrever) quando usuário escolhe explicitamente
-                    data["consultation_type"] = type_map[content]
+                        data["consultation_type"] = type_map[content]
                     logger.info(f"💾 Tipo de consulta atualizado (escolha explícita): {data['consultation_type']}")
                 
                 # 5. EXTRAÇÃO DE CONVÊNIO - SEMPRE atualizar quando escolha explícita
-                content_lower = content.lower().strip()
-                
+                    content_lower = content.lower().strip()
+                    
                 # Detectar menções diretas de convênios específicos (sempre atualizar)
-                if "cabergs" in content_lower:
-                    data["insurance_plan"] = "CABERGS"
+                    if "cabergs" in content_lower:
+                        data["insurance_plan"] = "CABERGS"
                     logger.info(f"💾 Convênio atualizado (menção direta): CABERGS")
-                elif "ipe" in content_lower:
-                    data["insurance_plan"] = "IPE"
+                    elif "ipe" in content_lower:
+                        data["insurance_plan"] = "IPE"
                     logger.info(f"💾 Convênio atualizado (menção direta): IPE")
-                # Compatibilidade numérica (quando usuário responde só "1" ou "2")
-                elif content in ["1", "2"]:
-                    insurance_map = {"1": "CABERGS", "2": "IPE"}
-                    data["insurance_plan"] = insurance_map[content]
+                    # Compatibilidade numérica (quando usuário responde só "1" ou "2")
+                    elif content in ["1", "2"]:
+                        insurance_map = {"1": "CABERGS", "2": "IPE"}
+                        data["insurance_plan"] = insurance_map[content]
                     logger.info(f"💾 Convênio atualizado (escolha numérica): {data['insurance_plan']}")
-                
+                    
                 # Detectar respostas negativas → Marcar como Particular (sempre atualizar)
-                negative_insurance = [
-                    "não tenho", "nao tenho", "não possuo", "nao possuo",
-                    "sem convênio", "sem convenio", "não tenho convênio", "nao tenho convenio",
-                    "não possuo convênio", "nao possuo convenio",
-                    "particular", "prefiro particular", "quero particular"
-                ]
-                
-                if any(phrase in content_lower for phrase in negative_insurance):
-                    data["insurance_plan"] = "Particular"
+                    negative_insurance = [
+                        "não tenho", "nao tenho", "não possuo", "nao possuo",
+                        "sem convênio", "sem convenio", "não tenho convênio", "nao tenho convenio",
+                        "não possuo convênio", "nao possuo convenio",
+                        "particular", "prefiro particular", "quero particular"
+                    ]
+                    
+                    if any(phrase in content_lower for phrase in negative_insurance):
+                        data["insurance_plan"] = "Particular"
                     logger.info(f"💳 Convênio atualizado como Particular (resposta negativa detectada)")
             
             logger.info(f"📋 Extração concluída: {data}")
@@ -631,7 +638,7 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
             return 8
         else:
             return 5
-    
+
     def _extrair_nome_e_data_robusto(self, mensagem: str) -> Dict[str, Any]:
         """
         Extrai nome completo e data de nascimento de forma robusta
@@ -1235,11 +1242,16 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                 context.flow_data["patient_birth_date"] = extracted["patient_birth_date"]
                 logger.info(f"💾 Data nascimento salva no flow_data: {extracted['patient_birth_date']}")
             
-            if extracted.get("appointment_date") and not context.flow_data.get("appointment_date"):
+            # Prevenir re-extração de appointment_date/appointment_time se agendamento já foi completado
+            appointment_completed = context.flow_data.get("appointment_completed", False)
+            
+            if extracted.get("appointment_date") and not context.flow_data.get("appointment_date") and not appointment_completed:
                 context.flow_data["appointment_date"] = extracted["appointment_date"]
                 logger.info(f"💾 Data consulta salva no flow_data: {extracted['appointment_date']}")
+            elif appointment_completed and extracted.get("appointment_date"):
+                logger.info(f"⏭️ Pulando salvamento de appointment_date - agendamento já foi completado")
             
-            if extracted.get("appointment_time") and not context.flow_data.get("appointment_time"):
+            if extracted.get("appointment_time") and not context.flow_data.get("appointment_time") and not appointment_completed:
                 # Validar horário antes de salvar: deve ser formato HH:MM com minutos == 00
                 time_str = extracted["appointment_time"]
                 import re
@@ -1252,6 +1264,8 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                         logger.warning(f"⚠️ Horário inválido (não inteiro) rejeitado: {time_str}")
                 else:
                     logger.warning(f"⚠️ Horário inválido (formato incorreto) rejeitado: {time_str}")
+            elif appointment_completed and extracted.get("appointment_time"):
+                logger.info(f"⏭️ Pulando salvamento de appointment_time - agendamento já foi completado")
             
             # SEMPRE atualizar tipo de consulta quando extraído (permite correção)
             if extracted.get("consultation_type"):
@@ -1269,7 +1283,7 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                 if convenio_anterior:
                     logger.info(f"💾 Convênio ATUALIZADO no flow_data: {convenio_anterior} → {extracted['insurance_plan']}")
                 else:
-                    logger.info(f"💾 Convênio salvo no flow_data: {extracted['insurance_plan']}")
+                logger.info(f"💾 Convênio salvo no flow_data: {extracted['insurance_plan']}")
             
             # 8. FALLBACK: Verificar se Claude deveria ter chamado confirm_time_slot mas não chamou
             # Isso acontece quando: temos data + horário, mas não tem pending_confirmation
@@ -1277,7 +1291,14 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
             
             # Verificar se a última resposta do assistente indica que já criou agendamento
             should_skip_fallback = False
-            if context.messages:
+            
+            # Verificar flag appointment_completed no flow_data
+            appointment_completed_flag = context.flow_data.get("appointment_completed", False)
+            if appointment_completed_flag:
+                should_skip_fallback = True
+                logger.info("⏭️ Pulando fallback - flag appointment_completed existe no flow_data")
+            
+            if not should_skip_fallback and context.messages:
                 last_assistant_msg = None
                 for msg in reversed(context.messages):
                     if msg.get("role") == "assistant":
@@ -1313,23 +1334,23 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                     context.flow_data["appointment_time"] = None
                     db.commit()
                 else:
-                    logger.info("🔄 FALLBACK: Claude não chamou confirm_time_slot, chamando manualmente...")
-                    logger.info(f"   Data: {context.flow_data['appointment_date']}")
-                    logger.info(f"   Horário: {context.flow_data['appointment_time']}")
+                logger.info("🔄 FALLBACK: Claude não chamou confirm_time_slot, chamando manualmente...")
+                logger.info(f"   Data: {context.flow_data['appointment_date']}")
+                logger.info(f"   Horário: {context.flow_data['appointment_time']}")
+                
+                # Chamar a tool manualmente
+                try:
+                    confirmation_msg = self._handle_confirm_time_slot({
+                        "date": context.flow_data["appointment_date"],
+                        "time": context.flow_data["appointment_time"]
+                    }, db, phone)
                     
-                    # Chamar a tool manualmente
-                    try:
-                        confirmation_msg = self._handle_confirm_time_slot({
-                            "date": context.flow_data["appointment_date"],
-                            "time": context.flow_data["appointment_time"]
-                        }, db, phone)
-                        
-                        # Substituir resposta do Claude pela confirmação
-                        bot_response = confirmation_msg
-                        logger.info("✅ Tool confirm_time_slot executada com sucesso via fallback")
-                    except Exception as e:
-                        logger.error(f"❌ Erro ao executar fallback de confirm_time_slot: {str(e)}")
-                        # Manter resposta original do Claude
+                    # Substituir resposta do Claude pela confirmação
+                    bot_response = confirmation_msg
+                    logger.info("✅ Tool confirm_time_slot executada com sucesso via fallback")
+                except Exception as e:
+                    logger.error(f"❌ Erro ao executar fallback de confirm_time_slot: {str(e)}")
+                    # Manter resposta original do Claude
             
             # 9. Atualizar contexto no banco
             context.last_activity = datetime.utcnow()
@@ -1350,7 +1371,7 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
             if tool_name == "get_clinic_info":
                 return self._handle_get_clinic_info(tool_input)
             elif tool_name == "validate_date_and_show_slots":
-                return self._handle_validate_date_and_show_slots(tool_input, db)
+                return self._handle_validate_date_and_show_slots(tool_input, db, phone)
             elif tool_name == "confirm_time_slot":
                 return self._handle_confirm_time_slot(tool_input, db, phone)
             elif tool_name == "create_appointment":
@@ -1793,12 +1814,20 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
             logger.error(f"Erro ao verificar disponibilidade: {str(e)}")
             return f"Erro ao verificar disponibilidade: {str(e)}"
 
-    def _handle_validate_date_and_show_slots(self, tool_input: Dict, db: Session) -> str:
+    def _handle_validate_date_and_show_slots(self, tool_input: Dict, db: Session, phone: str = None) -> str:
         """
         Valida data e mostra horários disponíveis automaticamente.
         Combina validação + listagem em uma única etapa.
         """
         try:
+            # Limpar flag appointment_completed ao iniciar novo agendamento
+            if phone:
+                context = db.query(ConversationContext).filter_by(phone=phone).first()
+                if context and context.flow_data and context.flow_data.get("appointment_completed"):
+                    context.flow_data.pop("appointment_completed", None)
+                    db.commit()
+                    logger.info("🧹 Flag appointment_completed removida - novo agendamento iniciado")
+            
             date_str = tool_input.get("date")
             
             if not date_str:
@@ -2124,13 +2153,13 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                     
                     # Usar flow_data APENAS se tool_input não forneceu o dado
                     if not consultation_type or consultation_type == "clinica_geral":  # valor padrão
-                        if context.flow_data.get("consultation_type"):
-                            consultation_type = context.flow_data.get("consultation_type")
+                    if context.flow_data.get("consultation_type"):
+                        consultation_type = context.flow_data.get("consultation_type")
                             logger.info(f"📋 Usando consultation_type do flow_data (fallback): {consultation_type}")
                     
                     if not insurance_plan or insurance_plan == "particular":  # valor padrão
-                        if context.flow_data.get("insurance_plan"):
-                            insurance_plan = context.flow_data.get("insurance_plan")
+                    if context.flow_data.get("insurance_plan"):
+                        insurance_plan = context.flow_data.get("insurance_plan")
                             logger.info(f"📋 Usando insurance_plan do flow_data (fallback): {insurance_plan}")
             
             # Validar tipo de consulta
@@ -2226,8 +2255,11 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                     context.flow_data.pop("appointment_date", None)
                     context.flow_data.pop("appointment_time", None)
                     context.flow_data.pop("pending_confirmation", None)
+                    # Adicionar flag para indicar que agendamento foi completado
+                    context.flow_data["appointment_completed"] = True
                     db.commit()
                     logger.info("🧹 Limpeza do flow_data: appointment_date, appointment_time e pending_confirmation removidos")
+                    logger.info("✅ Flag appointment_completed adicionada ao flow_data")
             
             # Buscar informações do tipo de consulta e convênio
             tipos_consulta = self.clinic_info.get('tipos_consulta', {})
