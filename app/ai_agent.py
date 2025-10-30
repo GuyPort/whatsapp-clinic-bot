@@ -537,11 +537,14 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                     time_match = re.search(time_pattern, content)
                     if time_match:
                         hour, minute = time_match.groups()
-                        data["appointment_time"] = f"{hour.zfill(2)}:{minute}"
+                        from app.utils import normalize_time_format
+                        normalized = normalize_time_format(f"{hour}:{minute}")
+                        if normalized:
+                            data["appointment_time"] = normalized
                 
                 # 2. EXTRAÇÃO BÁSICA DE DATAS - Apenas por regex simples
                 # Tentar identificar se é data de nascimento (< 2010) ou consulta (>= 2010)
-                if not data["patient_birth_date"] or not data["appointment_date"]:
+                if not data["patient_birth_date"] or not data["appointment_date"]:  
                     date_pattern = r'(\d{1,2})/(\d{1,2})/(\d{4})'
                     date_matches = re.findall(date_pattern, content)
                     for match in date_matches:
@@ -1253,18 +1256,14 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                 logger.info(f"⏭️ Pulando salvamento de appointment_date - agendamento já foi completado")
             
             if extracted.get("appointment_time") and not context.flow_data.get("appointment_time") and not appointment_completed:
-                # Validar horário antes de salvar: deve ser formato HH:MM com minutos == 00
+                # Validar horário antes de salvar usando função robusta
                 time_str = extracted["appointment_time"]
-                import re
-                if re.match(r'^\d{2}:\d{2}$', time_str):
-                    hour, minute = time_str.split(':')
-                    if minute == '00':
-                        context.flow_data["appointment_time"] = time_str
-                        logger.info(f"💾 Horário consulta salvo no flow_data: {time_str}")
-                    else:
-                        logger.warning(f"⚠️ Horário inválido (não inteiro) rejeitado: {time_str}")
+                from app.utils import validate_time_format
+                if validate_time_format(time_str):
+                    context.flow_data["appointment_time"] = time_str
+                    logger.info(f"💾 Horário consulta salvo no flow_data: {time_str}")
                 else:
-                    logger.warning(f"⚠️ Horário inválido (formato incorreto) rejeitado: {time_str}")
+                    logger.warning(f"⚠️ Horário inválido rejeitado: {time_str}")
             elif appointment_completed and extracted.get("appointment_time"):
                 logger.info(f"⏭️ Pulando salvamento de appointment_time - agendamento já foi completado")
             
@@ -1945,11 +1944,16 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
         """Validar e confirmar horário escolhido"""
         try:
             import re
+            from app.utils import normalize_time_format
+            
             date_str = tool_input.get("date")
             time_str = tool_input.get("time")
             
-            # Validar formato
-            if not re.match(r'^\d{2}:\d{2}$', time_str):
+            # Normalizar formato de horário
+            time_str_original = time_str
+            time_str = normalize_time_format(time_str)
+            
+            if not time_str:
                 # Limpar appointment_time do flow_data se existir
                 if phone:
                     context = db.query(ConversationContext).filter_by(phone=phone).first()
@@ -1957,7 +1961,7 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                         context.flow_data["appointment_time"] = None
                         db.commit()
                         logger.info(f"🧹 Horário inválido removido do flow_data (formato incorreto)")
-                return "❌ Formato de horário inválido. Use HH:MM (exemplo: 14:00)"
+                return f"❌ Formato de horário inválido: '{time_str_original}'. Use um horário válido (exemplo: 14:00, 14, ou 8:00)"
             
             # Validar se é hora inteira
             hour, minute = time_str.split(':')
@@ -2029,13 +2033,13 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                 
                 # Montar mensagem com todos os horários disponíveis
                 if available_slots:
-                    msg = "❌ Por favor, escolha um horário inteiro.\n\n"
+                    msg = "❌ Por favor, escolha um horário inteiro (exemplo: 8:00, 14:00).\n\n"
                     msg += "Esses são os únicos horários disponíveis para esta data:\n"
                     for slot in available_slots:
                         msg += f"• {slot}\n"
                     return msg
                 else:
-                    return "❌ Por favor, escolha um horário inteiro.\n\nNão há horários disponíveis para esta data."
+                    return "❌ Por favor, escolha um horário inteiro (exemplo: 8:00, 14:00).\n\nNão há horários disponíveis para esta data."
             
             # Verificar disponibilidade no banco (segurança contra race condition)
             appointment_date = parse_date_br(date_str)

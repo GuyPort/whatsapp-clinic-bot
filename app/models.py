@@ -3,9 +3,11 @@ Modelos de banco de dados para o bot da clínica.
 Versão completa com todos os campos necessários para o agente Claude.
 """
 from datetime import datetime, date, time
-from sqlalchemy import Column, Integer, String, DateTime, Date, Time, Text, Index, Enum, JSON
+from sqlalchemy import Column, Integer, String, DateTime, Date, Time, Text, Index, Enum, JSON, CheckConstraint
 from sqlalchemy.orm import declarative_base
+from sqlalchemy import event
 import enum
+import re
 
 Base = declarative_base()
 
@@ -65,6 +67,43 @@ class Appointment(Base):
     
     def __repr__(self):
         return f"<Appointment(id={self.id}, patient='{self.patient_name}', date='{self.appointment_date}', time='{self.appointment_time}', status='{self.status.value}')>"
+
+
+# Validações usando eventos SQLAlchemy
+@event.listens_for(Appointment, 'before_insert')
+@event.listens_for(Appointment, 'before_update')
+def validate_appointment_data(mapper, connection, target):
+    """Valida dados antes de inserir/atualizar agendamento"""
+    
+    # Validar nome não vazio
+    if not target.patient_name or not target.patient_name.strip():
+        raise ValueError("Nome do paciente não pode estar vazio")
+    
+    # Validar telefone não vazio
+    if not target.patient_phone or not target.patient_phone.strip():
+        raise ValueError("Telefone do paciente não pode estar vazio")
+    
+    # Validar formato da data de nascimento
+    if not re.match(r'^\d{2}/\d{2}/\d{4}$', target.patient_birth_date):
+        raise ValueError("Data de nascimento deve estar no formato DD/MM/AAAA")
+    
+    # Validar formato do horário
+    if not re.match(r'^\d{2}:\d{2}$', target.appointment_time):
+        raise ValueError("Horário deve estar no formato HH:MM")
+    
+    # Validar hora (00-23)
+    hour = int(target.appointment_time.split(':')[0])
+    if not (0 <= hour <= 23):
+        raise ValueError("Hora deve estar entre 00 e 23")
+    
+    # Validar minuto (00-59)
+    minute = int(target.appointment_time.split(':')[1])
+    if not (0 <= minute <= 59):
+        raise ValueError("Minuto deve estar entre 00 e 59")
+    
+    # Validar que é horário inteiro (minutos == 00)
+    if minute != 0:
+        raise ValueError("Apenas horários inteiros são aceitos (minutos deve ser 00)")
 
 
 class PausedContact(Base):

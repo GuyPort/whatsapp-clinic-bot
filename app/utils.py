@@ -65,7 +65,15 @@ def normalize_phone(phone: str) -> str:
     Returns:
         Número limpo (apenas dígitos) com código do país
     """
+    # Validar entrada
+    if not phone or not isinstance(phone, str):
+        return ""
+    
     clean = re.sub(r'\D', '', phone)
+    
+    # Validar tamanho (máximo 15 dígitos conforme padrão internacional)
+    if len(clean) > 15:
+        return ""
     
     # Garantir que tem código do país (55) para Brasil
     if not clean.startswith('55') and len(clean) >= 10:
@@ -102,4 +110,67 @@ def round_up_to_next_5_minutes(dt: datetime) -> datetime:
     if minute_mod == 0:
         rounded = dt.replace(second=0, microsecond=0)
     return rounded
+
+
+def validate_time_format(time_str: str) -> bool:
+    """
+    Valida se o formato de horário está correto (HH:MM) e se é um horário válido.
+    
+    Args:
+        time_str: String do horário no formato HH:MM
+        
+    Returns:
+        True se válido, False caso contrário
+    """
+    if not time_str or not isinstance(time_str, str):
+        return False
+    
+    # Verificar formato HH:MM
+    import re
+    if not re.match(r'^\d{2}:\d{2}$', time_str):
+        return False
+    
+    try:
+        hour, minute = time_str.split(':')
+        hour_int = int(hour)
+        minute_int = int(minute)
+        
+        # Validar hora (00-23) e minuto (00-59)
+        if not (0 <= hour_int <= 23) or not (0 <= minute_int <= 59):
+            return False
+        
+        # Só aceitar horários inteiros (minutos == 00)
+        if minute_int != 0:
+            return False
+        
+        return True
+    except (ValueError, IndexError):
+        return False
+
+
+def normalize_time_format(time_str: str) -> Optional[str]:
+    """
+    Normaliza formato de horário para HH:MM.
+    Aceita: "8:00", "8", "8:0", "08:00"
+    Retorna: "08:00" ou None se inválido
+    """
+    if not time_str or not isinstance(time_str, str):
+        return None
+    
+    time_str = time_str.strip()
+    
+    # Padrão: H:MM ou HH:MM ou H:M ou HH:M
+    match = re.match(r'^(\d{1,2})(?::(\d{1,2}))?$', time_str)
+    if not match:
+        return None
+    
+    hour_str, minute_str = match.groups()
+    hour = int(hour_str)
+    minute = int(minute_str) if minute_str else 0
+    
+    # Validar ranges
+    if not (0 <= hour <= 23) or not (0 <= minute <= 59):
+        return None
+    
+    return f"{hour:02d}:{minute:02d}"
 
