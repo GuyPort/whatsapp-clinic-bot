@@ -530,8 +530,9 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                     continue
                 content = (msg.get("content") or "").strip()
                 
-                # 1. EXTRAÇÃO DE HORÁRIOS - Buscar em qualquer parte da mensagem
-                if not data["appointment_time"]:
+                # 1. EXTRAÇÃO DE HORÁRIOS - Só extrair se já tiver data de consulta definida
+                # Isso evita capturar horários de nascimento mencionados antes da etapa de agendamento
+                if not data["appointment_time"] and data["appointment_date"]:
                     time_pattern = r'(\d{1,2}):(\d{2})'
                     time_match = re.search(time_pattern, content)
                     if time_match:
