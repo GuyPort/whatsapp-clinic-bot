@@ -1242,7 +1242,15 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
             # Extração manual de nome foi removida pois causava erros (ex: "Eu Preciso Marcar Uma Consulta")
             # Se precisar do nome, Claude deve chamar tool extract_patient_data
             
-            if extracted.get("patient_birth_date") and not context.flow_data.get("patient_birth_date"):
+            # Verificar se está aguardando correção de data de nascimento
+            if context.flow_data.get("awaiting_birth_date_correction"):
+                # Tentar extrair nova data de nascimento
+                if extracted.get("patient_birth_date"):
+                    context.flow_data["patient_birth_date"] = extracted["patient_birth_date"]
+                    context.flow_data["awaiting_birth_date_correction"] = False
+                    db.commit()
+                    logger.info("🔄 Data de nascimento corrigida, tentando agendar novamente")
+            elif extracted.get("patient_birth_date") and not context.flow_data.get("patient_birth_date"):
                 context.flow_data["patient_birth_date"] = extracted["patient_birth_date"]
                 logger.info(f"💾 Data nascimento salva no flow_data: {extracted['patient_birth_date']}")
             
@@ -1297,6 +1305,18 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
             if appointment_completed_flag:
                 should_skip_fallback = True
                 logger.info("⏭️ Pulando fallback - flag appointment_completed existe no flow_data")
+            
+            # Verificar se última resposta foi erro de create_appointment
+            last_assistant_msg = ""
+            for msg in reversed(messages):
+                if msg.get("role") == "assistant":
+                    last_assistant_msg = msg.get("content", "")
+                    break
+
+            # Se última mensagem foi erro de validação, não executar fallback
+            if "formato inválido" in last_assistant_msg.lower() or "erro ao criar" in last_assistant_msg.lower():
+                should_skip_fallback = True
+                logger.info("⏭️ Pulando fallback - última resposta foi erro de validação")
             
             if not should_skip_fallback and context.messages:
                 last_assistant_msg = None
@@ -2194,12 +2214,29 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
             # Normalizar telefone
             normalized_phone = normalize_phone(patient_phone)
             
-            # Converter datas
+            # Converter datas COM VALIDAÇÃO
             birth_date = parse_date_br(patient_birth_date)
             appointment_datetime = parse_date_br(appointment_date)
             
-            if not birth_date or not appointment_datetime:
-                return "Formato de data inválido. Use DD/MM/AAAA."
+            if not birth_date:
+                logger.error(f"❌ Data de nascimento inválida: {patient_birth_date}")
+                # Marcar que está aguardando correção
+                if phone:
+                    context = db.query(ConversationContext).filter_by(phone=phone).first()
+                    if context:
+                        if not context.flow_data:
+                            context.flow_data = {}
+                        context.flow_data["awaiting_birth_date_correction"] = True
+                        db.commit()
+                # NÃO limpar flow_data para permitir correção
+                return (f"❌ A data de nascimento '{patient_birth_date}' está em formato inválido.\n"
+                       f"Por favor, informe sua data de nascimento correta no formato DD/MM/AAAA (exemplo: 07/08/2003)")
+            
+            if not appointment_datetime:
+                logger.error(f"❌ Data de consulta inválida: {appointment_date}")
+                # NÃO limpar flow_data para permitir correção
+                return (f"❌ A data da consulta '{appointment_date}' está em formato inválido.\n"
+                       f"Por favor, informe a data correta no formato DD/MM/AAAA")
             
             # Combinar data e horário (com arredondamento para múltiplo de 5 min)
             try:

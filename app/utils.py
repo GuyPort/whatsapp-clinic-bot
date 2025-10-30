@@ -30,13 +30,23 @@ def parse_date_br(date_str: str) -> Optional[datetime]:
     Returns:
         datetime object ou None se inválido
     """
+    if not date_str or not isinstance(date_str, str):
+        return None
+    
     try:
-        # Aceitar tanto DD/MM/AAAA quanto DD/MM/AA
-        if len(date_str) == 8:  # DD/MM/AA
-            return datetime.strptime(date_str, "%d/%m/%y")
-        else:  # DD/MM/AAAA
-            return datetime.strptime(date_str, "%d/%m/%Y")
-    except ValueError:
+        # Regex rigorosa: exatamente 2 dígitos dia, 2 mês, 4 ano
+        match = re.match(r'^(\d{2})/(\d{2})/(\d{4})$', date_str)
+        if not match:
+            return None
+        
+        day, month, year = match.groups()
+        
+        # Validar se é uma data real
+        date_obj = datetime(int(year), int(month), int(day))
+        
+        return date_obj
+        
+    except (ValueError, AttributeError):
         return None
 
 
