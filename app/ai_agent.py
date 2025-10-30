@@ -1334,23 +1334,23 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                     context.flow_data["appointment_time"] = None
                     db.commit()
                 else:
-                logger.info("🔄 FALLBACK: Claude não chamou confirm_time_slot, chamando manualmente...")
-                logger.info(f"   Data: {context.flow_data['appointment_date']}")
-                logger.info(f"   Horário: {context.flow_data['appointment_time']}")
-                
-                # Chamar a tool manualmente
-                try:
-                    confirmation_msg = self._handle_confirm_time_slot({
-                        "date": context.flow_data["appointment_date"],
-                        "time": context.flow_data["appointment_time"]
-                    }, db, phone)
+                    logger.info("🔄 FALLBACK: Claude não chamou confirm_time_slot, chamando manualmente...")
+                    logger.info(f"   Data: {context.flow_data['appointment_date']}")
+                    logger.info(f"   Horário: {context.flow_data['appointment_time']}")
                     
-                    # Substituir resposta do Claude pela confirmação
-                    bot_response = confirmation_msg
-                    logger.info("✅ Tool confirm_time_slot executada com sucesso via fallback")
-                except Exception as e:
-                    logger.error(f"❌ Erro ao executar fallback de confirm_time_slot: {str(e)}")
-                    # Manter resposta original do Claude
+                    # Chamar a tool manualmente
+                    try:
+                        confirmation_msg = self._handle_confirm_time_slot({
+                            "date": context.flow_data["appointment_date"],
+                            "time": context.flow_data["appointment_time"]
+                        }, db, phone)
+                        
+                        # Substituir resposta do Claude pela confirmação
+                        bot_response = confirmation_msg
+                        logger.info("✅ Tool confirm_time_slot executada com sucesso via fallback")
+                    except Exception as e:
+                        logger.error(f"❌ Erro ao executar fallback de confirm_time_slot: {str(e)}")
+                        # Manter resposta original do Claude
             
             # 9. Atualizar contexto no banco
             context.last_activity = datetime.utcnow()
