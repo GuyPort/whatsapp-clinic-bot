@@ -208,12 +208,17 @@ FLUXO:
    Digite o número da opção desejada:"
 
 4. Após receber o tipo (1, 2 ou 3):
-   "Ótimo! Possui convênio médico?
-   
+   "Ótimo! Você possui convênio médico?
+
+   Trabalhamos com os seguintes convênios:
    • CABERGS
    • IPE
-   
-   Digite o nome do convênio ou responda 'não' se for particular."
+
+   📋 Como responder:
+   • Se você TEM um desses convênios → Digite o nome (CABERGS ou IPE)
+   • Se você NÃO TEM convênio → Responda apenas "Não"
+
+   Vamos prosseguir com consulta particular se você não tiver convênio."
    
    ⚠️ IMPORTANTE: Se usuário responder negativamente (não tenho, sem convênio, etc):
          - Python marcará automaticamente como "Particular"
@@ -242,6 +247,16 @@ FLUXO:
       - Ação: "Não entendi. Você possui convênio médico (CABERGS ou IPE) ou não possui?"
    
    REGRA CRÍTICA: Use seu entendimento de linguagem natural para classificar a INTENÇÃO, não apenas palavras específicas!
+   
+   ⚠️ REGRA CRÍTICA - CONVÊNIO:
+   1. Resposta "não"/"nao"/"n" → SEMPRE marcar como "Particular"
+   2. Resposta "CABERGS" ou contém "cabergs" → "CABERGS"
+   3. Resposta "IPE" ou contém "ipe" → "IPE"
+   4. Resposta "1" → "CABERGS"
+   5. Resposta "2" → "IPE"
+   6. Qualquer outra negativa (não tenho, sem convênio) → "Particular"
+   7. Resposta confusa → Perguntar novamente de forma clara
+   8. NUNCA assumir CABERGS como padrão
 
 5. Após receber o convênio (1, 2 ou 3):
    "Agora me informe o dia que gostaria de marcar a consulta (DD/MM/AAAA - ex: 25/11/2025):"
@@ -576,31 +591,53 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                 
                 # 5. EXTRAÇÃO DE CONVÊNIO - SEMPRE atualizar quando escolha explícita
                 content_lower = content.lower().strip()
+                content_stripped = content.strip().lower()
                 
-                # Detectar menções diretas de convênios específicos (sempre atualizar)
-                if "cabergs" in content_lower:
+                # Log para debug
+                logger.info(f"🔍 CONVÊNIO - Mensagem do usuário: '{content}'")
+                logger.info(f"🔍 CONVÊNIO - Conteúdo processado: '{content_lower}'")
+                
+                # NOVA LÓGICA: Detectar respostas ultra-curtas PRIMEIRO
+                
+                # 1. Detectar respostas negativas ultra-curtas (1-2 caracteres)
+                if content_stripped in ["não", "nao", "n", "nope", "nunca"]:
+                    data["insurance_plan"] = "Particular"
+                    logger.info(f"💳 Convênio: Particular (resposta negativa curta: '{content_stripped}')")
+                    
+                # 2. Detectar convênios explícitos
+                elif "cabergs" in content_lower:
                     data["insurance_plan"] = "CABERGS"
-                    logger.info(f"💾 Convênio atualizado (menção direta): CABERGS")
+                    logger.info(f"💾 Convênio: CABERGS (menção direta)")
+                    
                 elif "ipe" in content_lower:
                     data["insurance_plan"] = "IPE"
-                    logger.info(f"💾 Convênio atualizado (menção direta): IPE")
-                # Compatibilidade numérica (quando usuário responde só "1" ou "2")
+                    logger.info(f"💾 Convênio: IPE (menção direta)")
+                    
+                # 3. Compatibilidade numérica
                 elif content in ["1", "2"]:
                     insurance_map = {"1": "CABERGS", "2": "IPE"}
                     data["insurance_plan"] = insurance_map[content]
-                    logger.info(f"💾 Convênio atualizado (escolha numérica): {data['insurance_plan']}")
+                    logger.info(f"💾 Convênio: {data['insurance_plan']} (escolha numérica)")
                     
-                # Detectar respostas negativas → Marcar como Particular (sempre atualizar)
-                negative_insurance = [
-                    "não tenho", "nao tenho", "não possuo", "nao possuo",
-                    "sem convênio", "sem convenio", "não tenho convênio", "nao tenho convenio",
-                    "não possuo convênio", "nao possuo convenio",
-                    "particular", "prefiro particular", "quero particular"
-                ]
+                # 4. Detectar frases negativas completas (lista expandida)
+                else:
+                    negative_insurance = [
+                        # Frases completas
+                        "não tenho", "nao tenho", "não possuo", "nao possuo",
+                        "sem convênio", "sem convenio", "não tenho convênio", "nao tenho convenio",
+                        "não possuo convênio", "nao possuo convenio",
+                        # Palavras-chave de negação
+                        "sem plano", "não uso", "nao uso",
+                        # Particular explícito
+                        "particular", "prefiro particular", "quero particular", "vou particular"
+                    ]
+                    
+                    if any(phrase in content_lower for phrase in negative_insurance):
+                        data["insurance_plan"] = "Particular"
+                        logger.info(f"💳 Convênio: Particular (frase negativa detectada)")
                 
-                if any(phrase in content_lower for phrase in negative_insurance):
-                    data["insurance_plan"] = "Particular"
-                    logger.info(f"💳 Convênio atualizado como Particular (resposta negativa detectada)")
+                # Log do resultado final
+                logger.info(f"🔍 CONVÊNIO - Resultado da detecção: '{data.get('insurance_plan', 'Nenhum')}'")
             
             logger.info(f"📋 Extração concluída: {data}")
             return data
@@ -2192,10 +2229,18 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
             if consultation_type not in valid_types:
                 consultation_type = "clinica_geral"  # Fallback
             
-            # Validar convênio
-            valid_insurance = ["CABERGS", "IPE", "particular"]
+            # NOVA VALIDAÇÃO: Garantir que insurance_plan é válido (Camada 3)
+            valid_insurance = ["CABERGS", "IPE", "Particular", "particular"]
+            
             if insurance_plan not in valid_insurance:
-                insurance_plan = "particular"  # Fallback
+                logger.warning(f"⚠️ Convênio inválido detectado: '{insurance_plan}' - Assumindo Particular")
+                insurance_plan = "Particular"
+            
+            # Normalizar "particular" → "Particular"
+            if insurance_plan == "particular":
+                insurance_plan = "Particular"
+            
+            logger.info(f"✅ Convênio validado: {insurance_plan}")
             
             # Log detalhado antes da validação
             logger.info(f"🔍 Validando dados para criar agendamento:")
@@ -2313,8 +2358,11 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
             convenio_info = convenios_aceitos.get(insurance_plan, {})
             convenio_nome = convenio_info.get('nome', 'Particular')
             
-            return f"✅ **Agendamento realizado com sucesso!**\n\n" + \
-                   "Obrigado por confiar em nossa clínica! 😊\n" + \
+            return f"✅ *Agendamento realizado com sucesso!*\n\n" + \
+                   "Obrigado por confiar em nossa clínica! 😊\n\n" + \
+                   "📋 *Informações importantes:*\n" + \
+                   "• Por favor, traga seus últimos exames\n" + \
+                   "• Traga a lista de medicações que você usa\n\n" + \
                    "Vamos enviar uma notificação por WhatsApp no dia da sua consulta.\n\n" + \
                    "Posso te ajudar com mais alguma coisa?"
                    
