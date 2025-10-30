@@ -1308,7 +1308,7 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
             
             # Verificar se última resposta foi erro de create_appointment
             last_assistant_msg = ""
-            for msg in reversed(messages):
+            for msg in reversed(context.messages):
                 if msg.get("role") == "assistant":
                     last_assistant_msg = msg.get("content", "")
                     break
