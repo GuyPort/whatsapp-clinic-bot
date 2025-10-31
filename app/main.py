@@ -481,7 +481,7 @@ async def get_scheduled_appointments():
                     "patient_phone": apt.patient_phone,
                     "patient_birth_date": apt.patient_birth_date,
                     "appointment_date": _format_appointment_date(apt.appointment_date),  # DD/MM/YYYY
-                    "appointment_date_sortable": apt.appointment_date.replace('/', ''),  # DDMMYYYY para sort
+                    "appointment_date_sortable": apt.appointment_date,  # YYYYMMDD para sort (já está no formato correto)
                     "appointment_time": apt.appointment_time,  # String HH:MM
                     "consultation_type": apt.consultation_type,
                     "insurance_plan": apt.insurance_plan,

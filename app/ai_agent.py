@@ -3,7 +3,7 @@ Agente de IA com Claude SDK + Tools para agendamento de consultas.
 Versão completa com menu estruturado e gerenciamento de contexto.
 Corrigido: persistência de contexto + loop de processamento de tools.
 """
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time
 from typing import Optional, Dict, Any, List, Tuple
 import json
 import logging
@@ -25,19 +25,28 @@ logger = logging.getLogger(__name__)
 
 
 def format_closed_days(dias_fechados: List[str]) -> str:
-    """Agrupa dias consecutivos e formata bonito"""
+    """
+    Agrupa dias consecutivos e formata bonito para apresentação ao usuário.
+    
+    Args:
+        dias_fechados: Lista de datas no formato "DD/MM/YYYY"
+        
+    Returns:
+        String formatada com períodos agrupados
+    """
     if not dias_fechados:
         return ""
-    
-    from datetime import datetime
     
     # Converter para datetime e ordenar
     dates = []
     for d in dias_fechados:
         try:
             dates.append(datetime.strptime(d, '%d/%m/%Y'))
-        except:
+        except (ValueError, TypeError):
             continue
+    
+    if not dates:
+        return ""
     
     dates.sort()
     
@@ -59,7 +68,12 @@ def format_closed_days(dias_fechados: List[str]) -> str:
         if len(group) == 1:
             result += f"• {group[0].strftime('%d/%m/%Y')}\n"
         else:
-            result += f"• {group[0].strftime('%d/%m')} a {group[-1].strftime('%d/%m/%Y')}\n"
+            # Se começar e terminar no mesmo mês: "DD a DD/MM/YYYY"
+            if group[0].month == group[-1].month and group[0].year == group[-1].year:
+                result += f"• {group[0].strftime('%d')} a {group[-1].strftime('%d/%m/%Y')}\n"
+            # Se mês diferente: "DD/MM a DD/MM/YYYY"
+            else:
+                result += f"• {group[0].strftime('%d/%m')} a {group[-1].strftime('%d/%m/%Y')}\n"
     
     return result
 
@@ -258,57 +272,21 @@ FLUXO:
    7. Resposta confusa → Perguntar novamente de forma clara
    8. NUNCA assumir CABERGS como padrão
 
-5. Após receber o convênio (1, 2 ou 3):
-   "Agora me informe o dia que gostaria de marcar a consulta (DD/MM/AAAA - ex: 25/11/2025):"
+5. Após registrar o convênio:
+   - NÃO peça data ou horário manualmente.
+   - Informe: "Perfeito! Vou verificar automaticamente os próximos horários disponíveis (respeitando 48 horas de antecedência).".
+   - Aguarde a automação sugerir o próximo horário (ela enviará a mensagem automaticamente, você não precisa chamar nenhuma tool).
 
-6. **FLUXO CRÍTICO - Após receber a data desejada:**
-   a) Execute validate_date_and_show_slots com a data
-   b) Esta tool vai retornar uma mensagem COMPLETA com:
-      - Confirmação da data e dia da semana
-      - Horário de funcionamento
-      - Lista completa de horários disponíveis
-      - Texto "Qual horário você prefere?"
-   
-   REGRA CRÍTICA: Você DEVE repassar a mensagem COMPLETA da tool ao usuário.
-   NÃO resuma. NÃO adicione textos extras. Apenas copie e envie a mensagem exata.
-   
-   c) Se houver horários: repasse a mensagem COMPLETA
-   d) Se NÃO houver horários: repasse a mensagem COMPLETA
+6. Quando a automação enviar uma sugestão de horário:
+   - Reforce a pergunta somente se o paciente parecer indeciso.
+   - Se o paciente responder "sim"/"ok"/"pode ser": confirme a escolha com uma resposta positiva e siga o fluxo (o sistema concluirá o agendamento automaticamente).
+   - Se o paciente responder "não"/"prefiro outro": responda com empatia dizendo que você vai buscar outra opção. A automação enviará a próxima sugestão.
 
-7. **FLUXO CRÍTICO - Após usuário escolher um horário:**
-   
-   QUANDO DETECTAR MENSAGEM COM HORÁRIO (HH:MM):
-   - Exemplos: "17:00", "14:00", "09:00", "08:00", etc.
-   - Formato: 2 dígitos, dois pontos, 2 dígitos
-   
-   AÇÃO OBRIGATÓRIA:
-   a) Execute IMEDIATAMENTE confirm_time_slot com:
-      - date: a data que foi validada anteriormente (appointment_date)
-      - time: o horário que o usuário acabou de escolher
-   
-   b) Esta tool vai automaticamente:
-      - Verificar se é horário inteiro (só aceita 08:00, 09:00, etc)
-      - Verificar disponibilidade final (segurança contra race condition)
-      - Mostrar resumo da consulta (nome, data, hora, tipo, convênio)
-      - Pedir confirmação: "Posso confirmar o agendamento?"
-   
-   c) NÃO execute create_appointment imediatamente
-   d) Apenas repasse a mensagem da tool ao usuário
-   e) Aguarde confirmação do usuário ("sim", "confirma", "quero", etc)
-   
-   REGRA CRÍTICA: Se o usuário enviar QUALQUER mensagem no formato HH:MM,
-   você DEVE executar confirm_time_slot IMEDIATAMENTE, sem exceção.
+7. Após três recusas seguidas:
+   - Peça ao paciente: "Tudo bem! Me informe uma data que funcione para você no formato DD/MM/AAAA (ex: 25/11/2025). Se quiser, indique também o horário.".
+   - Assim que o paciente informar, confirme que vai tentar essa data. A automação testará o horário automaticamente e retornará com uma nova proposta.
 
-8. **FLUXO CRÍTICO - Após confirmação do usuário:**
-   a) Execute create_appointment com TODOS os dados
-   b) Os dados vêm do flow_data (já foram salvos nas etapas anteriores)
-   c) Se sucesso: "Agendamento realizado com suค่ะcesso! Posso te ajudar com mais alguma coisa?"
-
-IMPORTANTE - FLUXO DE CONFirmaÇÃO:
-1. O fluxo é: validate_date_and_show_slots → confirm_time_slot → create_appointment
-2. NÃO pule etapas
-3. NÃO tente criar o agendamento antes de confirmar o horário
-4. Use confirm_time_slot APENAS quando o usuário escolher um horário específico
+8. Quando o paciente aceitar uma sugestão ou uma data personalizada for aprovada, o sistema criará o agendamento e você deve apenas enviar a mensagem de sucesso padrão.
 
 CICLO DE ATENDIMENTO CONTÍNUO:
 1. Após QUALQUER tarefa concluída (agendamento, cancelamento, resposta a dúvida):
@@ -359,12 +337,12 @@ REGRAS IMPORTANTES:
 
 FERRAMENTAS DISPONÍVEIS:
 - get_clinic_info: Obter informações da clínica
-- validate_date_and_show_slots: Validar data e mostrar TODOS os horários disponíveis do dia
-- confirm_time_slot: Confirmar horário escolhido pelo paciente
+- confirm_time_slot: Confirmar horário escolhido pelo paciente (usado apenas em casos extraordinários)
 - create_appointment: Criar novo agendamento
 - search_appointments: Buscar agendamentos existentes
 - cancel_appointment: Cancelar agendamento
 - request_human_assistance: Transferir para atendimento humano
+- extract_patient_data: Extrair nome completo, data de nascimento e demais dados do histórico
 - end_conversation: Encerrar conversa quando usuário não precisa de mais nada
 
 Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
@@ -379,20 +357,6 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                     "type": "object",
                     "properties": {},
                     "required": []
-                }
-            },
-            {
-                "name": "validate_date_and_show_slots",
-                "description": "Validar data e mostrar automaticamente TODOS os horários disponíveis do dia",
-                "input_schema": {
-                    "type": "object",
-                    "properties": {
-                        "date": {
-                            "type": "string",
-                            "description": "Data no formato DD/MM/AAAA"
-                        }
-                    },
-                    "required": ["date"]
                 }
             },
             {
@@ -1026,6 +990,240 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
         
         return "unclear"
 
+    def _parse_iso_datetime(self, value: Optional[str]) -> Optional[datetime]:
+        """Converte string ISO em datetime, retornando None em caso de erro."""
+        if not value or not isinstance(value, str):
+            return None
+        try:
+            return datetime.fromisoformat(value)
+        except ValueError:
+            return None
+
+    def _auto_offer_next_slot(self, context: ConversationContext, db: Session, phone: str, reset_history: bool = False) -> Optional[str]:
+        """Busca e prepara a próxima sugestão automática de horário."""
+
+        if not context.flow_data:
+            context.flow_data = {}
+
+        tz = self.timezone
+        now_plus_buffer = now_brazil() + timedelta(hours=48)
+
+        # Determinar ponto de partida da busca
+        next_search_iso = context.flow_data.get("auto_offer_next_search")
+        next_search_dt = self._parse_iso_datetime(next_search_iso)
+
+        if next_search_dt is None:
+            start_after = now_plus_buffer
+        else:
+            start_after = max(next_search_dt.astimezone(tz), now_plus_buffer)
+
+        # Histórico de horários já oferecidos
+        if reset_history:
+            context.flow_data["auto_offer_history"] = []
+            context.flow_data["auto_offer_rejections"] = 0
+        history_list = context.flow_data.get("auto_offer_history") or []
+        history_set = set(history_list)
+
+        # Buscar próximo(s) horário(s)
+        search_limit = max(3, len(history_set) + 1)
+        candidate_slots = appointment_rules.find_next_available_slots(start_after, db, limit=search_limit)
+
+        selected_slot = None
+        for slot in candidate_slots:
+            slot_tz = tz.localize(slot)
+            slot_iso = slot_tz.isoformat()
+            if slot_iso in history_set:
+                continue
+            selected_slot = slot_tz
+            break
+
+        if selected_slot is None:
+            # Tentativa extra: buscar mais distante
+            candidate_slots = appointment_rules.find_next_available_slots(start_after + timedelta(days=1), db, limit=search_limit + 2)
+            for slot in candidate_slots:
+                slot_tz = tz.localize(slot)
+                slot_iso = slot_tz.isoformat()
+                if slot_iso in history_set:
+                    continue
+                selected_slot = slot_tz
+                break
+
+        if selected_slot is None:
+            logger.warning("⚠️ Nenhum horário disponível encontrado para sugestão automática")
+            return "❌ No momento não encontrei horários disponíveis após as próximas 48 horas. Posso tentar novamente em instantes ou você pode sugerir uma data específica." 
+
+        date_str = selected_slot.strftime('%d/%m/%Y')
+        time_str = selected_slot.strftime('%H:%M')
+        weekday_names = [
+            'segunda-feira', 'terça-feira', 'quarta-feira',
+            'quinta-feira', 'sexta-feira', 'sábado', 'domingo'
+        ]
+        weekday_label = weekday_names[selected_slot.weekday()].capitalize()
+
+        tipos_consulta = self.clinic_info.get('tipos_consulta', {})
+        consultation_type = context.flow_data.get("consultation_type")
+        tipo_msg = ""
+        if consultation_type:
+            tipo_info = tipos_consulta.get(consultation_type, {})
+            tipo_nome = tipo_info.get('nome', consultation_type)
+            tipo_valor = tipo_info.get('valor')
+            if tipo_valor is not None:
+                tipo_msg = f"🏥 Consulta: {tipo_nome} (R$ {tipo_valor:.2f})\n"
+            else:
+                tipo_msg = f"🏥 Consulta: {tipo_nome}\n"
+
+        insurance_plan = context.flow_data.get("insurance_plan") or "Particular"
+
+        message = (
+            "Encontrei o próximo horário disponível respeitando a carência mínima de 48 horas:\n\n"
+            f"📅 {weekday_label} - {date_str}\n"
+            f"⏰ {time_str}\n"
+            f"💳 Convênio: {insurance_plan}\n"
+        )
+
+        if tipo_msg:
+            message += tipo_msg
+
+        message += (
+            "\nPosso reservar esse horário para você?\n"
+            "Se não for possível, é só responder 'não' que eu busco outra opção."
+        )
+
+        # Atualizar estado do flow_data
+        slot_iso = selected_slot.isoformat()
+        history_list.append(slot_iso)
+        context.flow_data["auto_offer_history"] = history_list
+        context.flow_data["auto_offer_current"] = {
+            "date": date_str,
+            "time": time_str,
+            "weekday": weekday_label,
+            "iso": slot_iso
+        }
+        context.flow_data["appointment_date"] = date_str
+        context.flow_data["appointment_time"] = time_str
+        context.flow_data["auto_offer_pending"] = True
+        context.flow_data.setdefault("auto_offer_rejections", 0)
+        context.flow_data["auto_offer_next_search"] = (selected_slot + timedelta(minutes=1)).isoformat()
+        context.flow_data.pop("awaiting_manual_date", None)
+        context.flow_data.pop("fallback_confirm_time_slot_attempted", None)
+
+        db.commit()
+
+        logger.info(f"📅 Sugestão automática preparada: {date_str} às {time_str} ({weekday_label})")
+        return message
+
+    def _clear_auto_offer_state(self, context: ConversationContext, db: Session) -> None:
+        """Remove dados temporários do fluxo de sugestão automática."""
+        if not context.flow_data:
+            return
+        for key in [
+            "auto_offer_pending",
+            "auto_offer_current",
+            "auto_offer_next_search",
+            "auto_offer_history",
+            "auto_offer_rejections"
+        ]:
+            context.flow_data.pop(key, None)
+        db.commit()
+
+    def _handle_manual_date_selection(self, context: ConversationContext, message: str, db: Session, phone: str) -> str:
+        """Processa resposta do paciente com data (e horário) customizados."""
+
+        if not context.flow_data:
+            context.flow_data = {}
+
+        import re
+        date_match = re.search(r'(\d{2}/\d{2}/\d{4})', message)
+        if not date_match:
+            return (
+                "Para continuar, preciso que você me informe a data desejada no formato DD/MM/AAAA.\n"
+                "Exemplo: 25/11/2025. Se quiser sugerir horário, escreva junto (ex: 25/11/2025 às 15:00)."
+            )
+
+        date_str = date_match.group(1)
+        appointment_date = parse_date_br(date_str)
+        if not appointment_date:
+            return (
+                f"Não consegui entender a data '{date_str}'.\n"
+                "Use o formato DD/MM/AAAA (exemplo: 07/08/2025)."
+            )
+
+        tz = self.timezone
+        now_buffer = now_brazil() + timedelta(hours=48)
+
+        # Capturar horário, se fornecido
+        time_str = None
+        time_match = re.search(r'(\d{1,2})(?:[:h](\d{2}))', message, re.IGNORECASE)
+        if time_match:
+            hours = time_match.group(1)
+            minutes = time_match.group(2)
+            candidate = f"{int(hours):02d}:{int(minutes):02d}"
+            from app.utils import normalize_time_format
+            normalized = normalize_time_format(candidate)
+            if normalized and normalized.endswith(':00'):
+                time_str = normalized
+
+        if time_str is None:
+            # Procurar padrões simples como "às 15" ou "15h"
+            simple_match = re.search(r'(?:às|as|a partir das|depois das|preferencialmente as)\s*(\d{1,2})', message, re.IGNORECASE)
+            if simple_match:
+                hours = int(simple_match.group(1))
+                if 0 <= hours <= 23:
+                    time_str = f"{hours:02d}:00"
+
+        # Determinar ponto inicial da busca
+        if time_str:
+            hour, minute = map(int, time_str.split(':'))
+            start_after = tz.localize(datetime.combine(appointment_date.date(), time(hour, minute)))
+        else:
+            start_after = tz.localize(datetime.combine(appointment_date.date(), time.min))
+
+        if start_after < now_buffer:
+            min_date_str = now_buffer.strftime('%d/%m/%Y às %H:%M')
+            return (
+                "Para cumprir a carência mínima, só consigo agendar com pelo menos 48 horas de antecedência.\n"
+                f"A partir de agora, consigo oferecer horários a partir de {min_date_str}.\n"
+                "Você pode informar outra data depois desse limite?"
+            )
+
+        # Reiniciar estado e preparar próxima busca
+        context.flow_data["auto_offer_rejections"] = 0
+        context.flow_data["auto_offer_pending"] = False
+        context.flow_data["auto_offer_next_search"] = start_after.isoformat()
+        context.flow_data["auto_offer_history"] = []
+        db.commit()
+
+        suggestion = self._auto_offer_next_slot(context, db, phone, reset_history=True)
+        if suggestion:
+            return suggestion
+
+        return (
+            "Verifiquei e infelizmente não encontrei horários disponíveis para essa data.\n"
+            "Quer tentar uma outra data ou prefere que eu procure automaticamente os próximos horários livres?"
+        )
+
+    def _can_start_auto_offer(self, context: ConversationContext) -> bool:
+        if not context.flow_data:
+            return False
+        flow_data = context.flow_data
+        required_fields = [
+            "patient_name",
+            "patient_birth_date",
+            "consultation_type",
+            "insurance_plan"
+        ]
+        if any(not flow_data.get(field) for field in required_fields):
+            return False
+        if flow_data.get("appointment_completed"):
+            return False
+        if flow_data.get("auto_offer_pending"):
+            return False
+        if flow_data.get("awaiting_manual_date"):
+            return False
+        if flow_data.get("auto_offer_current"):
+            return False
+        return True
+
     def process_message(self, message: str, phone: str, db: Session) -> str:
         """Processa uma mensagem do usuário e retorna a resposta com contexto persistente"""
         try:
@@ -1045,6 +1243,15 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
             
             # 2. Verificação de timeout removida - agora é proativa via scheduler
             
+            # 2.1 Resetar estado de agendamento concluído quando paciente solicitar novo agendamento
+            message_lower = message.lower().strip()
+            if context.flow_data and context.flow_data.get("appointment_completed"):
+                if message_lower in {"1", "1️⃣"} or "marcar consulta" in message_lower:
+                    logger.info("🧹 Novo agendamento solicitado - limpando flag appointment_completed e estado automático")
+                    context.flow_data.pop("appointment_completed", None)
+                    self._clear_auto_offer_state(context, db)
+                    db.commit()
+
             # 3. Decidir se deve encerrar contexto por resposta negativa
             if self._should_end_context(context, message):
                 logger.info(f"🔚 Encerrando contexto para {phone} por resposta negativa do usuário")
@@ -1052,7 +1259,136 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                 db.commit()
                 return "Foi um prazer atender você! Até logo! 😊"
 
-            # 4. Verificar se há confirmação pendente ANTES de processar com Claude
+            # 4.1 Verificar se há uma sugestão automática pendente
+            if context.flow_data and context.flow_data.get("auto_offer_pending"):
+                intent = self._detect_confirmation_intent(message)
+
+                context.messages.append({
+                    "role": "user",
+                    "content": message,
+                    "timestamp": datetime.utcnow().isoformat()
+                })
+                flag_modified(context, 'messages')
+
+                current_slot = (context.flow_data or {}).get("auto_offer_current") or {}
+                date_str = current_slot.get("date")
+                time_str = current_slot.get("time")
+
+                if intent == "positive" and date_str and time_str:
+                    logger.info(f"✅ Usuário {phone} aceitou o horário sugerido automaticamente")
+
+                    data = context.flow_data or {}
+                    if not data.get("patient_name") or not data.get("patient_birth_date"):
+                        extracted = self._extract_appointment_data_from_messages(context.messages)
+                        data["patient_name"] = data.get("patient_name") or extracted.get("patient_name")
+                        if not data.get("patient_birth_date"):
+                            data["patient_birth_date"] = extracted.get("patient_birth_date")
+
+                    payload = {
+                        "patient_name": data.get("patient_name"),
+                        "patient_birth_date": data.get("patient_birth_date"),
+                        "appointment_date": date_str,
+                        "appointment_time": time_str,
+                        "patient_phone": phone,
+                        "consultation_type": data.get("consultation_type"),
+                        "insurance_plan": data.get("insurance_plan")
+                    }
+
+                    result = self._handle_create_appointment(payload, db, phone)
+                    self._clear_auto_offer_state(context, db)
+
+                    context.messages.append({
+                        "role": "assistant",
+                        "content": result,
+                        "timestamp": datetime.utcnow().isoformat()
+                    })
+                    flag_modified(context, 'messages')
+                    context.last_activity = datetime.utcnow()
+                    db.commit()
+                    return result
+
+                if intent == "negative":
+                    logger.info(f"❌ Usuário {phone} rejeitou o horário sugerido automaticamente")
+                    rejections = context.flow_data.get("auto_offer_rejections", 0) + 1
+                    context.flow_data["auto_offer_rejections"] = rejections
+                    context.flow_data["auto_offer_pending"] = False
+
+                    if rejections >= 3:
+                        context.flow_data["awaiting_manual_date"] = True
+                        context.flow_data.pop("appointment_date", None)
+                        context.flow_data.pop("appointment_time", None)
+                        context.flow_data.pop("auto_offer_current", None)
+                        context.flow_data["auto_offer_history"] = []
+                        db.commit()
+                        response = (
+                            "Sem problemas! 😊\n"
+                            "Você pode me informar uma data que fique boa para você (DD/MM/AAAA)?\n"
+                            "Se tiver um horário preferido, escreva junto (ex: 25/11/2025 às 15:00)."
+                        )
+                        context.messages.append({
+                            "role": "assistant",
+                            "content": response,
+                            "timestamp": datetime.utcnow().isoformat()
+                        })
+                        flag_modified(context, 'messages')
+                        context.last_activity = datetime.utcnow()
+                        db.commit()
+                        return response
+
+                    # Buscar próxima opção automaticamente
+                    next_option = self._auto_offer_next_slot(context, db, phone)
+                    if not next_option:
+                        next_option = (
+                            "Ainda não encontrei outro horário após as próximas 48 horas.\n"
+                            "Quer me informar uma data específica para eu tentar marcar?"
+                        )
+
+                    context.messages.append({
+                        "role": "assistant",
+                        "content": next_option,
+                        "timestamp": datetime.utcnow().isoformat()
+                    })
+                    flag_modified(context, 'messages')
+                    context.last_activity = datetime.utcnow()
+                    db.commit()
+                    return next_option
+
+                # Intenção não clara
+                clarification = (
+                    "Só para confirmar: esse horário funciona para você?\n"
+                    "Responda 'sim' para confirmar ou 'não' para eu buscar outra opção."
+                )
+                context.messages.append({
+                    "role": "assistant",
+                    "content": clarification,
+                    "timestamp": datetime.utcnow().isoformat()
+                })
+                flag_modified(context, 'messages')
+                context.last_activity = datetime.utcnow()
+                db.commit()
+                return clarification
+
+            # 4.2 Verificar se estamos aguardando data manual após múltiplas recusas
+            if context.flow_data and context.flow_data.get("awaiting_manual_date"):
+                context.messages.append({
+                    "role": "user",
+                    "content": message,
+                    "timestamp": datetime.utcnow().isoformat()
+                })
+                flag_modified(context, 'messages')
+
+                response = self._handle_manual_date_selection(context, message, db, phone)
+                context.messages.append({
+                    "role": "assistant",
+                    "content": response,
+                    "timestamp": datetime.utcnow().isoformat()
+                })
+                flag_modified(context, 'messages')
+                context.last_activity = datetime.utcnow()
+                db.commit()
+                return response
+
+            # 4.3 Verificar se há confirmação pendente ANTES de processar com Claude
             if context.flow_data and context.flow_data.get("pending_confirmation"):
                 intent = self._detect_confirmation_intent(message)
                 
@@ -1207,12 +1543,6 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                                 logger.info("🔚 end_conversation executado - retornando imediatamente sem continuar processamento")
                                 return tool_result
                             
-                            # Verificação especial para validate_and_check_availability
-                            if content.name == "validate_and_check_availability":
-                                if "disponível" in tool_result.lower() and "não" not in tool_result.lower():
-                                    # Horário disponível, adicionar hint para Claude criar agendamento
-                                    tool_result += "\n\n[SYSTEM: Execute create_appointment agora com os dados coletados: nome, data_nascimento, data_consulta, horario_consulta]"
-                            
                             logger.info(f"🔧 Iteration {iteration}: Tool {content.name} result: {tool_result[:200] if len(tool_result) > 200 else tool_result}")
                             
                             # Fazer follow-up com o resultado
@@ -1330,85 +1660,25 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                 else:
                     logger.info(f"💾 Convênio salvo no flow_data: {extracted['insurance_plan']}")
             
-            # 8. FALLBACK: Verificar se Claude deveria ter chamado confirm_time_slot mas não chamou
-            # Isso acontece quando: temos data + horário, mas não tem pending_confirmation
-            # IMPORTANTE: NÃO executar se acabou de criar um agendamento com sucesso
-            
-            # Verificar se a última resposta do assistente indica que já criou agendamento
-            should_skip_fallback = False
-            
-            # Verificar flag appointment_completed no flow_data
-            appointment_completed_flag = context.flow_data.get("appointment_completed", False)
-            if appointment_completed_flag:
-                should_skip_fallback = True
-                logger.info("⏭️ Pulando fallback - flag appointment_completed existe no flow_data")
-            
-            # Verificar se última resposta foi erro de create_appointment
-            last_assistant_msg = ""
-            for msg in reversed(context.messages):
-                if msg.get("role") == "assistant":
-                    last_assistant_msg = msg.get("content", "")
-                    break
-
-            # Se última mensagem foi erro de validação, não executar fallback
-            if "formato inválido" in last_assistant_msg.lower() or "erro ao criar" in last_assistant_msg.lower():
-                should_skip_fallback = True
-                logger.info("⏭️ Pulando fallback - última resposta foi erro de validação")
-            
-            if not should_skip_fallback and context.messages:
-                last_assistant_msg = None
-                for msg in reversed(context.messages):
-                    if msg.get("role") == "assistant":
-                        last_assistant_msg = msg.get("content", "")
-                        break
-                
-                # Se a última mensagem contém sucesso de agendamento, pular fallback
-                if last_assistant_msg and any(phrase in last_assistant_msg for phrase in [
-                    "Agendamento realizado com sucesso",
-                    "realizado com sucesso",
-                    "agendado com sucesso"
-                ]):
-                    should_skip_fallback = True
-                    logger.info("⏭️ Pulando fallback - agendamento já foi criado com sucesso")
-            
-            if (context.flow_data.get("appointment_date") and 
-                context.flow_data.get("appointment_time") and 
-                not context.flow_data.get("pending_confirmation") and
-                not should_skip_fallback):
-                
-                # Validar horário antes de executar fallback
-                time_str = context.flow_data["appointment_time"]
-                import re
-                is_valid = False
-                if re.match(r'^\d{2}:\d{2}$', time_str):
-                    hour, minute = time_str.split(':')
-                    if minute == '00':
-                        is_valid = True
-                
-                if not is_valid:
-                    logger.warning(f"⚠️ FALLBACK bloqueado: horário inválido no flow_data ({time_str})")
-                    # Limpar horário inválido
-                    context.flow_data["appointment_time"] = None
+            # 8. Iniciar sugestão automática quando dados estiverem completos
+            if self._can_start_auto_offer(context):
+                logger.info(f"🤖 Preparando sugestão automática de horário para {phone}")
+                suggestion = self._auto_offer_next_slot(context, db, phone, reset_history=True)
+                if suggestion:
+                    if context.messages and context.messages[-1].get("role") == "assistant":
+                        context.messages[-1]["content"] = suggestion
+                        context.messages[-1]["timestamp"] = datetime.utcnow().isoformat()
+                    else:
+                        context.messages.append({
+                            "role": "assistant",
+                            "content": suggestion,
+                            "timestamp": datetime.utcnow().isoformat()
+                        })
+                    flag_modified(context, 'messages')
+                    context.last_activity = datetime.utcnow()
                     db.commit()
-                else:
-                    logger.info("🔄 FALLBACK: Claude não chamou confirm_time_slot, chamando manualmente...")
-                    logger.info(f"   Data: {context.flow_data['appointment_date']}")
-                    logger.info(f"   Horário: {context.flow_data['appointment_time']}")
-                    
-                    # Chamar a tool manualmente
-                    try:
-                        confirmation_msg = self._handle_confirm_time_slot({
-                            "date": context.flow_data["appointment_date"],
-                            "time": context.flow_data["appointment_time"]
-                        }, db, phone)
-                        
-                        # Substituir resposta do Claude pela confirmação
-                        bot_response = confirmation_msg
-                        logger.info("✅ Tool confirm_time_slot executada com sucesso via fallback")
-                    except Exception as e:
-                        logger.error(f"❌ Erro ao executar fallback de confirm_time_slot: {str(e)}")
-                        # Manter resposta original do Claude
-            
+                    return suggestion
+
             # 9. Atualizar contexto no banco
             context.last_activity = datetime.utcnow()
             db.commit()
@@ -1427,8 +1697,6 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
 
             if tool_name == "get_clinic_info":
                 return self._handle_get_clinic_info(tool_input)
-            elif tool_name == "validate_date_and_show_slots":
-                return self._handle_validate_date_and_show_slots(tool_input, db, phone)
             elif tool_name == "confirm_time_slot":
                 return self._handle_confirm_time_slot(tool_input, db, phone)
             elif tool_name == "create_appointment":
@@ -1502,66 +1770,6 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
             logger.error(f"Erro ao obter info da clínica: {str(e)}")
             return f"Erro ao buscar informações: {str(e)}"
 
-    def _handle_validate_business_hours(self, tool_input: Dict) -> str:
-        """Tool: validate_business_hours"""
-        try:
-            date_str = tool_input.get("date")
-            time_str = tool_input.get("time")
-            
-            if not date_str or not time_str:
-                return "Data e horário são obrigatórios."
-            
-            # Converter data
-            appointment_date = parse_date_br(date_str)
-            if not appointment_date:
-                return "Data inválida. Use o formato DD/MM/AAAA."
-            
-            # Verificar se está em dias_fechados
-            dias_fechados = self.clinic_info.get('dias_fechados', [])
-            if date_str in dias_fechados:
-                return f"❌ A clínica estará fechada em {date_str} por motivo especial."
-            
-            # Obter dia da semana
-            weekday = appointment_date.strftime('%A').lower()
-            weekday_map = {
-                'monday': 'segunda',
-                'tuesday': 'terca', 
-                'wednesday': 'quarta',
-                'thursday': 'quinta',
-                'friday': 'sexta',
-                'saturday': 'sabado',
-                'sunday': 'domingo'
-            }
-            weekday_pt = weekday_map.get(weekday, weekday)
-            
-            # Verificar horários de funcionamento
-            horarios = self.clinic_info.get('horario_funcionamento', {})
-            horario_dia = horarios.get(weekday_pt, "FECHADO")
-            
-            if horario_dia == "FECHADO":
-                return f"❌ A clínica não funciona aos {weekday_pt}s. Horários de funcionamento:\n" + \
-                       self._format_business_hours()
-            
-            # Verificar se horário está dentro do funcionamento
-            try:
-                hora_consulta = datetime.strptime(time_str, '%H:%M').time()
-                hora_inicio, hora_fim = horario_dia.split('-')
-                hora_inicio = datetime.strptime(hora_inicio, '%H:%M').time()
-                hora_fim = datetime.strptime(hora_fim, '%H:%M').time()
-                
-                if hora_inicio <= hora_consulta <= hora_fim:
-                    return f"✅ Horário válido! A clínica funciona das {hora_inicio.strftime('%H:%M')} às {hora_fim.strftime('%H:%M')} aos {weekday_pt}s."
-                else:
-                    return f"❌ Horário inválido! A clínica funciona das {hora_inicio.strftime('%H:%M')} às {hora_fim.strftime('%H:%M')} aos {weekday_pt}s.\n" + \
-                           f"Por favor, escolha um horário entre {hora_inicio.strftime('%H:%M')} e {hora_fim.strftime('%H:%M')}."
-                           
-            except ValueError:
-                return "Formato de horário inválido. Use HH:MM (ex: 14:30)."
-            
-        except Exception as e:
-            logger.error(f"Erro ao validar horário: {str(e)}")
-            return f"Erro ao validar horário: {str(e)}"
-
     def _format_business_hours(self) -> str:
         """Formata horários de funcionamento para exibição"""
         horarios = self.clinic_info.get('horario_funcionamento', {})
@@ -1630,373 +1838,6 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
         except Exception as e:
             logger.error(f"Erro ao verificar se clínica está aberta: {str(e)}")
             return False, f"Erro ao verificar horário: {str(e)}"
-    
-    def _handle_validate_and_check_availability(self, tool_input: Dict, db: Session, phone: str = None) -> str:
-        """Tool: validate_and_check_availability - Valida horário de funcionamento + disponibilidade"""
-        try:
-            logger.info(f"🔍 Tool validate_and_check_availability chamada com input: {tool_input}")
-            
-            date_str = tool_input.get("date")
-            time_str = tool_input.get("time")
-            
-            if not date_str or not time_str:
-                logger.warning("❌ Data ou horário não fornecidos")
-                return "Data e horário são obrigatórios."
-            
-            logger.info(f"📅 Validando: {date_str} às {time_str}")
-            
-            # 1. Converter data
-            appointment_date = parse_date_br(date_str)
-            if not appointment_date:
-                logger.warning(f"❌ Data inválida: {date_str}")
-                return "Data inválida. Use o formato DD/MM/AAAA."
-            
-            # 2. Verificar se está em dias_fechados
-            dias_fechados = self.clinic_info.get('dias_fechados', [])
-            if date_str in dias_fechados:
-                logger.warning(f"❌ Clínica fechada em {date_str} (dia especial)")
-                return f"❌ A clínica estará fechada em {date_str} por motivo especial (feriado/férias).\n" + \
-                       "Por favor, escolha outra data."
-            
-            # 3. Validar horário de funcionamento
-            weekday = appointment_date.strftime('%A').lower()
-            weekday_map = {
-                'monday': 'segunda',
-                'tuesday': 'terca', 
-                'wednesday': 'quarta',
-                'thursday': 'quinta',
-                'friday': 'sexta',
-                'saturday': 'sabado',
-                'sunday': 'domingo'
-            }
-            weekday_pt = weekday_map.get(weekday, weekday)
-            
-            horarios = self.clinic_info.get('horario_funcionamento', {})
-            horario_dia = horarios.get(weekday_pt, "FECHADO")
-            
-            if horario_dia == "FECHADO":
-                logger.warning(f"❌ Clínica fechada aos {weekday_pt}s")
-                return f"❌ A clínica não funciona aos {weekday_pt}s. Horários de funcionamento:\n" + \
-                       self._format_business_hours()
-            
-            # 4. Verificar se horário está dentro do funcionamento
-            try:
-                # Garantir que time_str é string
-                if not isinstance(time_str, str):
-                    logger.error(f"❌ time_str não é string: {type(time_str)} - {time_str}")
-                    time_str = str(time_str)
-                
-                hora_consulta_original = datetime.strptime(time_str, '%H:%M').time()
-                hora_inicio, hora_fim = horario_dia.split('-')
-                
-                # Garantir que são strings antes de fazer strptime
-                if not isinstance(hora_inicio, str):
-                    logger.error(f"❌ hora_inicio não é string: {type(hora_inicio)}")
-                    hora_inicio = str(hora_inicio)
-                if not isinstance(hora_fim, str):
-                    logger.error(f"❌ hora_fim não é string: {type(hora_fim)}")
-                    hora_fim = str(hora_fim)
-                
-                hora_inicio = datetime.strptime(hora_inicio.strip(), '%H:%M').time()
-                hora_fim = datetime.strptime(hora_fim.strip(), '%H:%M').time()
-                
-                # Arredondar minuto para cima ao próximo múltiplo de 5
-                appointment_datetime_tmp = datetime.combine(appointment_date.date(), hora_consulta_original).replace(tzinfo=None)
-                hora_consulta_dt = round_up_to_next_5_minutes(appointment_datetime_tmp)
-                hora_consulta = hora_consulta_dt.time()
-                
-                if not (hora_inicio <= hora_consulta <= hora_fim):
-                    logger.warning(f"❌ Horário {time_str} fora do funcionamento")
-                    return f"❌ Horário inválido! A clínica funciona das {hora_inicio.strftime('%H:%M')} às {hora_fim.strftime('%H:%M')} aos {weekday_pt}s.\n" + \
-                           f"Por favor, escolha um horário entre {hora_inicio.strftime('%H:%M')} e {hora_fim.strftime('%H:%M')}."
-                           
-            except ValueError as ve:
-                logger.error(f"❌ ValueError ao processar horário: {str(ve)}")
-                logger.error(f"   time_str={time_str} (type: {type(time_str)})")
-                logger.error(f"   horario_dia={horario_dia}")
-                return "Formato de horário inválido. Use HH:MM (ex: 14:30)."
-            except Exception as e:
-                logger.error(f"❌ Erro inesperado ao processar horário: {str(e)}", exc_info=True)
-                logger.warning(f"❌ Formato de horário inválido: {time_str}")
-                return "Formato de horário inválido. Use HH:MM (ex: 14:30)."
-            
-            # 5. Verificar disponibilidade no banco de dados
-            appointment_datetime = datetime.combine(appointment_date.date(), hora_consulta).replace(tzinfo=None)
-            duracao = self.clinic_info.get('regras_agendamento', {}).get('duracao_consulta_minutos', 60)
-            
-            # Usar nova função para verificar disponibilidade
-            is_available = appointment_rules.check_slot_availability(appointment_datetime, duracao, db)
-            
-            if is_available:
-                ajuste_msg = ""
-                if hora_consulta.strftime('%H:%M') != time_str:
-                    ajuste_msg = f" (ajustado para {hora_consulta.strftime('%H:%M')})"
-                logger.info(f"✅ Horário {hora_consulta.strftime('%H:%M')} disponível!{ajuste_msg}")
-                
-                # Salvar dados no flow_data para confirmação
-                # Buscar contexto do usuário atual usando phone recebido
-                context = None
-                if phone:
-                    context = db.query(ConversationContext).filter_by(phone=phone).first()
-                    if context:
-                        # CRÍTICO: Não sobrescrever dados já salvos no flow_data
-                        if not context.flow_data:
-                            context.flow_data = {}
-                        
-                        # Atualizar APENAS campos vazios (não sobrescrever)
-                        nome_atual = context.flow_data.get("patient_name")
-                        logger.info(f"🔍 DEBUG: Nome atual no flow_data: {nome_atual}")
-                        
-                        if not nome_atual:
-                            logger.info(f"🔍 DEBUG: Nome está vazio, extraindo do histórico")
-                            extracted = self._extract_appointment_data_from_messages(context.messages)
-                            if extracted.get("patient_name"):
-                                logger.info(f"🔍 DEBUG: Nome extraído: {extracted.get('patient_name')}")
-                                context.flow_data["patient_name"] = extracted.get("patient_name")
-                        else:
-                            logger.info(f"🔍 DEBUG: Nome já existe ({nome_atual}), NÃO sobrescrevendo")
-                        
-                        if not context.flow_data.get("patient_birth_date"):
-                            if 'extracted' not in locals():
-                                extracted = self._extract_appointment_data_from_messages(context.messages)
-                            if extracted.get("patient_birth_date"):
-                                context.flow_data["patient_birth_date"] = extracted.get("patient_birth_date")
-                        
-                        if not context.flow_data.get("consultation_type"):
-                            if 'extracted' not in locals():
-                                extracted = self._extract_appointment_data_from_messages(context.messages)
-                            if extracted.get("consultation_type"):
-                                context.flow_data["consultation_type"] = extracted.get("consultation_type")
-                        
-                        if not context.flow_data.get("insurance_plan"):
-                            if 'extracted' not in locals():
-                                extracted = self._extract_appointment_data_from_messages(context.messages)
-                            if extracted.get("insurance_plan"):
-                                context.flow_data["insurance_plan"] = extracted.get("insurance_plan")
-                        
-                        # Sempre atualizar data/hora da consulta (podem mudar)
-                        context.flow_data["appointment_date"] = date_str
-                        context.flow_data["appointment_time"] = hora_consulta.strftime('%H:%M')
-                        context.flow_data["pending_confirmation"] = True
-                        
-                        db.commit()
-                        logger.info(f"💾 Dados salvos no flow_data para confirmação: {context.flow_data}")
-                
-                # Buscar tipo, convênio e nome do flow_data se disponível
-                tipo_info = ""
-                patient_name = ""
-                if context and context.flow_data:
-                    # Nome do paciente
-                    nome = context.flow_data.get("patient_name")
-                    if nome:
-                        patient_name = f"👤 Paciente: {nome}\n"
-                    
-                    # Tipo de consulta
-                    tipo = context.flow_data.get("consultation_type")
-                    convenio = context.flow_data.get("insurance_plan")
-                    
-                    if tipo:
-                        tipos_consulta = self.clinic_info.get('tipos_consulta', {})
-                        tipo_data = tipos_consulta.get(tipo, {})
-                        tipo_nome = tipo_data.get('nome', '')
-                        tipo_valor = tipo_data.get('valor', 0)
-                        tipo_info = f"💼 Tipo: {tipo_nome}\n💰 Valor: R$ {tipo_valor}\n"
-                    
-                    if convenio:
-                        convenios_aceitos = self.clinic_info.get('convenios_aceitos', {})
-                        convenio_data = convenios_aceitos.get(convenio, {})
-                        convenio_nome = convenio_data.get('nome', '')
-                        tipo_info += f"💳 Convênio: {convenio_nome}\n"
-                
-                # Retornar mensagem de confirmação
-                return f"✅ Horário {hora_consulta.strftime('%H:%M')} disponível!{ajuste_msg}\n\n" \
-                       f"📋 *Resumo da sua consulta:*\n" \
-                       f"{patient_name}" \
-                       f"{tipo_info}" \
-                       f"📅 Data: {date_str}\n" \
-                       f"⏰ Horário: {hora_consulta.strftime('%H:%M')}\n\n" \
-                       f"Posso confirmar sua consulta?"
-            else:
-                logger.warning(f"❌ Horário {time_str} não disponível (conflito)")
-                return f"❌ Horário {time_str} não está disponível. Já existe uma consulta neste horário.\n" + \
-                       "Por favor, escolha outro horário."
-            
-        except Exception as e:
-            logger.error(f"Erro ao validar disponibilidade: {str(e)}")
-            return f"Erro ao validar disponibilidade: {str(e)}"
-    
-    def _handle_check_availability(self, tool_input: Dict, db: Session) -> str:
-        """Tool: check_availability"""
-        try:
-            logger.info(f"🔍 Tool check_availability chamada com input: {tool_input}")
-            
-            date_str = tool_input.get("date")
-            if not date_str:
-                logger.warning("❌ Data não fornecida na tool check_availability")
-                return "Data é obrigatória."
-            
-            logger.info(f"📅 Verificando disponibilidade para data: {date_str}")
-            
-            # Converter data
-            appointment_date = parse_date_br(date_str)
-            if not appointment_date:
-                logger.warning(f"❌ Data inválida: {date_str}")
-                return "Data inválida. Use o formato DD/MM/AAAA."
-            
-            logger.info(f"📅 Data convertida: {appointment_date}")
-            
-            # Obter horários disponíveis
-            duracao = self.clinic_info.get('regras_agendamento', {}).get('duracao_consulta_minutos', 45)
-            logger.info(f"⏱️ Duração da consulta: {duracao} minutos")
-            
-            available_slots = appointment_rules.get_available_slots(appointment_date, duracao, db)
-            logger.info(f"📋 Slots encontrados: {len(available_slots)}")
-            
-            if not available_slots:
-                logger.warning(f"❌ Nenhum horário disponível para {appointment_date.strftime('%d/%m/%Y')}")
-                return f"❌ Não há horários disponíveis para {appointment_date.strftime('%d/%m/%Y')}.\n" + \
-                       "Por favor, escolha outra data."
-            
-            response = f"✅ Horários disponíveis para {appointment_date.strftime('%d/%m/%Y')}:\n\n"
-            for i, slot in enumerate(available_slots, 1):
-                response += f"{i}. {slot.strftime('%H:%M')}\n"
-            
-            response += f"\n⏱️ Duração: {duracao} minutos\n"
-            response += "Escolha um horário e me informe o número da opção desejada."
-            
-            logger.info(f"✅ Resposta da tool: {response}")
-            return response
-            
-        except Exception as e:
-            logger.error(f"Erro ao verificar disponibilidade: {str(e)}")
-            return f"Erro ao verificar disponibilidade: {str(e)}"
-
-    def _handle_validate_date_and_show_slots(self, tool_input: Dict, db: Session, phone: str = None) -> str:
-        """
-        Valida data e mostra horários disponíveis automaticamente.
-        Combina validação + listagem em uma única etapa.
-        """
-        try:
-            # Limpar flag appointment_completed ao iniciar novo agendamento
-            if phone:
-                context = db.query(ConversationContext).filter_by(phone=phone).first()
-                if context and context.flow_data and context.flow_data.get("appointment_completed"):
-                    context.flow_data.pop("appointment_completed", None)
-                    db.commit()
-                    logger.info("🧹 Flag appointment_completed removida - novo agendamento iniciado")
-            
-            date_str = tool_input.get("date")
-            
-            if not date_str:
-                return "Data é obrigatória. Informe no formato DD/MM/AAAA."
-            
-            # Validar data
-            appointment_date = parse_date_br(date_str)
-            if not appointment_date:
-                return "Data inválida. Use formato DD/MM/AAAA."
-            
-            logger.info(f"📅 Validando data e buscando slots: {date_str}")
-            
-            # ========== VALIDAÇÃO 1: DIA DA SEMANA ==========
-            weekday = appointment_date.weekday()  # 0=segunda, 6=domingo
-            dias_semana_pt = ['segunda', 'terca', 'quarta', 'quinta', 'sexta', 'sabado', 'domingo']
-            dia_nome = dias_semana_pt[weekday]
-            
-            # Verificar se funciona nesse dia
-            horarios = self.clinic_info.get('horario_funcionamento', {})
-            horario_dia = horarios.get(dia_nome, "FECHADO")
-            
-            if horario_dia == "FECHADO":
-                # Montar mensagem de erro completa
-                msg = f"❌ O dia {date_str} é {dia_nome.upper()} e a clínica não atende neste dia.\n\n"
-                msg += "📅 Horários de funcionamento:\n"
-                for dia, horario in horarios.items():
-                    if horario != "FECHADO":
-                        msg += f"• {dia.capitalize()}: {horario}\n"
-                
-                # Adicionar dias especiais
-                dias_fechados = self.clinic_info.get('dias_fechados', [])
-                if dias_fechados:
-                    msg += "\n🚫 Dias especiais (férias/feriados):\n"
-                    msg += format_closed_days(dias_fechados)
-                
-                msg += "\nPor favor, escolha outra data."
-                return msg
-            
-            # ========== VALIDAÇÃO 2: DIAS ESPECIAIS ==========
-            dias_fechados = self.clinic_info.get('dias_fechados', [])
-            if date_str in dias_fechados:
-                msg = f"❌ A clínica estará fechada em {date_str} (férias/feriado).\n\n"
-                msg += "🚫 Dias especiais fechados:\n"
-                msg += format_closed_days(dias_fechados)
-                msg += "\nPor favor, escolha outra data disponível."
-                return msg
-            
-            # ========== VALIDAÇÃO 3: CALCULAR SLOTS DISPONÍVEIS ==========
-            duracao = self.clinic_info.get('regras_agendamento', {}).get('duracao_consulta_minutos', 60)
-            
-            # Pegar horário de funcionamento
-            inicio_str, fim_str = horario_dia.split('-')
-            inicio_time = datetime.strptime(inicio_str, '%H:%M').time()
-            fim_time = datetime.strptime(fim_str, '%H:%M').time()
-            
-            # Buscar consultas já agendadas nesse dia
-            date_str_formatted = appointment_date.strftime('%Y%m%d')  # YYYYMMDD
-            existing_appointments = db.query(Appointment).filter(
-                Appointment.appointment_date == date_str_formatted,
-                Appointment.status == AppointmentStatus.AGENDADA
-            ).all()
-            
-            # Gerar slots disponíveis (apenas horários INTEIROS)
-            available_slots = []
-            current_time = inicio_time
-            while current_time < fim_time:
-                # Verificar se tem consulta nesse horário
-                slot_datetime = datetime.combine(appointment_date.date(), current_time)
-                tem_conflito = False
-                
-                for apt in existing_appointments:
-                    # Converter appointment_time para time object (pode ser string ou time)
-                    if isinstance(apt.appointment_time, str):
-                        apt_time = datetime.strptime(apt.appointment_time, '%H:%M').time()
-                    else:
-                        apt_time = apt.appointment_time
-                    
-                    apt_datetime = datetime.combine(appointment_date.date(), apt_time)
-                    
-                    # Verificar se há sobreposição - se o horário é exatamente o mesmo
-                    if slot_datetime == apt_datetime:
-                        tem_conflito = True
-                        break
-                
-                if not tem_conflito:
-                    available_slots.append(current_time.strftime('%H:%M'))
-                
-                # Avançar 1 hora (apenas horários inteiros)
-                current_time = (datetime.combine(appointment_date.date(), current_time) + 
-                                timedelta(hours=1)).time()
-            
-            # Formatar mensagem
-            dia_nome_completo = dias_semana_pt[weekday].upper()
-            msg = f"✅ A data {date_str} é {dia_nome_completo}\n"
-            msg += f"📅 Horário de atendimento: {horario_dia}\n"
-            msg += f"⏰ Cada consulta dura {duracao} minutos\n\n"
-            
-            if available_slots:
-                msg += "Horários disponíveis:\n"
-                for slot in available_slots:
-                    msg += f"• {slot}\n"
-                msg += "\nQual horário você prefere?"
-            else:
-                msg += "❌ Não há horários disponíveis neste dia.\n"
-                msg += "Por favor, escolha outra data."
-            
-            return msg
-            
-        except Exception as e:
-            logger.error(f"Erro ao validar data e mostrar slots: {str(e)}")
-            return f"Erro ao buscar horários disponíveis: {str(e)}"
-
     def _handle_confirm_time_slot(self, tool_input: Dict, db: Session, phone: str = None) -> str:
         """Validar e confirmar horário escolhido"""
         try:
@@ -2036,21 +1877,16 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                 if not appointment_date:
                     return "❌ Data inválida. Use formato DD/MM/AAAA."
                 
-                # Validar dia da semana
+                # Validar dia da semana e obter horários disponíveis
                 weekday = appointment_date.weekday()
                 dias_semana_pt = ['segunda', 'terca', 'quarta', 'quinta', 'sexta', 'sabado', 'domingo']
                 dia_nome = dias_semana_pt[weekday]
                 
-                horarios = self.clinic_info.get('horario_funcionamento', {})
-                horario_dia = horarios.get(dia_nome, "FECHADO")
+                horarios_disponiveis = self.clinic_info.get('horarios_disponiveis', {})
+                horarios_do_dia = horarios_disponiveis.get(dia_nome, [])
                 
-                if horario_dia == "FECHADO":
+                if not horarios_do_dia:
                     return f"❌ A clínica não atende em {dia_nome.capitalize()}. Por favor, escolha outra data."
-                
-                # Calcular slots disponíveis
-                inicio_str, fim_str = horario_dia.split('-')
-                inicio_time = datetime.strptime(inicio_str, '%H:%M').time()
-                fim_time = datetime.strptime(fim_str, '%H:%M').time()
                 
                 # Buscar consultas já agendadas nesse dia
                 date_str_formatted = appointment_date.strftime('%Y%m%d')  # YYYYMMDD
@@ -2059,10 +1895,12 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                     Appointment.status == AppointmentStatus.AGENDADA
                 ).all()
                 
-                # Gerar slots disponíveis (apenas horários INTEIROS)
+                # Gerar slots disponíveis baseados na lista de horários fixos
                 available_slots = []
-                current_time = inicio_time
-                while current_time < fim_time:
+                for horario_str in horarios_do_dia:
+                    hora, minuto = map(int, horario_str.split(':'))
+                    current_time = time(hora, minuto)
+                    
                     # Verificar se tem consulta nesse horário
                     slot_datetime = datetime.combine(appointment_date.date(), current_time)
                     tem_conflito = False
@@ -2082,21 +1920,17 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                             break
                     
                     if not tem_conflito:
-                        available_slots.append(current_time.strftime('%H:%M'))
-                    
-                    # Avançar 1 hora (apenas horários inteiros)
-                    current_time = (datetime.combine(appointment_date.date(), current_time) + 
-                                    timedelta(hours=1)).time()
+                        available_slots.append(horario_str)
                 
                 # Montar mensagem com todos os horários disponíveis
                 if available_slots:
-                    msg = "❌ Por favor, escolha um horário inteiro (exemplo: 8:00, 14:00).\n\n"
+                    msg = "❌ Por favor, escolha um horário inteiro (exemplo: 14:00, 15:00).\n\n"
                     msg += "Esses são os únicos horários disponíveis para esta data:\n"
                     for slot in available_slots:
                         msg += f"• {slot}\n"
                     return msg
                 else:
-                    return "❌ Por favor, escolha um horário inteiro (exemplo: 8:00, 14:00).\n\nNão há horários disponíveis para esta data."
+                    return "❌ Por favor, escolha um horário inteiro (exemplo: 14:00, 15:00).\n\nNão há horários disponíveis para esta data."
             
             # Verificar disponibilidade no banco (segurança contra race condition)
             appointment_date = parse_date_br(date_str)
@@ -2312,7 +2146,7 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
             is_available = appointment_rules.check_slot_availability(appointment_datetime_naive, duracao, db)
             
             if not is_available:
-                return f"❌ Horário {appointment_time} não está disponível. Use a tool check_availability para ver horários disponíveis."
+                return f"❌ Horário {appointment_time} não está disponível. Vou procurar outro horário para você em instantes."
             
             # Criar agendamento - SALVAR COMO STRING YYYYMMDD para evitar problemas de timezone
             appointment_datetime_formatted = str(appointment_datetime.strftime('%Y%m%d'))  # "20251022" - GARANTIR STRING
@@ -2344,6 +2178,8 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                     context.flow_data.pop("pending_confirmation", None)
                     # Adicionar flag para indicar que agendamento foi completado
                     context.flow_data["appointment_completed"] = True
+                    # Limpar estado de ofertas automáticas
+                    self._clear_auto_offer_state(context, db)
                     db.commit()
                     logger.info("🧹 Limpeza do flow_data: appointment_date, appointment_time e pending_confirmation removidos")
                     logger.info("✅ Flag appointment_completed adicionada ao flow_data")

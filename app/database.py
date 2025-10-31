@@ -67,5 +67,3 @@ def get_db() -> Generator[Session, None, None]:
         db.close()
 
 
-# get_db_session removido - não utilizado
-
