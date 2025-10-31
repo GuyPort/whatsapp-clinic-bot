@@ -1024,6 +1024,23 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
         history_list = context.flow_data.get("auto_offer_history") or []
         history_set = set(history_list)
 
+        # Validar convênio antes de gerar horários automáticos
+        insurance_plan_value = context.flow_data.get("insurance_plan")
+        valid_insurance = {"CABERGS", "IPE", "Particular"}
+
+        if insurance_plan_value not in valid_insurance:
+            logger.info("⏸️ Auto-oferta bloqueada: convênio ausente ou inválido")
+            context.flow_data.pop("auto_offer_pending", None)
+            context.flow_data.pop("auto_offer_current", None)
+            context.flow_data.pop("auto_offer_next_search", None)
+            context.flow_data.pop("auto_offer_history", None)
+            context.flow_data.pop("auto_offer_rejections", None)
+            db.commit()
+            return (
+                "Antes de buscar os horários disponíveis, preciso saber se você possui algum convênio.\n"
+                "Trabalhamos com CABERGS e IPE. Se não tiver convênio, responda 'Não' para seguirmos com consulta particular."
+            )
+
         # Buscar próximo(s) horário(s)
         search_limit = max(3, len(history_set) + 1)
         candidate_slots = appointment_rules.find_next_available_slots(start_after, db, limit=search_limit)
@@ -1222,6 +1239,12 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
             return False
         if flow_data.get("auto_offer_current"):
             return False
+
+        insurance_plan = flow_data.get("insurance_plan")
+        valid_insurance = {"CABERGS", "IPE", "Particular"}
+        if insurance_plan not in valid_insurance:
+            return False
+
         return True
 
     def process_message(self, message: str, phone: str, db: Session) -> str:
@@ -1243,14 +1266,36 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
             
             # 2. Verificação de timeout removida - agora é proativa via scheduler
             
-            # 2.1 Resetar estado de agendamento concluído quando paciente solicitar novo agendamento
+            # 2.1 Resetar estado quando paciente iniciar novo agendamento
             message_lower = message.lower().strip()
-            if context.flow_data and context.flow_data.get("appointment_completed"):
-                if message_lower in {"1", "1️⃣"} or "marcar consulta" in message_lower:
-                    logger.info("🧹 Novo agendamento solicitado - limpando flag appointment_completed e estado automático")
-                    context.flow_data.pop("appointment_completed", None)
-                    self._clear_auto_offer_state(context, db)
-                    db.commit()
+            is_new_booking_request = (
+                message_lower in {"1", "1️⃣"}
+                or ("marcar" in message_lower and "consulta" in message_lower)
+                or "quero marcar" in message_lower
+            )
+
+            if context.flow_data and is_new_booking_request:
+                logger.info("🧹 Novo agendamento detectado - limpando dados sensíveis do flow_data")
+
+                keys_to_reset = [
+                    "appointment_completed",
+                    "consultation_type",
+                    "insurance_plan",
+                    "appointment_date",
+                    "appointment_time",
+                    "pending_confirmation",
+                    "awaiting_manual_date"
+                ]
+
+                for key in keys_to_reset:
+                    if key in context.flow_data:
+                        context.flow_data.pop(key, None)
+
+                # Limpar estado de auto-ofertas (também executa commit)
+                self._clear_auto_offer_state(context, db)
+
+                # Garantir que alterações sejam persistidas caso _clear_auto_offer_state não execute commit
+                db.commit()
 
             # 3. Decidir se deve encerrar contexto por resposta negativa
             if self._should_end_context(context, message):
@@ -1283,6 +1328,13 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                         data["patient_name"] = data.get("patient_name") or extracted.get("patient_name")
                         if not data.get("patient_birth_date"):
                             data["patient_birth_date"] = extracted.get("patient_birth_date")
+
+                    # Desativar estado de auto-oferta antes de criar o agendamento
+                    context.flow_data["auto_offer_pending"] = False
+                    context.flow_data.pop("auto_offer_current", None)
+                    context.flow_data.pop("auto_offer_next_search", None)
+                    context.flow_data.pop("fallback_confirm_time_slot_attempted", None)
+                    db.commit()
 
                     payload = {
                         "patient_name": data.get("patient_name"),
