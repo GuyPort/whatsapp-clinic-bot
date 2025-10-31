@@ -65,6 +65,8 @@ class WhatsAppService:
             logger.error(f"Exceção ao enviar mensagem: {str(e)}")
             return False
     
+# send_message_with_buttons removido - não utilizado
+    
     async def get_instance_status(self) -> Dict[str, Any]:
         """
         Verifica o status da instância Evolution API.
@@ -107,4 +109,3 @@ class WhatsAppService:
 
 # Instância global do serviço
 whatsapp_service = WhatsAppService()
-

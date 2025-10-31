@@ -8,7 +8,6 @@ from sqlalchemy.orm import declarative_base
 from sqlalchemy import event
 import enum
 import re
-from sqlalchemy.ext.mutable import MutableDict, MutableList
 
 Base = declarative_base()
 
@@ -139,11 +138,11 @@ class ConversationContext(Base):
     phone = Column(String(20), primary_key=True, index=True)
     
     # Histórico de mensagens (JSON array)
-    messages = Column(MutableList.as_mutable(JSON), nullable=False, default=list)  # [{role, content, timestamp}]
+    messages = Column(JSON, nullable=False, default=list)  # [{role, content, timestamp}]
     
     # Estado atual do fluxo
     current_flow = Column(String(50), nullable=True)  # "agendamento" | "cancelamento" | "duvidas"
-    flow_data = Column(MutableDict.as_mutable(JSON), nullable=False, default=dict)  # Dados coletados no fluxo
+    flow_data = Column(JSON, nullable=False, default=dict)  # Dados coletados no fluxo
     # Estrutura esperada em flow_data:
     # {
     #     "patient_name": "...",

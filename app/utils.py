@@ -183,4 +183,3 @@ def normalize_time_format(time_str: str) -> Optional[str]:
         return None
     
     return f"{hour:02d}:{minute:02d}"
-

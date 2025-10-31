@@ -405,4 +405,3 @@ Desenvolvido por Daniel Nobrega Medeiros - Nobrega Medtech
 ---
 
 **Precisa de ajuda?** Entre em contato com o desenvolvedor.
-
