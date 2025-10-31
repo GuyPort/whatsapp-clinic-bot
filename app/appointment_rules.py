@@ -129,13 +129,15 @@ class AppointmentRules:
         
         # Criar datetime para início e fim
         start_time = target_date.replace(hour=inicio_h, minute=inicio_m, second=0, microsecond=0)
-        end_time = target_date.replace(hour=fim_h, minute=fim_m, second=0, microsecond=0)
+        last_slot_start = target_date.replace(hour=fim_h, minute=fim_m, second=0, microsecond=0)
         
         # Ajustar para sábado se necessário
         if weekday == 5:
             ultima_hora_sabado = self.rules.get('horario_ultima_consulta_sabado', '11:30')
             h, m = map(int, ultima_hora_sabado.split(':'))
-            end_time = target_date.replace(hour=h, minute=m, second=0, microsecond=0)
+            last_slot_start = target_date.replace(hour=h, minute=m, second=0, microsecond=0)
+
+        closing_time = last_slot_start + timedelta(minutes=consultation_duration)
         
         # Buscar consultas já agendadas no banco - USAR FORMATO STRING
         target_date_str = target_date.strftime('%Y%m%d')  # "20251015"
@@ -149,13 +151,13 @@ class AppointmentRules:
         current = start_time
         slot_step = 5  # Slots a cada 5 minutos
         
-        while current < end_time and (limit is None or len(available_slots) < limit):
+        while current <= last_slot_start and (limit is None or len(available_slots) < limit):
             slot_end = current + timedelta(minutes=consultation_duration)
             
             # Verificar se o slot é válido
             is_valid, _ = self.is_valid_appointment_date(current)
             
-            if is_valid and slot_end <= end_time:
+            if is_valid and slot_end <= closing_time:
                 # Verificar conflitos com consultas no banco
                 has_conflict = False
                 

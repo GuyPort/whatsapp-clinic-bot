@@ -1949,8 +1949,9 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
             
             # Gerar slots disponíveis (apenas horários INTEIROS)
             available_slots = []
+            last_slot_time = fim_time
             current_time = inicio_time
-            while current_time < fim_time:
+            while current_time <= last_slot_time:
                 # Verificar se tem consulta nesse horário
                 slot_datetime = datetime.combine(appointment_date.date(), current_time)
                 tem_conflito = False
@@ -2051,6 +2052,7 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                 inicio_str, fim_str = horario_dia.split('-')
                 inicio_time = datetime.strptime(inicio_str, '%H:%M').time()
                 fim_time = datetime.strptime(fim_str, '%H:%M').time()
+                last_slot_time = fim_time
                 
                 # Buscar consultas já agendadas nesse dia
                 date_str_formatted = appointment_date.strftime('%Y%m%d')  # YYYYMMDD
@@ -2062,7 +2064,7 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                 # Gerar slots disponíveis (apenas horários INTEIROS)
                 available_slots = []
                 current_time = inicio_time
-                while current_time < fim_time:
+                while current_time <= last_slot_time:
                     # Verificar se tem consulta nesse horário
                     slot_datetime = datetime.combine(appointment_date.date(), current_time)
                     tem_conflito = False
