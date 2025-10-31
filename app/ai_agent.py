@@ -12,6 +12,7 @@ from anthropic import Anthropic
 
 from sqlalchemy.orm import Session
 from sqlalchemy.orm.attributes import flag_modified
+from sqlalchemy.ext.mutable import MutableDict, MutableList
 
 from app.simple_config import settings
 from app.models import Appointment, AppointmentStatus, ConversationContext, PausedContact
@@ -1003,7 +1004,7 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
         """Busca e prepara a próxima sugestão automática de horário."""
 
         if not context.flow_data:
-            context.flow_data = {}
+            context.flow_data = MutableDict()
 
         tz = self.timezone
         now_plus_buffer = now_brazil() + timedelta(hours=48)
@@ -1147,7 +1148,7 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
         """Processa resposta do paciente com data (e horário) customizados."""
 
         if not context.flow_data:
-            context.flow_data = {}
+            context.flow_data = MutableDict()
 
         import re
         date_match = re.search(r'(\d{2}/\d{2}/\d{4})', message)
@@ -1256,7 +1257,8 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                 # Primeira mensagem deste usuário, criar contexto novo
                 context = ConversationContext(
                     phone=phone,
-                    messages=[],
+                    messages=MutableList(),
+                    flow_data=MutableDict(),
                     status="active"
                 )
                 db.add(context)
@@ -1474,7 +1476,7 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                     
                     # Limpar pending_confirmation
                     if not context.flow_data:
-                        context.flow_data = {}
+                        context.flow_data = MutableDict()
                     context.flow_data["pending_confirmation"] = False
                     context.messages.append({
                         "role": "user",
@@ -1497,7 +1499,7 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                     
                     # Limpar pending_confirmation
                     if not context.flow_data:
-                        context.flow_data = {}
+                        context.flow_data = MutableDict()
                     context.flow_data["pending_confirmation"] = False
                     db.commit()
                     
@@ -1652,7 +1654,7 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
             # Após cada resposta do Claude, verificar se coletou nome ou data nascimento
             # e salvar no flow_data imediatamente (não sobrescrever dados existentes)
             if not context.flow_data:
-                context.flow_data = {}
+                context.flow_data = MutableDict()
             
             # Extrair dados do histórico
             extracted = self._extract_appointment_data_from_messages(context.messages)
@@ -2002,7 +2004,7 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                 context = db.query(ConversationContext).filter_by(phone=phone).first()
                 if context:
                     if not context.flow_data:
-                        context.flow_data = {}
+                        context.flow_data = MutableDict()
                     context.flow_data["appointment_date"] = date_str
                     context.flow_data["appointment_time"] = time_str
                     context.flow_data["pending_confirmation"] = True
@@ -2156,7 +2158,7 @@ Lembre-se: Seja sempre educada, prestativa e siga o fluxo sequencial!"""
                     context = db.query(ConversationContext).filter_by(phone=phone).first()
                     if context:
                         if not context.flow_data:
-                            context.flow_data = {}
+                            context.flow_data = MutableDict()
                         context.flow_data["awaiting_birth_date_correction"] = True
                         db.commit()
                 # NÃO limpar flow_data para permitir correção
@@ -2503,7 +2505,7 @@ IMPORTANTE: Se identificar que "patient_name" é uma frase de pedido (ex: "Eu Pr
             
             # Atualizar flow_data com dados extraídos
             if not context.flow_data:
-                context.flow_data = {}
+                context.flow_data = MutableDict()
             
             # Atualizar apenas campos válidos (não None/null)
             if extracted_data.get("patient_name"):
