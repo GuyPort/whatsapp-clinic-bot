@@ -147,14 +147,14 @@ class AppointmentRules:
             Appointment.status == AppointmentStatus.AGENDADA  # Apenas consultas ativas
         ).all()
         
-        # Gerar slots usando o intervalo configurado
-        current = start_time
-        slot_step = 5  # Slots a cada 5 minutos
+        # Gerar slots de hora inteira (apenas horários como 14:00, 15:00, 16:00, etc.)
+        # Garantir que start_time tem minutos == 0
+        current = start_time.replace(minute=0, second=0, microsecond=0)
         
         while current <= last_slot_start and (limit is None or len(available_slots) < limit):
             slot_end = current + timedelta(minutes=consultation_duration)
             
-            # Verificar se o slot é válido
+            # Verificar se o slot é válido e não ultrapassa o horário de fechamento
             is_valid, _ = self.is_valid_appointment_date(current)
             
             if is_valid and slot_end <= closing_time:
@@ -183,8 +183,8 @@ class AppointmentRules:
                 if not has_conflict:
                     available_slots.append(current)
             
-            # Avançar para o próximo slot
-            current += timedelta(minutes=slot_step)
+            # Avançar para o próximo slot (1 hora)
+            current += timedelta(hours=1)
         
         return available_slots
     
@@ -214,6 +214,7 @@ class AppointmentRules:
             return None
         
         # Se start_from_time foi fornecido, filtrar slots >= start_from_time
+        # Nota: get_available_slots já retorna apenas slots de hora inteira
         if start_from_time is not None:
             # Garantir timezone consistency
             tz = get_brazil_timezone()
@@ -229,6 +230,7 @@ class AppointmentRules:
                 if slot.tzinfo is None:
                     slot = tz.localize(slot)
                 
+                # Verificar se slot é >= start_from_time
                 if slot >= start_from_time:
                     filtered_slots.append(slot)
             
