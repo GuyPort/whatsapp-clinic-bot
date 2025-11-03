@@ -183,3 +183,15 @@ def normalize_time_format(time_str: str) -> Optional[str]:
         return None
     
     return f"{hour:02d}:{minute:02d}"
+
+
+def get_minimum_appointment_datetime() -> datetime:
+    """
+    Calcula a data/hora mínima para agendamento (48 horas a partir de agora).
+    
+    Returns:
+        datetime object representando data/hora atual + 48 horas no timezone do Brasil
+    """
+    now = now_brazil()
+    minimum_datetime = now + timedelta(hours=48)
+    return minimum_datetime

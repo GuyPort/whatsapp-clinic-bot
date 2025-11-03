@@ -2,7 +2,7 @@
 Regras e validações para agendamento de consultas.
 """
 from datetime import datetime, timedelta, time
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional
 import logging
 
 from sqlalchemy.orm import Session
@@ -187,6 +187,32 @@ class AppointmentRules:
             current += timedelta(minutes=slot_step)
         
         return available_slots
+    
+    def _find_first_available_slot_in_day(
+        self,
+        target_date: datetime,
+        consultation_duration: int,
+        db: Session
+    ) -> Optional[datetime]:
+        """
+        Encontra o primeiro horário disponível de um dia específico.
+        
+        Args:
+            target_date: Data alvo (apenas a data importa, hora será ajustada)
+            consultation_duration: Duração da consulta em minutos
+            db: Sessão do banco de dados
+            
+        Returns:
+            datetime do primeiro slot disponível ou None se não houver
+        """
+        # Obter todos os slots disponíveis do dia
+        available_slots = self.get_available_slots(target_date, consultation_duration, db, limit=None)
+        
+        if not available_slots:
+            return None
+        
+        # Retornar o primeiro (menor horário)
+        return available_slots[0]
     
     def format_available_slots_message(self, slots: List[datetime], target_date: datetime = None) -> str:
         """
