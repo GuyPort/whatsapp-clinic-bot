@@ -192,7 +192,8 @@ class AppointmentRules:
         self,
         target_date: datetime,
         consultation_duration: int,
-        db: Session
+        db: Session,
+        start_from_time: Optional[datetime] = None
     ) -> Optional[datetime]:
         """
         Encontra o primeiro horário disponível de um dia específico.
@@ -201,6 +202,7 @@ class AppointmentRules:
             target_date: Data alvo (apenas a data importa, hora será ajustada)
             consultation_duration: Duração da consulta em minutos
             db: Sessão do banco de dados
+            start_from_time: Horário mínimo opcional - se fornecido, retorna apenas slots >= este horário
             
         Returns:
             datetime do primeiro slot disponível ou None se não houver
@@ -211,7 +213,32 @@ class AppointmentRules:
         if not available_slots:
             return None
         
-        # Retornar o primeiro (menor horário)
+        # Se start_from_time foi fornecido, filtrar slots >= start_from_time
+        if start_from_time is not None:
+            # Garantir timezone consistency
+            tz = get_brazil_timezone()
+            
+            # Garantir que start_from_time está timezone-aware
+            if start_from_time.tzinfo is None:
+                start_from_time = tz.localize(start_from_time)
+            
+            # Filtrar slots que são >= start_from_time
+            filtered_slots = []
+            for slot in available_slots:
+                # Garantir que slot está timezone-aware
+                if slot.tzinfo is None:
+                    slot = tz.localize(slot)
+                
+                if slot >= start_from_time:
+                    filtered_slots.append(slot)
+            
+            if not filtered_slots:
+                return None
+            
+            # Retornar o primeiro slot filtrado (menor horário >= start_from_time)
+            return filtered_slots[0]
+        
+        # Retornar o primeiro (menor horário) - comportamento original
         return available_slots[0]
     
     def format_available_slots_message(self, slots: List[datetime], target_date: datetime = None) -> str:

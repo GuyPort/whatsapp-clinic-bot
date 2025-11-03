@@ -187,13 +187,10 @@ Quando o usuário escolher marcar consulta (opção 1), você precisa coletar:
    - Se rejeitar todas alternativas → pergunte qual dia prefere e use 'validate_date_and_show_slots' para mostrar horários
 
 6. ESCOLHA DE HORÁRIO (fluxo manual)
-   
-   QUANDO DETECTAR MENSAGEM COM HORÁRIO (HH:MM):
-   - Exemplos: "17:00", "14:00", "09:00", "08:00", etc.
-   - Formato: 2 dígitos, dois pontos, 2 dígitos
-   
-   AÇÃO OBRIGATÓRIA:
-   a) Execute IMEDIATAMENTE confirm_time_slot com:
+   - Se usuário mencionar horário no formato HH:MM → use 'confirm_time_slot' para validar e mostrar resumo
+   - Aguarde confirmação final antes de criar agendamento
+
+═══════════════════════════════════════════════════════════
       - date: a data que foi validada anteriormente (appointment_date)
       - time: o horário que o usuário acabou de escolher
    
@@ -286,6 +283,31 @@ Após qualquer tarefa concluída (agendamento, cancelamento, resposta a dúvida)
 Mantenha TODO o contexto histórico durante o ciclo (nome, data nascimento, etc) para evitar repetir perguntas.
 
 ═══════════════════════════════════════════════════════════
+PERSISTÊNCIA E COMPLETAR TAREFAS
+═══════════════════════════════════════════════════════════
+
+PRINCÍPIO FUNDAMENTAL: Sempre complete a tarefa até o final. Não pare com mensagens genéricas.
+
+QUANDO DADOS FALTAREM:
+- NÃO retorne mensagem genérica de erro
+- Tente extrair dados do histórico usando extract_patient_data primeiro
+- Se não conseguir extrair, pergunte de forma natural e específica o que falta
+- Mantenha o contexto e continue de onde parou
+- Exemplo: Em vez de "Nome não encontrado", diga "Para continuar, preciso do seu nome completo. Pode me informar?"
+
+QUANDO UMA TOOL FALHAR:
+- Tente abordagem alternativa antes de retornar erro
+- Se faltar dados, tente extrair do histórico antes de retornar erro
+- Explique o problema de forma amigável e sugira solução
+- NÃO desista - continue tentando até completar a tarefa
+
+COMPLETANDO TAREFAS:
+- Marcar consulta: Não pare até o agendamento estar confirmado e salvo
+- Cancelar consulta: Não pare até o cancelamento estar completo e confirmado
+- Reagendar: Não pare até a nova data estar confirmada e salva
+- Receita: Não pare até a informação estar fornecida completamente
+
+═══════════════════════════════════════════════════════════
 VALIDAÇÕES CRÍTICAS
 ═══════════════════════════════════════════════════════════
 
@@ -296,7 +318,7 @@ VALIDAÇÕES CRÍTICAS
 
 ═══════════════════════════════════════════════════════════
 
-Lembre-se: Seja natural, adaptável e prestativa. Use as tools disponíveis conforme necessário e mantenha uma conversa fluida e educada."""
+Lembre-se: Seja natural, adaptável e prestativa. Use as tools disponíveis conforme necessário e mantenha uma conversa fluida e educada. Sempre complete a tarefa até o final."""
 
     def _define_tools(self) -> List[Dict]:
         """Define as tools disponíveis para o Claude"""
@@ -1497,10 +1519,10 @@ Lembre-se: Seja natural, adaptável e prestativa. Use as tools disponíveis conf
             
             # Tool não reconhecida
             logger.warning(f"❌ Tool não reconhecida: {tool_name}")
-            return f"Tool '{tool_name}' não reconhecida."
+            return "Desculpe, ocorreu um problema técnico. Por favor, tente novamente."
         except Exception as e:
             logger.error(f"Erro ao executar tool {tool_name}: {str(e)}")
-            return f"Erro ao executar {tool_name}: {str(e)}"
+            return "Desculpe, ocorreu um erro ao processar sua solicitação. Por favor, tente novamente ou me informe o que você precisa."
 
     def _handle_find_next_available_slot(self, tool_input: Dict, db: Session, phone: str = None) -> str:
         """
@@ -1516,7 +1538,7 @@ Lembre-se: Seja natural, adaptável e prestativa. Use as tools disponíveis conf
                 context = db.query(ConversationContext).filter_by(phone=phone).first()
             
             if not context or not context.flow_data:
-                return "❌ Dados do paciente não encontrados. Por favor, inicie o processo de agendamento novamente."
+                return "Para buscar o próximo horário disponível, preciso dos seus dados primeiro. Por favor, me informe seu nome completo."
             
             # Extrair dados coletados
             patient_name = context.flow_data.get("patient_name")
@@ -1567,7 +1589,7 @@ Lembre-se: Seja natural, adaptável e prestativa. Use as tools disponíveis conf
                         logger.warning(f"⚠️ Erro ao usar extract_patient_data: {str(e)}")
             
             if not patient_name:
-                return "❌ Nome do paciente não encontrado. Por favor, informe seu nome novamente."
+                return "Para continuar com o agendamento, preciso do seu nome completo. Pode me informar?"
             
             # 2. Calcular data mínima (48h)
             minimum_datetime = get_minimum_appointment_datetime()
@@ -1613,37 +1635,32 @@ Lembre-se: Seja natural, adaptável e prestativa. Use as tools disponíveis conf
                     days_checked += 1
                     continue
                 
-                # Verificar se data/hora mínima já passou para este dia
-                # Se estiver no mesmo dia, verificar se o horário mínimo já passou
-                if current_date.date() == minimum_datetime.date():
-                    # Mesmo dia - precisa verificar horário
-                    inicio_str, _ = horario_dia.split('-')
-                    inicio_h, inicio_m = map(int, inicio_str.split(':'))
-                    primeiro_horario_dia = current_date.replace(hour=inicio_h, minute=inicio_m, second=0, microsecond=0)
-                    
-                    if primeiro_horario_dia < minimum_datetime:
-                        # Primeiro horário já passou, buscar próximo horário disponível após minimum_datetime
-                        temp_date = minimum_datetime.replace(second=0, microsecond=0)
-                    else:
-                        temp_date = primeiro_horario_dia
-                else:
-                    # Dia futuro - usar primeiro horário do dia
-                    inicio_str, _ = horario_dia.split('-')
-                    inicio_h, inicio_m = map(int, inicio_str.split(':'))
-                    temp_date = current_date.replace(hour=inicio_h, minute=inicio_m, second=0, microsecond=0)
+                # Preparar data base para buscar slots (usar primeiro horário do dia)
+                inicio_str, _ = horario_dia.split('-')
+                inicio_h, inicio_m = map(int, inicio_str.split(':'))
+                temp_date = current_date.replace(hour=inicio_h, minute=inicio_m, second=0, microsecond=0)
                 
-                # Buscar primeiro slot disponível deste dia
+                # Determinar se deve usar start_from_time baseado na data mínima
+                # Se estiver no mesmo dia da data mínima, usar minimum_datetime como start_from_time
+                # Caso contrário, não filtrar (buscar desde o primeiro horário do dia)
+                start_from_time = None
+                if current_date.date() == minimum_datetime.date():
+                    # Mesmo dia - usar minimum_datetime como limite mínimo
+                    start_from_time = minimum_datetime
+                
+                # Buscar primeiro slot disponível deste dia respeitando 48h
                 first_slot = appointment_rules._find_first_available_slot_in_day(
-                    temp_date, duracao, db
+                    temp_date, duracao, db, start_from_time=start_from_time
                 )
                 
-                # Se encontrou slot e está após data mínima, usar
+                # Se encontrou slot, usar (já está garantido que é >= minimum_datetime se start_from_time foi passado)
                 if first_slot:
-                    # Garantir timezone-aware para comparação
+                    # Garantir timezone-aware para comparação final
                     if first_slot.tzinfo is None:
                         tz = get_brazil_timezone()
                         first_slot = tz.localize(first_slot)
                     
+                    # Verificação adicional de segurança (mesmo que start_from_time já tenha filtrado)
                     if first_slot >= minimum_datetime:
                         found_date = current_date
                         break
@@ -1712,7 +1729,7 @@ Lembre-se: Seja natural, adaptável e prestativa. Use as tools disponíveis conf
                 context = db.query(ConversationContext).filter_by(phone=phone).first()
             
             if not context or not context.flow_data:
-                return "❌ Dados do paciente não encontrados. Por favor, inicie o processo de agendamento novamente."
+                return "Para buscar o próximo horário disponível, preciso dos seus dados primeiro. Por favor, me informe seu nome completo."
             
             # Extrair dados coletados
             patient_name = context.flow_data.get("patient_name")
@@ -1720,7 +1737,7 @@ Lembre-se: Seja natural, adaptável e prestativa. Use as tools disponíveis conf
             insurance_plan = context.flow_data.get("insurance_plan", "particular")
             
             if not patient_name:
-                return "❌ Nome do paciente não encontrado. Por favor, informe seu nome novamente."
+                return "Para continuar com o agendamento, preciso do seu nome completo. Pode me informar?"
             
             # 2. Calcular data mínima (48h)
             minimum_datetime = get_minimum_appointment_datetime()
@@ -1763,32 +1780,32 @@ Lembre-se: Seja natural, adaptável e prestativa. Use as tools disponíveis conf
                     days_checked += 1
                     continue
                 
-                # Verificar se data/hora mínima já passou para este dia
-                if current_date.date() == minimum_datetime.date():
-                    inicio_str, _ = horario_dia.split('-')
-                    inicio_h, inicio_m = map(int, inicio_str.split(':'))
-                    primeiro_horario_dia = current_date.replace(hour=inicio_h, minute=inicio_m, second=0, microsecond=0)
-                    
-                    if primeiro_horario_dia < minimum_datetime:
-                        temp_date = minimum_datetime.replace(second=0, microsecond=0)
-                    else:
-                        temp_date = primeiro_horario_dia
-                else:
-                    inicio_str, _ = horario_dia.split('-')
-                    inicio_h, inicio_m = map(int, inicio_str.split(':'))
-                    temp_date = current_date.replace(hour=inicio_h, minute=inicio_m, second=0, microsecond=0)
+                # Preparar data base para buscar slots (usar primeiro horário do dia)
+                inicio_str, _ = horario_dia.split('-')
+                inicio_h, inicio_m = map(int, inicio_str.split(':'))
+                temp_date = current_date.replace(hour=inicio_h, minute=inicio_m, second=0, microsecond=0)
                 
-                # Buscar primeiro slot disponível deste dia
+                # Determinar se deve usar start_from_time baseado na data mínima
+                # Se estiver no mesmo dia da data mínima, usar minimum_datetime como start_from_time
+                # Caso contrário, não filtrar (buscar desde o primeiro horário do dia)
+                start_from_time = None
+                if current_date.date() == minimum_datetime.date():
+                    # Mesmo dia - usar minimum_datetime como limite mínimo
+                    start_from_time = minimum_datetime
+                
+                # Buscar primeiro slot disponível deste dia respeitando 48h
                 first_slot = appointment_rules._find_first_available_slot_in_day(
-                    temp_date, duracao, db
+                    temp_date, duracao, db, start_from_time=start_from_time
                 )
                 
-                # Se encontrou slot e está após data mínima, adicionar às alternativas
+                # Se encontrou slot, adicionar às alternativas (já está garantido que é >= minimum_datetime se start_from_time foi passado)
                 if first_slot:
+                    # Garantir timezone-aware para comparação final
                     if first_slot.tzinfo is None:
                         tz = get_brazil_timezone()
                         first_slot = tz.localize(first_slot)
                     
+                    # Verificação adicional de segurança (mesmo que start_from_time já tenha filtrado)
                     if first_slot >= minimum_datetime:
                         alternatives.append((first_slot, current_date))
                         logger.info(f"✅ Alternativa {len(alternatives)}: {format_date_br(current_date)} às {first_slot.strftime('%H:%M')}")
@@ -2289,12 +2306,12 @@ Lembre-se: Seja natural, adaptável e prestativa. Use as tools disponíveis conf
             date_str = tool_input.get("date")
             
             if not date_str:
-                return "Data é obrigatória. Informe no formato DD/MM/AAAA."
+                return "Para continuar, preciso da data da consulta. Por favor, informe no formato DD/MM/AAAA (exemplo: 15/01/2024)."
             
             # Validar data
             appointment_date = parse_date_br(date_str)
             if not appointment_date:
-                return "Data inválida. Use formato DD/MM/AAAA."
+                return f"O formato da data '{date_str}' não está correto. Por favor, use o formato DD/MM/AAAA (exemplo: 15/01/2024)."
             
             logger.info(f"📅 Validando data e buscando slots: {date_str}")
             
@@ -2655,9 +2672,39 @@ Lembre-se: Seja natural, adaptável e prestativa. Use as tools disponíveis conf
             logger.info(f"   consultation_type: {consultation_type}")
             logger.info(f"   insurance_plan: {insurance_plan}")
             
-            if not all([patient_name, patient_phone, patient_birth_date, appointment_date, appointment_time]):
-                logger.error(f"❌ VALIDAÇÃO FALHOU - Dados incompletos")
-                return "Todos os campos obrigatórios devem ser preenchidos."
+            # Tentar extrair dados faltantes do flow_data antes de retornar erro
+            if phone:
+                context = db.query(ConversationContext).filter_by(phone=phone).first()
+                if context and context.flow_data:
+                    if not patient_name:
+                        patient_name = context.flow_data.get("patient_name")
+                    if not patient_birth_date:
+                        patient_birth_date = context.flow_data.get("patient_birth_date")
+                    if not appointment_date:
+                        appointment_date = context.flow_data.get("appointment_date")
+                    if not appointment_time:
+                        appointment_time = context.flow_data.get("appointment_time")
+            
+            # Verificar quais campos estão faltando e listar especificamente
+            missing_fields = []
+            if not patient_name:
+                missing_fields.append("nome completo")
+            if not patient_birth_date:
+                missing_fields.append("data de nascimento")
+            if not appointment_date:
+                missing_fields.append("data da consulta")
+            if not appointment_time:
+                missing_fields.append("horário da consulta")
+            if not patient_phone:
+                missing_fields.append("telefone")
+            
+            if missing_fields:
+                logger.error(f"❌ VALIDAÇÃO FALHOU - Dados incompletos: {missing_fields}")
+                if len(missing_fields) == 1:
+                    return f"Para finalizar o agendamento, ainda preciso do seu {missing_fields[0]}. Pode me informar?"
+                else:
+                    fields_list = ", ".join(missing_fields[:-1]) + f" e {missing_fields[-1]}"
+                    return f"Para finalizar o agendamento, ainda preciso de: {fields_list}. Pode me informar?"
             
             # Normalizar telefone
             normalized_phone = normalize_phone(patient_phone)
