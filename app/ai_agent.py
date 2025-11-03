@@ -173,7 +173,8 @@ Quando o usuário escolher marcar consulta (opção 1), você precisa coletar:
    - Use seu entendimento de linguagem natural para interpretar a intenção
 
 4. BUSCA AUTOMÁTICA DE HORÁRIO
-   - Após coletar convênio (ou particular), chame IMEDIATAMENTE a tool 'find_next_available_slot'
+   - Após coletar convênio (ou particular), chame IMEDIATAMENTE a tool 'find_next_available_slot' SEM ADICIONAR TEXTO PRÉVIO
+   - Não diga "vou buscar", "deixe-me buscar" ou "permita-me buscar" - apenas execute a tool diretamente
    - Esta tool busca o próximo horário disponível respeitando 48 horas exatas de antecedência mínima
    - A tool retorna um resumo completo formatado - repasse a mensagem ao usuário
    - O sistema calcula 48h a partir do momento atual, contando finais de semana também
@@ -226,7 +227,7 @@ FERRAMENTAS E QUANDO USAR
 
 - get_clinic_info: Quando usuário perguntar sobre horários, endereço, telefone, dias fechados, etc. Execute imediatamente.
 
-- extract_patient_data: Quando precisar extrair ou validar nome/data do histórico de mensagens, especialmente se houver dúvida sobre se um texto é nome real ou frase de pedido.
+- extract_patient_data: Use quando o usuário mencionar seu nome mas você não tiver certeza ou precisar validar. Também use quando precisar extrair nome/data do histórico de mensagens, especialmente se houver dúvida sobre se um texto é nome real ou frase de pedido.
 
 - find_next_available_slot: Use APÓS coletar nome, data nascimento, tipo consulta e convênio. Busca automaticamente próximo horário (48h mínimo).
 
@@ -1293,9 +1294,37 @@ Lembre-se: Seja natural, adaptável e prestativa. Use as tools disponíveis conf
             # Extrair dados do histórico
             extracted = self._extract_appointment_data_from_messages(context.messages)
             
-            # NÃO extrair nome aqui - deixar Claude fazer via tool extract_patient_data
-            # Extração manual de nome foi removida pois causava erros (ex: "Eu Preciso Marcar Uma Consulta")
-            # Se precisar do nome, Claude deve chamar tool extract_patient_data
+            # FALLBACK: Tentar extrair nome se não estiver no flow_data mas houver padrão claro nas mensagens
+            if not context.flow_data.get("patient_name"):
+                # Verificar últimas mensagens do usuário por padrões claros de nome
+                import re
+                name_patterns = [
+                    r'(?:meu nome é|sou|me chamo|me chama|chamo-me)\s+([A-ZÁÉÍÓÚÂÊÔÇ][a-záéíóúâêôçãõ]+(?:\s+[A-ZÁÉÍÓÚÂÊÔÇ][a-záéíóúâêôçãõ]+)+)',
+                    r'(?:nome|chamo)\s+([A-ZÁÉÍÓÚÂÊÔÇ][a-záéíóúâêôçãõ]+(?:\s+[A-ZÁÉÍÓÚÂÊÔÇ][a-záéíóúâêôçãõ]+)+)',
+                ]
+                
+                # Verificar últimas 5 mensagens do usuário
+                for msg in reversed(context.messages[-10:]):  # Últimas 10 mensagens
+                    if msg.get("role") == "user":
+                        content = (msg.get("content") or "").strip()
+                        for pattern in name_patterns:
+                            match = re.search(pattern, content, re.IGNORECASE)
+                            if match:
+                                candidate_name = match.group(1).strip()
+                                # Validar se parece com nome real (mínimo 2 palavras, não é frase comum)
+                                words = candidate_name.split()
+                                if len(words) >= 2 and len(candidate_name) > 5:
+                                    # Verificar se não é frase comum
+                                    common_phrases = ["preciso marcar", "quero agendar", "preciso de", "gostaria de"]
+                                    if not any(phrase in candidate_name.lower() for phrase in common_phrases):
+                                        context.flow_data["patient_name"] = candidate_name
+                                        logger.info(f"💾 Nome extraído automaticamente (fallback): {candidate_name}")
+                                        break
+                        if context.flow_data.get("patient_name"):
+                            break
+            
+            # Se ainda não tem nome e Claude não chamou extract_patient_data, pode tentar usar a tool internamente
+            # Mas isso só aconteceria se o usuário mencionou nome mas não foi extraído
             
             # Verificar se está aguardando correção de data de nascimento
             if context.flow_data.get("awaiting_birth_date_correction"):
@@ -1493,6 +1522,49 @@ Lembre-se: Seja natural, adaptável e prestativa. Use as tools disponíveis conf
             patient_name = context.flow_data.get("patient_name")
             consultation_type = context.flow_data.get("consultation_type", "clinica_geral")
             insurance_plan = context.flow_data.get("insurance_plan", "particular")
+            
+            # FALLBACK: Se nome não estiver no flow_data, tentar extrair do histórico de mensagens
+            if not patient_name:
+                logger.info("⚠️ Nome não encontrado no flow_data, tentando extrair do histórico...")
+                import re
+                name_patterns = [
+                    r'(?:meu nome é|sou|me chamo|me chama|chamo-me)\s+([A-ZÁÉÍÓÚÂÊÔÇ][a-záéíóúâêôçãõ]+(?:\s+[A-ZÁÉÍÓÚÂÊÔÇ][a-záéíóúâêôçãõ]+)+)',
+                    r'(?:nome|chamo)\s+([A-ZÁÉÍÓÚÂÊÔÇ][a-záéíóúâêôçãõ]+(?:\s+[A-ZÁÉÍÓÚÂÊÔÇ][a-záéíóúâêôçãõ]+)+)',
+                ]
+                
+                # Verificar últimas mensagens do usuário
+                for msg in reversed(context.messages[-10:]):
+                    if msg.get("role") == "user":
+                        content = (msg.get("content") or "").strip()
+                        for pattern in name_patterns:
+                            match = re.search(pattern, content, re.IGNORECASE)
+                            if match:
+                                candidate_name = match.group(1).strip()
+                                words = candidate_name.split()
+                                if len(words) >= 2 and len(candidate_name) > 5:
+                                    common_phrases = ["preciso marcar", "quero agendar", "preciso de", "gostaria de"]
+                                    if not any(phrase in candidate_name.lower() for phrase in common_phrases):
+                                        patient_name = candidate_name
+                                        # Salvar no flow_data para próxima vez
+                                        context.flow_data["patient_name"] = patient_name
+                                        db.commit()
+                                        logger.info(f"✅ Nome extraído do histórico e salvo: {patient_name}")
+                                        break
+                        if patient_name:
+                            break
+                
+                # Se ainda não encontrou, tentar usar extract_patient_data internamente
+                if not patient_name:
+                    logger.info("🔍 Tentando usar extract_patient_data para extrair nome...")
+                    try:
+                        extracted_data = self._extract_patient_data_with_claude(context)
+                        if extracted_data.get("patient_name"):
+                            patient_name = extracted_data["patient_name"]
+                            context.flow_data["patient_name"] = patient_name
+                            db.commit()
+                            logger.info(f"✅ Nome extraído via extract_patient_data: {patient_name}")
+                    except Exception as e:
+                        logger.warning(f"⚠️ Erro ao usar extract_patient_data: {str(e)}")
             
             if not patient_name:
                 return "❌ Nome do paciente não encontrado. Por favor, informe seu nome novamente."
