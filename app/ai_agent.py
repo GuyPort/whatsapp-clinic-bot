@@ -228,7 +228,15 @@ REGRAS CRÍTICAS PARA find_next_available_slot:
 8. **FLUXO CRÍTICO - Após confirmação do usuário:**
    a) Execute create_appointment com TODOS os dados
    b) Os dados vêm do flow_data (já foram salvos nas etapas anteriores)
-   c) Se sucesso: "Agendamento realizado com suค่ะcesso! Posso te ajudar com mais alguma coisa?"
+   c) Quando create_appointment retornar sucesso, você receberá um contexto com informações importantes
+   d) VOCÊ DEVE gerar uma mensagem natural e amigável incluindo TODAS as informações fornecidas:
+      - Confirmação da data e horário da consulta
+      - Pedido para trazer últimos exames
+      - Pedido para tragar lista de medicações
+      - Endereço completo do consultório
+      - Informação sobre cadeira de rodas disponível (se mencionado no contexto)
+      - Informação sobre mensagem de lembrete que será enviada no dia da consulta para relembrar sobre a consulta
+   e) Termine sempre perguntando: "Posso te ajudar com mais alguma coisa?"
 
 IMPORTANTE - FLUXO DE CONFirmaÇÃO:
 1. O fluxo é: validate_date_and_show_slots → confirm_time_slot → create_appointment
@@ -293,13 +301,20 @@ PERGUNTAS FORA DO FLUXO:
 - Mantenha o contexto do agendamento ativo
 
 ═══════════════════════════════════════════════════════════
-CICLO DE ATENDIMENTO
+CICLO DE ATENDIMENTO E ENCERRAMENTO
 ═══════════════════════════════════════════════════════════
 
 Após qualquer tarefa concluída (agendamento, cancelamento, resposta a dúvida):
-- Pergunte: "Posso te ajudar com mais alguma coisa?"
-- Se sim ou nova pergunta → continue com contexto
-- Se não ou despedida → use 'end_conversation'
+- Sempre pergunte: "Posso te ajudar com mais alguma coisa?"
+- Se usuário responder positivamente (sim, quero, preciso, etc) ou fizer nova pergunta → continue ajudando com contexto completo
+- Se usuário responder negativamente (não, não preciso, obrigado, tchau, etc) → use imediatamente a tool 'end_conversation'
+- Após usar 'end_conversation', encerre a conversa com mensagem de despedida amigável
+
+REGRAS PARA end_conversation:
+- Use APENAS quando usuário indicar claramente que não precisa de mais nada
+- Exemplos de quando usar: "não", "não preciso", "não, obrigado", "só isso", "tchau", "até logo"
+- NÃO use para perguntas do usuário ou quando ele está pedindo ajuda
+- Após chamar end_conversation, o contexto será limpo automaticamente
 
 Mantenha TODO o contexto histórico durante o ciclo (nome, data nascimento, etc) para evitar repetir perguntas.
 
@@ -501,7 +516,7 @@ Lembre-se: Seja natural, adaptável e prestativa. Use as tools disponíveis conf
             },
             {
                 "name": "end_conversation",
-                "description": "Encerrar conversa e limpar contexto quando usuário não precisa de mais nada",
+                "description": "Encerrar conversa e limpar contexto do banco de dados quando usuário indicar claramente que não precisa de mais nada (ex: 'não', 'não preciso', 'não obrigado', 'só isso', 'tchau'). Use APENAS após perguntar 'Posso te ajudar com mais alguma coisa?' e receber resposta negativa. NÃO use para perguntas do usuário ou quando ele está pedindo ajuda.",
                 "input_schema": {
                     "type": "object",
                     "properties": {},
@@ -2958,13 +2973,34 @@ Lembre-se: Seja natural, adaptável e prestativa. Use as tools disponíveis conf
             convenio_info = convenios_aceitos.get(insurance_plan, {})
             convenio_nome = convenio_info.get('nome', 'Particular')
             
-            return f"✅ *Agendamento realizado com sucesso!*\n\n" + \
-                   "Obrigado por confiar em nossa clínica! 😊\n\n" + \
-                   "📋 *Informações importantes:*\n" + \
-                   "• Por favor, traga seus últimos exames\n" + \
-                   "• Traga a lista de medicações que você usa\n\n" + \
-                   "Vamos enviar uma notificação por WhatsApp no dia da sua consulta.\n\n" + \
-                   "Posso te ajudar com mais alguma coisa?"
+            # Formatar data e horário para exibição
+            dias_semana = ['segunda-feira', 'terça-feira', 'quarta-feira', 
+                          'quinta-feira', 'sexta-feira', 'sábado', 'domingo']
+            appointment_datetime_obj = parse_date_br(appointment_date)
+            if appointment_datetime_obj:
+                dia_nome_completo = dias_semana[appointment_datetime_obj.weekday()]
+                data_formatada = f"{format_date_br(appointment_datetime_obj)} ({dia_nome_completo})"
+            else:
+                data_formatada = appointment_date
+            
+            # Buscar endereço e informações adicionais
+            endereco = self.clinic_info.get('endereco', 'Endereço não informado')
+            info_adicionais = self.clinic_info.get('informacoes_adicionais', {})
+            cadeira_rodas = info_adicionais.get('cadeira_rodas_disponivel', False)
+            
+            # Retornar contexto para Claude gerar mensagem natural
+            return f"✅ Agendamento criado com sucesso!\n\n" + \
+                   f"IMPORTANTE: Agora você DEVE gerar uma mensagem natural e amigável para o usuário incluindo:\n\n" + \
+                   f"📅 Confirmação: Consulta confirmada para *{data_formatada} às {appointment_time}*\n" + \
+                   f"👤 Paciente: {patient_name}\n" + \
+                   f"🏥 Tipo: {tipo_nome}\n\n" + \
+                   f"📋 Informações importantes a incluir:\n" + \
+                   f"• Por favor, traga seus últimos exames\n" + \
+                   f"• Traga a lista de medicações que você usa\n" + \
+                   f"• Endereço: {endereco}\n" + \
+                   (f"• Temos cadeira de rodas disponível no local\n" if cadeira_rodas else "") + \
+                   f"• Você receberá uma mensagem de lembrete no dia da consulta via WhatsApp para relembrar sobre sua consulta\n\n" + \
+                   f"Gere uma mensagem natural incluindo todas essas informações e termine perguntando: 'Posso te ajudar com mais alguma coisa?'"
                    
         except Exception as e:
             logger.error(f"Erro ao criar agendamento: {str(e)}")
