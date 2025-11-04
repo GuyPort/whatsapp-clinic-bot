@@ -178,6 +178,14 @@ Quando o usuário escolher marcar consulta (opção 1), você precisa coletar:
    - Esta tool busca o próximo horário disponível respeitando 48 horas exatas de antecedência mínima
    - A tool retorna um resumo completo formatado - repasse a mensagem ao usuário
    - O sistema calcula 48h a partir do momento atual, contando finais de semana também
+   - IMPORTANTE: Quando receber resultado de find_next_available_slot, SEMPRE mostre o resumo completo retornado pela tool antes de pedir confirmação. Não assuma que o usuário já viu o resumo.
+
+FLUXO COMPLETO APÓS COLETAR DADOS:
+1. Chame find_next_available_slot (sem texto prévio)
+2. Receba o resultado completo com resumo formatado
+3. SEMPRE mostre o resumo completo ao usuário (copie exatamente o que a tool retornou)
+4. Depois de mostrar o resumo, pergunte: "Posso confirmar o agendamento?"
+5. Aguarde confirmação antes de criar agendamento
 
 5. CONFIRMAÇÃO OU ALTERNATIVAS
    - Se usuário confirmar → use 'create_appointment' com os dados coletados
@@ -447,7 +455,7 @@ Lembre-se: Seja natural, adaptável e prestativa. Use as tools disponíveis conf
             },
             {
                 "name": "find_next_available_slot",
-                "description": "Encontra automaticamente o próximo horário disponível para agendamento respeitando 48h de antecedência mínima. Use esta tool APÓS coletar todos os dados do paciente (nome, data nascimento, tipo consulta e convênio). Esta tool busca o primeiro dia útil após 48h e encontra o primeiro horário disponível desse dia. Retorna resumo completo formatado pronto para confirmação.",
+                "description": "Encontra automaticamente o próximo horário disponível para agendamento respeitando 48h de antecedência mínima. Use esta tool APÓS coletar todos os dados do paciente (nome, data nascimento, tipo consulta e convênio). Esta tool busca o primeiro dia útil após 48h e encontra o primeiro horário disponível desse dia. Retorna resumo completo formatado pronto para confirmação. IMPORTANTE: Sempre mostre o resumo completo retornado pela tool ao usuário antes de pedir confirmação.",
                 "input_schema": {
                     "type": "object",
                     "properties": {},
@@ -1589,6 +1597,13 @@ Lembre-se: Seja natural, adaptável e prestativa. Use as tools disponíveis conf
             context = None
             if phone:
                 context = db.query(ConversationContext).filter_by(phone=phone).first()
+            
+            # Remover flag appointment_completed ao iniciar novo agendamento
+            if context and context.flow_data and context.flow_data.get("appointment_completed"):
+                context.flow_data.pop("appointment_completed", None)
+                flag_modified(context, "flow_data")
+                db.commit()
+                logger.info("🧹 Flag appointment_completed removida - novo agendamento iniciado")
             
             if not context or not context.flow_data:
                 return "Para buscar o próximo horário disponível, preciso dos seus dados primeiro. Por favor, me informe seu nome completo."
