@@ -187,6 +187,16 @@ FLUXO COMPLETO APÓS COLETAR DADOS:
 4. Depois de mostrar o resumo, pergunte: "Posso confirmar o agendamento?"
 5. Aguarde confirmação antes de criar agendamento
 
+REGRAS CRÍTICAS PARA find_next_available_slot:
+1. Quando receber resultado desta tool, você DEVE:
+   a) Copiar EXATAMENTE o resumo completo retornado (incluindo todas as linhas: Nome, Tipo, Convênio, Data, Horário)
+   b) Mostrar o resumo COMPLETO ao usuário (sem omitir nada, sem resumir, sem parafrasear)
+   c) DEPOIS de mostrar o resumo completo, adicione: "Posso confirmar o agendamento?"
+2. NUNCA pule a etapa de mostrar o resumo completo
+3. NUNCA peça confirmação sem mostrar o resumo primeiro
+4. NUNCA assuma que o usuário já viu o resumo - sempre mostre novamente
+5. O resumo retornado pela tool contém TODAS as informações necessárias - use-o completamente
+
 5. CONFIRMAÇÃO OU ALTERNATIVAS
    - Se usuário confirmar → use 'create_appointment' com os dados coletados
    - Se usuário rejeitar → chame 'find_alternative_slots' para mostrar 3 opções alternativas
@@ -1335,6 +1345,42 @@ Lembre-se: Seja natural, adaptável e prestativa. Use as tools disponíveis conf
                             logger.info(f"📋 Response content length: {len(current_response.content) if current_response.content else 0}")
                             logger.info(f"📋 Response stop_reason: {current_response.stop_reason}")
                             
+                            # Validação especial para find_next_available_slot
+                            # Se a tool foi find_next_available_slot e a resposta do Claude é muito curta ou não contém palavras-chave do resumo,
+                            # interceptar e garantir que o resumo seja mostrado
+                            if content.name == "find_next_available_slot":
+                                if current_response.content and len(current_response.content) > 0:
+                                    content_text = ""
+                                    if current_response.content[0].type == "text":
+                                        content_text = current_response.content[0].text
+                                    
+                                    # Verificar se resposta é muito curta (< 100 chars) ou não contém palavras-chave do resumo
+                                    palavras_chave = ["Nome", "Tipo", "Convênio", "Data", "Horário", "Resumo"]
+                                    tem_palavras_chave = any(palavra in content_text for palavra in palavras_chave)
+                                    
+                                    if len(content_text) < 100 or not tem_palavras_chave:
+                                        logger.warning(f"⚠️ Resposta muito curta ou sem resumo após find_next_available_slot. Interceptando resposta.")
+                                        # Interceptar: criar nova resposta com resumo completo + pergunta de confirmação
+                                        resposta_completa = tool_result + "\n\nPosso confirmar o agendamento?"
+                                        # Criar objeto simples com type e text para substituir o conteúdo
+                                        class SimpleTextContent:
+                                            def __init__(self, text):
+                                                self.type = "text"
+                                                self.text = text
+                                        current_response.content = [SimpleTextContent(resposta_completa)]
+                                        logger.info(f"✅ Resumo completo adicionado à resposta com pergunta de confirmação")
+                                        
+                                        # Processar imediatamente o conteúdo interceptado
+                                        if current_response.content[0].type == "text":
+                                            bot_response = current_response.content[0].text
+                                            break
+                            
+                            # Verificar se Claude retornou texto após processar tool (iteração normal)
+                            if current_response.content and len(current_response.content) > 0:
+                                if current_response.content[0].type == "text":
+                                    bot_response = current_response.content[0].text
+                                    break
+                            
                             # Continuar loop para processar próxima resposta
                         else:
                             # Tipo desconhecido, sair do loop
@@ -1779,14 +1825,31 @@ Lembre-se: Seja natural, adaptável e prestativa. Use as tools disponíveis conf
                           'quinta-feira', 'sexta-feira', 'sábado', 'domingo']
             dia_nome_completo = dias_semana[found_date.weekday()]
             
+            # Validar first_slot antes de formatar
+            if not first_slot:
+                logger.error(f"❌ first_slot é None ou inválido")
+                return "❌ Erro ao buscar horário disponível. Por favor, tente novamente."
+            
+            # Verificar se first_slot é datetime válido
+            if not isinstance(first_slot, datetime):
+                logger.error(f"❌ first_slot não é datetime: {type(first_slot)}")
+                return "❌ Erro ao buscar horário disponível. Por favor, tente novamente."
+            
+            # Formatar horário com validação
+            try:
+                horario_str = first_slot.strftime('%H:%M')
+                logger.info(f"✅ Horário formatado: {horario_str}")
+            except Exception as e:
+                logger.error(f"❌ Erro ao formatar horário: {str(e)}")
+                horario_str = "N/A"
+            
             response = f"✅ Encontrei o próximo horário disponível para você!\n\n"
             response += f"📋 *Resumo da consulta:*\n"
             response += f"👤 Nome: {patient_name}\n"
             response += f"🏥 Tipo: {tipo_nome} - R$ {tipo_valor}\n"
             response += f"💳 Convênio: {convenio_nome}\n"
             response += f"📅 Data: {format_date_br(found_date)} ({dia_nome_completo})\n"
-            response += f"⏰ Horário: {first_slot.strftime('%H:%M')}\n\n"
-            response += f"Posso confirmar o agendamento?"
+            response += f"⏰ Horário: {horario_str}\n"
             
             return response
             
