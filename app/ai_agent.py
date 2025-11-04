@@ -224,9 +224,9 @@ FERRAMENTAS E QUANDO USAR
 
 - get_clinic_info: Quando usuário perguntar sobre horários, endereço, telefone, dias fechados, etc. Execute imediatamente.
 
-- extract_patient_data: Use quando o usuário mencionar seu nome mas você não tiver certeza ou precisar validar. Também use quando precisar extrair nome/data do histórico de mensagens, especialmente se houver dúvida sobre se um texto é nome real ou frase de pedido.
+- extract_patient_data: Use quando o usuário mencionar seu nome mas você não tiver certeza ou precisar validar. Também use quando precisar extrair nome/data do histórico de mensagens, especialmente se houver dúvida sobre se um texto é nome real ou frase de pedido. IMPORTANTE: O sistema já extrai automaticamente nome quando formato é "Nome, DD/MM/YYYY", então use esta tool apenas se houver dúvida ou se precisar validar.
 
-- find_next_available_slot: Use APÓS coletar nome, data nascimento, tipo consulta e convênio. Busca automaticamente próximo horário (48h mínimo).
+- find_next_available_slot: Use APÓS coletar nome, data nascimento, tipo consulta e convênio. IMPORTANTE: Antes de chamar, verifique se tem todos os dados necessários. O sistema tenta extrair automaticamente dados faltantes, mas se ainda faltar algo, pergunte ao usuário antes de chamar esta tool. Busca automaticamente próximo horário (48h mínimo).
 
 - find_alternative_slots: Use quando usuário rejeitar o primeiro horário oferecido. Retorna 3 opções alternativas.
 
@@ -499,7 +499,7 @@ Lembre-se: Seja natural, adaptável e prestativa. Use as tools disponíveis conf
         """
         try:
             data = {
-                "patient_name": None,  # NÃO extrair aqui - deixar Claude fazer
+                "patient_name": None,  # Agora vamos extrair aqui também
                 "patient_birth_date": None,
                 "appointment_date": None,
                 "appointment_time": None,
@@ -546,6 +546,51 @@ Lembre-se: Seja natural, adaptável e prestativa. Use as tools disponíveis conf
                                 # Provavelmente data de nascimento
                                 data["patient_birth_date"] = full_date
                                 logger.info(f"📅 Data nascimento extraída (regex): {full_date}")
+                                
+                                # 3. EXTRAÇÃO DE NOME quando formato é "Nome, DD/MM/YYYY" ou "Nome DD/MM/YYYY"
+                                # Se encontrou data de nascimento, tentar extrair nome que vem antes dela
+                                if not data["patient_name"]:
+                                    # Padrão: texto antes da data (pode ter vírgula ou espaço)
+                                    # Ex: "Andressa Schenkel, 01/08/2002" ou "Andressa Schenkel 01/08/2002"
+                                    name_pattern = r'^(.+?)(?:\s*,\s*|\s+)(?:' + re.escape(full_date) + r')'
+                                    name_match = re.search(name_pattern, content, re.IGNORECASE)
+                                    
+                                    if name_match:
+                                        candidate_name = name_match.group(1).strip()
+                                        # Validar se parece com nome real
+                                        words = candidate_name.split()
+                                        if len(words) >= 2 and len(candidate_name) > 5:
+                                            # Verificar se não é frase comum
+                                            common_phrases = [
+                                                "preciso marcar", "quero agendar", "preciso de", "gostaria de",
+                                                "meu nome é", "sou", "me chamo", "olá", "oi", "bom dia", "boa tarde"
+                                            ]
+                                            if not any(phrase in candidate_name.lower() for phrase in common_phrases):
+                                                # Validar que contém apenas letras, espaços, hífens e acentos
+                                                if re.match(r"^[a-zA-ZÀ-ÿ\s\-']+$", candidate_name):
+                                                    data["patient_name"] = candidate_name
+                                                    logger.info(f"💾 Nome extraído automaticamente: {candidate_name}")
+                                    
+                                    # Se não encontrou com padrão acima, tentar padrão mais simples
+                                    # Procura por 2+ palavras antes da data
+                                    if not data["patient_name"]:
+                                        # Remover data da mensagem e pegar o que sobra
+                                        content_without_date = re.sub(r'\s*\d{1,2}/\d{1,2}/\d{4}\s*', ' ', content).strip()
+                                        # Pegar primeiras palavras (até 4 palavras, mínimo 2)
+                                        words_before_date = content_without_date.split()[:4]
+                                        if len(words_before_date) >= 2:
+                                            candidate_name = ' '.join(words_before_date)
+                                            # Validar novamente
+                                            if len(candidate_name) > 5:
+                                                common_phrases = [
+                                                    "preciso marcar", "quero agendar", "preciso de", "gostaria de",
+                                                    "meu nome é", "sou", "me chamo", "olá", "oi", "bom dia", "boa tarde"
+                                                ]
+                                                if not any(phrase in candidate_name.lower() for phrase in common_phrases):
+                                                    if re.match(r"^[a-zA-ZÀ-ÿ\s\-']+$", candidate_name):
+                                                        data["patient_name"] = candidate_name
+                                                        logger.info(f"💾 Nome extraído automaticamente (fallback): {candidate_name}")
+                            
                             elif not data["appointment_date"] and y >= 2010:
                                 # Provavelmente data de consulta
                                 data["appointment_date"] = full_date
@@ -1319,6 +1364,11 @@ Lembre-se: Seja natural, adaptável e prestativa. Use as tools disponíveis conf
             # Extrair dados do histórico
             extracted = self._extract_appointment_data_from_messages(context.messages)
             
+            # Salvar nome extraído automaticamente se encontrado
+            if extracted.get("patient_name") and not context.flow_data.get("patient_name"):
+                context.flow_data["patient_name"] = extracted["patient_name"]
+                logger.info(f"💾 Nome extraído automaticamente e salvo no flow_data: {extracted['patient_name']}")
+            
             # FALLBACK: Tentar extrair nome se não estiver no flow_data mas houver padrão claro nas mensagens
             if not context.flow_data.get("patient_name"):
                 # Verificar últimas mensagens do usuário por padrões claros de nome
@@ -1548,37 +1598,19 @@ Lembre-se: Seja natural, adaptável e prestativa. Use as tools disponíveis conf
             consultation_type = context.flow_data.get("consultation_type", "clinica_geral")
             insurance_plan = context.flow_data.get("insurance_plan", "particular")
             
-            # FALLBACK: Se nome não estiver no flow_data, tentar extrair do histórico de mensagens
+            # VERIFICAÇÃO AUTOMÁTICA: Se nome não estiver no flow_data, tentar extrair automaticamente
             if not patient_name:
-                logger.info("⚠️ Nome não encontrado no flow_data, tentando extrair do histórico...")
-                import re
-                name_patterns = [
-                    r'(?:meu nome é|sou|me chamo|me chama|chamo-me)\s+([A-ZÁÉÍÓÚÂÊÔÇ][a-záéíóúâêôçãõ]+(?:\s+[A-ZÁÉÍÓÚÂÊÔÇ][a-záéíóúâêôçãõ]+)+)',
-                    r'(?:nome|chamo)\s+([A-ZÁÉÍÓÚÂÊÔÇ][a-záéíóúâêôçãõ]+(?:\s+[A-ZÁÉÍÓÚÂÊÔÇ][a-záéíóúâêôçãõ]+)+)',
-                ]
+                logger.info("⚠️ Nome não encontrado no flow_data, tentando extrair automaticamente...")
                 
-                # Verificar últimas mensagens do usuário
-                for msg in reversed(context.messages[-10:]):
-                    if msg.get("role") == "user":
-                        content = (msg.get("content") or "").strip()
-                        for pattern in name_patterns:
-                            match = re.search(pattern, content, re.IGNORECASE)
-                            if match:
-                                candidate_name = match.group(1).strip()
-                                words = candidate_name.split()
-                                if len(words) >= 2 and len(candidate_name) > 5:
-                                    common_phrases = ["preciso marcar", "quero agendar", "preciso de", "gostaria de"]
-                                    if not any(phrase in candidate_name.lower() for phrase in common_phrases):
-                                        patient_name = candidate_name
-                                        # Salvar no flow_data para próxima vez
-                                        context.flow_data["patient_name"] = patient_name
-                                        db.commit()
-                                        logger.info(f"✅ Nome extraído do histórico e salvo: {patient_name}")
-                                        break
-                        if patient_name:
-                            break
+                # Primeiro: tentar usar _extract_appointment_data_from_messages (agora extrai nome também)
+                extracted = self._extract_appointment_data_from_messages(context.messages)
+                if extracted.get("patient_name"):
+                    patient_name = extracted["patient_name"]
+                    context.flow_data["patient_name"] = patient_name
+                    db.commit()
+                    logger.info(f"✅ Nome extraído automaticamente: {patient_name}")
                 
-                # Se ainda não encontrou, tentar usar extract_patient_data internamente
+                # Se ainda não encontrou, tentar usar extract_patient_data com Claude
                 if not patient_name:
                     logger.info("🔍 Tentando usar extract_patient_data para extrair nome...")
                     try:
@@ -1652,21 +1684,50 @@ Lembre-se: Seja natural, adaptável e prestativa. Use as tools disponíveis conf
                     start_from_time = minimum_datetime
                 
                 # Buscar primeiro slot disponível deste dia respeitando 48h
-                first_slot = appointment_rules._find_first_available_slot_in_day(
-                    temp_date, duracao, db, start_from_time=start_from_time
-                )
-                
-                # Se encontrou slot, usar (já está garantido que é >= minimum_datetime se start_from_time foi passado)
-                if first_slot:
-                    # Garantir timezone-aware para comparação final
-                    if first_slot.tzinfo is None:
-                        tz = get_brazil_timezone()
-                        first_slot = tz.localize(first_slot)
+                try:
+                    first_slot = appointment_rules._find_first_available_slot_in_day(
+                        temp_date, duracao, db, start_from_time=start_from_time
+                    )
                     
-                    # Verificação adicional de segurança (mesmo que start_from_time já tenha filtrado)
-                    if first_slot >= minimum_datetime:
-                        found_date = current_date
-                        break
+                    # Se encontrou slot, usar (já está garantido que é >= minimum_datetime se start_from_time foi passado)
+                    if first_slot:
+                        # Garantir timezone-aware para comparação final
+                        if first_slot.tzinfo is None:
+                            tz = get_brazil_timezone()
+                            first_slot = tz.localize(first_slot)
+                        
+                        # Verificação adicional de segurança (mesmo que start_from_time já tenha filtrado)
+                        if first_slot >= minimum_datetime:
+                            found_date = current_date
+                            break
+                except TypeError as e:
+                    # Erro específico de timezone: "can't compare offset-naive and offset-aware datetimes"
+                    if "timezone" in str(e).lower() or "offset" in str(e).lower():
+                        logger.error(f"⚠️ Erro de timezone ao buscar slots: {str(e)}")
+                        logger.error(f"   Tentando normalizar timezones...")
+                        # Tentar recuperação: normalizar temp_date antes de tentar novamente
+                        try:
+                            # Remover timezone de temp_date se presente
+                            if temp_date.tzinfo is not None:
+                                temp_date = temp_date.replace(tzinfo=None)
+                            # Tentar novamente
+                            first_slot = appointment_rules._find_first_available_slot_in_day(
+                                temp_date, duracao, db, start_from_time=start_from_time
+                            )
+                            if first_slot:
+                                if first_slot.tzinfo is None:
+                                    tz = get_brazil_timezone()
+                                    first_slot = tz.localize(first_slot)
+                                if first_slot >= minimum_datetime:
+                                    found_date = current_date
+                                    break
+                        except Exception as e2:
+                            logger.error(f"❌ Erro ao tentar recuperação de timezone: {str(e2)}")
+                            # Continuar para próximo dia
+                            pass
+                    else:
+                        # Re-raise se não for erro de timezone
+                        raise
                 
                 # Próximo dia
                 current_date += timedelta(days=1)
@@ -1715,8 +1776,16 @@ Lembre-se: Seja natural, adaptável e prestativa. Use as tools disponíveis conf
             return response
             
         except Exception as e:
-            logger.error(f"Erro ao buscar próximo horário disponível: {str(e)}", exc_info=True)
-            return f"Erro ao buscar horário disponível: {str(e)}"
+            error_msg = str(e)
+            logger.error(f"❌ Erro ao buscar próximo horário disponível: {error_msg}", exc_info=True)
+            
+            # Mensagens específicas para erros conhecidos
+            if "timezone" in error_msg.lower() or "offset" in error_msg.lower():
+                logger.error("⚠️ Erro de timezone detectado. Isso pode indicar problema na normalização de datetimes.")
+                return "Desculpe, ocorreu um problema técnico ao buscar horários disponíveis. Por favor, tente novamente ou entre em contato conosco."
+            else:
+                logger.error(f"❌ Erro inesperado: {error_msg}")
+                return "Desculpe, ocorreu um erro ao processar sua solicitação. Por favor, tente novamente ou me informe o que você precisa."
 
     def _handle_find_alternative_slots(self, tool_input: Dict, db: Session, phone: str = None) -> str:
         """

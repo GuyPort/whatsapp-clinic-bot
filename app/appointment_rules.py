@@ -128,14 +128,24 @@ class AppointmentRules:
         fim_h, fim_m = map(int, fim_str.split(':'))
         
         # Criar datetime para início e fim
+        # IMPORTANTE: Garantir que todos sejam timezone-naive para evitar erros de comparação
         start_time = target_date.replace(hour=inicio_h, minute=inicio_m, second=0, microsecond=0)
         last_slot_start = target_date.replace(hour=fim_h, minute=fim_m, second=0, microsecond=0)
+        
+        # Remover timezone se presente (garantir timezone-naive)
+        if start_time.tzinfo is not None:
+            start_time = start_time.replace(tzinfo=None)
+        if last_slot_start.tzinfo is not None:
+            last_slot_start = last_slot_start.replace(tzinfo=None)
         
         # Ajustar para sábado se necessário
         if weekday == 5:
             ultima_hora_sabado = self.rules.get('horario_ultima_consulta_sabado', '11:30')
             h, m = map(int, ultima_hora_sabado.split(':'))
             last_slot_start = target_date.replace(hour=h, minute=m, second=0, microsecond=0)
+            # Garantir timezone-naive após replace
+            if last_slot_start.tzinfo is not None:
+                last_slot_start = last_slot_start.replace(tzinfo=None)
 
         closing_time = last_slot_start + timedelta(minutes=consultation_duration)
         
@@ -148,8 +158,10 @@ class AppointmentRules:
         ).all()
         
         # Gerar slots de hora inteira (apenas horários como 14:00, 15:00, 16:00, etc.)
-        # Garantir que start_time tem minutos == 0
+        # Garantir que start_time tem minutos == 0 e é timezone-naive
         current = start_time.replace(minute=0, second=0, microsecond=0)
+        if current.tzinfo is not None:
+            current = current.replace(tzinfo=None)
         
         while current <= last_slot_start and (limit is None or len(available_slots) < limit):
             slot_end = current + timedelta(minutes=consultation_duration)
