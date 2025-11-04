@@ -243,7 +243,10 @@ FERRAMENTAS E QUANDO USAR
 
 - cancel_appointment: Use para cancelar uma consulta existente.
 
-- request_human_assistance: Use quando usuário pedir para falar com humano, doutora, atendente, etc. Execute imediatamente sem perguntar confirmação.
+- request_human_assistance: Use APENAS quando usuário solicitar EXPLICITAMENTE falar com secretária ou atendente humano. 
+  Exemplos válidos: "quero falar com a secretária", "preciso de atendente", "pode transferir para humano".
+  NÃO use para: saudações como "Olá, Doutora", menções casuais ou quando usuário está apenas sendo educado.
+  Lembre-se: o objetivo é automatizar - só transfira quando realmente necessário.
 
 - end_conversation: Use quando usuário indicar que não precisa de mais nada (após pergunta "Posso te ajudar com mais alguma coisa?").
 
@@ -462,7 +465,7 @@ Lembre-se: Seja natural, adaptável e prestativa. Use as tools disponíveis conf
             },
             {
                 "name": "request_human_assistance",
-                "description": "Transferir atendimento para humano quando solicitado. Use imediatamente quando usuário pedir para falar com humano, doutora, atendente, etc. Execute sem perguntar confirmação.",
+                "description": "Transferir atendimento para SECRETÁRIA quando solicitado explicitamente. Use APENAS quando usuário solicitar claramente falar com secretária ou atendente humano (ex: 'quero falar com a secretária', 'preciso de atendente', 'pode transferir'). NÃO use para saudações casuais ou menções à doutora. Execute imediatamente sem perguntar confirmação quando houver solicitação explícita.",
                 "input_schema": {
                     "type": "object",
                     "properties": {},
@@ -2923,7 +2926,7 @@ Lembre-se: Seja natural, adaptável e prestativa. Use as tools disponíveis conf
             if not is_open:
                 # Clínica fechada - NÃO criar pausa, bot continua ativo
                 logger.info(f"🏥 Clínica fechada para {phone}: {message}")
-                return "No momento não temos atendentes disponíveis. Mas posso te ajudar! Como posso te auxiliar?"
+                return "No momento nossa secretária não está disponível (clínica fechada). Mas eu posso te ajudar com agendamentos, consultas e outras informações! Como posso te auxiliar?"
             
             # 2. Clínica aberta - prosseguir com transferência
             logger.info(f"🏥 Clínica aberta para {phone}: {message}")
