@@ -167,10 +167,18 @@ Quando o usuário escolher marcar consulta (opção 1), você precisa coletar:
 
    Vamos prosseguir com consulta particular se você não tiver convênio."
    
-   - Negativas: "não", "não tenho", "sem convênio" → marcar como "Particular"
-   - Positivas específicas: "CABERGS", "IPE" → usar o nome
-   - Positivas genéricas: "sim", "tenho" → perguntar qual
-   - Use seu entendimento de linguagem natural para interpretar a intenção
+   IMPORTANTE - INTERPRETAÇÃO DE CONVÊNIO:
+   - Você DEVE identificar e interpretar o convênio quando o usuário mencionar durante a conversa
+   - Use seu entendimento de linguagem natural para interpretar a intenção do usuário
+   - Exemplos de identificação:
+     * "CABERGS", "cabergs", "CaberGs" → CABERGS
+     * "IPE", "ipe" → IPE
+     * "não", "não tenho", "sem convênio", "particular" → Particular
+     * "sim, tenho" (quando você perguntou sobre convênio) → perguntar qual específico
+   - Quando identificar o convênio, salve mentalmente e use nas próximas interações
+   - Normalize sempre os valores: CABERGS, IPE ou Particular (não "particular" minúsculo)
+   - Ao chamar tools como find_next_available_slot ou create_appointment, se você identificou o convênio, passe como parâmetro insurance_plan
+   - Se não passou como parâmetro, as tools buscarão automaticamente do flow_data
 
 4. BUSCA AUTOMÁTICA DE HORÁRIO
    - Após coletar convênio (ou particular), chame IMEDIATAMENTE a tool 'find_next_available_slot' SEM ADICIONAR TEXTO PRÉVIO
@@ -229,13 +237,15 @@ REGRAS CRÍTICAS PARA find_next_available_slot:
    a) Execute create_appointment com TODOS os dados
    b) Os dados vêm do flow_data (já foram salvos nas etapas anteriores)
    c) Quando create_appointment retornar sucesso, você receberá um contexto com informações importantes
-   d) VOCÊ DEVE gerar uma mensagem natural e amigável incluindo TODAS as informações fornecidas:
-      - Confirmação da data e horário da consulta
-      - Pedido para trazer últimos exames
-      - Pedido para tragar lista de medicações
-      - Endereço completo do consultório
-      - Informação sobre cadeira de rodas disponível (se mencionado no contexto)
-      - Informação sobre mensagem de lembrete que será enviada no dia da consulta para relembrar sobre a consulta
+   d) VOCÊ DEVE gerar uma mensagem natural e amigável incluindo APENAS as informações fornecidas:
+      - NÃO inclua resumo da consulta (data, horário, paciente, tipo) - o usuário já sabe disso
+      - NÃO inclua mensagem de sucesso em negrito ou emojis de celebração
+      - Inclua APENAS as informações importantes:
+        * Pedido para trazer últimos exames
+        * Pedido para tragar lista de medicações
+        * Endereço completo do consultório
+        * Informação sobre cadeira de rodas disponível (se mencionado no contexto)
+        * Informação sobre mensagem de lembrete que será enviada no dia da consulta para relembrar sobre a consulta
    e) Termine sempre perguntando: "Posso te ajudar com mais alguma coisa?"
 
 IMPORTANTE - FLUXO DE CONFirmaÇÃO:
@@ -639,55 +649,9 @@ Lembre-se: Seja natural, adaptável e prestativa. Use as tools disponíveis conf
                     data["consultation_type"] = type_map[content]
                     logger.info(f"💾 Tipo de consulta atualizado (escolha explícita): {data['consultation_type']}")
                 
-                # 5. EXTRAÇÃO DE CONVÊNIO - SEMPRE atualizar quando escolha explícita
-                content_lower = content.lower().strip()
-                content_stripped = content.strip().lower()
-                
-                # Log para debug
-                logger.info(f"🔍 CONVÊNIO - Mensagem do usuário: '{content}'")
-                logger.info(f"🔍 CONVÊNIO - Conteúdo processado: '{content_lower}'")
-                
-                # NOVA LÓGICA: Detectar respostas ultra-curtas PRIMEIRO
-                
-                # 1. Detectar respostas negativas ultra-curtas (1-2 caracteres)
-                if content_stripped in ["não", "nao", "n", "nope", "nunca"]:
-                    data["insurance_plan"] = "Particular"
-                    logger.info(f"💳 Convênio: Particular (resposta negativa curta: '{content_stripped}')")
-                    
-                # 2. Detectar convênios explícitos
-                elif "cabergs" in content_lower:
-                    data["insurance_plan"] = "CABERGS"
-                    logger.info(f"💾 Convênio: CABERGS (menção direta)")
-                    
-                elif "ipe" in content_lower:
-                    data["insurance_plan"] = "IPE"
-                    logger.info(f"💾 Convênio: IPE (menção direta)")
-                    
-                # 3. Compatibilidade numérica
-                elif content in ["1", "2"]:
-                    insurance_map = {"1": "CABERGS", "2": "IPE"}
-                    data["insurance_plan"] = insurance_map[content]
-                    logger.info(f"💾 Convênio: {data['insurance_plan']} (escolha numérica)")
-                    
-                # 4. Detectar frases negativas completas (lista expandida)
-                else:
-                    negative_insurance = [
-                        # Frases completas
-                        "não tenho", "nao tenho", "não possuo", "nao possuo",
-                        "sem convênio", "sem convenio", "não tenho convênio", "nao tenho convenio",
-                        "não possuo convênio", "nao possuo convenio",
-                        # Palavras-chave de negação
-                        "sem plano", "não uso", "nao uso",
-                        # Particular explícito
-                        "particular", "prefiro particular", "quero particular", "vou particular"
-                    ]
-                    
-                    if any(phrase in content_lower for phrase in negative_insurance):
-                        data["insurance_plan"] = "Particular"
-                        logger.info(f"💳 Convênio: Particular (frase negativa detectada)")
-                
-                # Log do resultado final
-                logger.info(f"🔍 CONVÊNIO - Resultado da detecção: '{data.get('insurance_plan', 'Nenhum')}'")
+                # 5. EXTRAÇÃO DE CONVÊNIO - Removida detecção via regex
+                # A detecção de convênio agora é feita totalmente pelo Claude durante a conversa
+                # Claude identifica e interpreta naturalmente quando o usuário menciona convênio
             
             logger.info(f"📋 Extração concluída: {data}")
             return data
@@ -1673,6 +1637,20 @@ Lembre-se: Seja natural, adaptável e prestativa. Use as tools disponíveis conf
             patient_name = context.flow_data.get("patient_name")
             consultation_type = context.flow_data.get("consultation_type", "clinica_geral")
             insurance_plan = context.flow_data.get("insurance_plan", "particular")
+            
+            # SALVAMENTO AUTOMÁTICO: Se insurance_plan foi identificado por Claude mas não está no flow_data,
+            # tentar extrair do histórico recente (pode ter sido mencionado na última mensagem)
+            if not insurance_plan or insurance_plan == "particular":
+                # Tentar extrair do histórico usando extract_patient_data
+                try:
+                    extracted = self._extract_patient_data_with_claude(context)
+                    if extracted.get("insurance_plan"):
+                        insurance_plan = extracted["insurance_plan"]
+                        context.flow_data["insurance_plan"] = insurance_plan
+                        db.commit()
+                        logger.info(f"💾 Convênio identificado e salvo no flow_data: {insurance_plan}")
+                except Exception as e:
+                    logger.warning(f"⚠️ Erro ao tentar extrair convênio: {str(e)}")
             
             # VERIFICAÇÃO AUTOMÁTICA: Se nome não estiver no flow_data, tentar extrair automaticamente
             if not patient_name:
@@ -2808,6 +2786,18 @@ Lembre-se: Seja natural, adaptável e prestativa. Use as tools disponíveis conf
                         if context.flow_data.get("insurance_plan"):
                             insurance_plan = context.flow_data.get("insurance_plan")
                             logger.info(f"📋 Usando insurance_plan do flow_data (fallback): {insurance_plan}")
+                        else:
+                            # Tentar extrair do histórico usando extract_patient_data se não encontrou em flow_data
+                            try:
+                                extracted = self._extract_patient_data_with_claude(context)
+                                if extracted.get("insurance_plan"):
+                                    insurance_plan = extracted["insurance_plan"]
+                                    # Salvar no flow_data para próximas interações
+                                    context.flow_data["insurance_plan"] = insurance_plan
+                                    db.commit()
+                                    logger.info(f"💾 Convênio identificado e salvo no flow_data: {insurance_plan}")
+                            except Exception as e:
+                                logger.warning(f"⚠️ Erro ao tentar extrair convênio: {str(e)}")
             
             # Validar tipo de consulta
             valid_types = ["clinica_geral", "geriatria", "domiciliar"]
@@ -2826,6 +2816,21 @@ Lembre-se: Seja natural, adaptável e prestativa. Use as tools disponíveis conf
                 insurance_plan = "Particular"
             
             logger.info(f"✅ Convênio validado: {insurance_plan}")
+            
+            # SALVAMENTO AUTOMÁTICO: Após validação e normalização, salvar no flow_data para garantir persistência
+            if insurance_plan and phone:
+                context = db.query(ConversationContext).filter_by(phone=phone).first()
+                if context:
+                    if not context.flow_data:
+                        context.flow_data = {}
+                    convenio_anterior = context.flow_data.get("insurance_plan")
+                    if convenio_anterior != insurance_plan:
+                        context.flow_data["insurance_plan"] = insurance_plan
+                        db.commit()
+                        if convenio_anterior:
+                            logger.info(f"💾 Convênio atualizado no flow_data: {convenio_anterior} → {insurance_plan}")
+                        else:
+                            logger.info(f"💾 Convênio salvo no flow_data: {insurance_plan}")
             
             # Log detalhado antes da validação
             logger.info(f"🔍 Validando dados para criar agendamento:")
@@ -2989,18 +2994,15 @@ Lembre-se: Seja natural, adaptável e prestativa. Use as tools disponíveis conf
             cadeira_rodas = info_adicionais.get('cadeira_rodas_disponivel', False)
             
             # Retornar contexto para Claude gerar mensagem natural
-            return f"✅ Agendamento criado com sucesso!\n\n" + \
-                   f"IMPORTANTE: Agora você DEVE gerar uma mensagem natural e amigável para o usuário incluindo:\n\n" + \
-                   f"📅 Confirmação: Consulta confirmada para *{data_formatada} às {appointment_time}*\n" + \
-                   f"👤 Paciente: {patient_name}\n" + \
-                   f"🏥 Tipo: {tipo_nome}\n\n" + \
+            # IMPORTANTE: NÃO incluir resumo da consulta (data, horário, paciente, tipo) - apenas informações importantes
+            return f"Agendamento criado com sucesso. Agora você DEVE gerar uma mensagem natural e amigável para o usuário incluindo APENAS estas informações importantes:\n\n" + \
                    f"📋 Informações importantes a incluir:\n" + \
                    f"• Por favor, traga seus últimos exames\n" + \
-                   f"• Traga a lista de medicações que você usa\n" + \
+                   f"• Traga a lista de medicações que você usa atualmente\n" + \
                    f"• Endereço: {endereco}\n" + \
-                   (f"• Temos cadeira de rodas disponível no local\n" if cadeira_rodas else "") + \
+                   (f"• Temos cadeira de rodas disponível no local, caso precise\n" if cadeira_rodas else "") + \
                    f"• Você receberá uma mensagem de lembrete no dia da consulta via WhatsApp para relembrar sobre sua consulta\n\n" + \
-                   f"Gere uma mensagem natural incluindo todas essas informações e termine perguntando: 'Posso te ajudar com mais alguma coisa?'"
+                   f"NÃO inclua resumo da consulta (data, horário, paciente, tipo). NÃO inclua mensagem de sucesso em negrito ou emojis de celebração. Gere uma mensagem natural incluindo apenas essas informações e termine perguntando: 'Posso te ajudar com mais alguma coisa?'"
                    
         except Exception as e:
             logger.error(f"Erro ao criar agendamento: {str(e)}")
