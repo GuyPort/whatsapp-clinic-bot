@@ -1,7 +1,7 @@
 """
 Aplicação FastAPI principal com webhooks do WhatsApp.
 """
-from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
+from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 from contextlib import asynccontextmanager
 import logging
@@ -16,6 +16,8 @@ from app.whatsapp_service import whatsapp_service
 from app.utils import normalize_phone
 from app.models import Appointment, ConversationContext, PausedContact, AppointmentStatus
 from app.scheduler import start_scheduler, stop_scheduler
+from app.celery_app import celery_app
+import asyncio
 
 # Configurar logging
 logging.basicConfig(
@@ -175,7 +177,7 @@ async def health_check():
 
 
 @app.post("/webhook/whatsapp")
-async def whatsapp_webhook(request: Request, background_tasks: BackgroundTasks):
+async def whatsapp_webhook(request: Request):
     """
     Webhook para receber mensagens do Evolution API.
     
@@ -244,37 +246,61 @@ async def whatsapp_webhook(request: Request, background_tasks: BackgroundTasks):
         
         logger.info(f"Mensagem de {phone}: {message_text[:50]}...")
         
-        # Processar mensagem em background
-        background_tasks.add_task(
-            process_message_task,
-            phone,
-            message_text,
-            key.get('id')
-        )
+        # Enfileirar task no Celery
+        task = process_message_task.delay(phone, message_text, key.get('id'))
+        logger.info(f"📨 Task enfileirada: {task.id} para {phone}")
         
-        return {"status": "processing"}
+        return {"status": "processing", "task_id": task.id}
         
     except Exception as e:
         logger.error(f"Erro no webhook: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 
-async def process_message_task(phone: str, message_text: str, message_id: str = None):
+def _send_message_sync(phone: str, message: str) -> bool:
     """
-    Processa mensagem em background.
+    Wrapper síncrono para whatsapp_service.send_message (async).
+    Usado dentro de tasks Celery que são síncronas.
+    """
+    try:
+        return asyncio.run(whatsapp_service.send_message(phone, message))
+    except Exception as e:
+        logger.error(f"Erro ao enviar mensagem via wrapper síncrono: {str(e)}")
+        return False
+
+
+def _mark_message_as_read_sync(phone: str, message_id: str) -> bool:
+    """
+    Wrapper síncrono para whatsapp_service.mark_message_as_read (async).
+    Usado dentro de tasks Celery que são síncronas.
+    """
+    try:
+        return asyncio.run(whatsapp_service.mark_message_as_read(phone, message_id))
+    except Exception as e:
+        logger.error(f"Erro ao marcar mensagem como lida via wrapper síncrono: {str(e)}")
+        return False
+
+
+@celery_app.task(bind=True, max_retries=3, default_retry_delay=60)
+def process_message_task(self, phone: str, message_text: str, message_id: str = None):
+    """
+    Processa mensagem em background usando Celery.
     
     Args:
         phone: Número do telefone
         message_text: Texto da mensagem
         message_id: ID da mensagem (para marcar como lida)
     """
+    task_id = self.request.id
+    logger.info(f"🔄 Task {task_id} iniciada para {phone}: {message_text[:50]}...")
+    
     try:
         # Normalizar telefone
         phone = normalize_phone(phone)
         
         # Marcar como lida
         if message_id:
-            await whatsapp_service.mark_message_as_read(phone, message_id)
+            _mark_message_as_read_sync(phone, message_id)
         
         # Verificar se bot está pausado para este telefone
         with get_db() as db:
@@ -296,23 +322,28 @@ async def process_message_task(phone: str, message_text: str, message_id: str = 
         
         # Enviar resposta
         if response:
-            success = await whatsapp_service.send_message(phone, response)
+            success = _send_message_sync(phone, response)
             if success:
-                logger.info(f"Resposta enviada para {phone}")
+                logger.info(f"✅ Task {task_id} concluída - Resposta enviada para {phone}")
             else:
-                logger.error(f"Falha ao enviar resposta para {phone}")
+                logger.error(f"❌ Task {task_id} - Falha ao enviar resposta para {phone}")
+        else:
+            logger.warning(f"⚠️ Task {task_id} - Nenhuma resposta gerada para {phone}")
         
     except Exception as e:
-        logger.error(f"Erro ao processar mensagem: {str(e)}", exc_info=True)
+        logger.error(f"❌ Task {task_id} - Erro ao processar mensagem: {str(e)}", exc_info=True)
         
         # Tentar enviar mensagem de erro ao usuário
         try:
-            await whatsapp_service.send_message(
+            _send_message_sync(
                 phone,
                 "Desculpe, ocorreu um erro ao processar sua mensagem. Por favor, tente novamente em instantes."
             )
-        except:
-            pass
+        except Exception as send_error:
+            logger.error(f"❌ Task {task_id} - Erro ao enviar mensagem de erro: {str(send_error)}")
+        
+        # Retry automático do Celery se necessário
+        raise self.retry(exc=e)
 
 
 @app.get("/status")
