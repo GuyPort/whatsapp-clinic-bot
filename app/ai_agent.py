@@ -179,6 +179,13 @@ Quando o usuário escolher marcar consulta (opção 1), você precisa coletar:
    - Normalize sempre os valores: CABERGS, IPE ou Particular (não "particular" minúsculo)
    - Ao chamar tools como find_next_available_slot ou create_appointment, se você identificou o convênio, passe como parâmetro insurance_plan
    - Se não passou como parâmetro, as tools buscarão automaticamente do flow_data
+   
+   MUDANÇA DE CONVÊNIO DURANTE CONFirmaÇÃO:
+   - Quando o usuário estiver na etapa de confirmação (você perguntou "Posso confirmar o agendamento?") e mencionar mudança de convênio:
+     * Exemplos: "quero trocar para particular", "mudar para CABERGS", "é IPE", "convênio errado"
+   - O sistema detectará automaticamente e atualizará o flow_data
+   - Um resumo atualizado será mostrado automaticamente com o novo convênio
+   - Você deve pedir confirmação novamente após a atualização
 
 4. BUSCA AUTOMÁTICA DE HORÁRIO
    - Após coletar convênio (ou particular), chame IMEDIATAMENTE a tool 'find_next_available_slot' SEM ADICIONAR TEXTO PRÉVIO
@@ -1040,6 +1047,149 @@ Lembre-se: Seja natural, adaptável e prestativa. Use as tools disponíveis conf
         
         return "unclear"
 
+    def _detect_insurance_change_intent(self, message: str) -> bool:
+        """
+        Detecta se a mensagem indica intenção de mudar o convênio.
+        
+        Returns:
+            True se detectar intenção de mudar convênio, False caso contrário
+        """
+        message_lower = message.lower().strip()
+        
+        # Palavras-chave que indicam mudança de convênio
+        insurance_change_keywords = [
+            "trocar convênio", "trocar convenio", "mudar convênio", "mudar convenio",
+            "alterar convênio", "alterar convenio", "quero particular", "prefiro particular",
+            "quero cabergs", "prefiro cabergs", "quero ipe", "prefiro ipe",
+            "é particular", "eh particular", "será particular", "sera particular",
+            "vou particular", "mudar para particular", "trocar para particular",
+            "mudar para cabergs", "trocar para cabergs", "mudar para ipe", "trocar para ipe",
+            "convênio errado", "convenio errado", "convênio está errado", "convenio esta errado"
+        ]
+        
+        # Verificar se contém alguma palavra-chave
+        for keyword in insurance_change_keywords:
+            if keyword in message_lower:
+                return True
+        
+        return False
+
+    def _extract_insurance_from_message(self, message: str, context: ConversationContext) -> Optional[str]:
+        """
+        Extrai o novo convênio mencionado na mensagem usando Claude.
+        
+        Args:
+            message: Mensagem do usuário
+            context: Contexto da conversa
+            
+        Returns:
+            Convênio normalizado (IPE, CABERGS, Particular) ou None se não encontrar
+        """
+        try:
+            # Criar prompt para Claude extrair apenas o convênio
+            extraction_prompt = f"""Analise a seguinte mensagem do usuário e identifique qual convênio ele mencionou:
+
+Mensagem: "{message}"
+
+Convênios aceitos:
+- CABERGS
+- IPE
+- Particular (sem convênio)
+
+Retorne APENAS o nome do convênio em formato normalizado: CABERGS, IPE ou Particular.
+Se não mencionar nenhum convênio ou for ambíguo, retorne "None".
+
+Resposta (apenas o nome do convênio, nada mais):"""
+
+            # Chamar Claude para extrair
+            response = self.client.messages.create(
+                model="claude-sonnet-4-20250514",
+                max_tokens=50,
+                temperature=0.1,
+                messages=[
+                    {"role": "user", "content": extraction_prompt}
+                ]
+            )
+            
+            # Extrair resposta do Claude
+            claude_response = ""
+            if response.content:
+                for content_block in response.content:
+                    if hasattr(content_block, 'text'):
+                        claude_response += content_block.text.strip()
+            
+            # Normalizar resposta
+            claude_response_lower = claude_response.lower().strip()
+            
+            if "ipe" in claude_response_lower and "cabergs" not in claude_response_lower:
+                return "IPE"
+            elif "cabergs" in claude_response_lower:
+                return "CABERGS"
+            elif "particular" in claude_response_lower or "none" in claude_response_lower:
+                return "Particular"
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"Erro ao extrair convênio da mensagem: {e}")
+            return None
+
+    def _generate_updated_summary(self, context: ConversationContext, db: Session) -> str:
+        """
+        Gera resumo atualizado com os dados do flow_data.
+        
+        Args:
+            context: Contexto da conversa
+            db: Sessão do banco de dados
+            
+        Returns:
+            String formatada com resumo completo
+        """
+        if not context or not context.flow_data:
+            return "Erro ao gerar resumo: dados não disponíveis."
+        
+        # Extrair dados do flow_data
+        patient_name = context.flow_data.get("patient_name", "")
+        appointment_date = context.flow_data.get("appointment_date", "")
+        appointment_time = context.flow_data.get("appointment_time", "")
+        consultation_type = context.flow_data.get("consultation_type", "clinica_geral")
+        insurance_plan = context.flow_data.get("insurance_plan", "particular")
+        
+        # Normalizar convênio
+        if insurance_plan.lower() == "ipe":
+            insurance_plan = "IPE"
+        elif insurance_plan.lower() == "cabergs":
+            insurance_plan = "CABERGS"
+        elif insurance_plan.lower() in ["particular", "particula"]:
+            insurance_plan = "Particular"
+        
+        # Buscar nome formatado do convênio
+        convenios_aceitos = self.clinic_info.get('convenios_aceitos', {})
+        convenio_data = convenios_aceitos.get(insurance_plan, {})
+        convenio_nome = convenio_data.get('nome', insurance_plan)
+        
+        # Mapear tipo de consulta
+        tipo_map = {
+            "clinica_geral": "Clínica Geral",
+            "geriatria": "Geriatria Clínica e Preventiva",
+            "domiciliar": "Atendimento Domiciliar"
+        }
+        tipo_nome = tipo_map.get(consultation_type, consultation_type)
+        
+        # Montar resumo
+        msg = "✅ Resumo atualizado da consulta:\n\n"
+        msg += "📋 *Resumo da consulta:*\n"
+        if patient_name:
+            msg += f"👤 Nome: {patient_name}\n"
+        if appointment_date:
+            msg += f"📅 Data: {appointment_date}\n"
+        if appointment_time:
+            msg += f"⏰ Horário: {appointment_time}\n"
+        msg += f"🏥 Tipo: {tipo_nome}\n"
+        msg += f"💳 Convênio: {convenio_nome}\n"
+        
+        return msg
+
     def process_message(self, message: str, phone: str, db: Session) -> str:
         """Processa uma mensagem do usuário e retorna a resposta com contexto persistente"""
         try:
@@ -1140,6 +1290,43 @@ Lembre-se: Seja natural, adaptável e prestativa. Use as tools disponíveis conf
         
             # 5. Verificar se há confirmação pendente ANTES de processar com Claude
             if context.flow_data and context.flow_data.get("pending_confirmation"):
+                # NOVA DETECÇÃO: Verificar se usuário quer mudar convênio especificamente
+                if self._detect_insurance_change_intent(message):
+                    logger.info(f"🔄 Usuário {phone} quer mudar convênio durante confirmação")
+                    
+                    # Extrair novo convênio mencionado
+                    novo_convenio = self._extract_insurance_from_message(message, context)
+                    
+                    if novo_convenio:
+                        # Atualizar flow_data
+                        context.flow_data["insurance_plan"] = novo_convenio
+                        db.commit()
+                        logger.info(f"💾 Convênio atualizado no flow_data: {novo_convenio}")
+                        
+                        # Regenerar resumo com novo convênio
+                        resumo_atualizado = self._generate_updated_summary(context, db)
+                        
+                        # Manter pending_confirmation para continuar o fluxo de confirmação
+                        response = resumo_atualizado + "\n\nPosso confirmar o agendamento?"
+                        
+                        context.messages.append({
+                            "role": "user",
+                            "content": message,
+                            "timestamp": datetime.utcnow().isoformat()
+                        })
+                        context.messages.append({
+                            "role": "assistant",
+                            "content": response,
+                            "timestamp": datetime.utcnow().isoformat()
+                        })
+                        context.last_activity = datetime.utcnow()
+                        db.commit()
+                        
+                        return response
+                    else:
+                        logger.warning(f"⚠️ Não foi possível extrair novo convênio da mensagem")
+                        # Continuar com fluxo normal (perguntar o que mudar)
+                
                 intent = self._detect_confirmation_intent(message)
                 
                 if intent == "positive":
@@ -1203,7 +1390,8 @@ Lembre-se: Seja natural, adaptável e prestativa. Use as tools disponíveis conf
                     response = "Sem problemas! O que você gostaria de mudar?\n\n" \
                                "1️⃣ Data\n" \
                                "2️⃣ Horário\n" \
-                               "3️⃣ Ambos"
+                               "3️⃣ Convênio\n" \
+                               "4️⃣ Ambos (Data e Horário)"
                     
                     context.messages.append({
                         "role": "user",
@@ -2709,9 +2897,30 @@ Lembre-se: Seja natural, adaptável e prestativa. Use as tools disponíveis conf
                     logger.info(f"✅ Tipo encontrado no histórico: {tipo}")
                 
                 # Atualizar convênio se não tem ou é padrão
-                if (not convenio or convenio == "particular") and extracted.get("insurance_plan"):
-                    convenio = extracted["insurance_plan"]
-                    logger.info(f"✅ Convênio encontrado no histórico: {convenio}")
+                if (not convenio or convenio == "particular"):
+                    if extracted.get("insurance_plan"):
+                        convenio = extracted["insurance_plan"]
+                        logger.info(f"✅ Convênio encontrado no histórico: {convenio}")
+                    else:
+                        # FALLBACK: Usar Claude para buscar do histórico completo
+                        try:
+                            extracted_data = self._extract_patient_data_with_claude(context)
+                            if extracted_data and extracted_data.get("insurance_plan"):
+                                convenio = extracted_data["insurance_plan"]
+                                # Normalizar valores
+                                if convenio.lower() == "ipe":
+                                    convenio = "IPE"
+                                elif convenio.lower() == "cabergs":
+                                    convenio = "CABERGS"
+                                elif convenio.lower() in ["particular", "particula"]:
+                                    convenio = "Particular"
+                                
+                                # IMPORTANTE: Salvar no flow_data para não perder novamente
+                                context.flow_data["insurance_plan"] = convenio
+                                db.commit()
+                                logger.info(f"✅ Convênio recuperado via Claude e salvo: {convenio}")
+                        except Exception as e:
+                            logger.warning(f"⚠️ Erro ao buscar convênio com Claude: {e}")
                 
                 # Se nome estiver faltando ou parecer inválido (frases como "Eu Preciso Marcar Uma Consulta"),
                 # tentar extrair usando Claude diretamente
@@ -2745,8 +2954,21 @@ Lembre-se: Seja natural, adaptável e prestativa. Use as tools disponíveis conf
                     "domiciliar": "Atendimento Domiciliar"
                 }
                 msg += f"🏥 Tipo: {tipo_map.get(tipo, tipo)}\n"
+            
+            # Normalizar convênio antes de mostrar
             if convenio:
-                msg += f"💳 Convênio: {convenio}\n"
+                if convenio.lower() == "ipe":
+                    convenio = "IPE"
+                elif convenio.lower() == "cabergs":
+                    convenio = "CABERGS"
+                elif convenio.lower() in ["particular", "particula"]:
+                    convenio = "Particular"
+                
+                # Buscar nome formatado do clinic_info.json
+                convenios_aceitos = self.clinic_info.get('convenios_aceitos', {})
+                convenio_data = convenios_aceitos.get(convenio, {})
+                convenio_nome = convenio_data.get('nome', convenio)
+                msg += f"💳 Convênio: {convenio_nome}\n"
             
             msg += "\nPosso confirmar o agendamento?"
             return msg
