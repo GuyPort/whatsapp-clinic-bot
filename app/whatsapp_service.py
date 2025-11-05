@@ -15,10 +15,10 @@ class WhatsAppService:
     
     def __init__(self):
         self.base_url = settings.evolution_api_url.rstrip('/')
-        self.api_key = settings.evolution_api_key
+        self.api_key = settings.evolution_api_key.strip() if settings.evolution_api_key else None
         self.instance_name = settings.evolution_instance_name
         self.headers = {
-            "Authorization": f"Bearer {self.api_key}",
+            "Authorization": f"Bearer {self.api_key.strip() if self.api_key else ''}",
             "Content-Type": "application/json"
         }
         

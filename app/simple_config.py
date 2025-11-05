@@ -6,7 +6,7 @@ import os
 # Configurações carregadas diretamente das variáveis de ambiente
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 EVOLUTION_API_URL = "https://wasenderapi.com"
-EVOLUTION_API_KEY = os.getenv("WASENDER_API_KEY")
+EVOLUTION_API_KEY = os.getenv("WASENDER_API_KEY", "").strip() or None
 EVOLUTION_INSTANCE_NAME = os.getenv("WASENDER_PROJECT_NAME", "clinica-bot")
 
 # Configuração de banco de dados
