@@ -41,3 +41,6 @@ celery_app.conf.update(
 
 logger.info(f"✅ Celery configurado com broker: {settings.redis_url[:20]}...")
 
+# Importar módulo onde a task está definida para registro automático
+import app.main  # noqa: F401
+
