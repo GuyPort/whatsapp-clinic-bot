@@ -66,7 +66,7 @@ class WhatsAppService:
         try:
             # Adquirir lock antes de enviar (aguarda até 30s)
             logger.debug(f"🔒 Tentando adquirir lock para enviar mensagem para {phone}")
-            acquired = lock.acquire(blocking=True, timeout=30)
+            acquired = lock.acquire(blocking=True)
             
             if not acquired:
                 logger.error(f"❌ Timeout ao aguardar lock para enviar mensagem para {phone}")
