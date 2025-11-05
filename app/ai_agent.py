@@ -1074,6 +1074,46 @@ Lembre-se: Seja natural, adaptável e prestativa. Use as tools disponíveis conf
         
         return False
 
+    def _detect_insurance_in_message(self, message: str) -> Optional[str]:
+        """
+        Detecta convênio mencionado diretamente em uma mensagem específica.
+        Usa detecção simples para casos óbvios (IPE, CABERGS, particular).
+        
+        Args:
+            message: Mensagem do usuário para analisar
+            
+        Returns:
+            Convênio normalizado (IPE, CABERGS, Particular) ou None se não encontrar
+        """
+        if not message:
+            return None
+        
+        message_lower = message.lower().strip()
+        
+        # Detectar IPE (garantir que não é parte de outra palavra)
+        # Verificar se "ipe" está sozinho ou como palavra completa
+        import re
+        if re.search(r'\bipe\b', message_lower) and "cabergs" not in message_lower:
+            return "IPE"
+        
+        # Detectar CABERGS
+        if "cabergs" in message_lower:
+            return "CABERGS"
+        
+        # Detectar particular/frases negativas
+        negative_phrases = [
+            "não tenho", "nao tenho", "não possuo", "nao possuo",
+            "sem convênio", "sem convenio", "não tenho convênio", "nao tenho convenio",
+            "não possuo convênio", "nao possuo convenio",
+            "sem plano", "não uso", "nao uso", "particular"
+        ]
+        
+        for phrase in negative_phrases:
+            if phrase in message_lower:
+                return "Particular"
+        
+        return None
+
     def _extract_insurance_from_message(self, message: str, context: ConversationContext) -> Optional[str]:
         """
         Extrai o novo convênio mencionado na mensagem usando Claude.
@@ -1672,6 +1712,66 @@ Resposta (apenas o nome do convênio, nada mais):"""
                     logger.info(f"💾 Convênio ATUALIZADO no flow_data: {convenio_anterior} → {extracted['insurance_plan']}")
                 else:
                     logger.info(f"💾 Convênio salvo no flow_data: {extracted['insurance_plan']}")
+            else:
+                # NOVO: Se não encontrou via extração normal, verificar última mensagem do usuário
+                # para detectar menções diretas de convênio (ex: "IPE", "CABERGS")
+                if context.messages:
+                    last_user_message = None
+                    for msg in reversed(context.messages):
+                        if msg.get("role") == "user":
+                            last_user_message = msg.get("content", "").strip()
+                            break
+                    
+                    if last_user_message:
+                        # Tentar detecção direta primeiro (rápida e eficiente)
+                        detected_insurance = self._detect_insurance_in_message(last_user_message)
+                        
+                        if detected_insurance:
+                            # detected_insurance já vem normalizado da função (IPE, CABERGS, Particular)
+                            # Salvar no flow_data
+                            convenio_anterior = context.flow_data.get("insurance_plan")
+                            context.flow_data["insurance_plan"] = detected_insurance
+                            db.commit()
+                            
+                            if convenio_anterior:
+                                logger.info(f"💾 Convênio detectado na última mensagem e ATUALIZADO no flow_data: {convenio_anterior} → {detected_insurance}")
+                            else:
+                                logger.info(f"💾 Convênio detectado na última mensagem e salvo no flow_data: {detected_insurance}")
+                        else:
+                            # FALLBACK: Se detecção direta não encontrou, mas mensagem parece ser sobre convênio,
+                            # tentar com Claude (mais robusto para variações linguísticas)
+                            if any(keyword in last_user_message.lower() for keyword in ["convênio", "convenio", "plano", "ipe", "cabergs", "particular"]):
+                                try:
+                                    # Criar contexto temporário apenas com última mensagem
+                                    temp_context = ConversationContext(
+                                        phone=context.phone,
+                                        messages=[{"role": "user", "content": last_user_message}],
+                                        flow_data={}
+                                    )
+                                    extracted_data = self._extract_patient_data_with_claude(temp_context)
+                                    
+                                    if extracted_data and extracted_data.get("insurance_plan"):
+                                        detected_insurance = extracted_data["insurance_plan"]
+                                        
+                                        # Normalizar valor
+                                        if detected_insurance.lower() == "ipe":
+                                            detected_insurance = "IPE"
+                                        elif detected_insurance.lower() == "cabergs":
+                                            detected_insurance = "CABERGS"
+                                        elif detected_insurance.lower() in ["particular", "particula"]:
+                                            detected_insurance = "Particular"
+                                        
+                                        # Salvar no flow_data
+                                        convenio_anterior = context.flow_data.get("insurance_plan")
+                                        context.flow_data["insurance_plan"] = detected_insurance
+                                        db.commit()
+                                        
+                                        if convenio_anterior:
+                                            logger.info(f"💾 Convênio detectado via Claude e ATUALIZADO no flow_data: {convenio_anterior} → {detected_insurance}")
+                                        else:
+                                            logger.info(f"💾 Convênio detectado via Claude e salvo no flow_data: {detected_insurance}")
+                                except Exception as e:
+                                    logger.warning(f"⚠️ Erro ao tentar extrair convênio com Claude: {e}")
             
             # 8. FALLBACK: Verificar se Claude deveria ter chamado confirm_time_slot mas não chamou
             # Isso acontece quando: temos data + horário, mas não tem pending_confirmation
