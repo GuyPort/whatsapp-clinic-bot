@@ -37,6 +37,12 @@ celery_app.conf.update(
     # Configurações de worker
     worker_prefetch_multiplier=1,
     worker_max_tasks_per_child=1000,
+    
+    # Roteamento de tasks para filas separadas
+    task_routes={
+        'app.main.send_message_task': {'queue': 'send_queue'},
+        'app.main.process_message_task': {'queue': 'celery'},  # Fila padrão
+    },
 )
 
 logger.info(f"✅ Celery configurado com broker: {settings.redis_url[:20]}...")

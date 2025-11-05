@@ -282,6 +282,39 @@ def _mark_message_as_read_sync(phone: str, message_id: str) -> bool:
 
 
 @celery_app.task(bind=True, max_retries=3, default_retry_delay=60)
+def send_message_task(self, phone: str, message: str):
+    """
+    Task Celery dedicada para envio de mensagens para WhatsApp API.
+    Esta task é roteada para a fila 'send_queue' e usa rate limiting de 5 segundos.
+    
+    Args:
+        phone: Número do telefone
+        message: Texto da mensagem a ser enviada
+    """
+    task_id = self.request.id
+    logger.info(f"📤 Task de envio {task_id} iniciada para {phone}")
+    
+    try:
+        # Normalizar telefone
+        phone = normalize_phone(phone)
+        
+        # Enviar mensagem usando wrapper síncrono (já tem rate limiting)
+        success = _send_message_sync(phone, message)
+        
+        if success:
+            logger.info(f"✅ Task de envio {task_id} concluída - Mensagem enviada para {phone}")
+        else:
+            logger.error(f"❌ Task de envio {task_id} - Falha ao enviar mensagem para {phone}")
+            # Retry automático se falhou
+            raise Exception("Falha ao enviar mensagem")
+            
+    except Exception as e:
+        logger.error(f"❌ Task de envio {task_id} - Erro: {str(e)}", exc_info=True)
+        # Retry automático do Celery
+        raise self.retry(exc=e)
+
+
+@celery_app.task(bind=True, max_retries=3, default_retry_delay=60)
 def process_message_task(self, phone: str, message_text: str, message_id: str = None):
     """
     Processa mensagem em background usando Celery.
@@ -320,27 +353,25 @@ def process_message_task(self, phone: str, message_text: str, message_id: str = 
             # Processar com IA
             response = ai_agent.process_message(message_text, phone, db)
         
-        # Enviar resposta
+        # Enfileirar mensagem para envio na fila separada
         if response:
-            success = _send_message_sync(phone, response)
-            if success:
-                logger.info(f"✅ Task {task_id} concluída - Resposta enviada para {phone}")
-            else:
-                logger.error(f"❌ Task {task_id} - Falha ao enviar resposta para {phone}")
+            send_task = send_message_task.delay(phone, response)
+            logger.info(f"✅ Task {task_id} concluída - Resposta enfileirada para envio (task: {send_task.id})")
         else:
             logger.warning(f"⚠️ Task {task_id} - Nenhuma resposta gerada para {phone}")
         
     except Exception as e:
         logger.error(f"❌ Task {task_id} - Erro ao processar mensagem: {str(e)}", exc_info=True)
         
-        # Tentar enviar mensagem de erro ao usuário
+        # Tentar enfileirar mensagem de erro ao usuário
         try:
-            _send_message_sync(
+            send_message_task.delay(
                 phone,
                 "Desculpe, ocorreu um erro ao processar sua mensagem. Por favor, tente novamente em instantes."
             )
+            logger.info(f"📤 Mensagem de erro enfileirada para {phone}")
         except Exception as send_error:
-            logger.error(f"❌ Task {task_id} - Erro ao enviar mensagem de erro: {str(send_error)}")
+            logger.error(f"❌ Task {task_id} - Erro ao enfileirar mensagem de erro: {str(send_error)}")
         
         # Retry automático do Celery se necessário
         raise self.retry(exc=e)
