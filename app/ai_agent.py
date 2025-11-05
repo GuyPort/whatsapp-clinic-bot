@@ -8,6 +8,7 @@ from typing import Optional, Dict, Any, List, Tuple
 import json
 import logging
 import pytz
+import re
 from anthropic import Anthropic
 
 from sqlalchemy.orm import Session
@@ -237,8 +238,26 @@ REGRAS CRÍTICAS PARA find_next_available_slot:
    d) Apenas repasse a mensagem da tool ao usuário
    e) Aguarde confirmação do usuário ("sim", "confirma", "quero", etc)
    
-   REGRA CRÍTICA: Se o usuário enviar QUALQUER mensagem no formato HH:MM,
-   você DEVE executar confirm_time_slot IMEDIATAMENTE, sem exceção.
+   REGRA CRÍTICA: Se o usuário enviar QUALQUER mensagem contendo horário, você DEVE executar confirm_time_slot IMEDIATAMENTE, sem exceção.
+   
+   Exemplos de horários que devem acionar confirm_time_slot:
+   - "14:00", "15:30", "10:00"
+   - "às 14h", "15 horas", "10h"
+   - "quatorze horas", "quinze e meia"
+   - Qualquer menção a horário no formato HH:MM ou variações
+   
+   NÃO espere confirmação do usuário após ele escolher horário - execute a tool automaticamente.
+   NÃO pergunte "você quis dizer 14:00?" - execute confirm_time_slot diretamente.
+
+7.5. **REGRAS CRÍTICAS PARA RESPOSTAS APÓS TOOLS:**
+   APÓS executar qualquer tool, você DEVE sempre gerar uma resposta de texto completa para o usuário.
+   NUNCA retorne apenas um caractere ou espaço.
+   Sua resposta deve ser útil e informativa.
+   
+   Exemplos:
+   - Após confirm_time_slot, diga: "Horário confirmado! Posso criar o agendamento?" em vez de apenas "OK"
+   - Após find_next_available_slot, sempre mostre o resumo completo antes de pedir confirmação
+   - Após create_appointment, gere uma mensagem natural incluindo todas as informações importantes
 
 8. **FLUXO CRÍTICO - Após confirmação do usuário:**
    a) Execute create_appointment com TODOS os dados
@@ -401,7 +420,7 @@ Lembre-se: Seja natural, adaptável e prestativa. Use as tools disponíveis conf
             },
             {
                 "name": "confirm_time_slot",
-                "description": "Confirmar e validar o horário escolhido pelo paciente. Use quando usuário mencionar um horário específico no formato HH:MM após ter uma data validada. Esta tool valida o horário e mostra resumo para confirmação final.",
+                "description": "Confirmar e validar o horário escolhido pelo paciente. Execute esta tool IMEDIATAMENTE quando detectar qualquer menção a horário no formato HH:MM, HH:MM, ou variações como 'às 14h', '15 horas', '10h', 'quatorze horas', etc. Use quando usuário mencionar um horário específico após ter uma data validada. Esta tool valida o horário e mostra resumo para confirmação final. IMPORTANTE: Execute automaticamente sem perguntar confirmação ao usuário.",
                 "input_schema": {
                     "type": "object",
                     "properties": {
@@ -542,6 +561,44 @@ Lembre-se: Seja natural, adaptável e prestativa. Use as tools disponíveis conf
             }
         ]
 
+    def _normalize_and_validate_date(self, date_str: str) -> Optional[str]:
+        """
+        Normaliza e valida uma string de data no formato DD/MM/YYYY.
+        
+        Args:
+            date_str: String de data no formato DD/MM/YYYY
+            
+        Returns:
+            String normalizada no formato DD/MM/YYYY ou None se inválida
+        """
+        try:
+            # Validar formato básico
+            if not re.match(r'^\d{1,2}/\d{1,2}/\d{4}$', date_str):
+                return None
+            
+            # Parsear data
+            date_obj = datetime.strptime(date_str, '%d/%m/%Y')
+            
+            # Validar se data não é muito antiga (antes de 1900)
+            if date_obj.year < 1900:
+                return None
+            
+            # Validar se data não é muito futura (mais de 10 anos no futuro)
+            current_year = datetime.now().year
+            if date_obj.year > current_year + 10:
+                return None
+            
+            # Normalizar formato (garantir DD/MM/YYYY com zeros à esquerda)
+            day, month, year = date_str.split('/')
+            normalized = f"{day.zfill(2)}/{month.zfill(2)}/{year}"
+            
+            logger.info(f"📅 Data validada: {date_str} → {normalized}")
+            return normalized
+            
+        except (ValueError, AttributeError) as e:
+            logger.warning(f"⚠️ Data inválida: {date_str} - {str(e)}")
+            return None
+    
     def _extract_appointment_data_from_messages(self, messages: list) -> dict:
         """Extrai dados básicos de agendamento do histórico de mensagens.
         Versão simplificada: apenas detecção rápida de datas, horários e escolhas numéricas.
@@ -584,18 +641,20 @@ Lembre-se: Seja natural, adaptável e prestativa. Use as tools disponíveis conf
                 if not data["patient_birth_date"] or not data["appointment_date"]:  
                     date_pattern = r'(\d{1,2})/(\d{1,2})/(\d{4})'
                     date_matches = re.findall(date_pattern, content)
-                    for match in date_matches:
+                    # Priorizar última data mencionada quando há múltiplas
+                    for match in reversed(date_matches):
                         day, month, year = match
                         full_date = f"{day.zfill(2)}/{month.zfill(2)}/{year}"
-                        try:
-                            # Validar data
-                            date_obj = datetime.strptime(full_date, '%d/%m/%Y')
+                        
+                        # Normalizar e validar data
+                        normalized_date = self._normalize_and_validate_date(full_date)
+                        if normalized_date:
                             y = int(year)
                             
                             if not data["patient_birth_date"] and y < 2010:
                                 # Provavelmente data de nascimento
-                                data["patient_birth_date"] = full_date
-                                logger.info(f"📅 Data nascimento extraída (regex): {full_date}")
+                                data["patient_birth_date"] = normalized_date
+                                logger.info(f"📅 Data nascimento extraída (regex): {full_date} → {normalized_date}")
                                 
                                 # 3. EXTRAÇÃO DE NOME quando formato é "Nome, DD/MM/YYYY" ou "Nome DD/MM/YYYY"
                                 # Se encontrou data de nascimento, tentar extrair nome que vem antes dela
@@ -643,10 +702,8 @@ Lembre-se: Seja natural, adaptável e prestativa. Use as tools disponíveis conf
                             
                             elif not data["appointment_date"] and y >= 2010:
                                 # Provavelmente data de consulta
-                                data["appointment_date"] = full_date
-                                logger.info(f"📅 Data consulta extraída (regex): {full_date}")
-                        except ValueError:
-                            pass
+                                data["appointment_date"] = normalized_date
+                                logger.info(f"📅 Data consulta extraída (regex): {full_date} → {normalized_date}")
                 
                 # 4. EXTRAÇÃO DE TIPO DE CONSULTA - SEMPRE atualizar quando escolha explícita
                 # Se mensagem é só "1", "2" ou "3" (escolha explícita de tipo)
@@ -1552,35 +1609,49 @@ Resposta (apenas o nome do convênio, nada mais):"""
                             logger.info(f"📋 Response content length: {len(current_response.content) if current_response.content else 0}")
                             logger.info(f"📋 Response stop_reason: {current_response.stop_reason}")
                             
-                            # Validação especial para find_next_available_slot
-                            # Se a tool foi find_next_available_slot e a resposta do Claude é muito curta ou não contém palavras-chave do resumo,
-                            # interceptar e garantir que o resumo seja mostrado
-                            if content.name == "find_next_available_slot":
-                                if current_response.content and len(current_response.content) > 0:
-                                    content_text = ""
-                                    if current_response.content[0].type == "text":
-                                        content_text = current_response.content[0].text
-                                    
-                                    # Verificar se resposta é muito curta (< 100 chars) ou não contém palavras-chave do resumo
+                            # Interceptação universal de respostas curtas
+                            # Verificar se resposta é muito curta (< 100 chars) ou stop_reason é "end_turn"
+                            content_text = ""
+                            if current_response.content and len(current_response.content) > 0:
+                                if current_response.content[0].type == "text":
+                                    content_text = current_response.content[0].text
+                            
+                            is_short = len(content_text) < 100 or current_response.stop_reason == "end_turn"
+                            
+                            if is_short and tool_result:
+                                logger.warning(f"⚠️ Resposta muito curta ou end_turn após {content.name}. Interceptando resposta.")
+                                
+                                # Lógica especial para find_next_available_slot
+                                if content.name == "find_next_available_slot":
                                     palavras_chave = ["Nome", "Tipo", "Convênio", "Data", "Horário", "Resumo"]
                                     tem_palavras_chave = any(palavra in content_text for palavra in palavras_chave)
                                     
-                                    if len(content_text) < 100 or not tem_palavras_chave:
-                                        logger.warning(f"⚠️ Resposta muito curta ou sem resumo após find_next_available_slot. Interceptando resposta.")
-                                        # Interceptar: criar nova resposta com resumo completo + pergunta de confirmação
+                                    if not tem_palavras_chave:
+                                        # Adicionar resumo completo + pergunta de confirmação
                                         resposta_completa = tool_result + "\n\nPosso confirmar o agendamento?"
-                                        # Criar objeto simples com type e text para substituir o conteúdo
-                                        class SimpleTextContent:
-                                            def __init__(self, text):
-                                                self.type = "text"
-                                                self.text = text
-                                        current_response.content = [SimpleTextContent(resposta_completa)]
-                                        logger.info(f"✅ Resumo completo adicionado à resposta com pergunta de confirmação")
-                                        
-                                        # Processar imediatamente o conteúdo interceptado
-                                        if current_response.content[0].type == "text":
-                                            bot_response = current_response.content[0].text
-                                            break
+                                    else:
+                                        # Já tem palavras-chave, apenas adicionar pergunta se não tiver
+                                        if "confirmar" not in content_text.lower():
+                                            resposta_completa = tool_result + "\n\nPosso confirmar o agendamento?"
+                                        else:
+                                            resposta_completa = tool_result
+                                else:
+                                    # Para outras tools, usar o resultado diretamente
+                                    resposta_completa = tool_result
+                                
+                                # Criar objeto simples com type e text para substituir o conteúdo
+                                class SimpleTextContent:
+                                    def __init__(self, text):
+                                        self.type = "text"
+                                        self.text = text
+                                
+                                current_response.content = [SimpleTextContent(resposta_completa)]
+                                logger.info(f"✅ Resposta interceptada e substituída pelo resultado da tool {content.name}")
+                                
+                                # Processar imediatamente o conteúdo interceptado
+                                if current_response.content[0].type == "text":
+                                    bot_response = current_response.content[0].text
+                                    break
                             
                             # Verificar se Claude retornou texto após processar tool (iteração normal)
                             if current_response.content and len(current_response.content) > 0:
