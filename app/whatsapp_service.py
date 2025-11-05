@@ -96,9 +96,6 @@ class WhatsAppService:
             logger.error(f"❌ Falha ao enviar mensagem após {max_retries} tentativas")
             return False
             
-        except redis.exceptions.LockTimeout:
-            logger.error(f"❌ Timeout ao aguardar lock para enviar mensagem para {phone}")
-            return False
         except Exception as e:
             logger.error(f"❌ Exceção ao enviar mensagem: {str(e)}")
             return False
