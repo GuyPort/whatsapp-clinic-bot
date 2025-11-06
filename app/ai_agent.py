@@ -169,10 +169,9 @@ Quando o usuário escolher marcar consulta (opção 1), você precisa coletar:
       Você pode enviar tudo junto ou separado, como preferir!"
    3. AGUARDE o usuário fornecer o endereço completo
    4. DEPOIS: Chame request_home_address para extrair e salvar o endereço fornecido
-   5. Após request_home_address retornar sucesso, chame notify_doctor_home_visit automaticamente
-   6. Após notify_doctor_home_visit retornar sucesso, envie mensagem ao paciente:
-      "Perfeito! Registrei sua solicitação de atendimento domiciliar. A doutora vai entrar em contato com você em breve para agendar o melhor horário."
-   7. Pergunte: "Posso te ajudar com mais alguma coisa?"
+   5. Após request_home_address retornar sucesso, o sistema chamará notify_doctor_home_visit automaticamente
+   6. Após notify_doctor_home_visit retornar sucesso, você receberá uma mensagem de confirmação para enviar ao paciente
+   7. Envie a mensagem de confirmação e pergunte: "Posso te ajudar com mais alguma coisa?"
    8. Se resposta for "não" ou similar → chame end_conversation
    9. Se resposta for "sim" → ajude com o necessário e repita a pergunta até receber "não"
 
@@ -1597,34 +1596,6 @@ Resposta (apenas o nome do convênio, nada mais):"""
                         if not current_response.content or len(current_response.content) == 0:
                             logger.warning(f"⚠️ Iteration {iteration}: Claude retornou resposta vazia")
                             
-                            # Se a última tool foi request_home_address, continuar o loop para permitir notify_doctor_home_visit
-                            if 'last_tool_name' in locals() and last_tool_name == "request_home_address" and 'last_tool_content' in locals():
-                                logger.info("🔄 request_home_address executada - continuando loop para permitir notify_doctor_home_visit")
-                                # Fazer uma nova chamada ao Claude com instrução explícita usando o contexto real
-                                if 'tool_result' in locals():
-                                    # Usar o contexto real da última tool executada
-                                    current_response = self.client.messages.create(
-                                        model="claude-sonnet-4-20250514",
-                                        max_tokens=2000,
-                                        temperature=0.3,
-                                        system=self.system_prompt,
-                                        messages=claude_messages + [
-                                            {"role": "assistant", "content": [last_tool_content]},
-                                            {
-                                                "role": "user",
-                                                "content": [
-                                                    {
-                                                        "type": "tool_result",
-                                                        "tool_use_id": last_tool_content.id if hasattr(last_tool_content, 'id') else "temp",
-                                                        "content": tool_result + "\n\n[SYSTEM: Você DEVE chamar notify_doctor_home_visit agora para enviar a notificação para a doutora com os dados do paciente.]"
-                                                    }
-                                                ]
-                                            }
-                                        ]
-                                    )
-                                    logger.info(f"📋 Response content length após retry: {len(current_response.content) if current_response.content else 0}")
-                                    continue  # Continuar o loop para processar a nova resposta
-                            
                             # Se há tool_result anterior, usar como fallback (para outras tools)
                             if 'tool_result' in locals():
                                 # Usar diretamente o resultado da tool como resposta
@@ -1643,8 +1614,6 @@ Resposta (apenas o nome do convênio, nada mais):"""
                         elif content.type == "tool_use":
                             # Executar tool
                             tool_result = self._execute_tool(content.name, content.input, db, phone)
-                            last_tool_name = content.name  # Rastrear última tool executada
-                            last_tool_content = content  # Rastrear conteúdo da última tool para contexto
                             
                             # CRÍTICO: Se end_conversation foi executado, retornar imediatamente
                             # sem continuar processamento para evitar fallback executar
@@ -1658,10 +1627,89 @@ Resposta (apenas o nome do convênio, nada mais):"""
                                     # Horário disponível, adicionar hint para Claude criar agendamento
                                     tool_result += "\n\n[SYSTEM: Execute create_appointment agora com os dados coletados: nome, data_nascimento, data_consulta, horario_consulta]"
                             
-                            # Lógica especial: após request_home_address retornar sucesso, adicionar instrução para notify_doctor_home_visit
+                            # Lógica especial: após request_home_address retornar sucesso, chamar notify_doctor_home_visit automaticamente
                             if content.name == "request_home_address" and "registrado" in tool_result.lower():
-                                logger.info("🏠 request_home_address executada com sucesso - adicionando instrução para notify_doctor_home_visit")
-                                tool_result += "\n\n[SYSTEM: Você DEVE chamar notify_doctor_home_visit agora para enviar a notificação para a doutora com os dados do paciente.]"
+                                logger.info("🏠 request_home_address executada com sucesso - chamando notify_doctor_home_visit automaticamente")
+                                
+                                # Verificar se dados necessários estão no flow_data antes de chamar
+                                context = db.query(ConversationContext).filter_by(phone=phone).first()
+                                if context and context.flow_data:
+                                    flow_data = context.flow_data
+                                    has_name = flow_data.get("patient_name")
+                                    has_birth_date = flow_data.get("patient_birth_date")
+                                    has_address = flow_data.get("patient_address")
+                                    
+                                    if has_name and has_birth_date and has_address:
+                                        # Chamar notify_doctor_home_visit diretamente
+                                        notify_result = self._execute_tool("notify_doctor_home_visit", {}, db, phone)
+                                        
+                                        if "sucesso" in notify_result.lower() or "enviada" in notify_result.lower():
+                                            # Notificação enviada com sucesso
+                                            confirmation_message = "Perfeito! Registrei sua solicitação de atendimento domiciliar. A doutora vai entrar em contato com você em breve para agendar o melhor horário.\n\nPosso te ajudar com mais alguma coisa?"
+                                            
+                                            # Construir contexto completo para Claude processar a confirmação
+                                            # Incluir: histórico + request_home_address tool_use + tool_result + notify_doctor_home_visit tool_use + tool_result + mensagem de confirmação
+                                            current_response = self.client.messages.create(
+                                                model="claude-sonnet-4-20250514",
+                                                max_tokens=2000,
+                                                temperature=0.3,
+                                                system=self.system_prompt,
+                                                messages=claude_messages + [
+                                                    {"role": "assistant", "content": current_response.content},
+                                                    {
+                                                        "role": "user",
+                                                        "content": [
+                                                            {
+                                                                "type": "tool_result",
+                                                                "tool_use_id": content.id,
+                                                                "content": tool_result
+                                                            }
+                                                        ]
+                                                    },
+                                                    {
+                                                        "role": "assistant",
+                                                        "content": [{"type": "tool_use", "name": "notify_doctor_home_visit", "input": {}, "id": "auto_notify"}]
+                                                    },
+                                                    {
+                                                        "role": "user",
+                                                        "content": [
+                                                            {
+                                                                "type": "tool_result",
+                                                                "tool_use_id": "auto_notify",
+                                                                "content": notify_result
+                                                            }
+                                                        ]
+                                                    },
+                                                    {
+                                                        "role": "user",
+                                                        "content": f"[SYSTEM: Envie a seguinte mensagem ao paciente: {confirmation_message}]"
+                                                    }
+                                                ]
+                                            )
+                                            
+                                            # Processar resposta do Claude
+                                            if current_response.content and len(current_response.content) > 0:
+                                                if current_response.content[0].type == "text":
+                                                    bot_response = current_response.content[0].text
+                                                    break
+                                                elif current_response.content[0].type == "tool_use":
+                                                    # Claude pode ter chamado uma tool (ex: end_conversation), continuar processamento
+                                                    content = current_response.content[0]
+                                                    continue
+                                            
+                                            # Se Claude não retornou nada, usar mensagem de confirmação diretamente
+                                            bot_response = confirmation_message
+                                            break
+                                        else:
+                                            # Erro ao enviar notificação, adicionar ao tool_result para Claude tratar
+                                            tool_result += f"\n\n[ERRO: Falha ao enviar notificação para a doutora: {notify_result}]"
+                                    else:
+                                        # Dados faltando, adicionar ao tool_result para Claude tratar
+                                        missing = []
+                                        if not has_name: missing.append("nome")
+                                        if not has_birth_date: missing.append("data de nascimento")
+                                        if not has_address: missing.append("endereço")
+                                        tool_result += f"\n\n[ERRO: Faltam informações para enviar notificação: {', '.join(missing)}]"
                             
                             logger.info(f"🔧 Iteration {iteration}: Tool {content.name} result: {tool_result[:200] if len(tool_result) > 200 else tool_result}")
                             
