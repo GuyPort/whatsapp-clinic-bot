@@ -1596,7 +1596,36 @@ Resposta (apenas o nome do convênio, nada mais):"""
                         # Verificar se há content na resposta
                         if not current_response.content or len(current_response.content) == 0:
                             logger.warning(f"⚠️ Iteration {iteration}: Claude retornou resposta vazia")
-                            # Se há tool_result anterior, usar como fallback
+                            
+                            # Se a última tool foi request_home_address, continuar o loop para permitir notify_doctor_home_visit
+                            if 'last_tool_name' in locals() and last_tool_name == "request_home_address" and 'last_tool_content' in locals():
+                                logger.info("🔄 request_home_address executada - continuando loop para permitir notify_doctor_home_visit")
+                                # Fazer uma nova chamada ao Claude com instrução explícita usando o contexto real
+                                if 'tool_result' in locals():
+                                    # Usar o contexto real da última tool executada
+                                    current_response = self.client.messages.create(
+                                        model="claude-sonnet-4-20250514",
+                                        max_tokens=2000,
+                                        temperature=0.3,
+                                        system=self.system_prompt,
+                                        messages=claude_messages + [
+                                            {"role": "assistant", "content": [last_tool_content]},
+                                            {
+                                                "role": "user",
+                                                "content": [
+                                                    {
+                                                        "type": "tool_result",
+                                                        "tool_use_id": last_tool_content.id if hasattr(last_tool_content, 'id') else "temp",
+                                                        "content": tool_result + "\n\n[SYSTEM: Você DEVE chamar notify_doctor_home_visit agora para enviar a notificação para a doutora com os dados do paciente.]"
+                                                    }
+                                                ]
+                                            }
+                                        ]
+                                    )
+                                    logger.info(f"📋 Response content length após retry: {len(current_response.content) if current_response.content else 0}")
+                                    continue  # Continuar o loop para processar a nova resposta
+                            
+                            # Se há tool_result anterior, usar como fallback (para outras tools)
                             if 'tool_result' in locals():
                                 # Usar diretamente o resultado da tool como resposta
                                 bot_response = tool_result
@@ -1614,6 +1643,8 @@ Resposta (apenas o nome do convênio, nada mais):"""
                         elif content.type == "tool_use":
                             # Executar tool
                             tool_result = self._execute_tool(content.name, content.input, db, phone)
+                            last_tool_name = content.name  # Rastrear última tool executada
+                            last_tool_content = content  # Rastrear conteúdo da última tool para contexto
                             
                             # CRÍTICO: Se end_conversation foi executado, retornar imediatamente
                             # sem continuar processamento para evitar fallback executar
@@ -1626,6 +1657,11 @@ Resposta (apenas o nome do convênio, nada mais):"""
                                 if "disponível" in tool_result.lower() and "não" not in tool_result.lower():
                                     # Horário disponível, adicionar hint para Claude criar agendamento
                                     tool_result += "\n\n[SYSTEM: Execute create_appointment agora com os dados coletados: nome, data_nascimento, data_consulta, horario_consulta]"
+                            
+                            # Lógica especial: após request_home_address retornar sucesso, adicionar instrução para notify_doctor_home_visit
+                            if content.name == "request_home_address" and "registrado" in tool_result.lower():
+                                logger.info("🏠 request_home_address executada com sucesso - adicionando instrução para notify_doctor_home_visit")
+                                tool_result += "\n\n[SYSTEM: Você DEVE chamar notify_doctor_home_visit agora para enviar a notificação para a doutora com os dados do paciente.]"
                             
                             logger.info(f"🔧 Iteration {iteration}: Tool {content.name} result: {tool_result[:200] if len(tool_result) > 200 else tool_result}")
                             
