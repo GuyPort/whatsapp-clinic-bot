@@ -158,13 +158,23 @@ Quando o usuário escolher marcar consulta (opção 1), você precisa coletar:
 2.1. FLUXO ESPECIAL - ATENDIMENTO DOMICILIAR:
    Quando o usuário escolher "Atendimento Domiciliar" (opção 3):
    1. NÃO chame find_next_available_slot (não precisa agendar horário específico)
-   2. Chame request_home_address para solicitar o endereço completo do paciente
-   3. Após receber o endereço (quando request_home_address retornar sucesso), chame notify_doctor_home_visit automaticamente
-   4. Após notify_doctor_home_visit retornar sucesso, envie mensagem ao paciente:
+   2. PRIMEIRO: Pergunte ao usuário com esta mensagem formatada (NÃO chame nenhuma tool ainda):
+      "Perfeito! Para o atendimento domiciliar, preciso do seu endereço completo. Por favor, me informe:
+      
+      📍 Cidade
+      🏘️ Bairro
+      🛣️ Rua
+      🏠 Número da casa
+      
+      Você pode enviar tudo junto ou separado, como preferir!"
+   3. AGUARDE o usuário fornecer o endereço completo
+   4. DEPOIS: Chame request_home_address para extrair e salvar o endereço fornecido
+   5. Após request_home_address retornar sucesso, chame notify_doctor_home_visit automaticamente
+   6. Após notify_doctor_home_visit retornar sucesso, envie mensagem ao paciente:
       "Perfeito! Registrei sua solicitação de atendimento domiciliar. A doutora vai entrar em contato com você em breve para agendar o melhor horário."
-   5. Pergunte: "Posso te ajudar com mais alguma coisa?"
-   6. Se resposta for "não" ou similar → chame end_conversation
-   7. Se resposta for "sim" → ajude com o necessário e repita a pergunta até receber "não"
+   7. Pergunte: "Posso te ajudar com mais alguma coisa?"
+   8. Se resposta for "não" ou similar → chame end_conversation
+   9. Se resposta for "sim" → ajude com o necessário e repita a pergunta até receber "não"
 
 3. CONVÊNIO
    "Ótimo! Você possui convênio médico?
@@ -567,7 +577,7 @@ Lembre-se: Seja natural, adaptável e prestativa. Use as tools disponíveis conf
             },
             {
                 "name": "request_home_address",
-                "description": "Solicita e valida o endereço completo do paciente para atendimento domiciliar. Use APENAS quando consultation_type for 'domiciliar' e patient_address não estiver no flow_data. Esta tool extrai o endereço da mensagem do usuário e salva no flow_data.",
+                "description": "Extrai e salva o endereço completo do paciente para atendimento domiciliar. Use APENAS quando o usuário já forneceu o endereço completo (após você ter pedido o endereço). NÃO use quando o usuário ainda não forneceu o endereço - nesse caso, apenas peça o endereço sem chamar esta tool. Esta tool valida se a mensagem realmente contém um endereço antes de salvar.",
                 "input_schema": {
                     "type": "object",
                     "properties": {},
@@ -3790,7 +3800,23 @@ IMPORTANTE: Se identificar que "patient_name" é uma frase de pedido (ex: "Eu Pr
                     break
             
             if not last_user_message or len(last_user_message.strip()) < 10:
-                return "Por favor, forneça seu endereço completo (rua, número, bairro, cidade, CEP)."
+                return "Por favor, forneça seu endereço completo:\n\n📍 Cidade\n🏘️ Bairro\n🛣️ Rua\n🏠 Número da casa"
+            
+            # Validar se a mensagem parece ser um endereço (não é tipo de consulta)
+            last_message_lower = last_user_message.lower()
+            
+            # Palavras que indicam que NÃO é um endereço (é tipo de consulta ou outra coisa)
+            invalid_keywords = [
+                "atendimento domiciliar", "domiciliar", "opção 3", "opcao 3", 
+                "consulta", "tipo", "marcar", "agendar", "preciso", "quero"
+            ]
+            
+            if any(keyword in last_message_lower for keyword in invalid_keywords):
+                return "Por favor, forneça seu endereço completo:\n\n📍 Cidade\n🏘️ Bairro\n🛣️ Rua\n🏠 Número da casa\n\nApenas o endereço, não o tipo de consulta."
+            
+            # Se tem menos de 15 caracteres, provavelmente não é um endereço completo
+            if len(last_user_message.strip()) < 15:
+                return "Por favor, forneça seu endereço completo:\n\n📍 Cidade\n🏘️ Bairro\n🛣️ Rua\n🏠 Número da casa"
             
             # Salvar endereço no flow_data
             if not context.flow_data:
