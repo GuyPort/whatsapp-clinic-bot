@@ -58,6 +58,7 @@
     "formas_pagamento": ["Dinheiro", "Cartão de crédito", "Cartão de débito", "Pix"],
     "politica_cancelamento": "Cancelamentos devem ser feitos com no mínimo 24 horas de antecedência",
     "secretaria": "Beatriz",
-    "cadeira_rodas_disponivel": true
+    "cadeira_rodas_disponivel": true,
+    "telefone_doutora": "555199546355"
   }
 }

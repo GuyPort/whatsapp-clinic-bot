@@ -155,6 +155,17 @@ Quando o usuário escolher marcar consulta (opção 1), você precisa coletar:
    Digite o número da opção desejada."
    - Aceite: "1", "2", "3", "primeira opção", "opção 1", etc
 
+2.1. FLUXO ESPECIAL - ATENDIMENTO DOMICILIAR:
+   Quando o usuário escolher "Atendimento Domiciliar" (opção 3):
+   1. NÃO chame find_next_available_slot (não precisa agendar horário específico)
+   2. Chame request_home_address para solicitar o endereço completo do paciente
+   3. Após receber o endereço (quando request_home_address retornar sucesso), chame notify_doctor_home_visit automaticamente
+   4. Após notify_doctor_home_visit retornar sucesso, envie mensagem ao paciente:
+      "Perfeito! Registrei sua solicitação de atendimento domiciliar. A doutora vai entrar em contato com você em breve para agendar o melhor horário."
+   5. Pergunte: "Posso te ajudar com mais alguma coisa?"
+   6. Se resposta for "não" ou similar → chame end_conversation
+   7. Se resposta for "sim" → ajude com o necessário e repita a pergunta até receber "não"
+
 3. CONVÊNIO
    "Ótimo! Você possui convênio médico?
 
@@ -288,7 +299,11 @@ FERRAMENTAS E QUANDO USAR
 
 - extract_patient_data: Use quando o usuário mencionar seu nome mas você não tiver certeza ou precisar validar. Também use quando precisar extrair nome/data do histórico de mensagens, especialmente se houver dúvida sobre se um texto é nome real ou frase de pedido. IMPORTANTE: O sistema já extrai automaticamente nome quando formato é "Nome, DD/MM/YYYY", então use esta tool apenas se houver dúvida ou se precisar validar.
 
-- find_next_available_slot: Use APÓS coletar nome, data nascimento, tipo consulta e convênio. IMPORTANTE: Antes de chamar, verifique se tem todos os dados necessários. O sistema tenta extrair automaticamente dados faltantes, mas se ainda faltar algo, pergunte ao usuário antes de chamar esta tool. Busca automaticamente próximo horário (48h mínimo).
+- find_next_available_slot: Use APÓS coletar nome, data nascimento, tipo consulta e convênio. IMPORTANTE: Antes de chamar, verifique se tem todos os dados necessários. O sistema tenta extrair automaticamente dados faltantes, mas se ainda faltar algo, pergunte ao usuário antes de chamar esta tool. Busca automaticamente próximo horário (48h mínimo). NÃO use quando consultation_type for 'domiciliar' - use request_home_address em vez disso.
+
+- request_home_address: Use APENAS quando consultation_type for 'domiciliar' e patient_address não estiver no flow_data. Esta tool solicita e extrai o endereço completo do paciente.
+
+- notify_doctor_home_visit: Use APENAS após receber endereço completo do paciente (após request_home_address retornar sucesso) para atendimento domiciliar. Esta tool envia notificação formatada para a doutora com todas as informações do paciente.
 
 - find_alternative_slots: Use quando usuário rejeitar o primeiro horário oferecido. Retorna 3 opções alternativas.
 
@@ -544,6 +559,24 @@ Lembre-se: Seja natural, adaptável e prestativa. Use as tools disponíveis conf
             {
                 "name": "extract_patient_data",
                 "description": "Extrair dados do paciente do histórico de mensagens. Use esta tool quando precisar identificar nome completo real do paciente (não frases de pedido como 'Eu Preciso Marcar Uma Consulta'), data de nascimento, tipo de consulta e convênio. Esta tool valida automaticamente se um texto é um nome real ou apenas uma frase de solicitação de agendamento.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {},
+                    "required": []
+                }
+            },
+            {
+                "name": "request_home_address",
+                "description": "Solicita e valida o endereço completo do paciente para atendimento domiciliar. Use APENAS quando consultation_type for 'domiciliar' e patient_address não estiver no flow_data. Esta tool extrai o endereço da mensagem do usuário e salva no flow_data.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {},
+                    "required": []
+                }
+            },
+            {
+                "name": "notify_doctor_home_visit",
+                "description": "Envia notificação para a doutora sobre nova solicitação de atendimento domiciliar. Use APENAS após receber endereço completo do paciente (após request_home_address). Esta tool coleta nome, data nascimento, endereço e telefone do flow_data e envia mensagem formatada para a doutora.",
                 "input_schema": {
                     "type": "object",
                     "properties": {},
@@ -1775,6 +1808,27 @@ Resposta (apenas o nome do convênio, nada mais):"""
                 else:
                     logger.info(f"💾 Tipo consulta salvo no flow_data: {extracted['consultation_type']}")
             
+            # INTERCEPTAÇÃO: Fluxo domiciliar
+            consultation_type = context.flow_data.get("consultation_type")
+            if consultation_type == "domiciliar":
+                patient_address = context.flow_data.get("patient_address")
+                doctor_notified = context.flow_data.get("doctor_notified", False)
+                
+                # Se não tem endereço, instruir Claude a chamar request_home_address
+                if not patient_address:
+                    logger.info("🏠 Detectado atendimento domiciliar sem endereço - instruindo Claude a chamar request_home_address")
+                    # Adicionar instrução no prompt para Claude chamar a tool
+                    # Isso será feito via prompt, mas podemos adicionar uma flag no flow_data
+                    context.flow_data["pending_home_address"] = True
+                    flag_modified(context, "flow_data")
+                    db.commit()
+                # Se tem endereço mas não notificou, instruir Claude a chamar notify_doctor_home_visit
+                elif patient_address and not doctor_notified:
+                    logger.info("🏠 Detectado atendimento domiciliar com endereço mas sem notificação - instruindo Claude a chamar notify_doctor_home_visit")
+                    context.flow_data["pending_doctor_notification"] = True
+                    flag_modified(context, "flow_data")
+                    db.commit()
+            
             # SEMPRE atualizar convênio quando extraído (permite correção)
             if extracted.get("insurance_plan"):
                 convenio_anterior = context.flow_data.get("insurance_plan")
@@ -1959,6 +2013,10 @@ Resposta (apenas o nome do convênio, nada mais):"""
                 return self._handle_request_human_assistance(tool_input, db, phone)
             elif tool_name == "extract_patient_data":
                 return self._handle_extract_patient_data(tool_input, db, phone)
+            elif tool_name == "request_home_address":
+                return self._handle_request_home_address(tool_input, db, phone)
+            elif tool_name == "notify_doctor_home_visit":
+                return self._handle_notify_doctor_home_visit(tool_input, db, phone)
             elif tool_name == "end_conversation":
                 return self._handle_end_conversation(tool_input, db, phone)
             
@@ -3681,6 +3739,129 @@ IMPORTANTE: Se identificar que "patient_name" é uma frase de pedido (ex: "Eu Pr
             logger.error(f"Erro ao extrair dados com Claude: {str(e)}")
             db.rollback()
             return f"Erro ao extrair dados: {str(e)}"
+
+    def _send_doctor_notification(self, patient_name: str, patient_birth_date: str, patient_address: str, patient_phone: str) -> bool:
+        """Função auxiliar para enviar notificação à doutora sobre atendimento domiciliar"""
+        try:
+            # Buscar telefone da doutora do clinic_info
+            doctor_phone = self.clinic_info.get("informacoes_adicionais", {}).get("telefone_doutora")
+            if not doctor_phone:
+                logger.error("❌ Telefone da doutora não encontrado no clinic_info.json")
+                return False
+            
+            # Normalizar telefone
+            doctor_phone = normalize_phone(doctor_phone)
+            
+            # Formatar mensagem
+            message = f"""🏠 NOVA SOLICITAÇÃO DE ATENDIMENTO DOMICILIAR
+
+👤 Paciente: {patient_name}
+📅 Data Nascimento: {patient_birth_date}
+📍 Endereço: {patient_address}
+📞 Contato: {patient_phone}"""
+            
+            # Enfileirar task de envio
+            from app.main import send_message_task
+            send_message_task.delay(doctor_phone, message)
+            
+            logger.info(f"✅ Notificação enfileirada para doutora ({doctor_phone})")
+            return True
+            
+        except Exception as e:
+            logger.error(f"❌ Erro ao enviar notificação para doutora: {str(e)}")
+            return False
+
+    def _handle_request_home_address(self, tool_input: Dict, db: Session, phone: str) -> str:
+        """Tool: request_home_address - Extrai e salva endereço do paciente"""
+        try:
+            logger.info(f"🏠 Tool request_home_address chamada para {phone}")
+            
+            # Buscar contexto
+            context = db.query(ConversationContext).filter_by(phone=phone).first()
+            if not context:
+                return "Erro: contexto não encontrado."
+            
+            # Buscar última mensagem do usuário
+            last_user_message = ""
+            for msg in reversed(context.messages):
+                if msg.get("role") == "user":
+                    last_user_message = msg.get("content", "")
+                    break
+            
+            if not last_user_message or len(last_user_message.strip()) < 10:
+                return "Por favor, forneça seu endereço completo (rua, número, bairro, cidade, CEP)."
+            
+            # Salvar endereço no flow_data
+            if not context.flow_data:
+                context.flow_data = {}
+            
+            context.flow_data["patient_address"] = last_user_message.strip()
+            flag_modified(context, "flow_data")
+            db.commit()
+            
+            logger.info(f"💾 Endereço salvo no flow_data: {last_user_message.strip()[:50]}...")
+            
+            return "Endereço registrado! Agora vou enviar sua solicitação para a doutora."
+            
+        except Exception as e:
+            logger.error(f"Erro ao processar endereço: {str(e)}")
+            db.rollback()
+            return f"Erro ao processar endereço: {str(e)}"
+
+    def _handle_notify_doctor_home_visit(self, tool_input: Dict, db: Session, phone: str) -> str:
+        """Tool: notify_doctor_home_visit - Envia notificação para a doutora"""
+        try:
+            logger.info(f"📞 Tool notify_doctor_home_visit chamada para {phone}")
+            
+            # Buscar contexto
+            context = db.query(ConversationContext).filter_by(phone=phone).first()
+            if not context:
+                return "Erro: contexto não encontrado."
+            
+            # Buscar dados do flow_data
+            flow_data = context.flow_data or {}
+            
+            patient_name = flow_data.get("patient_name")
+            patient_birth_date = flow_data.get("patient_birth_date")
+            patient_address = flow_data.get("patient_address")
+            patient_phone = phone
+            
+            # Validar que todos os dados estão presentes
+            missing_fields = []
+            if not patient_name:
+                missing_fields.append("nome")
+            if not patient_birth_date:
+                missing_fields.append("data de nascimento")
+            if not patient_address:
+                missing_fields.append("endereço")
+            
+            if missing_fields:
+                return f"Erro: faltam informações: {', '.join(missing_fields)}. Por favor, forneça todas as informações necessárias."
+            
+            # Enviar notificação
+            success = self._send_doctor_notification(
+                patient_name, 
+                patient_birth_date, 
+                patient_address, 
+                patient_phone
+            )
+            
+            if success:
+                # Marcar que notificação foi enviada
+                flow_data["doctor_notified"] = True
+                context.flow_data = flow_data
+                flag_modified(context, "flow_data")
+                db.commit()
+                
+                logger.info("✅ Notificação enviada com sucesso para a doutora")
+                return "Notificação enviada com sucesso para a doutora!"
+            else:
+                return "Erro ao enviar notificação. Por favor, tente novamente."
+            
+        except Exception as e:
+            logger.error(f"Erro ao notificar doutora: {str(e)}")
+            db.rollback()
+            return f"Erro ao notificar doutora: {str(e)}"
 
     def _handle_end_conversation(self, tool_input: Dict, db: Session, phone: str) -> str:
         """Tool: end_conversation - Encerrar conversa e limpar contexto"""
