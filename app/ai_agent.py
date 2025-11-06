@@ -1651,7 +1651,8 @@ Resposta (apenas o nome do convênio, nada mais):"""
                             
                             is_short = len(content_text) < 100 or current_response.stop_reason == "end_turn"
                             
-                            if is_short and tool_result:
+                            # NÃO interceptar extract_patient_data - é tool interna, Claude deve continuar o fluxo
+                            if is_short and tool_result and content.name != "extract_patient_data":
                                 logger.warning(f"⚠️ Resposta muito curta ou end_turn após {content.name}. Interceptando resposta.")
                                 
                                 # Lógica especial para find_next_available_slot
