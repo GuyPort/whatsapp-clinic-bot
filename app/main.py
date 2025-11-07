@@ -7,6 +7,10 @@ from contextlib import asynccontextmanager
 import logging
 from typing import Dict, Any, List
 from datetime import datetime, date
+import time
+
+import redis
+from redis.exceptions import RedisError
 
 from app.simple_config import settings
 
@@ -25,6 +29,57 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+
+# Redis para deduplicação de mensagens do webhook
+_WEBHOOK_DEDUP_TTL_SECONDS = 300
+try:
+    _webhook_dedup_client = redis.from_url(
+        settings.redis_url,
+        decode_responses=True
+    )
+    logger.info("✅ Redis conectado para deduplicação do webhook")
+except Exception as redis_error:
+    _webhook_dedup_client = None
+    logger.warning(f"⚠️ Não foi possível conectar ao Redis para deduplicação: {redis_error}")
+
+# Cache local como fallback quando Redis não estiver disponível
+_webhook_dedup_cache: Dict[str, float] = {}
+
+
+def _register_incoming_message(message_id: str) -> bool:
+    """Registra ID da mensagem recebida para impedir processamento duplicado."""
+    if not message_id:
+        return True
+
+    cache_key = f"whatsapp:webhook:message:{message_id}"
+
+    # Tentativa primária: Redis
+    if _webhook_dedup_client is not None:
+        try:
+            was_added = _webhook_dedup_client.setnx(cache_key, str(time.time()))
+            if was_added:
+                _webhook_dedup_client.expire(cache_key, _WEBHOOK_DEDUP_TTL_SECONDS)
+                return True
+            return False
+        except RedisError as redis_exc:
+            logger.warning(f"⚠️ Falha ao registrar mensagem no Redis: {redis_exc}")
+
+    # Fallback: cache em memória com TTL simples
+    now = time.time()
+    # Limpeza básica de itens expirados
+    expired_keys = [
+        key for key, ts in _webhook_dedup_cache.items()
+        if now - ts >= _WEBHOOK_DEDUP_TTL_SECONDS
+    ]
+    for key in expired_keys:
+        _webhook_dedup_cache.pop(key, None)
+
+    if cache_key in _webhook_dedup_cache:
+        return False
+
+    _webhook_dedup_cache[cache_key] = now
+    return True
 
 
 @asynccontextmanager
@@ -221,6 +276,12 @@ async def whatsapp_webhook(request: Request):
         if key.get('fromMe', False):
             return {"status": "ignored", "reason": "message from bot"}
         
+        # Deduplicação por ID da mensagem
+        message_id = key.get('id')
+        if not _register_incoming_message(message_id):
+            logger.info(f"Mensagem duplicada detectada (ID: {message_id}). Ignorando webhook.")
+            return {"status": "ignored", "reason": "duplicate message"}
+
         # Extrair informações
         phone = key.get('remoteJid', '')
         
@@ -247,7 +308,7 @@ async def whatsapp_webhook(request: Request):
         logger.info(f"Mensagem de {phone}: {message_text[:50]}...")
         
         # Enfileirar task no Celery
-        task = process_message_task.delay(phone, message_text, key.get('id'))
+        task = process_message_task.delay(phone, message_text, message_id)
         logger.info(f"📨 Task enfileirada: {task.id} para {phone}")
         
         return {"status": "processing", "task_id": task.id}

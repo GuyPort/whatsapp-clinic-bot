@@ -13,6 +13,7 @@ from anthropic import Anthropic
 
 from sqlalchemy.orm import Session
 from sqlalchemy.orm.attributes import flag_modified
+from sqlalchemy.exc import IntegrityError
 
 from app.simple_config import settings
 from app.models import Appointment, AppointmentStatus, ConversationContext, PausedContact
@@ -1379,14 +1380,23 @@ Resposta (apenas o nome do convênio, nada mais):"""
             # 1. Carregar contexto do banco
             context = db.query(ConversationContext).filter_by(phone=phone).first()
             if not context:
-                # Primeira mensagem deste usuário, criar contexto novo
+                # Primeira mensagem deste usuário, tentar criar contexto novo
                 context = ConversationContext(
                     phone=phone,
                     messages=[],
                     status="active"
                 )
                 db.add(context)
-                logger.info(f"🆕 Novo contexto criado para {phone}")
+                try:
+                    # flush garante que a criação seja persistida ou dispare IntegrityError imediatamente
+                    db.flush()
+                    logger.info(f"🆕 Novo contexto criado para {phone}")
+                except IntegrityError:
+                    db.rollback()
+                    context = db.query(ConversationContext).filter_by(phone=phone).first()
+                    if not context:
+                        raise
+                    logger.info(f"♻️ Contexto existente reutilizado após corrida para {phone}")
             else:
                 logger.info(f"📱 Contexto carregado para {phone}: {len(context.messages)} mensagens")
             
