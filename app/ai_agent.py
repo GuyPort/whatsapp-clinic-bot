@@ -134,17 +134,21 @@ PRINCÍPIOS DE COMUNICAÇÃO:
 FLUXO DE AGENDAMENTO
 ═══════════════════════════════════════════════════════════
 
-Quando o usuário escolher marcar consulta (opção 1), você precisa coletar:
+Após o usuário escolher qualquer opção do menu inicial, siga esta sequência obrigatória:
 
-1. NOME COMPLETO e DATA DE NASCIMENTO
-   - Pode vir juntos ou separados
-   - Use a tool 'extract_patient_data' se precisar extrair do histórico ou validar
-   - Nome deve ter ao menos 2 palavras (nome + sobrenome)
-   - Data deve ser completa (DD/MM/AAAA)
+1. NOME COMPLETO
+   - Verifique se já existe um nome válido salvo para o telefone. Se não houver, peça EXCLUSIVAMENTE o nome completo (sem falar de data na mesma mensagem).
+   - Aguarde e valide a resposta. Nome deve ter pelo menos duas palavras (nome + sobrenome).
+   - Se já existir um nome salvo, confirme de forma natural se deve mantê-lo ou atualizá-lo.
+   - Use a tool 'extract_patient_data' apenas quando precisar validar/recuperar o nome do histórico.
+
+2. DATA DE NASCIMENTO
+   - Somente depois de registrar um nome válido peça a data de nascimento (formato DD/MM/AAAA).
+   - Se vier em formato incorreto, explique o motivo e solicite novamente.
    - IMPORTANTE: Se Python validar a data (sem erro_data), aceite imediatamente. Não questione datas aprovadas pelo sistema.
-   - Lembre-se: pessoa pode estar agendando para outra (mãe para filho, etc)
+   - Lembre-se: alguém pode agendar para outra pessoa; mantenha os dados informados pelo usuário.
 
-2. TIPO DE CONSULTA
+3. TIPO DE CONSULTA
    - Após ter nome e data, mostre as opções:
    "Perfeito! Agora me informe qual tipo de consulta você deseja:
    
@@ -155,7 +159,7 @@ Quando o usuário escolher marcar consulta (opção 1), você precisa coletar:
    Digite o número da opção desejada."
    - Aceite: "1", "2", "3", "primeira opção", "opção 1", etc
 
-2.1. FLUXO ESPECIAL - ATENDIMENTO DOMICILIAR:
+3.1. FLUXO ESPECIAL - ATENDIMENTO DOMICILIAR:
    Quando o usuário escolher "Atendimento Domiciliar" (opção 3):
    1. NÃO chame find_next_available_slot (não precisa agendar horário específico)
    2. PRIMEIRO: Pergunte ao usuário com esta mensagem formatada (NÃO chame nenhuma tool ainda):
@@ -175,7 +179,7 @@ Quando o usuário escolher marcar consulta (opção 1), você precisa coletar:
    8. Se resposta for "não" ou similar → chame end_conversation
    9. Se resposta for "sim" → ajude com o necessário e repita a pergunta até receber "não"
 
-3. CONVÊNIO
+4. CONVÊNIO
    "Ótimo! Você possui convênio médico?
 
    Trabalhamos com os seguintes convênios:
@@ -208,7 +212,7 @@ Quando o usuário escolher marcar consulta (opção 1), você precisa coletar:
    - Um resumo atualizado será mostrado automaticamente com o novo convênio
    - Você deve pedir confirmação novamente após a atualização
 
-4. BUSCA AUTOMÁTICA DE HORÁRIO
+5. BUSCA AUTOMÁTICA DE HORÁRIO
    - Após coletar convênio (ou particular), chame IMEDIATAMENTE a tool 'find_next_available_slot' SEM ADICIONAR TEXTO PRÉVIO
    - Não diga "vou buscar", "deixe-me buscar" ou "permita-me buscar" - apenas execute a tool diretamente
    - Esta tool busca o próximo horário disponível respeitando 48 horas exatas de antecedência mínima
@@ -233,14 +237,14 @@ REGRAS CRÍTICAS PARA find_next_available_slot:
 4. NUNCA assuma que o usuário já viu o resumo - sempre mostre novamente
 5. O resumo retornado pela tool contém TODAS as informações necessárias - use-o completamente
 
-5. CONFIRMAÇÃO OU ALTERNATIVAS
+6. CONFIRMAÇÃO OU ALTERNATIVAS
    - Se usuário confirmar → use 'create_appointment' com os dados coletados
    - Se usuário rejeitar → chame 'find_alternative_slots' para mostrar 3 opções alternativas
    - Se usuário mencionar preferência (ex: "quinta à tarde") → interprete e use 'validate_date_and_show_slots' com a próxima ocorrência do dia após 48h
    - Se usuário escolher uma das 3 alternativas (1, 2 ou 3) → use os dados dessa opção para criar agendamento
    - Se rejeitar todas alternativas → pergunte qual dia prefere e use 'validate_date_and_show_slots' para mostrar horários
 
-6. ESCOLHA DE HORÁRIO (fluxo manual)
+7. ESCOLHA DE HORÁRIO (fluxo manual)
    - Se usuário mencionar horário no formato HH:MM → use 'confirm_time_slot' para validar e mostrar resumo
    - Aguarde confirmação final antes de criar agendamento
 
@@ -1273,6 +1277,87 @@ Resposta (apenas o nome do convênio, nada mais):"""
             logger.error(f"Erro ao extrair convênio da mensagem: {e}")
             return None
 
+    def _detect_main_menu_choice(self, message: str, context: ConversationContext) -> Optional[str]:
+        """Detecta se a mensagem corresponde a uma escolha do menu principal."""
+        if not message:
+            return None
+
+        if context and context.flow_data:
+            if context.flow_data.get("awaiting_patient_name") or context.flow_data.get("awaiting_patient_birth_date"):
+                return None
+            if context.flow_data.get("menu_choice") is not None:
+                return None
+
+        normalized = message.strip().lower()
+        if not normalized:
+            return None
+
+        normalized = normalized.replace("opção", "opcao").replace("opções", "opcoes")
+        digits_only = "".join(ch for ch in normalized if ch.isdigit())
+        if digits_only in {"1", "2", "3"} and len(normalized) <= 4:
+            return {"1": "booking", "2": "reschedule", "3": "prescription"}[digits_only]
+
+        if any(keyword in normalized for keyword in ["marcar consulta", "agendar", "nova consulta", "quero marcar", "agendamento"]):
+            return "booking"
+        if any(keyword in normalized for keyword in ["remarcar", "cancelar", "cancelamento", "remarcação", "remarcacao", "desmarcar"]):
+            return "reschedule"
+        if any(keyword in normalized for keyword in ["receita", "receitas", "prescrição", "prescricao"]):
+            return "prescription"
+
+        return None
+
+    def _start_identity_collection(self, context: ConversationContext, menu_choice: str):
+        """Inicia fluxo de coleta de identidade (nome e data) após seleção de menu."""
+        if not context.flow_data:
+            context.flow_data = {}
+
+        flow = context.flow_data
+        flow["menu_choice"] = menu_choice
+        flow["awaiting_patient_name"] = True
+        flow["awaiting_patient_birth_date"] = False
+        flow.pop("patient_name", None)
+        flow.pop("patient_birth_date", None)
+        flow.pop("awaiting_birth_date_correction", None)
+        flow.pop("pending_confirmation", None)
+        flow.pop("alternative_slots", None)
+        context.current_flow = menu_choice
+        flag_modified(context, "flow_data")
+
+    def _build_name_prompt(self, menu_choice: str) -> str:
+        """Retorna mensagem adequada para solicitar o nome completo."""
+        prompts = {
+            "booking": "Perfeito! Para começarmos, me informe seu nome completo, por favor.",
+            "reschedule": "Claro! Para localizar o atendimento, me informe o nome completo do paciente, por favor.",
+            "prescription": "Combinado! Para seguir com as receitas, me informe o nome completo do paciente, por favor."
+        }
+        return prompts.get(menu_choice, "Para continuarmos, me informe seu nome completo, por favor.")
+
+    def _record_interaction(
+        self,
+        context: ConversationContext,
+        user_message: str,
+        assistant_message: str,
+        db: Session,
+        flow_modified: bool = False
+    ):
+        """Registra interação interceptada (usuário + assistente) e sincroniza o banco."""
+        timestamp = datetime.utcnow().isoformat()
+        context.messages.append({
+            "role": "user",
+            "content": user_message,
+            "timestamp": timestamp
+        })
+        context.messages.append({
+            "role": "assistant",
+            "content": assistant_message,
+            "timestamp": datetime.utcnow().isoformat()
+        })
+        flag_modified(context, "messages")
+        if flow_modified:
+            flag_modified(context, "flow_data")
+        context.last_activity = datetime.utcnow()
+        db.commit()
+
     def _generate_updated_summary(self, context: ConversationContext, db: Session) -> str:
         """
         Gera resumo atualizado com os dados do flow_data.
@@ -1354,6 +1439,66 @@ Resposta (apenas o nome do convênio, nada mais):"""
                 db.delete(context)
                 db.commit()
                 return "Foi um prazer atender você! Até logo! 😊"
+
+            # 4. Verificar se há alternativas salvas e usuário escolheu uma (1, 2 ou 3)
+            if not context.flow_data:
+                context.flow_data = {}
+                flag_modified(context, "flow_data")
+            flow_data = context.flow_data
+
+            # 3. Detectar seleção de menu e iniciar coleta sequencial de identidade
+            menu_choice = None
+            if flow_data.get("menu_choice") is None and not flow_data.get("awaiting_patient_name") and not flow_data.get("awaiting_patient_birth_date"):
+                menu_choice = self._detect_main_menu_choice(message, context)
+
+            if menu_choice:
+                logger.info(f"🧭 Menu option '{menu_choice}' selecionada para {phone}")
+                self._start_identity_collection(context, menu_choice)
+                prompt = self._build_name_prompt(menu_choice)
+                self._record_interaction(context, message, prompt, db, flow_modified=True)
+                return prompt
+
+            if flow_data.get("awaiting_patient_name"):
+                name_extraction = self._extrair_nome_e_data_robusto(message)
+                captured_name = name_extraction.get("nome")
+
+                if captured_name:
+                    flow_data["patient_name"] = captured_name
+                    flow_data["awaiting_patient_name"] = False
+                    flow_data["awaiting_patient_birth_date"] = True
+                    flag_modified(context, "flow_data")
+                    first_name = captured_name.split()[0]
+                    response = (
+                        f"Muito obrigada, {first_name}! Agora, para manter o cadastro certinho, "
+                        "me informe sua data de nascimento no formato DD/MM/AAAA."
+                    )
+                    logger.info(f"👤 Nome registrado para {phone}: {captured_name}")
+                    self._record_interaction(context, message, response, db, flow_modified=True)
+                    return response
+
+                error_msg = name_extraction.get("erro_nome") or "Para continuar, preciso do seu nome completo (nome e sobrenome)."
+                response = f"{error_msg.strip().rstrip('.')}. Pode me informar seu nome completo, por favor?"
+                logger.warning(f"⚠️ Nome inválido informado por {phone}: {message}")
+                self._record_interaction(context, message, response, db)
+                return response
+
+            if flow_data.get("awaiting_patient_birth_date"):
+                birth_extraction = self._extrair_nome_e_data_robusto(message)
+                birth_date = birth_extraction.get("data")
+
+                if birth_date:
+                    flow_data["patient_birth_date"] = birth_date
+                    flow_data["awaiting_patient_birth_date"] = False
+                    flow_data.pop("awaiting_birth_date_correction", None)
+                    flag_modified(context, "flow_data")
+                    db.commit()
+                    logger.info(f"📅 Data de nascimento registrada para {phone}: {birth_date}")
+                else:
+                    error_msg = birth_extraction.get("erro_data") or "Não consegui identificar sua data de nascimento."
+                    response = f"{error_msg.strip().rstrip('.')}. Pode enviar no formato DD/MM/AAAA?"
+                    logger.warning(f"⚠️ Data de nascimento inválida informada por {phone}: {message}")
+                    self._record_interaction(context, message, response, db)
+                    return response
 
             # 4. Verificar se há alternativas salvas e usuário escolheu uma (1, 2 ou 3)
             if context.flow_data and context.flow_data.get("alternative_slots"):
