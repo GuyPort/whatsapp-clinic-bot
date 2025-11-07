@@ -1052,6 +1052,8 @@ Lembre-se: Seja natural, adaptável e prestativa. Use as tools disponíveis conf
             ',', '.', '!', '?', 'oi', 'olá', 'bom', 'dia', 'tarde', 'noite',
             # Palavras que não podem ser nomes
             'tudo', 'bem', 'tudo bem', 'beleza', 'ok', 'sim', 'não', 'nao',
+            'preciso', 'precisa', 'precisamos', 'precisava', 'marcar', 'marcação', 'agendar', 'agendamento',
+            'consulta', 'consultar', 'favor', 'por', 'favor', 'urgente', 'filho', 'filha', 'esposo', 'esposa',
             # Meses e abreviações
             'janeiro', 'jan', 'fevereiro', 'fev', 'março', 'mar', 'marco',
             'abril', 'abr', 'maio', 'mai', 'junho', 'jun', 'julho', 'jul',
@@ -1085,9 +1087,15 @@ Lembre-se: Seja natural, adaptável e prestativa. Use as tools disponíveis conf
                 preposicoes = ['de', 'da', 'do', 'dos', 'das']
                 palavras_validas = [p for p in nome_completo.split() if p.lower() not in preposicoes]
                 
-                # Verificar se não é frase comum como "Tudo Bem"
+                # Verificar se não é frase comum como "Tudo Bem" ou pedidos de atendimento
                 nome_lower = nome_completo.lower()
-                frases_invalidas = ['tudo bem', 'tudo bom', 'ok tudo', 'beleza tudo']
+                frases_invalidas = [
+                    'tudo bem', 'tudo bom', 'ok tudo', 'beleza tudo',
+                    'preciso', 'precisa', 'precisamos', 'marcar', 'agendar',
+                    'consulta', 'agendamento', 'por favor', 'favor', 'me ajuda', 'me ajudar',
+                    'preciso marcar', 'preciso agendar', 'quero marcar', 'quero agendar',
+                    'meu filho', 'minha filha', 'meu esposo', 'minha esposa'
+                ]
                 if any(frase in nome_lower for frase in frases_invalidas):
                     logger.info(f"🔍 Ignorando frase comum como nome: {nome_completo}")
                     resultado["erro_nome"] = "Frase comum detectada, não é um nome"
@@ -1615,31 +1623,72 @@ Resposta (apenas o nome do convênio, nada mais):"""
             if not context.flow_data:
                 context.flow_data = {}
 
-            detection = self._extrair_nome_e_data_robusto(message)
-            flow_updated = False
+            if not context.flow_data:
+                context.flow_data = {}
 
-            if (
-                detection.get("nome")
-                and not detection.get("erro_nome")
-                and not context.flow_data.get("patient_name")
-            ):
-                context.flow_data["patient_name"] = detection["nome"].strip()
-                logger.info(f"💾 Nome identificado automaticamente a partir da última mensagem: {detection['nome'].strip()}")
-                flow_updated = True
+            flow_data = context.flow_data
 
-            if (
-                detection.get("data")
-                and not detection.get("erro_data")
-                and not context.flow_data.get("patient_birth_date")
-            ):
-                context.flow_data["patient_birth_date"] = detection["data"].strip()
-                logger.info(f"💾 Data de nascimento identificada automaticamente a partir da última mensagem: {detection['data'].strip()}")
-                flow_updated = True
+            awaiting_name = bool(flow_data.get("awaiting_patient_name"))
+            awaiting_birth_date = bool(flow_data.get("awaiting_patient_birth_date"))
 
-            if flow_updated:
-                self._update_pending_flags(context)
-                flag_modified(context, "flow_data")
-                db.commit()
+            def _message_seems_to_include_patient_data(text: str) -> bool:
+                text_lower = (text or "").lower()
+                if re.search(r"\d{1,2}/\d{1,2}/\d{2,4}", text):
+                    return True
+                keywords = [
+                    "meu nome", "nome é", "nome eh", "me chamo", "chamo-me",
+                    "sou", "nasci", "nascimento", "data de nascimento"
+                ]
+                return any(keyword in text_lower for keyword in keywords)
+
+            should_attempt_extraction = (
+                awaiting_name
+                or awaiting_birth_date
+                or _message_seems_to_include_patient_data(message)
+            )
+
+            if should_attempt_extraction:
+                detection = self._extrair_nome_e_data_robusto(message)
+                flow_updated = False
+
+                message_lower = (message or "").lower()
+                name_keywords = [
+                    "meu nome", "nome é", "nome eh", "me chamo", "chamo-me", "sou"
+                ]
+                allow_name_capture = awaiting_name or any(keyword in message_lower for keyword in name_keywords)
+
+                if (
+                    allow_name_capture
+                    and detection.get("nome")
+                    and not detection.get("erro_nome")
+                    and not flow_data.get("patient_name")
+                ):
+                    flow_data["patient_name"] = detection["nome"].strip()
+                    flow_data.pop("awaiting_patient_name", None)
+                    logger.info(f"💾 Nome identificado automaticamente a partir da última mensagem: {detection['nome'].strip()}")
+                    flow_updated = True
+
+                birth_keywords = [
+                    "nasci", "nascimento", "data de nascimento", "dn", "d.n."
+                ]
+                has_date_pattern = bool(re.search(r"\d{1,2}/\d{1,2}/\d{2,4}", message or ""))
+                allow_birth_capture = awaiting_birth_date or has_date_pattern or any(keyword in message_lower for keyword in birth_keywords)
+
+                if (
+                    allow_birth_capture
+                    and detection.get("data")
+                    and not detection.get("erro_data")
+                    and not flow_data.get("patient_birth_date")
+                ):
+                    flow_data["patient_birth_date"] = detection["data"].strip()
+                    flow_data.pop("awaiting_patient_birth_date", None)
+                    logger.info(f"💾 Data de nascimento identificada automaticamente a partir da última mensagem: {detection['data'].strip()}")
+                    flow_updated = True
+
+                if flow_updated:
+                    self._update_pending_flags(context)
+                    flag_modified(context, "flow_data")
+                    db.commit()
 
             # 6. Preparar mensagens para Claude (histórico completo)
             claude_messages = []
@@ -1939,6 +1988,38 @@ Resposta (apenas o nome do convênio, nada mais):"""
             # e salvar no flow_data imediatamente (não sobrescrever dados existentes)
             if not context.flow_data:
                 context.flow_data = {}
+
+            flow_data = context.flow_data
+            flow_data_changed = False
+
+            response_lower = (bot_response or "").lower()
+            name_prompt_keywords = [
+                "qual seu nome", "qual é seu nome", "qual e seu nome",
+                "nome completo", "seu nome completo", "preciso do seu nome",
+                "me informe seu nome", "me passa seu nome"
+            ]
+            birth_prompt_keywords = [
+                "data de nascimento", "sua data de nascimento",
+                "me informe sua data", "qual sua data de nascimento",
+                "nascimento (formato", "dd/mm/aaaa"
+            ]
+
+            if any(keyword in response_lower for keyword in name_prompt_keywords) and not flow_data.get("patient_name"):
+                if not flow_data.get("awaiting_patient_name"):
+                    flow_data["awaiting_patient_name"] = True
+                    flow_data_changed = True
+
+            if any(keyword in response_lower for keyword in birth_prompt_keywords) and not flow_data.get("patient_birth_date"):
+                if not flow_data.get("awaiting_patient_birth_date"):
+                    flow_data["awaiting_patient_birth_date"] = True
+                    flow_data_changed = True
+
+            if flow_data_changed:
+                flags_changed = self._update_pending_flags(context)
+                if flags_changed:
+                    flow_data_changed = True
+                flag_modified(context, "flow_data")
+                db.commit()
             
             # Extrair dados do histórico
             extracted = self._extract_appointment_data_from_messages(context.messages)
@@ -2258,6 +2339,8 @@ Resposta (apenas o nome do convênio, nada mais):"""
             context = None
             if phone:
                 context = db.query(ConversationContext).filter_by(phone=phone).first()
+                if context and not context.flow_data:
+                    context.flow_data = {}
             
             # Remover flag appointment_completed ao iniciar novo agendamento
             if context and context.flow_data and context.flow_data.get("appointment_completed"):
@@ -2270,9 +2353,10 @@ Resposta (apenas o nome do convênio, nada mais):"""
                 return "Para buscar o próximo horário disponível, preciso dos seus dados primeiro. Por favor, me informe seu nome completo."
             
             # Extrair dados coletados
-            patient_name = context.flow_data.get("patient_name")
-            consultation_type = context.flow_data.get("consultation_type", "clinica_geral")
-            insurance_plan = context.flow_data.get("insurance_plan", "particular")
+            flow_data = context.flow_data
+            patient_name = flow_data.get("patient_name")
+            consultation_type = flow_data.get("consultation_type", "clinica_geral")
+            insurance_plan = flow_data.get("insurance_plan", "particular")
             
             # SALVAMENTO AUTOMÁTICO: Se insurance_plan foi identificado por Claude mas não está no flow_data,
             # tentar extrair do histórico recente (pode ter sido mencionado na última mensagem)
@@ -2290,28 +2374,29 @@ Resposta (apenas o nome do convênio, nada mais):"""
             
             # VERIFICAÇÃO AUTOMÁTICA: Se nome não estiver no flow_data, tentar extrair automaticamente
             if not patient_name:
-                logger.info("⚠️ Nome não encontrado no flow_data, tentando extrair automaticamente...")
-                
-                # Primeiro: tentar usar _extract_appointment_data_from_messages (agora extrai nome também)
-                extracted = self._extract_appointment_data_from_messages(context.messages)
-                if extracted.get("patient_name"):
-                    patient_name = extracted["patient_name"]
-                    context.flow_data["patient_name"] = patient_name
-                    db.commit()
-                    logger.info(f"✅ Nome extraído automaticamente: {patient_name}")
-                
-                # Se ainda não encontrou, tentar usar extract_patient_data com Claude
-                if not patient_name:
-                    logger.info("🔍 Tentando usar extract_patient_data para extrair nome...")
-                    try:
-                        extracted_data = self._extract_patient_data_with_claude(context)
-                        if extracted_data.get("patient_name"):
-                            patient_name = extracted_data["patient_name"]
-                            context.flow_data["patient_name"] = patient_name
-                            db.commit()
-                            logger.info(f"✅ Nome extraído via extract_patient_data: {patient_name}")
-                    except Exception as e:
-                        logger.warning(f"⚠️ Erro ao usar extract_patient_data: {str(e)}")
+                if self._should_attempt_patient_data_extraction(context):
+                    logger.info("⚠️ Nome não encontrado no flow_data, tentando extrair automaticamente...")
+                    
+                    extracted = self._extract_appointment_data_from_messages(context.messages)
+                    if extracted.get("patient_name"):
+                        patient_name = extracted["patient_name"]
+                        flow_data["patient_name"] = patient_name
+                        flag_modified(context, "flow_data")
+                        db.commit()
+                        logger.info(f"✅ Nome extraído automaticamente: {patient_name}")
+                    
+                    if not patient_name:
+                        logger.info("🔍 Tentando usar extract_patient_data para extrair nome...")
+                        try:
+                            extracted_data = self._extract_patient_data_with_claude(context)
+                            if extracted_data.get("patient_name"):
+                                patient_name = extracted_data["patient_name"]
+                                flow_data["patient_name"] = patient_name
+                                flag_modified(context, "flow_data")
+                                db.commit()
+                                logger.info(f"✅ Nome extraído via extract_patient_data: {patient_name}")
+                        except Exception as e:
+                            logger.warning(f"⚠️ Erro ao usar extract_patient_data: {str(e)}")
             
             if not patient_name:
                 return "Para continuar com o agendamento, preciso do seu nome completo. Pode me informar?"
@@ -3352,42 +3437,42 @@ Resposta (apenas o nome do convênio, nada mais):"""
                         logger.info(f"✅ Convênio encontrado no histórico: {convenio}")
                     else:
                         # FALLBACK: Usar Claude para buscar do histórico completo
-                        try:
-                            extracted_data = self._extract_patient_data_with_claude(context)
-                            if extracted_data and extracted_data.get("insurance_plan"):
-                                convenio = extracted_data["insurance_plan"]
-                                # Normalizar valores
-                                if convenio.lower() == "ipe":
-                                    convenio = "IPE"
-                                elif convenio.lower() == "cabergs":
-                                    convenio = "CABERGS"
-                                elif convenio.lower() in ["particular", "particula"]:
-                                    convenio = "Particular"
+                        if self._should_attempt_patient_data_extraction(context):
+                            try:
+                                extracted_data = self._extract_patient_data_with_claude(context)
+                                if extracted_data and extracted_data.get("insurance_plan"):
+                                    convenio = extracted_data["insurance_plan"]
+                                    # Normalizar valores
+                                    if convenio.lower() == "ipe":
+                                        convenio = "IPE"
+                                    elif convenio.lower() == "cabergs":
+                                        convenio = "CABERGS"
+                                    elif convenio.lower() in ["particular", "particula"]:
+                                        convenio = "Particular"
 
-                                # IMPORTANTE: Salvar no flow_data para não perder novamente
-                                context.flow_data["insurance_plan"] = convenio
-                                db.commit()
-                                logger.info(f"✅ Convênio recuperado via Claude e salvo: {convenio}")
-                        except Exception as e:
-                            logger.warning(f"⚠️ Erro ao buscar convênio com Claude: {e}")
+                                    # IMPORTANTE: Salvar no flow_data para não perder novamente
+                                    context.flow_data["insurance_plan"] = convenio
+                                    db.commit()
+                                    logger.info(f"✅ Convênio recuperado via Claude e salvo: {convenio}")
+                            except Exception as e:
+                                logger.warning(f"⚠️ Erro ao buscar convênio com Claude: {e}")
                 
                 # Se nome estiver faltando ou parecer inválido (frases como "Eu Preciso Marcar Uma Consulta"),
                 # tentar extrair usando Claude diretamente
                 if not nome or any(phrase in nome.lower() for phrase in ["preciso", "quero", "marcar", "consulta", "agendamento", "tudo bem"]):
                     logger.warning(f"⚠️ Nome suspeito/inválido detectado: '{nome}'. Tentando extrair com Claude...")
-                    try:
-                        # Chamar função auxiliar para extrair dados diretamente
-                        extracted_data = self._extract_patient_data_with_claude(context)
-                        if extracted_data and extracted_data.get("patient_name"):
-                            novo_nome = extracted_data["patient_name"]
-                            if novo_nome and novo_nome != nome:
-                                nome = novo_nome
-                                # Atualizar também no flow_data
-                                context.flow_data["patient_name"] = novo_nome
-                                db.commit()
-                                logger.info(f"✅ Nome corrigido pelo Claude: {nome}")
-                    except Exception as e:
-                        logger.error(f"Erro ao tentar extrair nome com Claude: {e}")
+                    if self._should_attempt_patient_data_extraction(context):
+                        try:
+                            extracted_data = self._extract_patient_data_with_claude(context)
+                            if extracted_data and extracted_data.get("patient_name"):
+                                novo_nome = extracted_data["patient_name"]
+                                if novo_nome and novo_nome != nome:
+                                    nome = novo_nome
+                                    context.flow_data["patient_name"] = novo_nome
+                                    db.commit()
+                                    logger.info(f"✅ Nome corrigido pelo Claude: {nome}")
+                        except Exception as e:
+                            logger.error(f"Erro ao tentar extrair nome com Claude: {e}")
             
             # Retornar resumo para confirmação
             msg = f"✅ Horário {time_str} disponível!\n\n"
@@ -3817,6 +3902,34 @@ Resposta (apenas o nome do convênio, nada mais):"""
             db.rollback()
             return f"Erro ao transferir para humano: {str(e)}"
 
+    def _should_attempt_patient_data_extraction(self, context: Optional[ConversationContext]) -> bool:
+        """Define se devemos tentar extrair dados automaticamente a partir do histórico."""
+        if not context:
+            return False
+
+        flow_data = context.flow_data or {}
+        if flow_data.get("awaiting_patient_name") or flow_data.get("awaiting_patient_birth_date"):
+            return True
+
+        for msg in reversed(context.messages or []):
+            if msg.get("role") != "user":
+                continue
+            text = (msg.get("content") or "").strip()
+            if not text:
+                continue
+            text_lower = text.lower()
+            if re.search(r"\d{1,2}/\d{1,2}/\d{2,4}", text):
+                return True
+            keywords = [
+                "meu nome", "nome é", "nome eh", "me chamo", "chamo-me",
+                "data de nascimento", "nasci", "sou"
+            ]
+            if any(keyword in text_lower for keyword in keywords):
+                return True
+            break
+
+        return False
+
     def _extract_patient_data_with_claude(self, context: ConversationContext, return_dict: bool = False) -> Dict[str, Any]:
         """Usa Claude para extrair dados do paciente do histórico (função auxiliar interna)"""
         try:
@@ -4149,6 +4262,12 @@ IMPORTANTE: Se identificar que "patient_name" é uma frase de pedido (ex: "Eu Pr
 
         ensure_flag("pending_patient_name", bool(flow_data.get("patient_name")))
         ensure_flag("pending_birth_date", bool(flow_data.get("patient_birth_date")))
+
+        if flow_data.get("patient_name") and flow_data.pop("awaiting_patient_name", None) is not None:
+            changed = True
+
+        if flow_data.get("patient_birth_date") and flow_data.pop("awaiting_patient_birth_date", None) is not None:
+            changed = True
 
         if flow_data.get("consultation_type") == "domiciliar":
             ensure_flag("pending_home_address", bool(flow_data.get("patient_address")))
