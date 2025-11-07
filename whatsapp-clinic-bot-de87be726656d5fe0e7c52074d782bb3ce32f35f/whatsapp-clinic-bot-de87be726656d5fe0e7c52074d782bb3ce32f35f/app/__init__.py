@@ -1,2 +1,0 @@
-# WhatsApp Clinic Bot
-
