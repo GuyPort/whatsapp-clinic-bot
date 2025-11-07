@@ -1332,6 +1332,28 @@ Resposta (apenas o nome do convênio, nada mais):"""
         }
         return prompts.get(menu_choice, "Para continuarmos, me informe seu nome completo, por favor.")
 
+    def _build_post_identity_prompt(self, menu_choice: str) -> str:
+        """Mensagem padrão para a próxima etapa após captar nome e data."""
+        if menu_choice == "booking":
+            return (
+                "Perfeito! Agora me informe qual tipo de consulta você deseja:\n\n"
+                "1️⃣ Clínica Geral - R$ 300\n"
+                "2️⃣ Geriatria Clínica e Preventiva - R$ 300\n"
+                "3️⃣ Atendimento Domiciliar ao Paciente Idoso - R$ 500\n\n"
+                "Digite o número da opção desejada."
+            )
+        if menu_choice == "reschedule":
+            return (
+                "Obrigada! Localizei seu cadastro. Qual consulta você deseja remarcar ou cancelar? "
+                "Se puder, me informe a data ou horário que lembra."
+            )
+        if menu_choice == "prescription":
+            return (
+                "Perfeito! Qual receita você precisa renovar ou consultar? "
+                "Pode me informar o nome da medicação ou a indicação da receita."
+            )
+        return "Obrigada! Como posso te ajudar a seguir?"
+
     def _record_interaction(
         self,
         context: ConversationContext,
@@ -1491,8 +1513,11 @@ Resposta (apenas o nome do convênio, nada mais):"""
                     flow_data["awaiting_patient_birth_date"] = False
                     flow_data.pop("awaiting_birth_date_correction", None)
                     flag_modified(context, "flow_data")
-                    db.commit()
                     logger.info(f"📅 Data de nascimento registrada para {phone}: {birth_date}")
+
+                    next_prompt = self._build_post_identity_prompt(flow_data.get("menu_choice"))
+                    self._record_interaction(context, message, next_prompt, db, flow_modified=True)
+                    return next_prompt
                 else:
                     error_msg = birth_extraction.get("erro_data") or "Não consegui identificar sua data de nascimento."
                     response = f"{error_msg.strip().rstrip('.')}. Pode enviar no formato DD/MM/AAAA?"
