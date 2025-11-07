@@ -820,6 +820,10 @@ Lembre-se: Seja natural, adaptável e prestativa. Use as tools disponíveis conf
         import re
         from datetime import datetime
         
+        # Normalizar espaços e acentos simples
+        mensagem = mensagem.strip()
+        mensagem_lower = mensagem.lower()
+        
         # Lista de frases curtas que devem ser ignoradas (não são nomes)
         FRASES_IGNORAR = [
             "sim", "não", "nao", "tudo bem", "obrigado", "obrigada",
@@ -828,15 +832,50 @@ Lembre-se: Seja natural, adaptável e prestativa. Use as tools disponíveis conf
             "prazer", "impeça", "adicione", "venha", "vir", "está"
         ]
         
+        # Opções do menu principal que não devem ser interpretadas como nome
+        MENU_OPCOES = [
+            "marcar consulta",
+            "remarcar",
+            "remarcar consulta",
+            "cancelar consulta",
+            "remarcar/cancelar consulta",
+            "receitas",
+            "receita",
+            "opção 1",
+            "opção 2",
+            "opção 3",
+            "opcao 1",
+            "opcao 2",
+            "opcao 3",
+            "1",
+            "2",
+            "3"
+        ]
+        
         # Lista de palavras ofensivas a serem ignoradas
         PALAVRAS_OFENSIVAS = [
             "puta", "pinto", "buceta", "caralho", "cacete", "porra", "merda",
             "cu", "foda", "fodas", "foder", "chupa", "viado", "veado",
-            "sua mãe", "sua mãe", "filho da puta", "filha da puta"
+            "sua mãe", "sua mae", "filho da puta", "filha da puta"
         ]
         
-        # Validar se mensagem não é apenas uma frase de confirmação
-        mensagem_lower = mensagem.lower().strip()
+        # Ignorar mensagens que combinam opções do menu
+        if mensagem_lower in MENU_OPCOES:
+            return {
+                "nome": None,
+                "data": None,
+                "erro_nome": "menu_option",
+                "erro_data": None
+            }
+        
+        # Ignorar mensagens numéricas pequenas (ex: "01", "02")
+        if mensagem.isdigit() and len(mensagem) <= 2:
+            return {
+                "nome": None,
+                "data": None,
+                "erro_nome": "menu_option",
+                "erro_data": None
+            }
         
         # Ignorar mensagens com palavras ofensivas
         if any(palavra in mensagem_lower for palavra in PALAVRAS_OFENSIVAS):
