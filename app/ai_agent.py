@@ -3337,8 +3337,8 @@ Resposta (apenas o nome do convênio, nada mais):"""
                 # Atualizar convênio se não tem ou é padrão
                 if (not convenio or convenio == "particular"):
                     if extracted.get("insurance_plan"):
-                    convenio = extracted["insurance_plan"]
-                    logger.info(f"✅ Convênio encontrado no histórico: {convenio}")
+                        convenio = extracted["insurance_plan"]
+                        logger.info(f"✅ Convênio encontrado no histórico: {convenio}")
                     else:
                         # FALLBACK: Usar Claude para buscar do histórico completo
                         try:
@@ -3352,7 +3352,7 @@ Resposta (apenas o nome do convênio, nada mais):"""
                                     convenio = "CABERGS"
                                 elif convenio.lower() in ["particular", "particula"]:
                                     convenio = "Particular"
-                                
+
                                 # IMPORTANTE: Salvar no flow_data para não perder novamente
                                 context.flow_data["insurance_plan"] = convenio
                                 db.commit()
