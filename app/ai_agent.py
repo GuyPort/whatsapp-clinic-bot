@@ -3336,8 +3336,9 @@ Resposta (apenas o nome do convênio, nada mais):"""
                 
                 # Atualizar convênio se não tem ou é padrão
                 if (not convenio or convenio == "particular"):
-                    if extracted.get("insurance_plan"):
-                        convenio = extracted["insurance_plan"]
+                    insurance_from_history = extracted.get("insurance_plan") if extracted else None
+                    if insurance_from_history:
+                        convenio = insurance_from_history
                         logger.info(f"✅ Convênio encontrado no histórico: {convenio}")
                     else:
                         # FALLBACK: Usar Claude para buscar do histórico completo
