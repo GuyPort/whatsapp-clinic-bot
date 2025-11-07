@@ -647,6 +647,25 @@ Lembre-se: Seja natural, adaptável e prestativa. Use as tools disponíveis conf
             logger.warning(f"⚠️ Data inválida: {date_str} - {str(e)}")
             return None
 
+    def _pick_relevant_block(self, content_blocks: List[Any]) -> Optional[Any]:
+        """
+        Seleciona o primeiro bloco relevante retornado pelo Claude.
+        Ignora blocos de pensamento ou metadados e retorna blocos textuais
+        ou de tool_use que devam ser processados.
+        """
+        if not content_blocks:
+            return None
+
+        ignored_types = {"thinking", "message_metadata"}
+
+        for block in content_blocks:
+            block_type = getattr(block, "type", None)
+            if block_type in ignored_types:
+                continue
+            return block
+
+        return None
+
     def _extract_appointment_data_from_messages(self, messages: list) -> dict:
         """Extrai dados básicos de agendamento do histórico de mensagens.
         Versão simplificada: apenas detecção rápida de datas, horários e escolhas numéricas.
@@ -1709,9 +1728,12 @@ Resposta (apenas o nome do convênio, nada mais):"""
             
             # 7. Processar resposta do Claude
             if response.content:
-                content = response.content[0]
-                
-                if content.type == "text":
+                content = self._pick_relevant_block(response.content)
+
+                if not content:
+                    logger.warning("⚠️ Nenhum bloco relevante encontrado na resposta inicial do Claude")
+                    bot_response = "Desculpe, não consegui processar sua mensagem. Tente novamente."
+                elif content.type == "text":
                     bot_response = content.text
                 elif content.type == "tool_use":
                     # Loop para processar múltiplas tools em sequência
@@ -1722,20 +1744,17 @@ Resposta (apenas o nome do convênio, nada mais):"""
                     while iteration < max_iterations:
                         iteration += 1
                         
-                        # Verificar se há content na resposta
-                        if not current_response.content or len(current_response.content) == 0:
-                            logger.warning(f"⚠️ Iteration {iteration}: Claude retornou resposta vazia")
-                            
-                            # Se há tool_result anterior, usar como fallback (para outras tools)
+                        content = self._pick_relevant_block(current_response.content or [])
+
+                        if not content:
+                            logger.warning(f"⚠️ Iteration {iteration}: Claude não retornou bloco relevante")
+
                             if 'tool_result' in locals():
-                                # Usar diretamente o resultado da tool como resposta
                                 bot_response = tool_result
-                                logger.info("📤 Usando tool_result como resposta (Claude retornou vazio)")
+                                logger.info("📤 Usando tool_result como resposta (Claude retornou bloco irrelevante)")
                             else:
                                 bot_response = "Desculpe, não consegui processar sua solicitação completamente."
                             break
-                        
-                        content = current_response.content[0]
                         
                         if content.type == "text":
                             # Claude retornou texto final, sair do loop
@@ -1845,13 +1864,14 @@ Resposta (apenas o nome do convênio, nada mais):"""
                                             )
                                             
                                             # Processar resposta do Claude
-                                            if current_response.content and len(current_response.content) > 0:
-                                                if current_response.content[0].type == "text":
-                                                    bot_response = current_response.content[0].text
+                                            followup_block = self._pick_relevant_block(current_response.content or [])
+                                            if followup_block:
+                                                if followup_block.type == "text":
+                                                    bot_response = followup_block.text
                                                     break
-                                                elif current_response.content[0].type == "tool_use":
+                                                if followup_block.type == "tool_use":
                                                     # Claude pode ter chamado uma tool (ex: end_conversation), continuar processamento
-                                                    content = current_response.content[0]
+                                                    content = followup_block
                                                     continue
                                             
                                             # Se Claude não retornou nada, usar mensagem de confirmação diretamente
@@ -1904,9 +1924,9 @@ Resposta (apenas o nome do convênio, nada mais):"""
                             # Interceptação universal de respostas curtas
                             # Verificar se resposta é muito curta (< 100 chars) ou stop_reason é "end_turn"
                             content_text = ""
-                            if current_response.content and len(current_response.content) > 0:
-                                if current_response.content[0].type == "text":
-                                    content_text = current_response.content[0].text
+                            followup_block = self._pick_relevant_block(current_response.content or [])
+                            if followup_block and followup_block.type == "text":
+                                content_text = followup_block.text
                             
                             is_short = len(content_text) < 100 or current_response.stop_reason == "end_turn"
                             
@@ -1942,15 +1962,16 @@ Resposta (apenas o nome do convênio, nada mais):"""
                                 logger.info(f"✅ Resposta interceptada e substituída pelo resultado da tool {content.name}")
                                 
                                 # Processar imediatamente o conteúdo interceptado
-                                if current_response.content[0].type == "text":
-                                    bot_response = current_response.content[0].text
+                                intercepted_block = self._pick_relevant_block(current_response.content or [])
+                                if intercepted_block and intercepted_block.type == "text":
+                                    bot_response = intercepted_block.text
                                     break
                             
                             # Verificar se Claude retornou texto após processar tool (iteração normal)
-                            if current_response.content and len(current_response.content) > 0:
-                                if current_response.content[0].type == "text":
-                                    bot_response = current_response.content[0].text
-                                    break
+                            followup_block = self._pick_relevant_block(current_response.content or [])
+                            if followup_block and followup_block.type == "text":
+                                bot_response = followup_block.text
+                                break
                             
                             # Continuar loop para processar próxima resposta
                         else:
