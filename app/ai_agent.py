@@ -662,7 +662,6 @@ Lembre-se: Seja natural, adaptável e prestativa. Use as tools disponíveis conf
                 "insurance_plan": None
             }
             logger.info(f"🔍 Extraindo dados básicos de {len(messages)} mensagens (versão simplificada)")
-            import re
             from datetime import datetime
             
             # Processar em ORDEM CRONOLÓGICA (primeira mensagem primeiro)
@@ -818,7 +817,6 @@ Lembre-se: Seja natural, adaptável e prestativa. Use as tools disponíveis conf
                 "erro_data": str | None
             }
         """
-        import re
         from datetime import datetime
         
         # Normalizar espaços e acentos simples
@@ -1244,7 +1242,6 @@ Lembre-se: Seja natural, adaptável e prestativa. Use as tools disponíveis conf
         
         # Detectar IPE (garantir que não é parte de outra palavra)
         # Verificar se "ipe" está sozinho ou como palavra completa
-        import re
         if re.search(r'\bipe\b', message_lower) and "cabergs" not in message_lower:
             return "IPE"
         
@@ -2032,7 +2029,6 @@ Resposta (apenas o nome do convênio, nada mais):"""
             # FALLBACK: Tentar extrair nome se não estiver no flow_data mas houver padrão claro nas mensagens
             if not context.flow_data.get("patient_name"):
                 # Verificar últimas mensagens do usuário por padrões claros de nome
-                import re
                 name_patterns = [
                     r'(?:meu nome é|sou|me chamo|me chama|chamo-me)\s+([A-ZÁÉÍÓÚÂÊÔÇ][a-záéíóúâêôçãõ]+(?:\s+[A-ZÁÉÍÓÚÂÊÔÇ][a-záéíóúâêôçãõ]+)+)',
                     r'(?:nome|chamo)\s+([A-ZÁÉÍÓÚÂÊÔÇ][a-záéíóúâêôçãõ]+(?:\s+[A-ZÁÉÍÓÚÂÊÔÇ][a-záéíóúâêôçãõ]+)+)',
@@ -2246,7 +2242,6 @@ Resposta (apenas o nome do convênio, nada mais):"""
                 
                 # Validar horário antes de executar fallback
                 time_str = context.flow_data["appointment_time"]
-                import re
                 is_valid = False
                 if re.match(r'^\d{2}:\d{2}$', time_str):
                     hour, minute = time_str.split(':')
@@ -3283,7 +3278,6 @@ Resposta (apenas o nome do convênio, nada mais):"""
     def _handle_confirm_time_slot(self, tool_input: Dict, db: Session, phone: str = None) -> str:
         """Validar e confirmar horário escolhido"""
         try:
-            import re
             from app.utils import normalize_time_format
             
             date_str = tool_input.get("date")
@@ -3995,7 +3989,6 @@ IMPORTANTE: Se identificar que "patient_name" é uma frase de pedido (ex: "Eu Pr
             
             # Tentar parsear JSON da resposta
             import json
-            import re
             
             # Buscar JSON na resposta (pode estar entre markdown code blocks ou direto)
             json_match = re.search(r'\{[^{}]*"patient_name"[^{}]*\}', claude_response, re.DOTALL)
@@ -4051,8 +4044,6 @@ IMPORTANTE: Se identificar que "patient_name" é uma frase de pedido (ex: "Eu Pr
                 context.flow_data["appointment_date"] = extracted_data["appointment_date"]
             
             if extracted_data.get("appointment_time"):
-                # Validar formato HH:MM antes de salvar
-                import re
                 if re.match(r'^\d{2}:\d{2}$', extracted_data["appointment_time"]):
                     hour, minute = extracted_data["appointment_time"].split(':')
                     if minute == '00':
