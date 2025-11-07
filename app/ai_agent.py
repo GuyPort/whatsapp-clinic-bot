@@ -169,11 +169,16 @@ Quando o usuário escolher marcar consulta (opção 1), você precisa coletar:
       Você pode enviar tudo junto ou separado, como preferir!"
    3. AGUARDE o usuário fornecer o endereço completo
    4. DEPOIS: Chame request_home_address para extrair e salvar o endereço fornecido
-   5. Após request_home_address retornar sucesso, o sistema chamará notify_doctor_home_visit automaticamente
-   6. Após notify_doctor_home_visit retornar sucesso, você receberá uma mensagem de confirmação para enviar ao paciente
-   7. Envie a mensagem de confirmação e pergunte: "Posso te ajudar com mais alguma coisa?"
-   8. Se resposta for "não" ou similar → chame end_conversation
-   9. Se resposta for "sim" → ajude com o necessário e repita a pergunta até receber "não"
+   5. Após request_home_address retornar sucesso, o sistema tentará avisar a doutora automaticamente assim que nome, data de nascimento e endereço estiverem salvos no flow_data
+   6. VERIFIQUE SEMPRE o flow_data antes de prosseguir:
+      • Se existir `pending_patient_name` → peça o nome completo do paciente
+      • Se existir `pending_birth_date` → peça a data de nascimento (DD/MM/AAAA)
+      • Se existir `pending_home_address` → peça o endereço completo (Cidade, Bairro, Rua e Número)
+      • Se existir `pending_doctor_notification` → confirme com o paciente que a doutora será avisada e finalize a mensagem de confirmação
+   7. Quando a notificação for enviada, você receberá uma mensagem de confirmação pronta para enviar ao paciente
+   8. Envie essa mensagem e pergunte: "Posso te ajudar com mais alguma coisa?"
+   9. Se resposta for "não" ou similar → chame end_conversation
+   10. Se resposta for "sim" → ajude com o necessário e repita a pergunta até receber "não"
 
 3. CONVÊNIO
    "Ótimo! Você possui convênio médico?
@@ -576,7 +581,7 @@ Lembre-se: Seja natural, adaptável e prestativa. Use as tools disponíveis conf
             },
             {
                 "name": "request_home_address",
-                "description": "Extrai e salva o endereço completo do paciente para atendimento domiciliar. Use APENAS quando o usuário já forneceu o endereço completo (após você ter pedido o endereço). NÃO use quando o usuário ainda não forneceu o endereço - nesse caso, apenas peça o endereço sem chamar esta tool. Esta tool valida se a mensagem realmente contém um endereço antes de salvar.",
+                "description": "Extrai e salva o endereço completo do paciente para atendimento domiciliar. Use quando consultation_type for 'domiciliar' e `pending_home_address` estiver presente no flow_data (ou após o paciente informar o endereço em texto). Antes de chamar, peça claramente o endereço no chat. Após esta tool retornar sucesso, o sistema cuidará de avisar a doutora automaticamente, então só repita a tool se o paciente enviar um novo endereço.",
                 "input_schema": {
                     "type": "object",
                     "properties": {},
@@ -585,7 +590,7 @@ Lembre-se: Seja natural, adaptável e prestativa. Use as tools disponíveis conf
             },
             {
                 "name": "notify_doctor_home_visit",
-                "description": "Envia notificação para a doutora sobre nova solicitação de atendimento domiciliar. Use APENAS após receber endereço completo do paciente (após request_home_address). Esta tool coleta nome, data nascimento, endereço e telefone do flow_data e envia mensagem formatada para a doutora.",
+                "description": "Envia notificação para a doutora sobre nova solicitação de atendimento domiciliar. Normalmente o sistema chama esta tool automaticamente assim que nome, data de nascimento e endereço estiverem completos. Use manualmente apenas se `pending_doctor_notification` continuar ativo no flow_data ou se houver necessidade explícita de reenviar a notificação.",
                 "input_schema": {
                     "type": "object",
                     "properties": {},
@@ -1556,7 +1561,36 @@ Resposta (apenas o nome do convênio, nada mais):"""
                 "content": message,
                 "timestamp": datetime.utcnow().isoformat()
             })
-            flag_modified(context, 'messages')
+
+            # 5.1 Atualizar automaticamente nome e data de nascimento enviados em mensagens isoladas
+            if not context.flow_data:
+                context.flow_data = {}
+
+            detection = self._extrair_nome_e_data_robusto(message)
+            flow_updated = False
+
+            if (
+                detection.get("nome")
+                and not detection.get("erro_nome")
+                and not context.flow_data.get("patient_name")
+            ):
+                context.flow_data["patient_name"] = detection["nome"].strip()
+                logger.info(f"💾 Nome identificado automaticamente a partir da última mensagem: {detection['nome'].strip()}")
+                flow_updated = True
+
+            if (
+                detection.get("data")
+                and not detection.get("erro_data")
+                and not context.flow_data.get("patient_birth_date")
+            ):
+                context.flow_data["patient_birth_date"] = detection["data"].strip()
+                logger.info(f"💾 Data de nascimento identificada automaticamente a partir da última mensagem: {detection['data'].strip()}")
+                flow_updated = True
+
+            if flow_updated:
+                self._update_pending_flags(context)
+                flag_modified(context, "flow_data")
+                db.commit()
 
             # 6. Preparar mensagens para Claude (histórico completo)
             claude_messages = []
@@ -1565,7 +1599,8 @@ Resposta (apenas o nome do convênio, nada mais):"""
                     "role": msg["role"],
                     "content": msg["content"]
                 })
-            
+            flag_modified(context, 'messages')
+
             # 6. Fazer chamada para o Claude com histórico completo
             logger.info(f"🤖 Enviando {len(claude_messages)} mensagens para Claude")
             response = self.client.messages.create(
@@ -1639,6 +1674,33 @@ Resposta (apenas o nome do convênio, nada mais):"""
                                     has_birth_date = flow_data.get("patient_birth_date")
                                     has_address = flow_data.get("patient_address")
                                     
+                                    data_updated = False
+                                    if context and (not has_name or not has_birth_date):
+                                        try:
+                                            extracted_data = self._extract_patient_data_with_claude(context)
+                                            if extracted_data:
+                                                if not has_name and extracted_data.get("patient_name"):
+                                                    flow_data["patient_name"] = extracted_data["patient_name"].strip()
+                                                    has_name = flow_data["patient_name"]
+                                                    data_updated = True
+                                                    logger.info(f"✅ Nome preenchido automaticamente via Claude: {has_name}")
+                                                if not has_birth_date and extracted_data.get("patient_birth_date"):
+                                                    flow_data["patient_birth_date"] = extracted_data["patient_birth_date"].strip()
+                                                    has_birth_date = flow_data["patient_birth_date"]
+                                                    data_updated = True
+                                                    logger.info(f"✅ Data de nascimento preenchida automaticamente via Claude: {has_birth_date}")
+                                        except Exception as e:
+                                            logger.warning(f"⚠️ Não foi possível extrair dados adicionais via Claude: {str(e)}")
+                                    
+                                    flags_changed = self._update_pending_flags(context)
+                                    if data_updated or flags_changed:
+                                        flag_modified(context, "flow_data")
+                                        db.commit()
+                                    
+                                    has_name = flow_data.get("patient_name")
+                                    has_birth_date = flow_data.get("patient_birth_date")
+                                    has_address = flow_data.get("patient_address")
+                                    
                                     if has_name and has_birth_date and has_address:
                                         # Chamar notify_doctor_home_visit diretamente
                                         notify_result = self._execute_tool("notify_doctor_home_visit", {}, db, phone)
@@ -1704,12 +1766,20 @@ Resposta (apenas o nome do convênio, nada mais):"""
                                             # Erro ao enviar notificação, adicionar ao tool_result para Claude tratar
                                             tool_result += f"\n\n[ERRO: Falha ao enviar notificação para a doutora: {notify_result}]"
                                     else:
-                                        # Dados faltando, adicionar ao tool_result para Claude tratar
-                                        missing = []
-                                        if not has_name: missing.append("nome")
-                                        if not has_birth_date: missing.append("data de nascimento")
-                                        if not has_address: missing.append("endereço")
-                                        tool_result += f"\n\n[ERRO: Faltam informações para enviar notificação: {', '.join(missing)}]"
+                                        # Dados faltando, orientar Claude a solicitar informações restantes
+                                        missing_parts = []
+                                        if not has_name:
+                                            missing_parts.append("• Nome completo do paciente")
+                                        if not has_birth_date:
+                                            missing_parts.append("• Data de nascimento do paciente")
+                                        if not has_address:
+                                            missing_parts.append("• Endereço completo (Cidade, Bairro, Rua e Número)")
+                                        if missing_parts:
+                                            checklist = "\n".join(missing_parts)
+                                            tool_result = (
+                                                "Endereço registrado! Antes de avisar a doutora, ainda preciso das seguintes informações:\n"
+                                                f"{checklist}\nPor favor, peça esses dados ao paciente e me informe assim que possível."
+                                            )
                             
                             logger.info(f"🔧 Iteration {iteration}: Tool {content.name} result: {tool_result[:200] if len(tool_result) > 200 else tool_result}")
                             
@@ -1921,6 +1991,11 @@ Resposta (apenas o nome do convênio, nada mais):"""
                 elif patient_address and not doctor_notified:
                     logger.info("🏠 Detectado atendimento domiciliar com endereço mas sem notificação - instruindo Claude a chamar notify_doctor_home_visit")
                     context.flow_data["pending_doctor_notification"] = True
+                    flag_modified(context, "flow_data")
+                    db.commit()
+            elif context.flow_data.get("pending_home_address"):
+                # Garantir que a flag seja removida se usuário mudou o tipo de consulta
+                if self._update_pending_flags(context):
                     flag_modified(context, "flow_data")
                     db.commit()
             
@@ -3907,6 +3982,7 @@ IMPORTANTE: Se identificar que "patient_name" é uma frase de pedido (ex: "Eu Pr
                 context.flow_data = {}
             
             context.flow_data["patient_address"] = last_user_message.strip()
+            self._update_pending_flags(context)
             flag_modified(context, "flow_data")
             db.commit()
             
@@ -3998,6 +4074,39 @@ IMPORTANTE: Se identificar que "patient_name" é uma frase de pedido (ex: "Eu Pr
         logger.info("🔄 Recarregando informações da clínica...")
         self.clinic_info = load_clinic_info()
         logger.info("✅ Informações da clínica recarregadas!")
+
+    def _update_pending_flags(self, context: ConversationContext) -> bool:
+        """Atualiza flags de pendências no flow_data e retorna True se algo foi alterado."""
+        if not context:
+            return False
+
+        if not context.flow_data:
+            context.flow_data = {}
+
+        flow_data = context.flow_data
+        changed = False
+
+        def ensure_flag(flag_name: str, has_value: bool) -> None:
+            nonlocal changed
+            if has_value:
+                if flag_name in flow_data:
+                    flow_data.pop(flag_name, None)
+                    changed = True
+            else:
+                if not flow_data.get(flag_name):
+                    flow_data[flag_name] = True
+                    changed = True
+
+        ensure_flag("pending_patient_name", bool(flow_data.get("patient_name")))
+        ensure_flag("pending_birth_date", bool(flow_data.get("patient_birth_date")))
+
+        if flow_data.get("consultation_type") == "domiciliar":
+            ensure_flag("pending_home_address", bool(flow_data.get("patient_address")))
+        else:
+            if flow_data.pop("pending_home_address", None) is not None:
+                changed = True
+
+        return changed
 
 
 # Instância global do agente
