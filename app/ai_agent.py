@@ -130,10 +130,10 @@ PRINCÍPIOS DE COMUNICAÇÃO:
 - Se informação estiver incompleta ou ambígua, pergunte de forma clara e educada
 - Se não entender algo, peça esclarecimento de forma amigável
 
-═══════════════════════════════════════════════════════════
+   ═══════════════════════════════════════════════════════════
 FLUXO DE AGENDAMENTO
-═══════════════════════════════════════════════════════════
-
+   ═══════════════════════════════════════════════════════════
+   
 Quando o usuário escolher marcar consulta (opção 1), você precisa coletar:
 
 1. NOME COMPLETO e DATA DE NASCIMENTO
@@ -645,7 +645,7 @@ Lembre-se: Seja natural, adaptável e prestativa. Use as tools disponíveis conf
         except (ValueError, AttributeError) as e:
             logger.warning(f"⚠️ Data inválida: {date_str} - {str(e)}")
             return None
-    
+
     def _extract_appointment_data_from_messages(self, messages: list) -> dict:
         """Extrai dados básicos de agendamento do histórico de mensagens.
         Versão simplificada: apenas detecção rápida de datas, horários e escolhas numéricas.
@@ -1639,7 +1639,7 @@ Resposta (apenas o nome do convênio, nada mais):"""
                     "content": msg["content"]
                 })
             flag_modified(context, 'messages')
-
+            
             # 6. Fazer chamada para o Claude com histórico completo
             logger.info(f"🤖 Enviando {len(claude_messages)} mensagens para Claude")
             response = self.client.messages.create(
@@ -3337,8 +3337,8 @@ Resposta (apenas o nome do convênio, nada mais):"""
                 # Atualizar convênio se não tem ou é padrão
                 if (not convenio or convenio == "particular"):
                     if extracted.get("insurance_plan"):
-                        convenio = extracted["insurance_plan"]
-                        logger.info(f"✅ Convênio encontrado no histórico: {convenio}")
+                    convenio = extracted["insurance_plan"]
+                    logger.info(f"✅ Convênio encontrado no histórico: {convenio}")
                     else:
                         # FALLBACK: Usar Claude para buscar do histórico completo
                         try:
