@@ -1,16 +1,3 @@
-    def _is_small_talk(self, message: str) -> bool:
-        if not message:
-            return False
-        text = message.strip().lower()
-        small_talk_phrases = {
-            "tudo bem?", "tudo bem", "como vai?", "como vai", "como você está?",
-            "como voce esta?", "como vcs estao?", "como estão?", "como está?",
-            "como esta?", "como vocês estão?", "como vc está?", "como vocês estao?",
-            "como vc esta?", "tudo bom?", "tudo bom", "oi", "olá", "ola",
-            "bom dia", "boa tarde", "boa noite"
-        }
-        return text in small_talk_phrases
-
 """
 Agente de IA com Claude SDK + Tools para agendamento de consultas.
 Versão completa com menu estruturado e gerenciamento de contexto.
@@ -88,6 +75,19 @@ class ClaudeToolAgent:
         self.timezone = get_brazil_timezone()
         self.tools = self._define_tools()
         self.system_prompt = self._create_system_prompt()
+
+    def _is_small_talk(self, message: str) -> bool:
+        if not message:
+            return False
+        text = message.strip().lower()
+        small_talk_phrases = {
+            "tudo bem?", "tudo bem", "como vai?", "como vai", "como você está?",
+            "como voce esta?", "como vcs estao?", "como estão?", "como está?",
+            "como esta?", "como vocês estão?", "como vc está?", "como vocês estao?",
+            "como vc esta?", "tudo bom?", "tudo bom", "oi", "olá", "ola",
+            "bom dia", "boa tarde", "boa noite"
+        }
+        return text in small_talk_phrases
         
     def _create_system_prompt(self) -> str:
         """Cria o prompt do sistema para o Claude"""
