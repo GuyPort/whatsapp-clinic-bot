@@ -1,3 +1,16 @@
+    def _is_small_talk(self, message: str) -> bool:
+        if not message:
+            return False
+        text = message.strip().lower()
+        small_talk_phrases = {
+            "tudo bem?", "tudo bem", "como vai?", "como vai", "como você está?",
+            "como voce esta?", "como vcs estao?", "como estão?", "como está?",
+            "como esta?", "como vocês estão?", "como vc está?", "como vocês estao?",
+            "como vc esta?", "tudo bom?", "tudo bom", "oi", "olá", "ola",
+            "bom dia", "boa tarde", "boa noite"
+        }
+        return text in small_talk_phrases
+
 """
 Agente de IA com Claude SDK + Tools para agendamento de consultas.
 Versão completa com menu estruturado e gerenciamento de contexto.
@@ -1422,6 +1435,43 @@ Resposta (apenas o nome do convênio, nada mais):"""
             logger.error(f"Erro ao extrair convênio da mensagem: {e}")
             return None
 
+    def _aggregate_recent_messages(self, context: ConversationContext, new_message: str) -> str:
+        if not new_message or not context:
+            return new_message
+        
+        if not context.flow_data:
+            context.flow_data = {}
+        
+        pending = context.flow_data.get("pending_user_messages", [])
+        now = datetime.utcnow()
+        pending.append({"text": new_message, "timestamp": now.isoformat()})
+        
+        window_start = now - timedelta(seconds=3)
+        filtered = []
+        for item in pending:
+            ts = item.get("timestamp")
+            try:
+                ts_dt = datetime.fromisoformat(ts)
+            except Exception:
+                continue
+            if ts_dt >= window_start:
+                filtered.append(item)
+        
+        # Remover duplicidades e montar texto combinado
+        texts = []
+        seen = set()
+        for item in filtered:
+            text = (item.get("text") or "").strip()
+            if text and text not in seen:
+                texts.append(text)
+                seen.add(text)
+        
+        aggregated = " ".join(texts) if texts else new_message
+        
+        context.flow_data["pending_user_messages"] = filtered
+        context.flow_data["last_aggregated_message"] = aggregated
+        return aggregated
+
     def _detect_main_menu_choice(self, message: str, context: ConversationContext) -> Optional[str]:
         """Detecta se a mensagem corresponde a uma escolha do menu principal."""
         if not message:
@@ -1436,6 +1486,10 @@ Resposta (apenas o nome do convênio, nada mais):"""
         normalized = message.strip().lower()
         if not normalized:
             return None
+
+        # Atualizar timestamp do último menu exibido para controlar repetições
+        if context and context.flow_data:
+            context.flow_data["last_menu_shown_at"] = datetime.utcnow().isoformat()
 
         normalized = normalized.replace("opção", "opcao").replace("opções", "opcoes")
         digits_only = "".join(ch for ch in normalized if ch.isdigit())
@@ -1615,6 +1669,12 @@ Resposta (apenas o nome do convênio, nada mais):"""
                 flag_modified(context, "flow_data")
             flow_data = context.flow_data
 
+            # Agregar mensagens de mesma janela curta
+            aggregated_message = self._aggregate_recent_messages(context, message)
+            if aggregated_message != message:
+                logger.info(f"🧵 Mensagem agregada para {phone}: {aggregated_message}")
+                message = aggregated_message
+
             # Detectar solicitações naturais de data/horário personalizadas
             custom_request = None
             if flow_data and (
@@ -1652,17 +1712,38 @@ Resposta (apenas o nome do convênio, nada mais):"""
                 prompt = self._build_name_prompt(menu_choice)
                 self._record_interaction(context, message, prompt, db, flow_modified=True)
                 return prompt
+        
+        # Detectar small talk após menu
+        if self._is_small_talk(message):
+            flow = context.flow_data or {}
+            last_menu_iso = flow.get("last_menu_shown_at")
+            if last_menu_iso:
+                try:
+                    last_menu_time = datetime.fromisoformat(last_menu_iso)
+                except ValueError:
+                    last_menu_time = None
+            else:
+                last_menu_time = None
+            
+            if last_menu_time and (datetime.utcnow() - last_menu_time).total_seconds() < 20:
+                response = "Estou muito bem, obrigada por perguntar! 😊 Em que posso te ajudar?"
+                self._record_interaction(context, message, response, db)
+                return response
 
-            if flow_data.get("awaiting_patient_name"):
-                name_extraction = self._extrair_nome_e_data_robusto(message)
-                captured_name = name_extraction.get("nome")
+        if flow_data.get("awaiting_patient_name"):
+            name_extraction = self._extrair_nome_e_data_robusto(message)
+            captured_name = name_extraction.get("nome")
 
-                if captured_name:
-                    flow_data["patient_name"] = captured_name
-                    flow_data["awaiting_patient_name"] = False
+            if captured_name:
+                flow_data["patient_name"] = captured_name
+                flow_data["awaiting_patient_name"] = False
+                if not flow_data.get("patient_birth_date"):
                     flow_data["awaiting_patient_birth_date"] = True
-                    flag_modified(context, "flow_data")
-                    first_name = captured_name.split()[0]
+                else:
+                    flow_data.pop("awaiting_patient_birth_date", None)
+                flag_modified(context, "flow_data")
+                first_name = captured_name.split()[0]
+                if flow_data.get("awaiting_patient_birth_date"):
                     response = (
                         f"Muito obrigada, {first_name}! Agora, para manter o cadastro certinho, "
                         "me informe sua data de nascimento no formato DD/MM/AAAA."
@@ -1670,33 +1751,33 @@ Resposta (apenas o nome do convênio, nada mais):"""
                     logger.info(f"👤 Nome registrado para {phone}: {captured_name}")
                     self._record_interaction(context, message, response, db, flow_modified=True)
                     return response
-
+            else:
                 error_msg = name_extraction.get("erro_nome") or "Para continuar, preciso do seu nome completo (nome e sobrenome)."
                 response = f"{error_msg.strip().rstrip('.')}. Pode me informar seu nome completo, por favor?"
                 logger.warning(f"⚠️ Nome inválido informado por {phone}: {message}")
                 self._record_interaction(context, message, response, db)
                 return response
 
-            if flow_data.get("awaiting_patient_birth_date"):
-                birth_extraction = self._extrair_nome_e_data_robusto(message)
-                birth_date = birth_extraction.get("data")
+        if flow_data.get("awaiting_patient_birth_date"):
+            birth_extraction = self._extrair_nome_e_data_robusto(message)
+            birth_date = birth_extraction.get("data")
 
-                if birth_date:
-                    flow_data["patient_birth_date"] = birth_date
-                    flow_data["awaiting_patient_birth_date"] = False
-                    flow_data.pop("awaiting_birth_date_correction", None)
-                    flag_modified(context, "flow_data")
-                    logger.info(f"📅 Data de nascimento registrada para {phone}: {birth_date}")
+            if birth_date:
+                flow_data["patient_birth_date"] = birth_date
+                flow_data["awaiting_patient_birth_date"] = False
+                flow_data.pop("awaiting_birth_date_correction", None)
+                flag_modified(context, "flow_data")
+                logger.info(f"📅 Data de nascimento registrada para {phone}: {birth_date}")
 
-                    next_prompt = self._build_post_identity_prompt(flow_data.get("menu_choice"))
-                    self._record_interaction(context, message, next_prompt, db, flow_modified=True)
-                    return next_prompt
-                else:
-                    error_msg = birth_extraction.get("erro_data") or "Não consegui identificar sua data de nascimento."
-                    response = f"{error_msg.strip().rstrip('.')}. Pode enviar no formato DD/MM/AAAA?"
-                    logger.warning(f"⚠️ Data de nascimento inválida informada por {phone}: {message}")
-                    self._record_interaction(context, message, response, db)
-                    return response
+                next_prompt = self._build_post_identity_prompt(flow_data.get("menu_choice"))
+                self._record_interaction(context, message, next_prompt, db, flow_modified=True)
+                return next_prompt
+            else:
+                error_msg = birth_extraction.get("erro_data") or "Não consegui identificar sua data de nascimento."
+                response = f"{error_msg.strip().rstrip('.')}. Pode enviar no formato DD/MM/AAAA?"
+                logger.warning(f"⚠️ Data de nascimento inválida informada por {phone}: {message}")
+                self._record_interaction(context, message, response, db)
+                return response
 
             # 4. Verificar se há alternativas salvas e usuário escolheu uma (1, 2 ou 3)
             if context.flow_data and context.flow_data.get("alternative_slots"):

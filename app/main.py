@@ -368,8 +368,8 @@ def process_message_task(self, phone: str, message_text: str, message_id: str = 
                     db.delete(paused_contact)
                     db.commit()
             
-            # Processar com IA
-            response = ai_agent.process_message(message_text, phone, db)
+        # Processar com IA
+        response = ai_agent.process_message(message_text, phone, db)
         
         # Enfileirar mensagem para envio na fila separada
         if response:
