@@ -19,7 +19,7 @@ from app.models import Appointment, AppointmentStatus, ConversationContext, Paus
 from app.utils import (
     load_clinic_info, normalize_phone, parse_date_br, 
     format_datetime_br, now_brazil, get_brazil_timezone, round_up_to_next_5_minutes,
-    get_minimum_appointment_datetime, format_date_br
+    get_minimum_appointment_datetime, format_date_br, normalize_time_format
 )
 from app.appointment_rules import appointment_rules
 
@@ -1150,6 +1150,151 @@ Lembre-se: Seja natural, adaptável e prestativa. Use as tools disponíveis conf
         
         return "unclear"
 
+    def _normalize_text_for_weekday(self, text: str) -> str:
+        replacements = {
+            "á": "a", "à": "a", "ã": "a", "â": "a",
+            "é": "e", "ê": "e",
+            "í": "i",
+            "ó": "o", "ô": "o", "õ": "o",
+            "ú": "u",
+            "ç": "c"
+        }
+        normalized = text.lower()
+        for original, replacement in replacements.items():
+            normalized = normalized.replace(original, replacement)
+        return normalized
+
+    def _detect_custom_schedule_request(self, message: str) -> Optional[Dict[str, Any]]:
+        """Identifica se a mensagem contém referência clara a data ou dia específico (com ou sem horário)."""
+        if not message:
+            return None
+        
+        result: Dict[str, Any] = {}
+        
+        # Detectar data explícita DD/MM/AAAA ou DD-MM-AAAA
+        date_match = re.search(r'\b(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})\b', message)
+        if date_match:
+            day, month, year = date_match.groups()
+            try:
+                normalized_date = f"{int(day):02d}/{int(month):02d}/{int(year):04d}"
+                # Validar data rapidamente
+                if parse_date_br(normalized_date):
+                    result["date"] = normalized_date
+            except ValueError:
+                pass
+        
+        # Detectar dia da semana
+        normalized = self._normalize_text_for_weekday(message)
+        weekday_keywords = {
+            "segunda": 0,
+            "segundafeira": 0,
+            "segunda feira": 0,
+            "terca": 1,
+            "terca-feira": 1,
+            "terca feira": 1,
+            "quarta": 2,
+            "quarta-feira": 2,
+            "quarta feira": 2,
+            "quinta": 3,
+            "quinta-feira": 3,
+            "quinta feira": 3,
+            "sexta": 4,
+            "sexta-feira": 4,
+            "sexta feira": 4,
+            "sabado": 5,
+            "sabado-feira": 5,
+            "sabado feira": 5,
+            "domingo": 6,
+            "domingo-feira": 6,
+            "domingo feira": 6
+        }
+        if "weekday" not in result:
+            for keyword, index in weekday_keywords.items():
+                if re.search(rf'\b{keyword}\b', normalized):
+                    result["weekday"] = index
+                    break
+        
+        # Detectar horário (HH:MM, HHh, HH horas)
+        time_candidate = None
+        time_match = re.search(r'\b(\d{1,2}):(\d{2})\b', message)
+        if time_match:
+            time_candidate = f"{time_match.group(1)}:{time_match.group(2)}"
+        else:
+            time_match = re.search(r'\b(\d{1,2})\s*h(?:oras)?\b', normalized)
+            if time_match:
+                time_candidate = f"{time_match.group(1)}:00"
+            else:
+                time_match = re.search(r'\b(\d{1,2})\s*horas?\b', normalized)
+                if time_match:
+                    time_candidate = f"{time_match.group(1)}:00"
+        
+        if time_candidate:
+            normalized_time = normalize_time_format(time_candidate)
+            if normalized_time:
+                result["time"] = normalized_time
+        
+        return result or None
+
+    def _get_next_available_date_for_weekday(self, weekday_index: int) -> Optional[datetime]:
+        """Retorna a próxima data >= 48h a partir de agora que cai no dia da semana fornecido."""
+        if weekday_index is None or not (0 <= weekday_index <= 6):
+            return None
+        
+        minimum_datetime = get_minimum_appointment_datetime()
+        candidate_date = minimum_datetime.date()
+        
+        # Avançar até encontrar o dia desejado
+        for _ in range(14):  # Limite de segurança (duas semanas)
+            if candidate_date.weekday() == weekday_index:
+                return datetime.combine(candidate_date, datetime.min.time())
+            candidate_date += timedelta(days=1)
+        
+        return None
+
+    def _process_custom_schedule_request(
+        self,
+        request: Dict[str, Any],
+        context: ConversationContext,
+        db: Session,
+        phone: str
+    ) -> Optional[str]:
+        """Processa uma solicitação de agendamento personalizada interpretada do texto do usuário."""
+        if not request:
+            return None
+        
+        date_str = request.get("date")
+        weekday_index = request.get("weekday")
+        
+        if not date_str and weekday_index is not None:
+            next_date = self._get_next_available_date_for_weekday(weekday_index)
+            if not next_date:
+                return "❌ Não consegui encontrar datas disponíveis para esse dia da semana. Pode informar uma data no formato DD/MM/AAAA?"
+            date_str = format_date_br(next_date)
+        
+        if not date_str:
+            return None
+        
+        if context:
+            if not context.flow_data:
+                context.flow_data = {}
+            context.flow_data.pop("alternative_slots", None)
+            context.flow_data["alternatives_offered"] = False
+            context.flow_data["awaiting_custom_date"] = False
+            db.commit()
+        
+        if request.get("time"):
+            return self._handle_confirm_time_slot(
+                {"date": date_str, "time": request["time"]},
+                db,
+                phone
+            )
+        
+        return self._handle_validate_date_and_show_slots(
+            {"date": date_str},
+            db,
+            phone
+        )
+
     def _detect_insurance_change_intent(self, message: str) -> bool:
         """
         Detecta se a mensagem indica intenção de mudar o convênio.
@@ -1320,6 +1465,8 @@ Resposta (apenas o nome do convênio, nada mais):"""
         flow.pop("awaiting_birth_date_correction", None)
         flow.pop("pending_confirmation", None)
         flow.pop("alternative_slots", None)
+        flow["alternatives_offered"] = False
+        flow.pop("awaiting_custom_date", None)
         context.current_flow = menu_choice
         flag_modified(context, "flow_data")
 
@@ -1468,6 +1615,32 @@ Resposta (apenas o nome do convênio, nada mais):"""
                 flag_modified(context, "flow_data")
             flow_data = context.flow_data
 
+            # Detectar solicitações naturais de data/horário personalizadas
+            custom_request = None
+            if flow_data and (
+                flow_data.get("pending_confirmation")
+                or flow_data.get("awaiting_custom_date")
+                or flow_data.get("alternatives_offered")
+            ):
+                custom_request = self._detect_custom_schedule_request(message)
+                if custom_request and (custom_request.get("date") or custom_request.get("weekday")):
+                    logger.info(f"🗓️ Solicitação personalizada detectada: {custom_request}")
+                    response = self._process_custom_schedule_request(custom_request, context, db, phone)
+                    if response:
+                        context.messages.append({
+                            "role": "user",
+                            "content": message,
+                            "timestamp": datetime.utcnow().isoformat()
+                        })
+                        context.messages.append({
+                            "role": "assistant",
+                            "content": response,
+                            "timestamp": datetime.utcnow().isoformat()
+                        })
+                        context.last_activity = datetime.utcnow()
+                        db.commit()
+                        return response
+
             # 3. Detectar seleção de menu e iniciar coleta sequencial de identidade
             menu_choice = None
             if flow_data.get("menu_choice") is None and not flow_data.get("awaiting_patient_name") and not flow_data.get("awaiting_patient_birth_date"):
@@ -1542,6 +1715,8 @@ Resposta (apenas o nome do convênio, nada mais):"""
                             context.flow_data["appointment_time"] = selected_alt["time"]
                             context.flow_data["pending_confirmation"] = True
                             context.flow_data.pop("alternative_slots", None)  # Limpar alternativas
+                            context.flow_data["alternatives_offered"] = False
+                            context.flow_data.pop("awaiting_custom_date", None)
                             db.commit()
                             
                             # Mostrar resumo e pedir confirmação final
@@ -1596,6 +1771,35 @@ Resposta (apenas o nome do convênio, nada mais):"""
                     except (ValueError, IndexError, KeyError) as e:
                         logger.error(f"Erro ao processar escolha de alternativa: {str(e)}")
                         # Continuar com processamento normal
+                else:
+                    alt_intent = self._detect_confirmation_intent(message)
+                    if alt_intent == "negative":
+                        logger.info(f"❌ Usuário {phone} recusou as alternativas sugeridas")
+                        context.flow_data.pop("alternative_slots", None)
+                        context.flow_data["alternatives_offered"] = False
+                        context.flow_data["awaiting_custom_date"] = True
+                        db.commit()
+
+                        response = (
+                            "Sem problemas! Qual dia funciona melhor para você? "
+                            "Pode me informar uma data no formato DD/MM/AAAA ou dizer, por exemplo, "
+                            "\"terça-feira pela manhã\"."
+                        )
+
+                        context.messages.append({
+                            "role": "user",
+                            "content": message,
+                            "timestamp": datetime.utcnow().isoformat()
+                        })
+                        context.messages.append({
+                            "role": "assistant",
+                            "content": response,
+                            "timestamp": datetime.utcnow().isoformat()
+                        })
+                        context.last_activity = datetime.utcnow()
+                        db.commit()
+
+                        return response
         
             # 5. Verificar se há confirmação pendente ANTES de processar com Claude
             if context.flow_data and context.flow_data.get("pending_confirmation"):
@@ -1670,6 +1874,7 @@ Resposta (apenas o nome do convênio, nada mais):"""
                     if not context.flow_data:
                         context.flow_data = {}
                     context.flow_data["pending_confirmation"] = False
+                    context.flow_data["alternatives_offered"] = False
                     context.messages.append({
                         "role": "user",
                         "content": message,
@@ -1686,22 +1891,48 @@ Resposta (apenas o nome do convênio, nada mais):"""
                     return result
                 
                 elif intent == "negative":
-                    # Usuário NÃO confirmou, quer mudar
-                    logger.info(f"❌ Usuário {phone} não confirmou, pedindo alteração")
-                    
-                    # Limpar pending_confirmation
+                    logger.info(f"❌ Usuário {phone} recusou o horário sugerido")
                     if not context.flow_data:
                         context.flow_data = {}
+                    alternatives_already_offered = context.flow_data.get("alternatives_offered", False)
+
+                    if not alternatives_already_offered:
+                        logger.info("🔁 Oferecendo alternativas automaticamente")
+                        # Encerrar confirmação atual e apresentar alternativas
+                        context.flow_data["pending_confirmation"] = False
+                        context.flow_data["alternatives_offered"] = True
+                        db.commit()
+
+                        alternatives_message = self._handle_find_alternative_slots({}, db, phone)
+
+                        context.messages.append({
+                            "role": "user",
+                            "content": message,
+                            "timestamp": datetime.utcnow().isoformat()
+                        })
+                        context.messages.append({
+                            "role": "assistant",
+                            "content": alternatives_message,
+                            "timestamp": datetime.utcnow().isoformat()
+                        })
+                        context.last_activity = datetime.utcnow()
+                        db.commit()
+
+                        return alternatives_message
+
+                    logger.info("🗓️ Alternativas já oferecidas - solicitando nova disponibilidade")
                     context.flow_data["pending_confirmation"] = False
+                    context.flow_data["awaiting_custom_date"] = True
+                    # Limpar alternativas anteriores para evitar reapresentação
+                    context.flow_data.pop("alternative_slots", None)
                     db.commit()
-                    
-                    # Perguntar o que mudar
-                    response = "Sem problemas! O que você gostaria de mudar?\n\n" \
-                               "1️⃣ Data\n" \
-                               "2️⃣ Horário\n" \
-                               "3️⃣ Convênio\n" \
-                               "4️⃣ Ambos (Data e Horário)"
-                    
+
+                    response = (
+                        "Tudo bem! Qual dia fica melhor para você? "
+                        "Você pode me informar o dia no formato DD/MM/AAAA ou dizer, por exemplo, "
+                        "\"quinta-feira à tarde\"."
+                    )
+
                     context.messages.append({
                         "role": "user",
                         "content": message,
@@ -1714,7 +1945,7 @@ Resposta (apenas o nome do convênio, nada mais):"""
                     })
                     context.last_activity = datetime.utcnow()
                     db.commit()
-                    
+
                     return response
                 
                 # Se unclear, processar normalmente com Claude
@@ -2479,6 +2710,7 @@ Resposta (apenas o nome do convênio, nada mais):"""
                 context.flow_data["appointment_date"] = format_date_br(found_date)
                 context.flow_data["appointment_time"] = first_slot.strftime('%H:%M')
                 context.flow_data["pending_confirmation"] = True
+                context.flow_data["alternatives_offered"] = False
                 db.commit()
                 logger.info(f"💾 Dados salvos no flow_data para confirmação")
             
@@ -2525,6 +2757,7 @@ Resposta (apenas o nome do convênio, nada mais):"""
             response += f"💳 Convênio: {convenio_nome}\n"
             response += f"📅 Data: {format_date_br(found_date)} ({dia_nome_completo})\n"
             response += f"⏰ Horário: {horario_str}\n"
+            response += "\nPosso confirmar o agendamento?"
             
             return response
             
