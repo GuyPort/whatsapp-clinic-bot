@@ -18,7 +18,7 @@ Bot inteligente de WhatsApp para automatização de agendamentos e atendimento d
 - **IA**: Claude 3.5 Sonnet (Anthropic)
 - **WhatsApp**: Evolution API
 - **Backend**: Python 3.11+ com FastAPI
-- **Banco de Dados**: SQLite com SQLAlchemy
+- **Banco de Dados**: PostgreSQL (Railway) com SQLAlchemy
 - **Calendário**: Google Calendar API
 - **Deploy**: Railway / Render
 
@@ -38,7 +38,7 @@ Bot inteligente de WhatsApp para automatização de agendamentos e atendimento d
 │   └── utils.py             # Funções auxiliares
 ├── data/
 │   ├── clinic_info.json     # Dados da clínica (EDITÁVEL)
-│   └── appointments.db      # Banco SQLite (gerado automaticamente)
+│   └── appointments.db      # (Opcional para testes locais simples; produção usa PostgreSQL)
 ├── requirements.txt
 ├── .env                     # Variáveis de ambiente (criar baseado em .env.example)
 ├── .gitignore
@@ -54,6 +54,8 @@ Bot inteligente de WhatsApp para automatização de agendamentos e atendimento d
 - Conta na Anthropic (para API do Claude)
 - Evolution API configurada
 - Google Cloud Project com Calendar API habilitada
+- Instância PostgreSQL acessível (ex.: Railway Postgres)
+- Instância Redis acessível (ex.: Railway Redis)
 
 ### 2. Instalação
 
@@ -94,13 +96,15 @@ EVOLUTION_INSTANCE_NAME=clinica-bot
 GOOGLE_CALENDAR_ID=seu-calendario@group.calendar.google.com
 GOOGLE_SERVICE_ACCOUNT_FILE=google-credentials.json
 
-# Database
-DATABASE_URL=sqlite:///./data/appointments.db
+# Database (use URL do seu PostgreSQL)
+DATABASE_URL=postgresql://usuario:senha@host:5432/nome-do-banco
 
 # Configurações gerais
 ENVIRONMENT=development
 LOG_LEVEL=INFO
 ```
+
+Após definir as variáveis, inicialize o banco executando `python run.py` (ou chamando `POST /admin/init-db`) para criar as tabelas no PostgreSQL.
 
 #### 3.2 Google Calendar
 

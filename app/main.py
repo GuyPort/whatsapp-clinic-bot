@@ -327,9 +327,27 @@ def process_message_task(self, phone: str, message_text: str, message_id: str = 
     task_id = self.request.id
     logger.info(f"🔄 Task {task_id} iniciada para {phone}: {message_text[:50]}...")
     
+    lock = None
+    lock_acquired = False
+    
     try:
         # Normalizar telefone
         phone = normalize_phone(phone)
+        
+        # Garantir processamento serializado por contato
+        lock = whatsapp_service.acquire_chat_lock(phone)
+        if lock:
+            try:
+                lock_acquired = lock.acquire(blocking=True)
+            except Exception as lock_error:
+                logger.warning(f"⚠️ Não foi possível adquirir lock para {phone}: {lock_error}")
+                raise self.retry(exc=lock_error, countdown=2)
+            
+            if not lock_acquired:
+                logger.warning(f"⚠️ Lock ocupado para {phone}, reagendando task")
+                raise self.retry(exc=Exception("chat_lock_busy"), countdown=2)
+        else:
+            logger.warning(f"⚠️ Processando {phone} sem lock - Redis indisponível")
         
         # Marcar como lida
         if message_id:
@@ -360,21 +378,46 @@ def process_message_task(self, phone: str, message_text: str, message_id: str = 
         else:
             logger.warning(f"⚠️ Task {task_id} - Nenhuma resposta gerada para {phone}")
         
+    except CeleryRetry:
+        raise
     except Exception as e:
+        try:
+            from celery.exceptions import Retry as CeleryRetry  # type: ignore
+        except ImportError:
+            CeleryRetry = None
+        
+        if CeleryRetry and isinstance(e, CeleryRetry):
+            raise e
+        
         logger.error(f"❌ Task {task_id} - Erro ao processar mensagem: {str(e)}", exc_info=True)
         
-        # Tentar enfileirar mensagem de erro ao usuário
-        try:
-            send_message_task.delay(
-                phone,
-                "Desculpe, ocorreu um erro ao processar sua mensagem. Por favor, tente novamente em instantes."
-            )
-            logger.info(f"📤 Mensagem de erro enfileirada para {phone}")
-        except Exception as send_error:
-            logger.error(f"❌ Task {task_id} - Erro ao enfileirar mensagem de erro: {str(send_error)}")
+        error_text = str(e).lower()
+        concurrency_issue = any(
+            issue in error_text
+            for issue in ["database is locked", "chat_lock_busy", "deadlock", "could not obtain lock"]
+        )
+        
+        if concurrency_issue:
+            logger.warning(f"⚠️ Erro de concorrência detectado para {phone}; retry silencioso.")
+        else:
+            # Tentar enfileirar mensagem de erro ao usuário
+            try:
+                send_message_task.delay(
+                    phone,
+                    "Desculpe, ocorreu um erro ao processar sua mensagem. Por favor, tente novamente em instantes."
+                )
+                logger.info(f"📤 Mensagem de erro enfileirada para {phone}")
+            except Exception as send_error:
+                logger.error(f"❌ Task {task_id} - Erro ao enfileirar mensagem de erro: {str(send_error)}")
         
         # Retry automático do Celery se necessário
-        raise self.retry(exc=e)
+        raise self.retry(exc=e, countdown=2 if concurrency_issue else 60)
+    finally:
+        if lock and lock_acquired:
+            try:
+                lock.release()
+            except Exception as release_error:
+                logger.warning(f"⚠️ Erro ao liberar lock de {phone}: {release_error}")
 
 
 @app.get("/status")

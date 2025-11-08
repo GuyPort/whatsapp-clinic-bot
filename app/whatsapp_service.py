@@ -177,6 +177,23 @@ class WhatsAppService:
             logger.error(f"Erro ao verificar status: {str(e)}")
             return {"error": str(e)}
     
+    def acquire_chat_lock(self, phone: str, timeout: int = 60, blocking_timeout: int = 10) -> Optional[Lock]:
+        """
+        Retorna um lock Redis específico por contato.
+        Quando Redis não estiver disponível, retorna None (seguimos sem lock).
+        """
+        if not self.redis_client:
+            logger.warning("⚠️ Redis indisponível - processamento seguirá sem lock por contato")
+            return None
+        
+        lock_key = f"whatsapp:chat-lock:{phone}"
+        return Lock(
+            self.redis_client,
+            lock_key,
+            timeout=timeout,
+            blocking_timeout=blocking_timeout
+        )
+    
     async def mark_message_as_read(self, phone: str, message_id: str) -> bool:
         """
         Marca uma mensagem como lida.

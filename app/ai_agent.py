@@ -3933,7 +3933,7 @@ Resposta (apenas o nome do convênio, nada mais):"""
             appointment_datetime_obj = parse_date_br(appointment_date)
             if appointment_datetime_obj:
                 dia_nome_completo = dias_semana[appointment_datetime_obj.weekday()]
-                data_formatada = f"{format_date_br(appointment_datetime_obj)} ({dia_nome_completo})"
+                data_formatada = f"{dia_nome_completo}, {format_date_br(appointment_datetime_obj)}"
             else:
                 data_formatada = appointment_date
             
@@ -3942,16 +3942,24 @@ Resposta (apenas o nome do convênio, nada mais):"""
             info_adicionais = self.clinic_info.get('informacoes_adicionais', {})
             cadeira_rodas = info_adicionais.get('cadeira_rodas_disponivel', False)
             
-            # Retornar contexto para Claude gerar mensagem natural
-            # IMPORTANTE: NÃO incluir resumo da consulta (data, horário, paciente, tipo) - apenas informações importantes
-            return f"Agendamento criado com sucesso. Agora você DEVE gerar uma mensagem natural e amigável para o usuário incluindo APENAS estas informações importantes:\n\n" + \
-                   f"📋 Informações importantes a incluir:\n" + \
-                   f"• Por favor, traga seus últimos exames\n" + \
-                   f"• Traga a lista de medicações que você usa atualmente\n" + \
-                   f"• Endereço: {endereco}\n" + \
-                   (f"• Temos cadeira de rodas disponível no local, caso precise\n" if cadeira_rodas else "") + \
-                   f"• Você receberá uma mensagem de lembrete no dia da consulta via WhatsApp para relembrar sobre sua consulta\n\n" + \
-                   f"NÃO inclua resumo da consulta (data, horário, paciente, tipo). NÃO inclua mensagem de sucesso em negrito ou emojis de celebração. Gere uma mensagem natural incluindo apenas essas informações e termine perguntando: 'Posso te ajudar com mais alguma coisa?'"
+            message_lines = [
+                "✅ Agendamento confirmado com sucesso!",
+                "",
+                f"A consulta do {patient_name} está marcada para *{data_formatada} às {appointment_time}*.",
+                "",
+                "📋 Informações importantes:",
+                "",
+                "• Por favor, traga os últimos exames realizados",
+                "• Traga também a lista de medicações que ele está tomando atualmente",
+                f"• Nossa clínica fica na {endereco}",
+            ]
+            if cadeira_rodas:
+                message_lines.append("• Temos cadeira de rodas disponível se necessário")
+            message_lines.append("• Você receberá uma mensagem de lembrete no dia da consulta")
+            message_lines.append("")
+            message_lines.append("Posso te ajudar com mais alguma coisa?")
+
+            return "\n".join(message_lines)
                    
         except Exception as e:
             logger.error(f"Erro ao criar agendamento: {str(e)}")

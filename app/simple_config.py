@@ -10,9 +10,11 @@ EVOLUTION_API_KEY = os.getenv("WASENDER_API_KEY", "").strip() or None
 EVOLUTION_INSTANCE_NAME = os.getenv("WASENDER_PROJECT_NAME", "clinica-bot")
 
 # Configuração de banco de dados
+# Importante: projeto espera PostgreSQL em produção. Defina DATABASE_URL.
+# O fallback abaixo só deve ser usado em experimentos locais sem concorrência.
 DATABASE_URL = os.getenv(
     "DATABASE_URL",
-    "sqlite:///./data/appointments.db"  # Fallback para dev local
+    "sqlite:///./data/appointments.db"
 )
 
 # Railway PostgreSQL usa postgres:// mas SQLAlchemy precisa de postgresql://
