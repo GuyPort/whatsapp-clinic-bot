@@ -2660,6 +2660,35 @@ Resposta (apenas o nome do convênio, nada mais):"""
                     current_date += timedelta(days=1)
                     days_checked += 1
                     continue
+
+                allowed, reason = appointment_rules.is_plan_allowed_on_date(current_date, insurance_plan)
+                if not allowed:
+                    logger.info(f"⏭️ Alternativa pulada em {current_date.strftime('%d/%m/%Y')} - {reason}")
+                    current_date += timedelta(days=1)
+                    days_checked += 1
+                    continue
+
+                capacity_ok, capacity_reason = appointment_rules.has_capacity_for_insurance(current_date, insurance_plan, db)
+                if not capacity_ok:
+                    logger.info(f"⏭️ Alternativa pulada em {current_date.strftime('%d/%m/%Y')} - {capacity_reason}")
+                    current_date += timedelta(days=1)
+                    days_checked += 1
+                    continue
+                
+                # Verificar regras específicas de convênio para o dia
+                allowed, reason = appointment_rules.is_plan_allowed_on_date(current_date, insurance_plan)
+                if not allowed:
+                    logger.info(f"⏭️ Pulando {current_date.strftime('%d/%m/%Y')} - {reason}")
+                    current_date += timedelta(days=1)
+                    days_checked += 1
+                    continue
+                
+                capacity_ok, capacity_reason = appointment_rules.has_capacity_for_insurance(current_date, insurance_plan, db)
+                if not capacity_ok:
+                    logger.info(f"⏭️ Pulando {current_date.strftime('%d/%m/%Y')} - {capacity_reason}")
+                    current_date += timedelta(days=1)
+                    days_checked += 1
+                    continue
                 
                 # Verificar se funciona nesse dia
                 dias_semana_pt = ['segunda', 'terca', 'quarta', 'quinta', 'sexta', 'sabado', 'domingo']
@@ -2688,7 +2717,7 @@ Resposta (apenas o nome do convênio, nada mais):"""
                 # Buscar primeiro slot disponível deste dia respeitando 48h
                 try:
                     first_slot = appointment_rules._find_first_available_slot_in_day(
-                        temp_date, duracao, db, start_from_time=start_from_time
+                        temp_date, duracao, db, start_from_time=start_from_time, insurance_plan=insurance_plan
                     )
                     
                     # Se encontrou slot, usar (já está garantido que é >= minimum_datetime se start_from_time foi passado)
@@ -2714,7 +2743,7 @@ Resposta (apenas o nome do convênio, nada mais):"""
                                 temp_date = temp_date.replace(tzinfo=None)
                             # Tentar novamente
                             first_slot = appointment_rules._find_first_available_slot_in_day(
-                                temp_date, duracao, db, start_from_time=start_from_time
+                                temp_date, duracao, db, start_from_time=start_from_time, insurance_plan=insurance_plan
                             )
                             if first_slot:
                                 if first_slot.tzinfo is None:
@@ -2761,7 +2790,10 @@ Resposta (apenas o nome do convênio, nada mais):"""
             tipo_data = tipos_consulta.get(consultation_type, {})
             tipo_valor = tipo_data.get('valor', 0)
             
-            convenio_nome = insurance_plan if insurance_plan != "particular" else "Particular"
+            if not insurance_plan or insurance_plan.lower() in {"particular", "particula"}:
+                convenio_nome = "Particular"
+            else:
+                convenio_nome = insurance_plan.upper()
             
             dias_semana = ['segunda-feira', 'terça-feira', 'quarta-feira', 
                           'quinta-feira', 'sexta-feira', 'sábado', 'domingo']
@@ -2888,7 +2920,7 @@ Resposta (apenas o nome do convênio, nada mais):"""
                 
                 # Buscar primeiro slot disponível deste dia respeitando 48h
                 first_slot = appointment_rules._find_first_available_slot_in_day(
-                    temp_date, duracao, db, start_from_time=start_from_time
+                    temp_date, duracao, db, start_from_time=start_from_time, insurance_plan=insurance_plan
                 )
                 
                 # Se encontrou slot, adicionar às alternativas (já está garantido que é >= minimum_datetime se start_from_time foi passado)
@@ -3359,8 +3391,15 @@ Resposta (apenas o nome do convênio, nada mais):"""
             # Obter horários disponíveis
             duracao = self.clinic_info.get('regras_agendamento', {}).get('duracao_consulta_minutos', 45)
             logger.info(f"⏱️ Duração da consulta: {duracao} minutos")
+
+            insurance_plan = tool_input.get("insurance_plan", "Particular") if isinstance(tool_input, dict) else "Particular"
             
-            available_slots = appointment_rules.get_available_slots(appointment_date, duracao, db)
+            available_slots = appointment_rules.get_available_slots(
+                appointment_date,
+                duracao,
+                db,
+                insurance_plan=insurance_plan
+            )
             logger.info(f"📋 Slots encontrados: {len(available_slots)}")
             
             if not available_slots:
@@ -3388,13 +3427,17 @@ Resposta (apenas o nome do convênio, nada mais):"""
         Combina validação + listagem em uma única etapa.
         """
         try:
+            context: Optional[ConversationContext] = None
+            insurance_plan = "Particular"
             # Limpar flag appointment_completed ao iniciar novo agendamento
             if phone:
                 context = db.query(ConversationContext).filter_by(phone=phone).first()
-                if context and context.flow_data and context.flow_data.get("appointment_completed"):
-                    context.flow_data.pop("appointment_completed", None)
-                    db.commit()
-                    logger.info("🧹 Flag appointment_completed removida - novo agendamento iniciado")
+                if context and context.flow_data:
+                    if context.flow_data.get("appointment_completed"):
+                        context.flow_data.pop("appointment_completed", None)
+                        db.commit()
+                        logger.info("🧹 Flag appointment_completed removida - novo agendamento iniciado")
+                    insurance_plan = context.flow_data.get("insurance_plan", insurance_plan)
             
             date_str = tool_input.get("date")
             
@@ -3439,6 +3482,15 @@ Resposta (apenas o nome do convênio, nada mais):"""
                         f"A partir de agora, a primeira data disponível é {next_available.strftime('%d/%m/%Y')}.\n"
                         "Pode me informar uma nova data por favor?"
                     )
+
+            # ========== VALIDAÇÃO DE CONVÊNIO (SEGUNDA-FEIRA / LIMITE IPE) ==========
+            allowed_plan, reason_plan = appointment_rules.is_plan_allowed_on_date(appointment_date, insurance_plan)
+            if not allowed_plan:
+                return f"❌ {reason_plan}\nPor favor, escolha outra data."
+
+            capacity_ok, capacity_message = appointment_rules.has_capacity_for_insurance(appointment_date, insurance_plan, db)
+            if not capacity_ok:
+                return f"❌ {capacity_message}\nPoderia escolher outra data, por favor?"
 
             # ========== VALIDAÇÃO 1: DIA DA SEMANA ==========
             weekday = appointment_date.weekday()  # 0=segunda, 6=domingo
@@ -3547,6 +3599,13 @@ Resposta (apenas o nome do convênio, nada mais):"""
             import re
             from app.utils import normalize_time_format
             
+            context: Optional[ConversationContext] = None
+            insurance_plan = "Particular"
+            if phone:
+                context = db.query(ConversationContext).filter_by(phone=phone).first()
+                if context and context.flow_data:
+                    insurance_plan = context.flow_data.get("insurance_plan", insurance_plan)
+            
             date_str = tool_input.get("date")
             time_str = tool_input.get("time")
             
@@ -3590,6 +3649,14 @@ Resposta (apenas o nome do convênio, nada mais):"""
                 
                 if horario_dia == "FECHADO":
                     return f"❌ A clínica não atende em {dia_nome.capitalize()}. Por favor, escolha outra data."
+
+                allowed_plan, reason_plan = appointment_rules.is_plan_allowed_on_date(appointment_date, insurance_plan)
+                if not allowed_plan:
+                    return f"❌ {reason_plan}\nPor favor, escolha outra data."
+
+                capacity_ok, capacity_message = appointment_rules.has_capacity_for_insurance(appointment_date, insurance_plan, db)
+                if not capacity_ok:
+                    return f"❌ {capacity_message}\nPoderia escolher outra data, por favor?"
                 
                 # Calcular slots disponíveis
                 inicio_str, fim_str = horario_dia.split('-')
@@ -3645,6 +3712,14 @@ Resposta (apenas o nome do convênio, nada mais):"""
             
             # Verificar disponibilidade no banco (segurança contra race condition)
             appointment_date = parse_date_br(date_str)
+            allowed_plan, reason_plan = appointment_rules.is_plan_allowed_on_date(appointment_date, insurance_plan)
+            if not allowed_plan:
+                return f"❌ {reason_plan}\nPor favor, escolha outra data."
+
+            capacity_ok, capacity_message = appointment_rules.has_capacity_for_insurance(appointment_date, insurance_plan, db)
+            if not capacity_ok:
+                return f"❌ {capacity_message}\nPoderia escolher outro dia, por favor?"
+
             appointment_datetime = datetime.combine(appointment_date.date(), 
                                                     datetime.strptime(time_str, '%H:%M').time())
             

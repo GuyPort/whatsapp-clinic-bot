@@ -20,15 +20,57 @@ class AppointmentRules:
         self.clinic_info = load_clinic_info()
         self.rules = self.clinic_info.get('regras_agendamento', {})
         self.timezone = get_brazil_timezone()
+        self.ipe_daily_limit = self.rules.get('limite_diario_ipe', 3)
     
     def reload_clinic_info(self):
         """Recarrega informações da clínica"""
         self.clinic_info = load_clinic_info()
         self.rules = self.clinic_info.get('regras_agendamento', {})
+        self.ipe_daily_limit = self.rules.get('limite_diario_ipe', 3)
     
     def get_interval_between_appointments(self) -> int:
         """Retorna intervalo mínimo entre consultas em minutos"""
         return self.rules.get('intervalo_entre_consultas_minutos', 15)
+
+    def _normalize_plan(self, insurance_plan: Optional[str]) -> str:
+        """Normaliza convênio para valores padrão."""
+        if not insurance_plan:
+            return "Particular"
+        plan = insurance_plan.strip()
+        if not plan:
+            return "Particular"
+        plan_lower = plan.lower()
+        if plan_lower in {"particular", "particula"}:
+            return "Particular"
+        if plan_lower == "ipe":
+            return "IPE"
+        if plan_lower == "cabergs":
+            return "CABERGS"
+        return plan
+
+    def is_plan_allowed_on_date(self, appointment_date: datetime, insurance_plan: Optional[str]) -> Tuple[bool, str]:
+        """Verifica se o convênio é permitido nesta data (ex.: segunda-feira só particular)."""
+        plan = self._normalize_plan(insurance_plan)
+        if appointment_date.weekday() == 0 and plan != "Particular":
+            return False, "Segundas-feiras atendemos apenas consultas particulares."
+        return True, ""
+
+    def has_capacity_for_insurance(self, appointment_date: datetime, insurance_plan: Optional[str], db: Session) -> Tuple[bool, str]:
+        """Verifica se ainda há vagas para o convênio na data (limite diário IPE)."""
+        plan = self._normalize_plan(insurance_plan)
+        if plan != "IPE":
+            return True, ""
+
+        date_str = appointment_date.strftime('%Y%m%d')
+        count = db.query(Appointment).filter(
+            Appointment.appointment_date == date_str,
+            Appointment.status == AppointmentStatus.AGENDADA,
+            Appointment.insurance_plan.ilike("ipe")
+        ).count()
+
+        if count >= self.ipe_daily_limit:
+            return False, "Já atingimos o limite diário de atendimentos IPE para essa data."
+        return True, ""
     
     def is_valid_appointment_date(self, appointment_date: datetime) -> Tuple[bool, str]:
         """
@@ -96,7 +138,8 @@ class AppointmentRules:
         target_date: datetime,
         consultation_duration: int,
         db: Session,
-        limit: int = None
+        limit: int = None,
+        insurance_plan: Optional[str] = None
     ) -> List[datetime]:
         """
         Retorna horários disponíveis para uma data específica.
@@ -111,7 +154,8 @@ class AppointmentRules:
             Lista de datetime com horários disponíveis
         """
         available_slots = []
-        
+        plan = self._normalize_plan(insurance_plan)
+
         # Definir horário de início e fim para o dia
         weekday = target_date.weekday()
         horarios = self.clinic_info.get('horario_funcionamento', {})
@@ -120,6 +164,10 @@ class AppointmentRules:
         horario_dia = horarios.get(dia_nome, "FECHADO")
         
         if horario_dia == "FECHADO":
+            return []
+
+        allowed, _ = self.is_plan_allowed_on_date(target_date, plan)
+        if not allowed:
             return []
         
         # Parse horário
@@ -148,7 +196,7 @@ class AppointmentRules:
                 last_slot_start = last_slot_start.replace(tzinfo=None)
 
         closing_time = last_slot_start + timedelta(minutes=consultation_duration)
-        
+
         # Buscar consultas já agendadas no banco - USAR FORMATO STRING
         target_date_str = target_date.strftime('%Y%m%d')  # "20251015"
         
@@ -156,6 +204,15 @@ class AppointmentRules:
             Appointment.appointment_date == target_date_str,  # Comparação STRING
             Appointment.status == AppointmentStatus.AGENDADA  # Apenas consultas ativas
         ).all()
+
+        if plan == "IPE":
+            scheduled_ipe = sum(
+                1
+                for appointment in existing_appointments
+                if (appointment.insurance_plan or "").strip().lower() == "ipe"
+            )
+            if scheduled_ipe >= self.ipe_daily_limit:
+                return []
         
         # Gerar slots de hora inteira (apenas horários como 14:00, 15:00, 16:00, etc.)
         # Garantir que start_time tem minutos == 0 e é timezone-naive
@@ -205,7 +262,8 @@ class AppointmentRules:
         target_date: datetime,
         consultation_duration: int,
         db: Session,
-        start_from_time: Optional[datetime] = None
+        start_from_time: Optional[datetime] = None,
+        insurance_plan: Optional[str] = None
     ) -> Optional[datetime]:
         """
         Encontra o primeiro horário disponível de um dia específico.
@@ -219,8 +277,22 @@ class AppointmentRules:
         Returns:
             datetime do primeiro slot disponível ou None se não houver
         """
+        allowed, _ = self.is_plan_allowed_on_date(target_date, insurance_plan)
+        if not allowed:
+            return None
+
+        capacity_ok, _ = self.has_capacity_for_insurance(target_date, insurance_plan, db)
+        if not capacity_ok:
+            return None
+
         # Obter todos os slots disponíveis do dia
-        available_slots = self.get_available_slots(target_date, consultation_duration, db, limit=None)
+        available_slots = self.get_available_slots(
+            target_date,
+            consultation_duration,
+            db,
+            limit=None,
+            insurance_plan=insurance_plan
+        )
         
         if not available_slots:
             return None
