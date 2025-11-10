@@ -11,8 +11,6 @@ import pytz
 import re
 from anthropic import Anthropic
 
-from app.intents import IntentClassifier
-
 from sqlalchemy.orm import Session
 from sqlalchemy.orm.attributes import flag_modified
 
@@ -73,489 +71,354 @@ class ClaudeToolAgent:
     
     def __init__(self):
         self.client = Anthropic(api_key=settings.anthropic_api_key)
-        self.intent_classifier = IntentClassifier(self.client)
         self.clinic_info = load_clinic_info()
         self.timezone = get_brazil_timezone()
         self.tools = self._define_tools()
         self.system_prompt = self._create_system_prompt()
         
     def _create_system_prompt(self) -> str:
-        """Cria o prompt do sistema para o Claude com orientações flexíveis e contextuais."""
+        """Cria o prompt do sistema para o Claude"""
         clinic_name = self.clinic_info.get('nome_clinica', 'Clínica')
         endereco = self.clinic_info.get('endereco', 'Endereço não informado')
-        telefone = self.clinic_info.get('telefone', 'Não informado')
         horarios = self.clinic_info.get('horario_funcionamento', {})
-        duracao = self.clinic_info.get('regras_agendamento', {}).get('duracao_consulta_minutos', 45)
-
+        
         horarios_str = ""
         for dia, horario in horarios.items():
             if horario != "FECHADO":
                 horarios_str += f"• {dia.capitalize()}: {horario}\n"
+        
+        duracao = self.clinic_info.get('regras_agendamento', {}).get('duracao_consulta_minutos', 45)
+        secretaria = self.clinic_info.get('informacoes_adicionais', {}).get('secretaria', 'Beatriz')
+        
+        return f"""Você é a Beatriz, secretária da {clinic_name}. Você é prestativa, educada e ajuda pacientes de forma natural e conversacional.
 
-        sections = [
-            f"Você é a Beatriz, secretária da {clinic_name}. Responda com empatia, clareza e foco em resolver a solicitação.",
-            "════════════ CLÍNICA ════════════",
-            f"📍 Endereço: {endereco}",
-            "⏰ Horários de funcionamento:",
-            horarios_str or "• Horários não informados",
-            f"⏱️ Duração média das consultas: {duracao} minutos",
-            f"📞 Telefone: {telefone}",
-            "════════════ MISSÃO ════════════",
-            (
-                "Ajude pacientes em português brasileiro a agendar, remarcar, cancelar consultas ou obter informações. "
-                "Adapte-se ao tom do usuário e utilize as ferramentas quando elas economizarem passos ou garantirem precisão."
-            ),
-            "════════════ COMUNICAÇÃO ════════════",
-            (
-                "• Comece com o menu apenas se a conversa estiver iniciando ou sem contexto; caso já exista contexto, continue de onde parou.\n"
-                "• Quando o usuário informar dados fora de ordem (ex.: horário antes do nome), registre o que já foi fornecido, confirme o entendimento e peça apenas o que faltar.\n"
-                "• Se alguma informação parecer ambígua, valide com uma pergunta objetiva. Evite loops; reconheça o que já foi dito antes de solicitar algo novamente.\n"
-                "• Em correções, agradeça e atualize os dados relevantes."
-            ),
-            "════════════ COLETA DE DADOS ════════════",
-            (
-                "Priorize conhecer: nome completo, data de nascimento, tipo de consulta e convênio. "
-                "Siga uma abordagem flexível: se o paciente adiantar alguns itens, aproveite-os e conduza gentilmente para o restante. "
-                "Garanta que cada dado esteja claro antes de avançar para confirmação."
-            ),
-            "════════════ FERRAMENTAS ════════════",
-            (
-                "• Prefira interagir naturalmente e, quando necessário, acione a tool adequada.\n"
-                "• `find_next_available_slot`, `validate_date_and_show_slots`, `confirm_time_slot` e `create_appointment` organizam o agendamento. "
-                "Execute-as quando tiver dados suficientes para que cada etapa faça sentido para o paciente.\n"
-                "• `request_home_address` e `notify_doctor_home_visit` cuidam do fluxo domiciliar: colete o endereço completo antes de notificar a doutora.\n"
-                "• `search_appointments` e `cancel_appointment` atendem a pedidos de remarcação ou cancelamento.\n"
-                "• `request_human_assistance` só deve ser usada quando o usuário pedir claramente por atendimento humano.\n"
-                "• Sempre que retornar dados de uma tool, contextualize o resultado em linguagem natural."
-            ),
-            "════════════ CONFIRMAÇÃO ════════════",
-            (
-                "Ao propor horários ou confirmar um agendamento, apresente um resumo que inclua nome, data, horário, tipo de consulta e convênio. "
-                "Peça confirmação apenas após esse resumo e, diante de negativas, ofereça alternativas ou pergunte preferências específicas."
-            ),
-            "════════════ ENCERRAMENTO ════════════",
-            (
-                "Depois de concluir a solicitação, confirme se há mais algo em que possa ajudar. "
-                "Se a pessoa disser que não, encerre com cordialidade e utilize `end_conversation` para limpar o contexto."
-            ),
-            "════════════ BOAS PRÁTICAS ════════════",
-            (
-                "• Utilize linguagem inclusiva e acolhedora.\n"
-                "• Evite respostas automáticas repetidas; reconheça esforços do usuário.\n"
-                "• Se detectar possível frustração ou falhas repetidas, ofereça alternativa humana ou peça desculpas antes de tentar novamente.\n"
-                "• Garanta consistência com dados oficiais da clínica; quando em dúvida, consulte `get_clinic_info`."
-            )
-        ]
+INFORMAÇÕES DA CLÍNICA:
+📍 Endereço: {endereco}
+⏰ Horários de funcionamento:
+{horarios_str}
+⏱️ Duração das consultas: {duracao} minutos
+📞 Telefone: {self.clinic_info.get('telefone', 'Não informado')}
 
-        return "\n".join(section for section in sections if section is not None)
+═══════════════════════════════════════════════════════════
+SEU OBJETIVO PRINCIPAL
+═══════════════════════════════════════════════════════════
 
-    def _ensure_flow_data(self, context: ConversationContext):
-        """Garante que flow_data seja sempre um dicionário mutável."""
-        if context.flow_data is None:
-            context.flow_data = {}
-            flag_modified(context, "flow_data")
+Ajudar pacientes a agendar consultas de forma eficiente e natural. Adapte-se ao estilo de comunicação do usuário e use as tools disponíveis conforme necessário.
 
-    def _build_state_guidance(self, context: ConversationContext) -> Optional[str]:
-        """Produz um resumo interno para orientar o LLM sobre dados coletados e lacunas."""
-        flow = context.flow_data or {}
+═══════════════════════════════════════════════════════════
+ABORDAGEM DE COMUNICAÇÃO
+═══════════════════════════════════════════════════════════
 
-        collected = []
-        if flow.get("patient_name"):
-            collected.append(f"Nome: {flow['patient_name']}")
-        if flow.get("patient_birth_date"):
-            collected.append(f"Data nascimento: {flow['patient_birth_date']}")
-        if flow.get("consultation_type"):
-            collected.append(f"Tipo: {flow['consultation_type']}")
-        if flow.get("insurance_plan"):
-            collected.append(f"Convênio: {flow['insurance_plan']}")
-        if flow.get("appointment_date"):
-            collected.append(f"Data consulta: {flow['appointment_date']}")
-        if flow.get("appointment_time"):
-            collected.append(f"Horário consulta: {flow['appointment_time']}")
+MENU INICIAL:
+- Quando não houver contexto claro de agendamento ou o usuário iniciar nova conversa, apresente o menu:
 
-        missing = []
-        if not flow.get("patient_name"):
-            missing.append("nome completo")
-        if not flow.get("patient_birth_date"):
-            missing.append("data de nascimento")
-        if not flow.get("consultation_type"):
-            missing.append("tipo de consulta")
-        if flow.get("consultation_type") != "domiciliar" and not flow.get("insurance_plan"):
-            missing.append("convênio ou informação de particular")
-        if flow.get("consultation_type") and not flow.get("appointment_date"):
-            missing.append("data desejada")
-        if flow.get("consultation_type") and flow.get("appointment_date") and not flow.get("appointment_time"):
-            missing.append("horário desejado")
+"Olá! Eu sou a Beatriz, secretária do {clinic_name}! 😊
+Como posso te ajudar hoje?
 
-        alerts = []
-        if flow.get("name_validation_error"):
-            alerts.append(f"Revisar nome: {flow['name_validation_error']}")
-        if flow.get("birth_date_validation_error"):
-            alerts.append(f"Revisar data nascimento: {flow['birth_date_validation_error']}")
+1️⃣ Marcar consulta
+2️⃣ Remarcar/Cancelar consulta  
+3️⃣ Receitas
 
-        if not (collected or missing or alerts):
-            return None
+Digite o número da opção desejada."
+- Se o usuário já estiver no meio de um fluxo, mantenha o contexto e continue naturalmente
 
-        guidance_lines = ["[Contexto interno]"]
-        if collected:
-            guidance_lines.append("Dados já coletados: " + ", ".join(collected))
-        if missing:
-            guidance_lines.append("Dados ainda necessários: " + ", ".join(missing))
-        if alerts:
-            guidance_lines.append("Atenções: " + "; ".join(alerts))
+PRINCÍPIOS DE COMUNICAÇÃO:
+- Seja conversacional e adapte-se ao estilo do usuário (formal ou informal)
+- Peça informações de forma natural, uma por vez
+- Se o usuário fornecer múltiplas informações juntas, extraia o que conseguir e pergunte o que faltar
+- Se o usuário corrigir algo, agradeça e atualize os dados
+- Se informação estiver incompleta ou ambígua, pergunte de forma clara e educada
+- Se não entender algo, peça esclarecimento de forma amigável
 
-        return "\n".join(guidance_lines)
+═══════════════════════════════════════════════════════════
+FLUXO DE AGENDAMENTO
+═══════════════════════════════════════════════════════════
 
-    def _update_identity_state(self, context: ConversationContext, message: str):
-        """Atualiza flags de coleta de identidade sem bloquear a conversa."""
-        flow = context.flow_data or {}
+Após o usuário escolher qualquer opção do menu inicial, siga esta sequência obrigatória:
 
-        if flow.get("awaiting_patient_name"):
-            name_extraction = self._extrair_nome_e_data_robusto(message)
-            captured_name = name_extraction.get("nome")
-            if captured_name:
-                flow["patient_name"] = captured_name
-                flow["awaiting_patient_name"] = False
-                flow["awaiting_patient_birth_date"] = True
-                flow.pop("name_validation_error", None)
-                logger.info(f"👤 Nome registrado automaticamente: {captured_name}")
-            else:
-                flow["name_validation_error"] = (
-                    name_extraction.get("erro_nome")
-                    or "Não identifiquei um nome completo válido na última mensagem."
-                )
+1. NOME COMPLETO
+   - Verifique se já existe um nome válido salvo para o telefone. Se não houver, peça EXCLUSIVAMENTE o nome completo (sem falar de data na mesma mensagem).
+   - Aguarde e valide a resposta. Nome deve ter pelo menos duas palavras (nome + sobrenome).
+   - Se já existir um nome salvo, confirme de forma natural se deve mantê-lo ou atualizá-lo.
+   - Use a tool 'extract_patient_data' apenas quando precisar validar/recuperar o nome do histórico.
 
-        if flow.get("awaiting_patient_birth_date"):
-            birth_extraction = self._extrair_nome_e_data_robusto(message)
-            birth_date = birth_extraction.get("data")
-            if birth_date:
-                flow["patient_birth_date"] = birth_date
-                flow["awaiting_patient_birth_date"] = False
-                flow.pop("birth_date_validation_error", None)
-                flow.pop("awaiting_birth_date_correction", None)
-                logger.info(f"📅 Data de nascimento capturada automaticamente: {birth_date}")
-            else:
-                flow["birth_date_validation_error"] = (
-                    birth_extraction.get("erro_data")
-                    or "Ainda preciso da data de nascimento no formato DD/MM/AAAA."
-                )
+2. DATA DE NASCIMENTO
+   - Somente depois de registrar um nome válido peça a data de nascimento (formato DD/MM/AAAA).
+   - Se vier em formato incorreto, explique o motivo e solicite novamente.
+   - IMPORTANTE: Se Python validar a data (sem erro_data), aceite imediatamente. Não questione datas aprovadas pelo sistema.
+   - Lembre-se: alguém pode agendar para outra pessoa; mantenha os dados informados pelo usuário.
 
-        flag_modified(context, "flow_data")
+3. TIPO DE CONSULTA
+   - Após ter nome e data, mostre as opções:
+   "Perfeito! Agora me informe qual tipo de consulta você deseja:
+   
+   1️⃣ Clínica Geral - R$ 300
+   2️⃣ Geriatria Clínica e Preventiva - R$ 300
+   3️⃣ Atendimento Domiciliar ao Paciente Idoso - R$ 500
+   
+   Digite o número da opção desejada."
+   - Aceite: "1", "2", "3", "primeira opção", "opção 1", etc
 
-    def _log_metric(self, event: str, **payload):
-        """Registra métricas operacionais de forma estruturada."""
-        extras = " ".join(f"{key}={value}" for key, value in payload.items())
-        logger.info(f"[metric] event={event} {extras}".strip())
+3.1. FLUXO ESPECIAL - ATENDIMENTO DOMICILIAR:
+   Quando o usuário escolher "Atendimento Domiciliar" (opção 3):
+   1. NÃO chame find_next_available_slot (não precisa agendar horário específico)
+   2. PRIMEIRO: Pergunte ao usuário com esta mensagem formatada (NÃO chame nenhuma tool ainda):
+      "Perfeito! Para o atendimento domiciliar, preciso do seu endereço completo. Por favor, me informe:
+      
+      📍 Cidade
+      🏘️ Bairro
+      🛣️ Rua
+      🏠 Número da casa
+      
+      Você pode enviar tudo junto ou separado, como preferir!"
+   3. AGUARDE o usuário fornecer o endereço completo
+   4. DEPOIS: Chame request_home_address para extrair e salvar o endereço fornecido
+   5. Após request_home_address retornar sucesso, o sistema chamará notify_doctor_home_visit automaticamente
+   6. Após notify_doctor_home_visit retornar sucesso, você receberá uma mensagem de confirmação para enviar ao paciente
+   7. Envie a mensagem de confirmação e pergunte: "Posso te ajudar com mais alguma coisa?"
+   8. Se resposta for "não" ou similar → chame end_conversation
+   9. Se resposta for "sim" → ajude com o necessário e repita a pergunta até receber "não"
 
-    def _handle_structured_shortcuts(
-        self,
-        context: ConversationContext,
-        message: str,
-        db: Session,
-        phone: str
-    ) -> Optional[str]:
-        """Trata respostas determinísticas que dispensam o LLM."""
-        flow_data = context.flow_data or {}
+4. CONVÊNIO
+   "Ótimo! Você possui convênio médico?
 
-        # 1. Seleção de alternativas (1, 2 ou 3)
-        if flow_data.get("alternative_slots"):
-            message_stripped = message.strip()
-            if message_stripped in ["1", "2", "3"]:
-                try:
-                    option_index = int(message_stripped) - 1
-                    alternatives = flow_data.get("alternative_slots", [])
-                    if 0 <= option_index < len(alternatives):
-                        selected_alt = alternatives[option_index]
-                        flow_data["appointment_date"] = selected_alt["date"]
-                        flow_data["appointment_time"] = selected_alt["time"]
-                        flow_data["pending_confirmation"] = True
-                        flow_data.pop("alternative_slots", None)
-                        flow_data["alternatives_offered"] = False
-                        flow_data.pop("awaiting_custom_date", None)
-                        db.commit()
+   Trabalhamos com os seguintes convênios:
+   • CABERGS
+   • IPE
 
-                        patient_name = flow_data.get("patient_name", "")
-                        consultation_type = flow_data.get("consultation_type", "clinica_geral")
-                        insurance_plan = flow_data.get("insurance_plan", "Particular")
+   📋 Como responder:
+   • Se você TEM um desses convênios → Digite o nome (CABERGS ou IPE)
+   • Se você NÃO TEM convênio → Responda apenas "Não"
 
-                        tipo_map = {
-                            "clinica_geral": "Clínica Geral",
-                            "geriatria": "Geriatria Clínica e Preventiva",
-                            "domiciliar": "Atendimento Domiciliar ao Paciente Idoso"
-                        }
-                        tipo_nome = tipo_map.get(consultation_type, "Clínica Geral")
+   Vamos prosseguir com consulta particular se você não tiver convênio."
+   
+   IMPORTANTE - INTERPRETAÇÃO DE CONVÊNIO:
+   - Você DEVE identificar e interpretar o convênio quando o usuário mencionar durante a conversa
+   - Use seu entendimento de linguagem natural para interpretar a intenção do usuário
+   - Exemplos de identificação:
+     * "CABERGS", "cabergs", "CaberGs" → CABERGS
+     * "IPE", "ipe" → IPE
+     * "não", "não tenho", "sem convênio", "particular" → Particular
+     * "sim, tenho" (quando você perguntou sobre convênio) → perguntar qual específico
+   - Quando identificar o convênio, salve mentalmente e use nas próximas interações
+   - Normalize sempre os valores: CABERGS, IPE ou Particular (não "particular" minúsculo)
+   - Ao chamar tools como find_next_available_slot ou create_appointment, se você identificou o convênio, passe como parâmetro insurance_plan
+   - Se não passou como parâmetro, as tools buscarão automaticamente do flow_data
+   
+   MUDANÇA DE CONVÊNIO DURANTE CONFirmaÇÃO:
+   - Quando o usuário estiver na etapa de confirmação (você perguntou "Posso confirmar o agendamento?") e mencionar mudança de convênio:
+     * Exemplos: "quero trocar para particular", "mudar para CABERGS", "é IPE", "convênio errado"
+   - O sistema detectará automaticamente e atualizará o flow_data
+   - Um resumo atualizado será mostrado automaticamente com o novo convênio
+   - Você deve pedir confirmação novamente após a atualização
 
-                        tipos_consulta = self.clinic_info.get('tipos_consulta', {})
-                        tipo_data = tipos_consulta.get(consultation_type, {})
-                        tipo_valor = tipo_data.get('valor', 0)
+5. BUSCA AUTOMÁTICA DE HORÁRIO
+   - Após coletar convênio (ou particular), chame IMEDIATAMENTE a tool 'find_next_available_slot' SEM ADICIONAR TEXTO PRÉVIO
+   - Não diga "vou buscar", "deixe-me buscar" ou "permita-me buscar" - apenas execute a tool diretamente
+   - Esta tool busca o próximo horário disponível respeitando 48 horas exatas de antecedência mínima
+   - A tool retorna um resumo completo formatado - repasse a mensagem ao usuário
+   - O sistema calcula 48h a partir do momento atual, contando finais de semana também
+   - IMPORTANTE: Quando receber resultado de find_next_available_slot, SEMPRE mostre o resumo completo retornado pela tool antes de pedir confirmação. Não assuma que o usuário já viu o resumo.
 
-                        convenio_nome = insurance_plan if insurance_plan != "particular" else "Particular"
+FLUXO COMPLETO APÓS COLETAR DADOS:
+1. Chame find_next_available_slot (sem texto prévio)
+2. Receba o resultado completo com resumo formatado
+3. SEMPRE mostre o resumo completo ao usuário (copie exatamente o que a tool retornou)
+4. Depois de mostrar o resumo, pergunte: "Posso confirmar o agendamento?"
+5. Aguarde confirmação antes de criar agendamento
 
-                        dias_semana = [
-                            'segunda-feira', 'terça-feira', 'quarta-feira',
-                            'quinta-feira', 'sexta-feira', 'sábado', 'domingo'
-                        ]
-                        alt_date = parse_date_br(selected_alt["date"])
-                        dia_nome_completo = dias_semana[alt_date.weekday()] if alt_date else ""
+REGRAS CRÍTICAS PARA find_next_available_slot:
+1. Quando receber resultado desta tool, você DEVE:
+   a) Copiar EXATAMENTE o resumo completo retornado (incluindo todas as linhas: Nome, Tipo, Convênio, Data, Horário)
+   b) Mostrar o resumo COMPLETO ao usuário (sem omitir nada, sem resumir, sem parafrasear)
+   c) DEPOIS de mostrar o resumo completo, adicione: "Posso confirmar o agendamento?"
+2. NUNCA pule a etapa de mostrar o resumo completo
+3. NUNCA peça confirmação sem mostrar o resumo primeiro
+4. NUNCA assuma que o usuário já viu o resumo - sempre mostre novamente
+5. O resumo retornado pela tool contém TODAS as informações necessárias - use-o completamente
 
-                        response = (
-                            f"Perfeito! Você escolheu a opção {message_stripped}.\n\n"
-                            "📋 *Resumo da consulta:*\n"
-                            f"👤 Nome: {patient_name}\n"
-                            f"🏥 Tipo: {tipo_nome} - R$ {tipo_valor}\n"
-                            f"💳 Convênio: {convenio_nome}\n"
-                            f"📅 Data: {selected_alt['date']} ({dia_nome_completo})\n"
-                            f"⏰ Horário: {selected_alt['time']}\n\n"
-                            "Posso confirmar o agendamento?"
-                        )
+6. CONFIRMAÇÃO OU ALTERNATIVAS
+   - Se usuário confirmar → use 'create_appointment' com os dados coletados
+   - Se usuário rejeitar → chame 'find_alternative_slots' para mostrar 3 opções alternativas
+   - Se usuário mencionar preferência (ex: "quinta à tarde") → interprete e use 'validate_date_and_show_slots' com a próxima ocorrência do dia após 48h
+   - Se usuário escolher uma das 3 alternativas (1, 2 ou 3) → use os dados dessa opção para criar agendamento
+   - Se rejeitar todas alternativas → pergunte qual dia prefere e use 'validate_date_and_show_slots' para mostrar horários
 
-                        self._log_metric("alternative_selected", phone=phone, option=message_stripped, date=selected_alt["date"], time=selected_alt["time"])
-                        self._record_interaction(context, message, response, db, flow_modified=True)
-                        return response
-                except (ValueError, IndexError, KeyError) as exc:
-                    logger.error(f"Erro ao processar alternativa: {exc}", exc_info=True)
+7. ESCOLHA DE HORÁRIO (fluxo manual)
+   - Se usuário mencionar horário no formato HH:MM → use 'confirm_time_slot' para validar e mostrar resumo
+   - Aguarde confirmação final antes de criar agendamento
 
-            intent_alt = self._detect_confirmation_intent(message)
-            if intent_alt == "negative":
-                flow_data.pop("alternative_slots", None)
-                flow_data["alternatives_offered"] = False
-                flow_data["awaiting_custom_date"] = True
-                db.commit()
+═══════════════════════════════════════════════════════════
+      - date: a data que foi validada anteriormente (appointment_date)
+      - time: o horário que o usuário acabou de escolher
+   
+   b) Esta tool vai automaticamente:
+      - Verificar se é horário inteiro (só aceita 08:00, 09:00, etc)
+      - Verificar disponibilidade final (segurança contra race condition)
+      - Mostrar resumo da consulta (nome, data, hora, tipo, convênio)
+      - Pedir confirmação: "Posso confirmar o agendamento?"
+   
+   c) NÃO execute create_appointment imediatamente
+   d) Apenas repasse a mensagem da tool ao usuário
+   e) Aguarde confirmação do usuário ("sim", "confirma", "quero", etc)
+   
+   REGRA CRÍTICA: Se o usuário enviar QUALQUER mensagem contendo horário, você DEVE executar confirm_time_slot IMEDIATAMENTE, sem exceção.
+   
+   Exemplos de horários que devem acionar confirm_time_slot:
+   - "14:00", "15:30", "10:00"
+   - "às 14h", "15 horas", "10h"
+   - "quatorze horas", "quinze e meia"
+   - Qualquer menção a horário no formato HH:MM ou variações
+   
+   NÃO espere confirmação do usuário após ele escolher horário - execute a tool automaticamente.
+   NÃO pergunte "você quis dizer 14:00?" - execute confirm_time_slot diretamente.
 
-                response = (
-                    "Sem problemas! Qual dia funciona melhor para você? "
-                    "Pode me informar uma data no formato DD/MM/AAAA ou dizer algo como "
-                    "\"terça-feira pela manhã\"."
-                )
-                self._log_metric("alternatives_rejected", phone=phone)
-                self._record_interaction(context, message, response, db, flow_modified=True)
-                return response
+7.5. **REGRAS CRÍTICAS PARA RESPOSTAS APÓS TOOLS:**
+   APÓS executar qualquer tool, você DEVE sempre gerar uma resposta de texto completa para o usuário.
+   NUNCA retorne apenas um caractere ou espaço.
+   Sua resposta deve ser útil e informativa.
+   
+   Exemplos:
+   - Após confirm_time_slot, diga: "Horário confirmado! Posso criar o agendamento?" em vez de apenas "OK"
+   - Após find_next_available_slot, sempre mostre o resumo completo antes de pedir confirmação
+   - Após create_appointment, gere uma mensagem natural incluindo todas as informações importantes
 
-        # 2. Solicitações personalizadas de data/horário quando aguardando preferência
-        if (
-            flow_data.get("pending_confirmation")
-            or flow_data.get("awaiting_custom_date")
-            or flow_data.get("alternatives_offered")
-        ):
-            custom_request = self._detect_custom_schedule_request(message)
-            if custom_request and (custom_request.get("date") or custom_request.get("weekday")):
-                response = self._process_custom_schedule_request(custom_request, context, db, phone)
-                if response:
-                    self._record_interaction(context, message, response, db)
-                    return response
+8. **FLUXO CRÍTICO - Após confirmação do usuário:**
+   a) Execute create_appointment com TODOS os dados
+   b) Os dados vêm do flow_data (já foram salvos nas etapas anteriores)
+   c) Quando create_appointment retornar sucesso, você receberá um contexto com informações importantes
+   d) VOCÊ DEVE gerar uma mensagem natural e amigável incluindo APENAS as informações fornecidas:
+      - NÃO inclua resumo da consulta (data, horário, paciente, tipo) - o usuário já sabe disso
+      - NÃO inclua mensagem de sucesso em negrito ou emojis de celebração
+      - Inclua APENAS as informações importantes:
+        * Pedido para trazer últimos exames
+        * Pedido para tragar lista de medicações
+        * Endereço completo do consultório
+        * Informação sobre cadeira de rodas disponível (se mencionado no contexto)
+        * Informação sobre mensagem de lembrete que será enviada no dia da consulta para relembrar sobre a consulta
+   e) Termine sempre perguntando: "Posso te ajudar com mais alguma coisa?"
 
-        # 3. Fluxo de confirmação pendente
-        if flow_data.get("pending_confirmation"):
-            if self._detect_insurance_change_intent(message):
-                novo_convenio = self._extract_insurance_from_message(message, context)
-                if novo_convenio:
-                    flow_data["insurance_plan"] = novo_convenio
-                    db.commit()
-                    self._log_metric("insurance_change", phone=phone, insurance=novo_convenio)
-                    resumo_atualizado = self._generate_updated_summary(context, db)
-                    response = resumo_atualizado + "\n\nPosso confirmar o agendamento?"
-                    self._record_interaction(context, message, response, db)
-                    return response
+IMPORTANTE - FLUXO DE CONFirmaÇÃO:
+1. O fluxo é: validate_date_and_show_slots → confirm_time_slot → create_appointment
+2. NÃO pule etapas
+3. NÃO tente criar o agendamento antes de confirmar o horário
+4. Use confirm_time_slot APENAS quando o usuário escolher um horário específico
 
-            intent = self._detect_confirmation_intent(message)
-            if intent == "positive":
-                data = flow_data or {}
-                if not data.get("patient_name") or not data.get("patient_birth_date"):
-                    logger.warning("Dados incompletos no flow_data durante confirmação; extraindo histórico.")
-                    extracted = self._extract_appointment_data_from_messages(context.messages)
-                    data["patient_name"] = data.get("patient_name") or extracted.get("patient_name")
-                    data["patient_birth_date"] = data.get("patient_birth_date") or extracted.get("patient_birth_date")
+═══════════════════════════════════════════════════════════
+FERRAMENTAS E QUANDO USAR
+═══════════════════════════════════════════════════════════
 
-                result = self._handle_create_appointment({
-                    "patient_name": data.get("patient_name"),
-                    "patient_birth_date": data.get("patient_birth_date"),
-                    "appointment_date": data.get("appointment_date"),
-                    "appointment_time": data.get("appointment_time"),
-                    "patient_phone": phone
-                }, db, phone)
+- get_clinic_info: Quando usuário perguntar sobre horários, endereço, telefone, dias fechados, etc. Execute imediatamente.
 
-                flow_data["pending_confirmation"] = False
-                flow_data["alternatives_offered"] = False
-                self._log_metric(
-                    "appointment_confirmed",
-                    phone=phone,
-                    date=data.get("appointment_date"),
-                    time=data.get("appointment_time"),
-                    consultation=data.get("consultation_type")
-                )
-                self._record_interaction(context, message, result, db, flow_modified=True)
-                return result
+- extract_patient_data: Use quando o usuário mencionar seu nome mas você não tiver certeza ou precisar validar. Também use quando precisar extrair nome/data do histórico de mensagens, especialmente se houver dúvida sobre se um texto é nome real ou frase de pedido. IMPORTANTE: O sistema já extrai automaticamente nome quando formato é "Nome, DD/MM/YYYY", então use esta tool apenas se houver dúvida ou se precisar validar.
 
-            if intent == "negative":
-                if not flow_data.get("alternatives_offered"):
-                    flow_data["pending_confirmation"] = False
-                    flow_data["alternatives_offered"] = True
-                    db.commit()
-                    alternatives_message = self._handle_find_alternative_slots({}, db, phone)
-                    self._log_metric("appointment_declined_first_offer", phone=phone)
-                    self._record_interaction(context, message, alternatives_message, db, flow_modified=True)
-                    return alternatives_message
+- find_next_available_slot: Use APÓS coletar nome, data nascimento, tipo consulta e convênio. IMPORTANTE: Antes de chamar, verifique se tem todos os dados necessários. O sistema tenta extrair automaticamente dados faltantes, mas se ainda faltar algo, pergunte ao usuário antes de chamar esta tool. Busca automaticamente próximo horário (48h mínimo). NÃO use quando consultation_type for 'domiciliar' - use request_home_address em vez disso.
 
-                flow_data["pending_confirmation"] = False
-                flow_data["awaiting_custom_date"] = True
-                flow_data.pop("alternative_slots", None)
-                db.commit()
+- request_home_address: Use APENAS quando consultation_type for 'domiciliar' e patient_address não estiver no flow_data. Esta tool solicita e extrai o endereço completo do paciente.
 
-                response = (
-                    "Tudo bem! Qual dia fica melhor para você? "
-                    "Informe a data no formato DD/MM/AAAA ou descreva o período, por exemplo, "
-                    "\"quinta-feira à tarde\"."
-                )
-                self._log_metric("appointment_declined_after_alternatives", phone=phone)
-                self._record_interaction(context, message, response, db, flow_modified=True)
-                return response
+- notify_doctor_home_visit: Use APENAS após receber endereço completo do paciente (após request_home_address retornar sucesso) para atendimento domiciliar. Esta tool envia notificação formatada para a doutora com todas as informações do paciente.
 
-        return None
+- find_alternative_slots: Use quando usuário rejeitar o primeiro horário oferecido. Retorna 3 opções alternativas.
 
-    def _sync_flow_data_from_history(self, context: ConversationContext, db: Session):
-        """Atualiza flow_data usando o histórico completo da conversa."""
-        try:
-            if not context.flow_data:
-                context.flow_data = {}
+- validate_date_and_show_slots: Use quando:
+  - Usuário mencionar preferência de dia específico (ex: "quinta à tarde")
+  - Usuário rejeitar todas as 3 alternativas e pedir para escolher dia
+  - Precisar mostrar horários disponíveis de uma data específica
 
-            extracted = self._extract_appointment_data_from_messages(context.messages)
+- confirm_time_slot: Use quando usuário escolher um horário específico (HH:MM). Valida e mostra resumo para confirmação.
 
-            if extracted.get("patient_name") and not context.flow_data.get("patient_name"):
-                context.flow_data["patient_name"] = extracted["patient_name"]
-                logger.info(f"💾 Nome extraído automaticamente e salvo no flow_data: {extracted['patient_name']}")
+- create_appointment: Use para criar o agendamento final após confirmação do usuário. Os dados já estão no flow_data.
 
-            if not context.flow_data.get("patient_name"):
-                import re
-                name_patterns = [
-                    r'(?:meu nome é|sou|me chamo|me chama|chamo-me)\s+([A-ZÁÉÍÓÚÂÊÔÇ][a-záéíóúâêôçãõ]+(?:\s+[A-ZÁÉÍÓÚÂÊÔÇ][a-záéíóúâêôçãõ]+)+)',
-                    r'(?:nome|chamo)\s+([A-ZÁÉÍÓÚÂÊÔÇ][a-záéíóúâêôçãõ]+(?:\s+[A-ZÁÉÍÓÚÂÊÔÇ][a-záéíóúâêôçãõ]+)+)',
-                ]
-                for msg in reversed(context.messages[-10:]):
-                    if msg.get("role") == "user":
-                        content = (msg.get("content") or "").strip()
-                        for pattern in name_patterns:
-                            match = re.search(pattern, content, re.IGNORECASE)
-                            if match:
-                                candidate_name = match.group(1).strip()
-                                words = candidate_name.split()
-                                if len(words) >= 2 and len(candidate_name) > 5:
-                                    common_phrases = ["preciso marcar", "quero agendar", "preciso de", "gostaria de"]
-                                    if not any(phrase in candidate_name.lower() for phrase in common_phrases):
-                                        context.flow_data["patient_name"] = candidate_name
-                                        logger.info(f"💾 Nome extraído automaticamente (fallback): {candidate_name}")
-                                        break
-                        if context.flow_data.get("patient_name"):
-                            break
+- search_appointments: Use quando usuário quiser verificar consultas agendadas ou remarcar/cancelar.
 
-            if context.flow_data.get("awaiting_birth_date_correction"):
-                if extracted.get("patient_birth_date"):
-                    context.flow_data["patient_birth_date"] = extracted["patient_birth_date"]
-                    context.flow_data["awaiting_birth_date_correction"] = False
-                    db.commit()
-                    logger.info("🔄 Data de nascimento corrigida, tentando agendar novamente")
-            elif extracted.get("patient_birth_date") and not context.flow_data.get("patient_birth_date"):
-                context.flow_data["patient_birth_date"] = extracted["patient_birth_date"]
-                logger.info(f"💾 Data nascimento salva no flow_data: {extracted['patient_birth_date']}")
+- cancel_appointment: Use para cancelar uma consulta existente.
 
-            appointment_completed = context.flow_data.get("appointment_completed", False)
+- request_human_assistance: Use APENAS quando usuário solicitar EXPLICITAMENTE falar com secretária ou atendente humano. 
+  Exemplos válidos: "quero falar com a secretária", "preciso de atendente", "pode transferir para humano".
+  NÃO use para: saudações como "Olá, Doutora", menções casuais ou quando usuário está apenas sendo educado.
+  Lembre-se: o objetivo é automatizar - só transfira quando realmente necessário.
 
-            if extracted.get("appointment_date") and not context.flow_data.get("appointment_date") and not appointment_completed:
-                context.flow_data["appointment_date"] = extracted["appointment_date"]
-                logger.info(f"💾 Data consulta salva no flow_data: {extracted['appointment_date']}")
-            elif appointment_completed and extracted.get("appointment_date"):
-                logger.info("⏭️ Pulando salvamento de appointment_date - agendamento já foi completado")
+- end_conversation: Use quando usuário indicar que não precisa de mais nada (após pergunta "Posso te ajudar com mais alguma coisa?").
 
-            if extracted.get("appointment_time") and not context.flow_data.get("appointment_time") and not appointment_completed:
-                time_str = extracted["appointment_time"]
-                from app.utils import validate_time_format
-                if validate_time_format(time_str):
-                    context.flow_data["appointment_time"] = time_str
-                    logger.info(f"💾 Horário consulta salvo no flow_data: {time_str}")
-                else:
-                    logger.warning(f"⚠️ Horário inválido rejeitado: {time_str}")
-            elif appointment_completed and extracted.get("appointment_time"):
-                logger.info("⏭️ Pulando salvamento de appointment_time - agendamento já foi completado")
+═══════════════════════════════════════════════════════════
+RECUPERAÇÃO E ADAPTAÇÃO
+═══════════════════════════════════════════════════════════
 
-            if extracted.get("consultation_type"):
-                tipo_anterior = context.flow_data.get("consultation_type")
-                context.flow_data["consultation_type"] = extracted["consultation_type"]
-                if tipo_anterior:
-                    logger.info(f"💾 Tipo consulta ATUALIZADO no flow_data: {tipo_anterior} → {extracted['consultation_type']}")
-                else:
-                    logger.info(f"💾 Tipo consulta salvo no flow_data: {extracted['consultation_type']}")
+LIDANDO COM VARIAÇÕES:
+- Se usuário usar linguagem informal, adapte sua resposta mantendo profissionalismo
+- Se usuário der informações incompletas, pergunte o que falta de forma natural
+- Se usuário pular etapas (ex: "quero marcar quinta às 15h"), tente extrair o que conseguir e pergunte o que faltar
+- Se usuário mencionar algo fora do fluxo (ex: "quanto custa?" no meio do agendamento), responda brevemente e retome o fluxo
 
-            consultation_type = context.flow_data.get("consultation_type")
-            if consultation_type == "domiciliar":
-                patient_address = context.flow_data.get("patient_address")
-                doctor_notified = context.flow_data.get("doctor_notified", False)
+DETECTANDO CORREÇÕES:
+- Se usuário disser "mudou", "corrigindo", "na verdade", "errei" → entenda como correção
+- Agradeça a correção e atualize os dados
+- Continue de onde parou
 
-                if not patient_address:
-                    context.flow_data["pending_home_address"] = True
-                    flag_modified(context, "flow_data")
-                    db.commit()
-                elif patient_address and not doctor_notified:
-                    context.flow_data["pending_doctor_notification"] = True
-                    flag_modified(context, "flow_data")
-                    db.commit()
+INTERPRETANDO ESCOLHAS:
+- Aceite variações: "1", "primeira opção", "opção 1", "a primeira", etc
+- Use contexto para entender intenções ambíguas
+- Se não tiver certeza, pergunte de forma amigável
 
-            if extracted.get("insurance_plan"):
-                convenio_anterior = context.flow_data.get("insurance_plan")
-                context.flow_data["insurance_plan"] = extracted["insurance_plan"]
-                if convenio_anterior:
-                    logger.info(f"💾 Convênio ATUALIZADO no flow_data: {convenio_anterior} → {extracted['insurance_plan']}")
-                else:
-                    logger.info(f"💾 Convênio salvo no flow_data: {extracted['insurance_plan']}")
-            else:
-                if context.messages:
-                    last_user_message = None
-                    for msg in reversed(context.messages):
-                        if msg.get("role") == "user":
-                            last_user_message = msg.get("content", "").strip()
-                            break
+PERGUNTAS FORA DO FLUXO:
+- Se usuário fizer perguntas sobre a clínica durante agendamento, responda brevemente usando 'get_clinic_info' e retome o fluxo
+- Mantenha o contexto do agendamento ativo
 
-                    if last_user_message:
-                        detected_insurance = self._detect_insurance_in_message(last_user_message)
+═══════════════════════════════════════════════════════════
+CICLO DE ATENDIMENTO E ENCERRAMENTO
+═══════════════════════════════════════════════════════════
 
-                        if detected_insurance:
-                            convenio_anterior = context.flow_data.get("insurance_plan")
-                            context.flow_data["insurance_plan"] = detected_insurance
-                            db.commit()
-                            if convenio_anterior:
-                                logger.info(f"💾 Convênio detectado na última mensagem e ATUALIZADO no flow_data: {convenio_anterior} → {detected_insurance}")
-                            else:
-                                logger.info(f"💾 Convênio detectado na última mensagem e salvo no flow_data: {detected_insurance}")
-                        else:
-                            if any(keyword in last_user_message.lower() for keyword in ["convênio", "convenio", "plano", "ipe", "cabergs", "particular"]):
-                                try:
-                                    temp_context = ConversationContext(
-                                        phone=context.phone,
-                                        messages=[{"role": "user", "content": last_user_message}],
-                                        flow_data={}
-                                    )
-                                    extracted_data = self._extract_patient_data_with_claude(temp_context)
+Após qualquer tarefa concluída (agendamento, cancelamento, resposta a dúvida):
+- Sempre pergunte: "Posso te ajudar com mais alguma coisa?"
+- Se usuário responder positivamente (sim, quero, preciso, etc) ou fizer nova pergunta → continue ajudando com contexto completo
+- Se usuário responder negativamente (não, não preciso, obrigado, tchau, etc) → use imediatamente a tool 'end_conversation'
+- Após usar 'end_conversation', encerre a conversa com mensagem de despedida amigável
 
-                                    if extracted_data and extracted_data.get("insurance_plan"):
-                                        detected_insurance = extracted_data["insurance_plan"]
-                                        if detected_insurance.lower() == "ipe":
-                                            detected_insurance = "IPE"
-                                        elif detected_insurance.lower() == "cabergs":
-                                            detected_insurance = "CABERGS"
-                                        elif detected_insurance.lower() in ["particular", "particula"]:
-                                            detected_insurance = "Particular"
+REGRAS PARA end_conversation:
+- Use APENAS quando usuário indicar claramente que não precisa de mais nada
+- Exemplos de quando usar: "não", "não preciso", "não, obrigado", "só isso", "tchau", "até logo"
+- NÃO use para perguntas do usuário ou quando ele está pedindo ajuda
+- Após chamar end_conversation, o contexto será limpo automaticamente
 
-                                        convenio_anterior = context.flow_data.get("insurance_plan")
-                                        context.flow_data["insurance_plan"] = detected_insurance
-                                        db.commit()
-                                        if convenio_anterior:
-                                            logger.info(f"💾 Convênio detectado via Claude e ATUALIZADO no flow_data: {convenio_anterior} → {detected_insurance}")
-                                        else:
-                                            logger.info(f"💾 Convênio detectado via Claude e salvo no flow_data: {detected_insurance}")
-                                except Exception as exc:
-                                    logger.warning(f"⚠️ Erro ao extrair convênio com Claude: {exc}")
+Mantenha TODO o contexto histórico durante o ciclo (nome, data nascimento, etc) para evitar repetir perguntas.
 
-            flag_modified(context, "flow_data")
-        except Exception as exc:
-            logger.error(f"Erro ao sincronizar flow_data: {exc}", exc_info=True)
+═══════════════════════════════════════════════════════════
+PERSISTÊNCIA E COMPLETAR TAREFAS
+═══════════════════════════════════════════════════════════
+
+PRINCÍPIO FUNDAMENTAL: Sempre complete a tarefa até o final. Não pare com mensagens genéricas.
+
+QUANDO DADOS FALTAREM:
+- NÃO retorne mensagem genérica de erro
+- Tente extrair dados do histórico usando extract_patient_data primeiro
+- Se não conseguir extrair, pergunte de forma natural e específica o que falta
+- Mantenha o contexto e continue de onde parou
+- Exemplo: Em vez de "Nome não encontrado", diga "Para continuar, preciso do seu nome completo. Pode me informar?"
+
+QUANDO UMA TOOL FALHAR:
+- Tente abordagem alternativa antes de retornar erro
+- Se faltar dados, tente extrair do histórico antes de retornar erro
+- Explique o problema de forma amigável e sugira solução
+- NÃO desista - continue tentando até completar a tarefa
+
+COMPLETANDO TAREFAS:
+- Marcar consulta: Não pare até o agendamento estar confirmado e salvo
+- Cancelar consulta: Não pare até o cancelamento estar completo e confirmado
+- Reagendar: Não pare até a nova data estar confirmada e salva
+- Receita: Não pare até a informação estar fornecida completamente
+
+═══════════════════════════════════════════════════════════
+VALIDAÇÕES CRÍTICAS
+═══════════════════════════════════════════════════════════
+
+- Confie nas validações do Python para dados críticos (formato de data, horários válidos)
+- Se Python aprovar uma data (sem erro_data), aceite imediatamente
+- Não questione ou valide manualmente dados já aprovados pelo sistema
+- Para nome: use 'extract_patient_data' se houver dúvida se é nome real ou frase
+
+═══════════════════════════════════════════════════════════
+
+Lembre-se: Seja natural, adaptável e prestativa. Use as tools disponíveis conforme necessário e mantenha uma conversa fluida e educada. Sempre complete a tarefa até o final."""
 
     def _define_tools(self) -> List[Dict]:
         """Define as tools disponíveis para o Claude"""
@@ -1258,9 +1121,34 @@ class ClaudeToolAgent:
             "negative" - usuário negou/quer mudar
             "unclear" - não foi possível determinar
         """
-        result = self.intent_classifier.classify_confirmation(message)
-        logger.debug(f"🎯 Classificação de confirmação: {result.label} (confiança {result.confidence})")
-        return result.label
+        message_lower = message.lower().strip()
+        
+        # Palavras-chave positivas
+        positive_keywords = [
+            "sim", "pode", "confirma", "confirmar", "claro", "ok", "okay",
+            "perfeito", "isso", "certo", "exato", "vamos", "agendar",
+            "marcar", "beleza", "aceito", "tá bom", "ta bom", "show",
+            "positivo", "concordo", "fechado", "fechou"
+        ]
+        
+        # Palavras-chave negativas
+        negative_keywords = [
+            "não", "nao", "nunca", "jamais", "mudar", "alterar", "trocar",
+            "outro", "outra", "diferente", "modificar", "cancelar",
+            "desistir", "quero mudar", "prefiro", "melhor não"
+        ]
+        
+        # Verificar positivos
+        for keyword in positive_keywords:
+            if keyword in message_lower:
+                return "positive"
+        
+        # Verificar negativos
+        for keyword in negative_keywords:
+            if keyword in message_lower:
+                return "negative"
+        
+        return "unclear"
 
     def _normalize_text_for_weekday(self, text: str) -> str:
         replacements = {
@@ -1414,9 +1302,25 @@ class ClaudeToolAgent:
         Returns:
             True se detectar intenção de mudar convênio, False caso contrário
         """
-        detected = self.intent_classifier.detect_insurance_change(message or "")
-        logger.debug(f"🏷️ Intenção de mudança de convênio detectada? {detected}")
-        return detected
+        message_lower = message.lower().strip()
+        
+        # Palavras-chave que indicam mudança de convênio
+        insurance_change_keywords = [
+            "trocar convênio", "trocar convenio", "mudar convênio", "mudar convenio",
+            "alterar convênio", "alterar convenio", "quero particular", "prefiro particular",
+            "quero cabergs", "prefiro cabergs", "quero ipe", "prefiro ipe",
+            "é particular", "eh particular", "será particular", "sera particular",
+            "vou particular", "mudar para particular", "trocar para particular",
+            "mudar para cabergs", "trocar para cabergs", "mudar para ipe", "trocar para ipe",
+            "convênio errado", "convenio errado", "convênio está errado", "convenio esta errado"
+        ]
+        
+        # Verificar se contém alguma palavra-chave
+        for keyword in insurance_change_keywords:
+            if keyword in message_lower:
+                return True
+        
+        return False
 
     def _detect_insurance_in_message(self, message: str) -> Optional[str]:
         """
@@ -1680,10 +1584,12 @@ Resposta (apenas o nome do convênio, nada mais):"""
         return msg
 
     def process_message(self, message: str, phone: str, db: Session) -> str:
-        """Processa uma mensagem do usuário aplicando pré-processamento flexível antes do LLM."""
+        """Processa uma mensagem do usuário e retorna a resposta com contexto persistente"""
         try:
+            # 1. Carregar contexto do banco
             context = db.query(ConversationContext).filter_by(phone=phone).first()
             if not context:
+                # Primeira mensagem deste usuário, criar contexto novo
                 context = ConversationContext(
                     phone=phone,
                     messages=[],
@@ -1693,179 +1599,890 @@ Resposta (apenas o nome do convênio, nada mais):"""
                 logger.info(f"🆕 Novo contexto criado para {phone}")
             else:
                 logger.info(f"📱 Contexto carregado para {phone}: {len(context.messages)} mensagens")
-
+            
+            # 2. Verificação de timeout removida - agora é proativa via scheduler
+            
+            # 3. Decidir se deve encerrar contexto por resposta negativa
             if self._should_end_context(context, message):
                 logger.info(f"🔚 Encerrando contexto para {phone} por resposta negativa do usuário")
                 db.delete(context)
                 db.commit()
                 return "Foi um prazer atender você! Até logo! 😊"
 
-            self._ensure_flow_data(context)
+            # 4. Verificar se há alternativas salvas e usuário escolheu uma (1, 2 ou 3)
+            if not context.flow_data:
+                context.flow_data = {}
+                flag_modified(context, "flow_data")
+            flow_data = context.flow_data
 
-            shortcut_response = self._handle_structured_shortcuts(context, message, db, phone)
-            if shortcut_response:
-                return shortcut_response
+            # Detectar solicitações naturais de data/horário personalizadas
+            custom_request = None
+            if flow_data and (
+                flow_data.get("pending_confirmation")
+                or flow_data.get("awaiting_custom_date")
+                or flow_data.get("alternatives_offered")
+            ):
+                custom_request = self._detect_custom_schedule_request(message)
+                if custom_request and (custom_request.get("date") or custom_request.get("weekday")):
+                    logger.info(f"🗓️ Solicitação personalizada detectada: {custom_request}")
+                    response = self._process_custom_schedule_request(custom_request, context, db, phone)
+                    if response:
+                        context.messages.append({
+                            "role": "user",
+                            "content": message,
+                            "timestamp": datetime.utcnow().isoformat()
+                        })
+                        context.messages.append({
+                            "role": "assistant",
+                            "content": response,
+                            "timestamp": datetime.utcnow().isoformat()
+                        })
+                        context.last_activity = datetime.utcnow()
+                        db.commit()
+                        return response
 
-            flow = context.flow_data or {}
-            if flow.get("menu_choice") is None and not flow.get("awaiting_patient_name") and not flow.get("awaiting_patient_birth_date"):
+            # 3. Detectar seleção de menu e iniciar coleta sequencial de identidade
+            menu_choice = None
+            if flow_data.get("menu_choice") is None and not flow_data.get("awaiting_patient_name") and not flow_data.get("awaiting_patient_birth_date"):
                 menu_choice = self._detect_main_menu_choice(message, context)
-                if menu_choice:
-                    logger.info(f"🧭 Menu option '{menu_choice}' identificada para {phone}")
-                    self._start_identity_collection(context, menu_choice)
 
-            self._update_identity_state(context, message)
+            if menu_choice:
+                logger.info(f"🧭 Menu option '{menu_choice}' selecionada para {phone}")
+                self._start_identity_collection(context, menu_choice)
+                prompt = self._build_name_prompt(menu_choice)
+                self._record_interaction(context, message, prompt, db, flow_modified=True)
+                return prompt
 
-            self._record_user_message(context, message)
+            if flow_data.get("awaiting_patient_name"):
+                name_extraction = self._extrair_nome_e_data_robusto(message)
+                captured_name = name_extraction.get("nome")
 
-            self._sync_flow_data_from_history(context, db)
+                if captured_name:
+                    flow_data["patient_name"] = captured_name
+                    flow_data["awaiting_patient_name"] = False
+                    flow_data["awaiting_patient_birth_date"] = True
+                    flag_modified(context, "flow_data")
+                    first_name = captured_name.split()[0]
+                    response = (
+                        f"Muito obrigada, {first_name}! Agora, para manter o cadastro certinho, "
+                        "me informe sua data de nascimento no formato DD/MM/AAAA."
+                    )
+                    logger.info(f"👤 Nome registrado para {phone}: {captured_name}")
+                    self._record_interaction(context, message, response, db, flow_modified=True)
+                    return response
 
-            internal_guidance = self._build_state_guidance(context)
+                error_msg = name_extraction.get("erro_nome") or "Para continuar, preciso do seu nome completo (nome e sobrenome)."
+                response = f"{error_msg.strip().rstrip('.')}. Pode me informar seu nome completo, por favor?"
+                logger.warning(f"⚠️ Nome inválido informado por {phone}: {message}")
+                self._record_interaction(context, message, response, db)
+                return response
 
-            claude_messages: List[Dict[str, Any]] = [
-                {"role": msg["role"], "content": msg["content"]}
-                for msg in context.messages
-            ]
+            if flow_data.get("awaiting_patient_birth_date"):
+                birth_extraction = self._extrair_nome_e_data_robusto(message)
+                birth_date = birth_extraction.get("data")
 
-            if internal_guidance:
+                if birth_date:
+                    flow_data["patient_birth_date"] = birth_date
+                    flow_data["awaiting_patient_birth_date"] = False
+                    flow_data.pop("awaiting_birth_date_correction", None)
+                    flag_modified(context, "flow_data")
+                    logger.info(f"📅 Data de nascimento registrada para {phone}: {birth_date}")
+
+                    next_prompt = self._build_post_identity_prompt(flow_data.get("menu_choice"))
+                    self._record_interaction(context, message, next_prompt, db, flow_modified=True)
+                    return next_prompt
+                else:
+                    error_msg = birth_extraction.get("erro_data") or "Não consegui identificar sua data de nascimento."
+                    response = f"{error_msg.strip().rstrip('.')}. Pode enviar no formato DD/MM/AAAA?"
+                    logger.warning(f"⚠️ Data de nascimento inválida informada por {phone}: {message}")
+                    self._record_interaction(context, message, response, db)
+                    return response
+
+            # 4. Verificar se há alternativas salvas e usuário escolheu uma (1, 2 ou 3)
+            if context.flow_data and context.flow_data.get("alternative_slots"):
+                message_stripped = message.strip()
+                if message_stripped in ["1", "2", "3"]:
+                    try:
+                        option_index = int(message_stripped) - 1  # Converter para índice (0, 1, 2)
+                        alternatives = context.flow_data.get("alternative_slots", [])
+                        
+                        if 0 <= option_index < len(alternatives):
+                            selected_alt = alternatives[option_index]
+                            logger.info(f"✅ Usuário {phone} escolheu alternativa {message_stripped}: {selected_alt}")
+                            
+                            # Atualizar flow_data com a alternativa escolhida
+                            context.flow_data["appointment_date"] = selected_alt["date"]
+                            context.flow_data["appointment_time"] = selected_alt["time"]
+                            context.flow_data["pending_confirmation"] = True
+                            context.flow_data.pop("alternative_slots", None)  # Limpar alternativas
+                            context.flow_data["alternatives_offered"] = False
+                            context.flow_data.pop("awaiting_custom_date", None)
+                            db.commit()
+                            
+                            # Mostrar resumo e pedir confirmação final
+                            patient_name = context.flow_data.get("patient_name", "")
+                            consultation_type = context.flow_data.get("consultation_type", "clinica_geral")
+                            insurance_plan = context.flow_data.get("insurance_plan", "particular")
+                            
+                            tipo_map = {
+                                "clinica_geral": "Clínica Geral",
+                                "geriatria": "Geriatria Clínica e Preventiva",
+                                "domiciliar": "Atendimento Domiciliar ao Paciente Idoso"
+                            }
+                            tipo_nome = tipo_map.get(consultation_type, "Clínica Geral")
+                            
+                            tipos_consulta = self.clinic_info.get('tipos_consulta', {})
+                            tipo_data = tipos_consulta.get(consultation_type, {})
+                            tipo_valor = tipo_data.get('valor', 0)
+                            
+                            convenio_nome = insurance_plan if insurance_plan != "particular" else "Particular"
+                            
+                            dias_semana = ['segunda-feira', 'terça-feira', 'quarta-feira', 
+                                          'quinta-feira', 'sexta-feira', 'sábado', 'domingo']
+                            alt_date = parse_date_br(selected_alt["date"])
+                            if alt_date:
+                                dia_nome_completo = dias_semana[alt_date.weekday()]
+                            else:
+                                dia_nome_completo = ""
+                            
+                            response = f"Perfeito! Você escolheu a opção {message_stripped}.\n\n"
+                            response += f"📋 *Resumo da consulta:*\n"
+                            response += f"👤 Nome: {patient_name}\n"
+                            response += f"🏥 Tipo: {tipo_nome} - R$ {tipo_valor}\n"
+                            response += f"💳 Convênio: {convenio_nome}\n"
+                            response += f"📅 Data: {selected_alt['date']} ({dia_nome_completo})\n"
+                            response += f"⏰ Horário: {selected_alt['time']}\n\n"
+                            response += f"Posso confirmar o agendamento?"
+                            
+                            context.messages.append({
+                                "role": "user",
+                                "content": message,
+                                "timestamp": datetime.utcnow().isoformat()
+                            })
+                            context.messages.append({
+                                "role": "assistant",
+                                "content": response,
+                                "timestamp": datetime.utcnow().isoformat()
+                            })
+                            context.last_activity = datetime.utcnow()
+                            db.commit()
+                            
+                            return response
+                    except (ValueError, IndexError, KeyError) as e:
+                        logger.error(f"Erro ao processar escolha de alternativa: {str(e)}")
+                        # Continuar com processamento normal
+                else:
+                    alt_intent = self._detect_confirmation_intent(message)
+                    if alt_intent == "negative":
+                        logger.info(f"❌ Usuário {phone} recusou as alternativas sugeridas")
+                        context.flow_data.pop("alternative_slots", None)
+                        context.flow_data["alternatives_offered"] = False
+                        context.flow_data["awaiting_custom_date"] = True
+                        db.commit()
+
+                        response = (
+                            "Sem problemas! Qual dia funciona melhor para você? "
+                            "Pode me informar uma data no formato DD/MM/AAAA ou dizer, por exemplo, "
+                            "\"terça-feira pela manhã\"."
+                        )
+
+                        context.messages.append({
+                            "role": "user",
+                            "content": message,
+                            "timestamp": datetime.utcnow().isoformat()
+                        })
+                        context.messages.append({
+                            "role": "assistant",
+                            "content": response,
+                            "timestamp": datetime.utcnow().isoformat()
+                        })
+                        context.last_activity = datetime.utcnow()
+                        db.commit()
+
+                        return response
+        
+            # 5. Verificar se há confirmação pendente ANTES de processar com Claude
+            if context.flow_data and context.flow_data.get("pending_confirmation"):
+                # NOVA DETECÇÃO: Verificar se usuário quer mudar convênio especificamente
+                if self._detect_insurance_change_intent(message):
+                    logger.info(f"🔄 Usuário {phone} quer mudar convênio durante confirmação")
+                    
+                    # Extrair novo convênio mencionado
+                    novo_convenio = self._extract_insurance_from_message(message, context)
+                    
+                    if novo_convenio:
+                        # Atualizar flow_data
+                        context.flow_data["insurance_plan"] = novo_convenio
+                        db.commit()
+                        logger.info(f"💾 Convênio atualizado no flow_data: {novo_convenio}")
+                        
+                        # Regenerar resumo com novo convênio
+                        resumo_atualizado = self._generate_updated_summary(context, db)
+                        
+                        # Manter pending_confirmation para continuar o fluxo de confirmação
+                        response = resumo_atualizado + "\n\nPosso confirmar o agendamento?"
+                        
+                        context.messages.append({
+                            "role": "user",
+                            "content": message,
+                            "timestamp": datetime.utcnow().isoformat()
+                        })
+                        context.messages.append({
+                            "role": "assistant",
+                            "content": response,
+                            "timestamp": datetime.utcnow().isoformat()
+                        })
+                        context.last_activity = datetime.utcnow()
+                        db.commit()
+                        
+                        return response
+                    else:
+                        logger.warning(f"⚠️ Não foi possível extrair novo convênio da mensagem")
+                        # Continuar com fluxo normal (perguntar o que mudar)
+                
+                intent = self._detect_confirmation_intent(message)
+                
+                if intent == "positive":
+                    # Usuário confirmou! Executar agendamento
+                    logger.info(f"✅ Usuário {phone} confirmou agendamento")
+                    
+                    # Usar dados do flow_data como fonte primária
+                    data = context.flow_data or {}
+                    
+                    # Apenas extrair do histórico se flow_data estiver completamente vazio
+                    if not data.get("patient_name") or not data.get("patient_birth_date"):
+                        logger.warning(f"⚠️ Dados ausentes no flow_data, extraindo do histórico")
+                        logger.warning(f"   flow_data atual: {data}")
+                        extracted = self._extract_appointment_data_from_messages(context.messages)
+                        data["patient_name"] = data.get("patient_name") or extracted.get("patient_name")
+                        if not data.get("patient_birth_date"):
+                            data["patient_birth_date"] = extracted.get("patient_birth_date")
+                        logger.info(f"   Dados após extração: {data}")
+                    else:
+                        logger.info(f"✅ Usando dados do flow_data: {data}")
+                    
+                    # Criar agendamento
+                    result = self._handle_create_appointment({
+                        "patient_name": data.get("patient_name"),
+                        "patient_birth_date": data.get("patient_birth_date"),
+                        "appointment_date": data.get("appointment_date"),
+                        "appointment_time": data.get("appointment_time"),
+                        "patient_phone": phone
+                    }, db, phone)
+                    
+                    # Limpar pending_confirmation
+                    if not context.flow_data:
+                        context.flow_data = {}
+                    context.flow_data["pending_confirmation"] = False
+                    context.flow_data["alternatives_offered"] = False
+                    context.messages.append({
+                        "role": "user",
+                        "content": message,
+                        "timestamp": datetime.utcnow().isoformat()
+                    })
+                    context.messages.append({
+                        "role": "assistant",
+                        "content": result,
+                        "timestamp": datetime.utcnow().isoformat()
+                    })
+                    context.last_activity = datetime.utcnow()
+                    db.commit()
+                    
+                    return result
+                
+                elif intent == "negative":
+                    logger.info(f"❌ Usuário {phone} recusou o horário sugerido")
+                    if not context.flow_data:
+                        context.flow_data = {}
+                    alternatives_already_offered = context.flow_data.get("alternatives_offered", False)
+
+                    if not alternatives_already_offered:
+                        logger.info("🔁 Oferecendo alternativas automaticamente")
+                        # Encerrar confirmação atual e apresentar alternativas
+                        context.flow_data["pending_confirmation"] = False
+                        context.flow_data["alternatives_offered"] = True
+                        db.commit()
+
+                        alternatives_message = self._handle_find_alternative_slots({}, db, phone)
+
+                        context.messages.append({
+                            "role": "user",
+                            "content": message,
+                            "timestamp": datetime.utcnow().isoformat()
+                        })
+                        context.messages.append({
+                            "role": "assistant",
+                            "content": alternatives_message,
+                            "timestamp": datetime.utcnow().isoformat()
+                        })
+                        context.last_activity = datetime.utcnow()
+                        db.commit()
+
+                        return alternatives_message
+
+                    logger.info("🗓️ Alternativas já oferecidas - solicitando nova disponibilidade")
+                    context.flow_data["pending_confirmation"] = False
+                    context.flow_data["awaiting_custom_date"] = True
+                    # Limpar alternativas anteriores para evitar reapresentação
+                    context.flow_data.pop("alternative_slots", None)
+                    db.commit()
+
+                    response = (
+                        "Tudo bem! Qual dia fica melhor para você? "
+                        "Você pode me informar o dia no formato DD/MM/AAAA ou dizer, por exemplo, "
+                        "\"quinta-feira à tarde\"."
+                    )
+
+                    context.messages.append({
+                        "role": "user",
+                        "content": message,
+                        "timestamp": datetime.utcnow().isoformat()
+                    })
+                    context.messages.append({
+                        "role": "assistant",
+                        "content": response,
+                        "timestamp": datetime.utcnow().isoformat()
+                    })
+                    context.last_activity = datetime.utcnow()
+                    db.commit()
+
+                    return response
+                
+                # Se unclear, processar normalmente com Claude
+                logger.info(f"⚠️ Intenção não clara, processando com Claude")
+
+            # 5. Adicionar mensagem do usuário ao histórico
+            context.messages.append({
+                "role": "user",
+                "content": message,
+                "timestamp": datetime.utcnow().isoformat()
+            })
+            flag_modified(context, 'messages')
+
+            # 6. Preparar mensagens para Claude (histórico completo)
+            claude_messages = []
+            for msg in context.messages:
                 claude_messages.append({
-                    "role": "assistant",
-                    "content": internal_guidance
+                    "role": msg["role"],
+                    "content": msg["content"]
                 })
-
+            
+            # 6. Fazer chamada para o Claude com histórico completo
             logger.info(f"🤖 Enviando {len(claude_messages)} mensagens para Claude")
-            claude_response = self.client.messages.create(
+            response = self.client.messages.create(
                 model="claude-sonnet-4-20250514",
                 max_tokens=2000,
                 temperature=0.3,
                 system=self.system_prompt,
-                messages=claude_messages,
+                messages=claude_messages,  # ✅ HISTÓRICO COMPLETO!
                 tools=self.tools
             )
-
-            bot_response = self._interpret_claude_response(
-                claude_response,
-                claude_messages,
-                context,
-                db,
-                phone
-            )
-
-            self._record_assistant_message(context, bot_response)
-
-            self._sync_flow_data_from_history(context, db)
-
-            context.last_activity = datetime.utcnow()
-            flag_modified(context, "messages")
-            flag_modified(context, "flow_data")
-            db.commit()
-
-            return bot_response
-        except Exception as exc:
-            logger.error(f"Erro ao processar mensagem: {exc}", exc_info=True)
-            db.rollback()
-            return "Desculpe, encontrei um problema ao processar sua mensagem. Pode tentar novamente?"
-
-    def _record_user_message(self, context: ConversationContext, message: str):
-        context.messages.append({
-            "role": "user",
-            "content": message,
-            "timestamp": datetime.utcnow().isoformat()
-        })
-        flag_modified(context, "messages")
-
-    def _record_assistant_message(self, context: ConversationContext, response: str):
-        context.messages.append({
-            "role": "assistant",
-            "content": response,
-            "timestamp": datetime.utcnow().isoformat()
-        })
-        flag_modified(context, "messages")
-
-    def _interpret_claude_response(
-        self,
-        response: Any,
-        base_messages: List[Dict[str, Any]],
-        context: ConversationContext,
-        db: Session,
-        phone: str
-    ) -> str:
-        """Processa a resposta do Claude executando tools em cadeia quando necessário."""
-        if not getattr(response, "content", None):
-            return "Desculpe, não consegui processar sua mensagem. Tente novamente."
-
-        conversation = list(base_messages)
-        pending_response = response
-        tool_result = ""
-        max_iterations = 5
-        iteration = 0
-
-        while iteration < max_iterations:
-            iteration += 1
-            first_block = pending_response.content[0]
-
-            if first_block.type == "text":
-                return first_block.text
-
-            if first_block.type != "tool_use":
-                logger.warning(f"⚠️ Conteúdo inesperado retornado por Claude: {first_block.type}")
-                self._log_metric("claude_unexpected_content", phone=phone, content_type=first_block.type)
-                break
-
-            tool_name = first_block.name
-            tool_input = first_block.input or {}
-            logger.info(f"🛠️ Executando tool '{tool_name}' (iter {iteration}) com input: {tool_input}")
-
-            tool_result = self._execute_tool(tool_name, tool_input, db, phone)
-
-            if tool_name == "end_conversation":
-                self._log_metric("tool_end_conversation", phone=phone)
-                return tool_result
-
-            if tool_name == "validate_and_check_availability":
-                if "disponível" in tool_result.lower() and "não" not in tool_result.lower():
-                    tool_result += "\n\n[SYSTEM: Considere confirmar o agendamento com create_appointment usando os dados coletados.]"
-
-            if tool_name == "request_home_address" and "registrado" in tool_result.lower():
-                flow = context.flow_data or {}
-                if (
-                    flow.get("patient_name")
-                    and flow.get("patient_birth_date")
-                    and flow.get("patient_address")
-                ):
-                    notify_result = self._execute_tool("notify_doctor_home_visit", {}, db, phone)
-                    tool_result += f"\n\n{notify_result}"
-
-            conversation.append({
+            
+            # 7. Processar resposta do Claude
+            if response.content:
+                content = response.content[0]
+                
+                if content.type == "text":
+                    bot_response = content.text
+                elif content.type == "tool_use":
+                    # Loop para processar múltiplas tools em sequência
+                    max_iterations = 5  # Limite de segurança para evitar loops infinitos
+                    iteration = 0
+                    current_response = response
+                    
+                    while iteration < max_iterations:
+                        iteration += 1
+                        
+                        # Verificar se há content na resposta
+                        if not current_response.content or len(current_response.content) == 0:
+                            logger.warning(f"⚠️ Iteration {iteration}: Claude retornou resposta vazia")
+                            
+                            # Se há tool_result anterior, usar como fallback (para outras tools)
+                            if 'tool_result' in locals():
+                                # Usar diretamente o resultado da tool como resposta
+                                bot_response = tool_result
+                                logger.info("📤 Usando tool_result como resposta (Claude retornou vazio)")
+                            else:
+                                bot_response = "Desculpe, não consegui processar sua solicitação completamente."
+                            break
+                        
+                        content = current_response.content[0]
+                        
+                        if content.type == "text":
+                            # Claude retornou texto final, sair do loop
+                            bot_response = content.text
+                            break
+                        elif content.type == "tool_use":
+                            # Executar tool
+                            tool_result = self._execute_tool(content.name, content.input, db, phone)
+                            
+                            # CRÍTICO: Se end_conversation foi executado, retornar imediatamente
+                            # sem continuar processamento para evitar fallback executar
+                            if content.name == "end_conversation":
+                                logger.info("🔚 end_conversation executado - retornando imediatamente sem continuar processamento")
+                                return tool_result
+                            
+                            # Verificação especial para validate_and_check_availability
+                            if content.name == "validate_and_check_availability":
+                                if "disponível" in tool_result.lower() and "não" not in tool_result.lower():
+                                    # Horário disponível, adicionar hint para Claude criar agendamento
+                                    tool_result += "\n\n[SYSTEM: Execute create_appointment agora com os dados coletados: nome, data_nascimento, data_consulta, horario_consulta]"
+                            
+                            # Lógica especial: após request_home_address retornar sucesso, chamar notify_doctor_home_visit automaticamente
+                            if content.name == "request_home_address" and "registrado" in tool_result.lower():
+                                logger.info("🏠 request_home_address executada com sucesso - chamando notify_doctor_home_visit automaticamente")
+                                
+                                # Verificar se dados necessários estão no flow_data antes de chamar
+                                context = db.query(ConversationContext).filter_by(phone=phone).first()
+                                if context and context.flow_data:
+                                    flow_data = context.flow_data
+                                    has_name = flow_data.get("patient_name")
+                                    has_birth_date = flow_data.get("patient_birth_date")
+                                    has_address = flow_data.get("patient_address")
+                                    
+                                    if has_name and has_birth_date and has_address:
+                                        # Chamar notify_doctor_home_visit diretamente
+                                        notify_result = self._execute_tool("notify_doctor_home_visit", {}, db, phone)
+                                        
+                                        if "sucesso" in notify_result.lower() or "enviada" in notify_result.lower():
+                                            # Notificação enviada com sucesso
+                                            confirmation_message = "Perfeito! Registrei sua solicitação de atendimento domiciliar. A doutora vai entrar em contato com você em breve para agendar o melhor horário.\n\nPosso te ajudar com mais alguma coisa?"
+                                            
+                                            # Construir contexto completo para Claude processar a confirmação
+                                            # Incluir: histórico + request_home_address tool_use + tool_result + notify_doctor_home_visit tool_use + tool_result + mensagem de confirmação
+                                            current_response = self.client.messages.create(
+                                                model="claude-sonnet-4-20250514",
+                                                max_tokens=2000,
+                                                temperature=0.3,
+                                                system=self.system_prompt,
+                                                messages=claude_messages + [
+                                                    {"role": "assistant", "content": current_response.content},
+                                                    {
+                                                        "role": "user",
+                                                        "content": [
+                                                            {
+                                                                "type": "tool_result",
+                                                                "tool_use_id": content.id,
+                                                                "content": tool_result
+                                                            }
+                                                        ]
+                                                    },
+                                                    {
+                                                        "role": "assistant",
+                                                        "content": [{"type": "tool_use", "name": "notify_doctor_home_visit", "input": {}, "id": "auto_notify"}]
+                                                    },
+                                                    {
+                                                        "role": "user",
+                                                        "content": [
+                                                            {
+                                                                "type": "tool_result",
+                                                                "tool_use_id": "auto_notify",
+                                                                "content": notify_result
+                                                            }
+                                                        ]
+                                                    },
+                                                    {
+                                                        "role": "user",
+                                                        "content": f"[SYSTEM: Envie a seguinte mensagem ao paciente: {confirmation_message}]"
+                                                    }
+                                                ]
+                                            )
+                                            
+                                            # Processar resposta do Claude
+                                            if current_response.content and len(current_response.content) > 0:
+                                                if current_response.content[0].type == "text":
+                                                    bot_response = current_response.content[0].text
+                                                    break
+                                                elif current_response.content[0].type == "tool_use":
+                                                    # Claude pode ter chamado uma tool (ex: end_conversation), continuar processamento
+                                                    content = current_response.content[0]
+                                                    continue
+                                            
+                                            # Se Claude não retornou nada, usar mensagem de confirmação diretamente
+                                            bot_response = confirmation_message
+                                            break
+                                        else:
+                                            # Erro ao enviar notificação, adicionar ao tool_result para Claude tratar
+                                            tool_result += f"\n\n[ERRO: Falha ao enviar notificação para a doutora: {notify_result}]"
+                                    else:
+                                        # Dados faltando, adicionar ao tool_result para Claude tratar
+                                        missing = []
+                                        if not has_name: missing.append("nome")
+                                        if not has_birth_date: missing.append("data de nascimento")
+                                        if not has_address: missing.append("endereço")
+                                        tool_result += f"\n\n[ERRO: Faltam informações para enviar notificação: {', '.join(missing)}]"
+                            
+                            logger.info(f"🔧 Iteration {iteration}: Tool {content.name} result: {tool_result[:200] if len(tool_result) > 200 else tool_result}")
+                            
+                            # Fazer follow-up com o resultado
+                            current_response = self.client.messages.create(
+                                model="claude-sonnet-4-20250514",
+                                max_tokens=2000,
+                                temperature=0.3,
+                                system=self.system_prompt,
+                                messages=claude_messages + [
+                                    {"role": "assistant", "content": current_response.content},
+                                    {
+                                        "role": "user",
+                                        "content": [
+                                            {
+                                                "type": "tool_result",
+                                                "tool_use_id": content.id,
+                                                "content": tool_result
+                                            }
+                                        ]
+                                    }
+                                ]
+                            )
+                            logger.info(f"📋 Response content length: {len(current_response.content) if current_response.content else 0}")
+                            logger.info(f"📋 Response stop_reason: {current_response.stop_reason}")
+                            
+                            # Interceptação universal de respostas curtas
+                            # Verificar se resposta é muito curta (< 100 chars) ou stop_reason é "end_turn"
+                            content_text = ""
+                            if current_response.content and len(current_response.content) > 0:
+                                if current_response.content[0].type == "text":
+                                    content_text = current_response.content[0].text
+                            
+                            is_short = len(content_text) < 100 or current_response.stop_reason == "end_turn"
+                            
+                            # NÃO interceptar extract_patient_data e request_home_address - são tools internas, Claude deve continuar o fluxo
+                            if is_short and tool_result and content.name != "extract_patient_data" and content.name != "request_home_address":
+                                logger.warning(f"⚠️ Resposta muito curta ou end_turn após {content.name}. Interceptando resposta.")
+                                
+                                # Lógica especial para find_next_available_slot
+                                if content.name == "find_next_available_slot":
+                                    palavras_chave = ["Nome", "Tipo", "Convênio", "Data", "Horário", "Resumo"]
+                                    tem_palavras_chave = any(palavra in content_text for palavra in palavras_chave)
+                                    
+                                    if not tem_palavras_chave:
+                                        # Adicionar resumo completo + pergunta de confirmação
+                                        resposta_completa = tool_result + "\n\nPosso confirmar o agendamento?"
+                                    else:
+                                        # Já tem palavras-chave, apenas adicionar pergunta se não tiver
+                                        if "confirmar" not in content_text.lower():
+                                            resposta_completa = tool_result + "\n\nPosso confirmar o agendamento?"
+                                        else:
+                                            resposta_completa = tool_result
+                                else:
+                                    # Para outras tools, usar o resultado diretamente
+                                    resposta_completa = tool_result
+                                
+                                # Criar objeto simples com type e text para substituir o conteúdo
+                                class SimpleTextContent:
+                                    def __init__(self, text):
+                                        self.type = "text"
+                                        self.text = text
+                                
+                                current_response.content = [SimpleTextContent(resposta_completa)]
+                                logger.info(f"✅ Resposta interceptada e substituída pelo resultado da tool {content.name}")
+                                
+                                # Processar imediatamente o conteúdo interceptado
+                                if current_response.content[0].type == "text":
+                                    bot_response = current_response.content[0].text
+                                    break
+                            
+                            # Verificar se Claude retornou texto após processar tool (iteração normal)
+                            if current_response.content and len(current_response.content) > 0:
+                                if current_response.content[0].type == "text":
+                                    bot_response = current_response.content[0].text
+                                    break
+                            
+                            # Continuar loop para processar próxima resposta
+                        else:
+                            # Tipo desconhecido, sair do loop
+                            logger.warning(f"⚠️ Tipo de conteúdo desconhecido: {content.type}")
+                            bot_response = tool_result if 'tool_result' in locals() else "Desculpe, não consegui processar sua mensagem."
+                            break
+                    
+                    # Se atingiu o limite de iterações sem retornar texto
+                    if iteration >= max_iterations:
+                        logger.error(f"❌ Limite de iterações atingido ({max_iterations})")
+                        if 'tool_result' in locals():
+                            logger.info(f"📤 Usando último tool_result como resposta")
+                            bot_response = tool_result
+                        else:
+                            bot_response = "Desculpe, houve um problema ao processar sua solicitação. Tente novamente."
+                else:
+                    bot_response = "Desculpe, não consegui processar sua mensagem. Tente novamente."
+            else:
+                bot_response = "Desculpe, não consegui processar sua mensagem. Tente novamente."
+            
+            # 7. Salvar resposta do Claude no histórico
+            context.messages.append({
                 "role": "assistant",
-                "content": pending_response.content
+                "content": bot_response,
+                "timestamp": datetime.utcnow().isoformat()
             })
-            conversation.append({
-                "role": "user",
-                "content": [{
-                    "type": "tool_result",
-                    "tool_use_id": first_block.id,
-                    "content": tool_result
-                }]
-            })
+            flag_modified(context, 'messages')
+            
+            # 7.5. Persistir dados incrementalmente no flow_data
+            # Após cada resposta do Claude, verificar se coletou nome ou data nascimento
+            # e salvar no flow_data imediatamente (não sobrescrever dados existentes)
+            if not context.flow_data:
+                context.flow_data = {}
+            
+            # Extrair dados do histórico
+            extracted = self._extract_appointment_data_from_messages(context.messages)
+            
+            # Salvar nome extraído automaticamente se encontrado
+            if extracted.get("patient_name") and not context.flow_data.get("patient_name"):
+                context.flow_data["patient_name"] = extracted["patient_name"]
+                logger.info(f"💾 Nome extraído automaticamente e salvo no flow_data: {extracted['patient_name']}")
+            
+            # FALLBACK: Tentar extrair nome se não estiver no flow_data mas houver padrão claro nas mensagens
+            if not context.flow_data.get("patient_name"):
+                # Verificar últimas mensagens do usuário por padrões claros de nome
+                import re
+                name_patterns = [
+                    r'(?:meu nome é|sou|me chamo|me chama|chamo-me)\s+([A-ZÁÉÍÓÚÂÊÔÇ][a-záéíóúâêôçãõ]+(?:\s+[A-ZÁÉÍÓÚÂÊÔÇ][a-záéíóúâêôçãõ]+)+)',
+                    r'(?:nome|chamo)\s+([A-ZÁÉÍÓÚÂÊÔÇ][a-záéíóúâêôçãõ]+(?:\s+[A-ZÁÉÍÓÚÂÊÔÇ][a-záéíóúâêôçãõ]+)+)',
+                ]
+                
+                # Verificar últimas 5 mensagens do usuário
+                for msg in reversed(context.messages[-10:]):  # Últimas 10 mensagens
+                    if msg.get("role") == "user":
+                        content = (msg.get("content") or "").strip()
+                        for pattern in name_patterns:
+                            match = re.search(pattern, content, re.IGNORECASE)
+                            if match:
+                                candidate_name = match.group(1).strip()
+                                # Validar se parece com nome real (mínimo 2 palavras, não é frase comum)
+                                words = candidate_name.split()
+                                if len(words) >= 2 and len(candidate_name) > 5:
+                                    # Verificar se não é frase comum
+                                    common_phrases = ["preciso marcar", "quero agendar", "preciso de", "gostaria de"]
+                                    if not any(phrase in candidate_name.lower() for phrase in common_phrases):
+                                        context.flow_data["patient_name"] = candidate_name
+                                        logger.info(f"💾 Nome extraído automaticamente (fallback): {candidate_name}")
+                                        break
+                        if context.flow_data.get("patient_name"):
+                            break
+            
+            # Se ainda não tem nome e Claude não chamou extract_patient_data, pode tentar usar a tool internamente
+            # Mas isso só aconteceria se o usuário mencionou nome mas não foi extraído
+            
+            # Verificar se está aguardando correção de data de nascimento
+            if context.flow_data.get("awaiting_birth_date_correction"):
+                # Tentar extrair nova data de nascimento
+                if extracted.get("patient_birth_date"):
+                    context.flow_data["patient_birth_date"] = extracted["patient_birth_date"]
+                    context.flow_data["awaiting_birth_date_correction"] = False
+                    db.commit()
+                    logger.info("🔄 Data de nascimento corrigida, tentando agendar novamente")
+            elif extracted.get("patient_birth_date") and not context.flow_data.get("patient_birth_date"):
+                context.flow_data["patient_birth_date"] = extracted["patient_birth_date"]
+                logger.info(f"💾 Data nascimento salva no flow_data: {extracted['patient_birth_date']}")
+            
+            # Prevenir re-extração de appointment_date/appointment_time se agendamento já foi completado
+            appointment_completed = context.flow_data.get("appointment_completed", False)
+            
+            if extracted.get("appointment_date") and not context.flow_data.get("appointment_date") and not appointment_completed:
+                context.flow_data["appointment_date"] = extracted["appointment_date"]
+                logger.info(f"💾 Data consulta salva no flow_data: {extracted['appointment_date']}")
+            elif appointment_completed and extracted.get("appointment_date"):
+                logger.info(f"⏭️ Pulando salvamento de appointment_date - agendamento já foi completado")
+            
+            if extracted.get("appointment_time") and not context.flow_data.get("appointment_time") and not appointment_completed:
+                # Validar horário antes de salvar usando função robusta
+                time_str = extracted["appointment_time"]
+                from app.utils import validate_time_format
+                if validate_time_format(time_str):
+                    context.flow_data["appointment_time"] = time_str
+                    logger.info(f"💾 Horário consulta salvo no flow_data: {time_str}")
+                else:
+                    logger.warning(f"⚠️ Horário inválido rejeitado: {time_str}")
+            elif appointment_completed and extracted.get("appointment_time"):
+                logger.info(f"⏭️ Pulando salvamento de appointment_time - agendamento já foi completado")
+            
+            # SEMPRE atualizar tipo de consulta quando extraído (permite correção)
+            if extracted.get("consultation_type"):
+                tipo_anterior = context.flow_data.get("consultation_type")
+                context.flow_data["consultation_type"] = extracted["consultation_type"]
+                if tipo_anterior:
+                    logger.info(f"💾 Tipo consulta ATUALIZADO no flow_data: {tipo_anterior} → {extracted['consultation_type']}")
+                else:
+                    logger.info(f"💾 Tipo consulta salvo no flow_data: {extracted['consultation_type']}")
+            
+            # INTERCEPTAÇÃO: Fluxo domiciliar
+            consultation_type = context.flow_data.get("consultation_type")
+            if consultation_type == "domiciliar":
+                patient_address = context.flow_data.get("patient_address")
+                doctor_notified = context.flow_data.get("doctor_notified", False)
+                
+                # Se não tem endereço, instruir Claude a chamar request_home_address
+                if not patient_address:
+                    logger.info("🏠 Detectado atendimento domiciliar sem endereço - instruindo Claude a chamar request_home_address")
+                    # Adicionar instrução no prompt para Claude chamar a tool
+                    # Isso será feito via prompt, mas podemos adicionar uma flag no flow_data
+                    context.flow_data["pending_home_address"] = True
+                    flag_modified(context, "flow_data")
+                    db.commit()
+                # Se tem endereço mas não notificou, instruir Claude a chamar notify_doctor_home_visit
+                elif patient_address and not doctor_notified:
+                    logger.info("🏠 Detectado atendimento domiciliar com endereço mas sem notificação - instruindo Claude a chamar notify_doctor_home_visit")
+                    context.flow_data["pending_doctor_notification"] = True
+                    flag_modified(context, "flow_data")
+                    db.commit()
+            
+            # SEMPRE atualizar convênio quando extraído (permite correção)
+            if extracted.get("insurance_plan"):
+                convenio_anterior = context.flow_data.get("insurance_plan")
+                context.flow_data["insurance_plan"] = extracted["insurance_plan"]
+                if convenio_anterior:
+                    logger.info(f"💾 Convênio ATUALIZADO no flow_data: {convenio_anterior} → {extracted['insurance_plan']}")
+                else:
+                    logger.info(f"💾 Convênio salvo no flow_data: {extracted['insurance_plan']}")
+            else:
+                # NOVO: Se não encontrou via extração normal, verificar última mensagem do usuário
+                # para detectar menções diretas de convênio (ex: "IPE", "CABERGS")
+                if context.messages:
+                    last_user_message = None
+                    for msg in reversed(context.messages):
+                        if msg.get("role") == "user":
+                            last_user_message = msg.get("content", "").strip()
+                            break
+                    
+                    if last_user_message:
+                        # Tentar detecção direta primeiro (rápida e eficiente)
+                        detected_insurance = self._detect_insurance_in_message(last_user_message)
+                        
+                        if detected_insurance:
+                            # detected_insurance já vem normalizado da função (IPE, CABERGS, Particular)
+                            # Salvar no flow_data
+                            convenio_anterior = context.flow_data.get("insurance_plan")
+                            context.flow_data["insurance_plan"] = detected_insurance
+                            db.commit()
+                            
+                            if convenio_anterior:
+                                logger.info(f"💾 Convênio detectado na última mensagem e ATUALIZADO no flow_data: {convenio_anterior} → {detected_insurance}")
+                            else:
+                                logger.info(f"💾 Convênio detectado na última mensagem e salvo no flow_data: {detected_insurance}")
+                        else:
+                            # FALLBACK: Se detecção direta não encontrou, mas mensagem parece ser sobre convênio,
+                            # tentar com Claude (mais robusto para variações linguísticas)
+                            if any(keyword in last_user_message.lower() for keyword in ["convênio", "convenio", "plano", "ipe", "cabergs", "particular"]):
+                                try:
+                                    # Criar contexto temporário apenas com última mensagem
+                                    temp_context = ConversationContext(
+                                        phone=context.phone,
+                                        messages=[{"role": "user", "content": last_user_message}],
+                                        flow_data={}
+                                    )
+                                    extracted_data = self._extract_patient_data_with_claude(temp_context)
+                                    
+                                    if extracted_data and extracted_data.get("insurance_plan"):
+                                        detected_insurance = extracted_data["insurance_plan"]
+                                        
+                                        # Normalizar valor
+                                        if detected_insurance.lower() == "ipe":
+                                            detected_insurance = "IPE"
+                                        elif detected_insurance.lower() == "cabergs":
+                                            detected_insurance = "CABERGS"
+                                        elif detected_insurance.lower() in ["particular", "particula"]:
+                                            detected_insurance = "Particular"
+                                        
+                                        # Salvar no flow_data
+                                        convenio_anterior = context.flow_data.get("insurance_plan")
+                                        context.flow_data["insurance_plan"] = detected_insurance
+                                        db.commit()
+                                        
+                                        if convenio_anterior:
+                                            logger.info(f"💾 Convênio detectado via Claude e ATUALIZADO no flow_data: {convenio_anterior} → {detected_insurance}")
+                                        else:
+                                            logger.info(f"💾 Convênio detectado via Claude e salvo no flow_data: {detected_insurance}")
+                                except Exception as e:
+                                    logger.warning(f"⚠️ Erro ao tentar extrair convênio com Claude: {e}")
+            
+            # 8. FALLBACK: Verificar se Claude deveria ter chamado confirm_time_slot mas não chamou
+            # Isso acontece quando: temos data + horário, mas não tem pending_confirmation
+            # IMPORTANTE: NÃO executar se acabou de criar um agendamento com sucesso
+            
+            # Verificar se a última resposta do assistente indica que já criou agendamento
+            should_skip_fallback = False
+            
+            # Verificar flag appointment_completed no flow_data
+            appointment_completed_flag = context.flow_data.get("appointment_completed", False)
+            if appointment_completed_flag:
+                should_skip_fallback = True
+                logger.info("⏭️ Pulando fallback - flag appointment_completed existe no flow_data")
+            
+            # Verificar se última resposta foi erro de create_appointment
+            last_assistant_msg = ""
+            for msg in reversed(context.messages):
+                if msg.get("role") == "assistant":
+                    last_assistant_msg = msg.get("content", "")
+                    break
 
-            pending_response = self.client.messages.create(
-                model="claude-sonnet-4-20250514",
-                max_tokens=1500,
-                temperature=0.3,
-                system=self.system_prompt,
-                messages=conversation,
-                tools=self.tools
-            )
-
-        if iteration >= max_iterations:
-            self._log_metric("claude_iteration_limit", phone=phone, last_tool=tool_name if 'tool_name' in locals() else None)
-
-        if tool_result:
-            self._log_metric("claude_tool_fallback_response", phone=phone, tool_result_length=len(tool_result))
-            return tool_result
-
-        self._log_metric("claude_no_response", phone=phone)
-        return "Desculpe, houve um problema ao processar sua solicitação. Tente novamente."
+            # Se última mensagem foi erro de validação, não executar fallback
+            if "formato inválido" in last_assistant_msg.lower() or "erro ao criar" in last_assistant_msg.lower():
+                should_skip_fallback = True
+                logger.info("⏭️ Pulando fallback - última resposta foi erro de validação")
+            
+            if not should_skip_fallback and context.messages:
+                last_assistant_msg = None
+                for msg in reversed(context.messages):
+                    if msg.get("role") == "assistant":
+                        last_assistant_msg = msg.get("content", "")
+                        break
+                
+                # Se a última mensagem contém sucesso de agendamento, pular fallback
+                if last_assistant_msg and any(phrase in last_assistant_msg for phrase in [
+                    "Agendamento realizado com sucesso",
+                    "realizado com sucesso",
+                    "agendado com sucesso"
+                ]):
+                    should_skip_fallback = True
+                    logger.info("⏭️ Pulando fallback - agendamento já foi criado com sucesso")
+            
+            if (context.flow_data.get("appointment_date") and 
+                context.flow_data.get("appointment_time") and 
+                not context.flow_data.get("pending_confirmation") and
+                not should_skip_fallback):
+                
+                # Validar horário antes de executar fallback
+                time_str = context.flow_data["appointment_time"]
+                import re
+                is_valid = False
+                if re.match(r'^\d{2}:\d{2}$', time_str):
+                    hour, minute = time_str.split(':')
+                    if minute == '00':
+                        is_valid = True
+                
+                if not is_valid:
+                    logger.warning(f"⚠️ FALLBACK bloqueado: horário inválido no flow_data ({time_str})")
+                    # Limpar horário inválido
+                    context.flow_data["appointment_time"] = None
+                    db.commit()
+                else:
+                    logger.info("🔄 FALLBACK: Claude não chamou confirm_time_slot, chamando manualmente...")
+                    logger.info(f"   Data: {context.flow_data['appointment_date']}")
+                    logger.info(f"   Horário: {context.flow_data['appointment_time']}")
+                    
+                    # Chamar a tool manualmente
+                    try:
+                        confirmation_msg = self._handle_confirm_time_slot({
+                            "date": context.flow_data["appointment_date"],
+                            "time": context.flow_data["appointment_time"]
+                        }, db, phone)
+                        
+                        # Substituir resposta do Claude pela confirmação
+                        bot_response = confirmation_msg
+                        logger.info("✅ Tool confirm_time_slot executada com sucesso via fallback")
+                    except Exception as e:
+                        logger.error(f"❌ Erro ao executar fallback de confirm_time_slot: {str(e)}")
+                        # Manter resposta original do Claude
+            
+            # 9. Atualizar contexto no banco
+            context.last_activity = datetime.utcnow()
+            db.commit()
+            
+            logger.info(f"💾 Contexto salvo para {phone}: {len(context.messages)} mensagens")
+            return bot_response
+                
+        except Exception as e:
+            logger.error(f"Erro ao processar mensagem: {str(e)}")
+            return "Desculpe, ocorreu um erro. Tente novamente em alguns instantes."
 
     def _execute_tool(self, tool_name: str, tool_input: Dict, db: Session, phone: str = None) -> str:
         """Executa uma tool específica"""
