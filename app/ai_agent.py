@@ -756,13 +756,14 @@ Lembre-se: Seja natural, adaptável e prestativa. Use as tools disponíveis conf
                                 data["appointment_date"] = normalized_date
                                 logger.info(f"📅 Data consulta extraída (regex): {full_date} → {normalized_date}")
                 
-                # 4. EXTRAÇÃO DE TIPO DE CONSULTA - SEMPRE atualizar quando escolha explícita
-                # Se mensagem é só "1", "2" ou "3" (escolha explícita de tipo)
-                if content in ["1", "2"]:
-                    type_map = {"1": "clinica_geral", "2": "geriatria"}
-                    # Sempre atualizar (sobrescrever) quando usuário escolhe explicitamente
-                    data["consultation_type"] = type_map[content]
-                    logger.info(f"💾 Tipo de consulta atualizado (escolha explícita): {data['consultation_type']}")
+                # 4. EXTRAÇÃO DE TIPO DE CONSULTA - interpretar respostas textuais
+                normalized_content = content.lower()
+                if "geriatr" in normalized_content:
+                    data["consultation_type"] = "geriatria"
+                    logger.info("💾 Tipo de consulta identificado: geriatria")
+                elif "clínica geral" in normalized_content or "clinica geral" in normalized_content:
+                    data["consultation_type"] = "clinica_geral"
+                    logger.info("💾 Tipo de consulta identificado: clínica geral")
                 
                 # 5. EXTRAÇÃO DE CONVÊNIO - Removida detecção via regex
                 # A detecção de convênio agora é feita totalmente pelo Claude durante a conversa
@@ -1508,10 +1509,10 @@ Resposta (apenas o nome do convênio, nada mais):"""
         """Mensagem padrão para a próxima etapa após captar nome e data."""
         if menu_choice == "booking":
             return (
-                "Perfeito! Agora me informe qual tipo de consulta você deseja:\n\n"
-                "1️⃣ Clínica Geral - R$ 300\n"
-                "2️⃣ Geriatria Clínica e Preventiva - R$ 300\n\n"
-                "Digite o número da opção desejada."
+                "Perfeito! Agora me conte qual consulta você prefere:\n\n"
+                "• Clínica Geral – R$ 300\n"
+                "• Geriatria Clínica e Preventiva – R$ 300\n\n"
+                "Escreva o nome da opção desejada."
             )
         if menu_choice == "home_visit":
             return (
