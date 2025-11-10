@@ -130,6 +130,11 @@ PRINCÍPIOS DE COMUNICAÇÃO:
 - Se o usuário corrigir algo, agradeça e atualize os dados
 - Se informação estiver incompleta ou ambígua, pergunte de forma clara e educada
 - Se não entender algo, peça esclarecimento de forma amigável
+- Quando o usuário pedir informações sobre a clínica, primeiro identifique a intenção real:
+  • Se a pergunta for genérica (ex.: "me fala da clínica", "quais informações vocês têm?"), peça educadamente para ele especificar o que precisa (ex.: horários, valores, endereço, convênios).
+  • Se ficar claro o que o paciente quer (ex.: horários, valores, endereço, convênios, dias fechados), responda apenas com o bloco relevante, sem repetir informações desnecessárias.
+  • Combine blocos quando a pergunta mencionar mais de um item (ex.: endereço + horários).
+  • Mantenha o tom acolhedor de secretária e ofereça ajuda para mais detalhes quando fizer sentido.
 
 ═══════════════════════════════════════════════════════════
 FLUXO DE AGENDAMENTO
@@ -2994,53 +2999,119 @@ Resposta (apenas o nome do convênio, nada mais):"""
             logger.error(f"Erro ao buscar alternativas: {str(e)}", exc_info=True)
             return f"Erro ao buscar alternativas: {str(e)}"
 
+    def _format_clinic_hours(self) -> str:
+        """Formata os horários de funcionamento."""
+        horarios = self.clinic_info.get('horario_funcionamento', {})
+        dias_ordenados = ['segunda', 'terca', 'quarta', 'quinta', 'sexta', 'sabado', 'domingo']
+        lines = []
+        for dia in dias_ordenados:
+            if dia in horarios:
+                horario = horarios[dia]
+                dia_formatado = dia.replace('terca', 'terça').replace('sabado', 'sábado')
+                if horario != "FECHADO":
+                    lines.append(f"• {dia_formatado.capitalize()}: {horario}")
+                else:
+                    lines.append(f"• {dia_formatado.capitalize()}: FECHADO")
+        return "\n".join(lines)
+
+    def _format_closed_days(self) -> str:
+        """Formata os dias especiais fechados."""
+        dias_fechados = self.clinic_info.get('dias_fechados', [])
+        if not dias_fechados:
+            return "Nenhum dia especial fechado informado."
+        return "\n".join(f"• {dia}" for dia in dias_fechados)
+
+    def _format_consultation_prices(self) -> str:
+        tipos_consulta = self.clinic_info.get('tipos_consulta', {})
+        if not tipos_consulta:
+            return "Não há valores cadastrados no momento."
+        lines = []
+        for key, data in tipos_consulta.items():
+            nome = data.get("nome", key.replace("_", " ").title())
+            valor = data.get("valor", "Sob consulta")
+            lines.append(f"• {nome}: R$ {valor:.2f}" if isinstance(valor, (int, float)) else f"• {nome}: {valor}")
+        return "\n".join(lines)
+
+    def _format_insurance_list(self) -> str:
+        convenios = self.clinic_info.get('convenios_aceitos', {})
+        if not convenios:
+            return "Atendemos apenas consultas particulares no momento."
+        linhas = []
+        for _, dados in convenios.items():
+            nome = dados.get("nome") or dados.get("codigo")
+            if nome:
+                linhas.append(f"• {nome}")
+        return "\n".join(linhas) if linhas else "Convênios não informados."
+
     def _handle_get_clinic_info(self, tool_input: Dict) -> str:
-        """Tool: get_clinic_info - Retorna informações da clínica formatadas de forma completa"""
+        """Tool: get_clinic_info - Retorna informações da clínica conforme a intenção solicitada."""
         try:
-            # Retornar TODAS as informações da clínica formatadas
-            response = ""
-            
-            # Nome da clínica
-            response += f"🏥 **{self.clinic_info.get('nome_clinica', 'Clínica')}**\n\n"
-            
-            # Endereço
-            response += f"📍 **Endereço:**\n{self.clinic_info.get('endereco', 'Não informado')}\n\n"
-            
-            # Telefone
-            response += f"📞 **Telefone:**\n{self.clinic_info.get('telefone', 'Não informado')}\n\n"
-            
-            # Horários de funcionamento
-            response += "📅 **Horários de Funcionamento:**\n"
-            horarios = self.clinic_info.get('horario_funcionamento', {})
-            dias_ordenados = ['segunda', 'terca', 'quarta', 'quinta', 'sexta', 'sabado', 'domingo']
-            
-            for dia in dias_ordenados:
-                if dia in horarios:
-                    horario = horarios[dia]
-                    dia_formatado = dia.replace('terca', 'terça').replace('sabado', 'sábado')
-                    if horario != "FECHADO":
-                        response += f"• {dia_formatado.capitalize()}: {horario}\n"
-                    else:
-                        response += f"• {dia_formatado.capitalize()}: FECHADO\n"
-            
-            # Dias especiais fechados
+            intent = (tool_input or {}).get("type") if isinstance(tool_input, dict) else None
+            intent = (intent or "overview").lower()
+
+            nome_clinica = self.clinic_info.get('nome_clinica', 'Clínica')
+            endereco = self.clinic_info.get('endereco', 'Não informado')
+            telefone = self.clinic_info.get('telefone', 'Não informado')
+
+            if intent == "address":
+                return (
+                    f"🏥 {nome_clinica}\n"
+                    f"📍 Endereço:\n{endereco}\n"
+                    f"📞 Telefone:\n{telefone}"
+                )
+
+            if intent == "hours":
+                return (
+                    f"🕒 Horários de funcionamento:\n{self._format_clinic_hours()}"
+                )
+
+            if intent == "closed_days":
+                return (
+                    "🚫 Dias especiais em que estaremos fechados:\n"
+                    f"{self._format_closed_days()}"
+                )
+
+            if intent == "prices":
+                return (
+                    "💰 Valores das consultas:\n"
+                    f"{self._format_consultation_prices()}"
+                )
+
+            if intent == "insurances":
+                return (
+                    "💳 Convênios atendidos:\n"
+                    f"{self._format_insurance_list()}"
+                )
+
+            # Overview (ou fallback genérico)
+            resposta = [
+                f"🏥 {nome_clinica}",
+                "",
+                f"📍 Endereço:\n{endereco}",
+                "",
+                f"📞 Telefone:\n{telefone}",
+                "",
+                "📅 Horários de funcionamento:",
+                self._format_clinic_hours()
+            ]
+
             dias_fechados = self.clinic_info.get('dias_fechados', [])
             if dias_fechados:
-                response += f"\n🚫 **Dias Especiais Fechados (Feriados/Férias):**\n"
-                for dia in dias_fechados:
-                    response += f"• {dia}\n"
-            
-            # Informações adicionais
-            info_adicionais = self.clinic_info.get('informacoes_adicionais', {})
-            if info_adicionais:
-                response += f"\n💡 **Informações Adicionais:**\n"
-                if 'duracao_consulta' in info_adicionais:
-                    response += f"• Duração da consulta: {info_adicionais['duracao_consulta']}\n"
-                if 'especialidades' in info_adicionais:
-                    response += f"• Especialidades: {info_adicionais['especialidades']}\n"
-            
-            return response
-            
+                resposta.extend([
+                    "",
+                    "🚫 Dias especiais fechados:",
+                    self._format_closed_days()
+                ])
+
+            info_pagamento = self.clinic_info.get("informacoes_adicionais", {}).get("formas_pagamento")
+            if info_pagamento:
+                resposta.extend([
+                    "",
+                    f"💳 Formas de pagamento: {', '.join(info_pagamento)}"
+                ])
+
+            return "\n".join(resposta)
+
         except Exception as e:
             logger.error(f"Erro ao obter info da clínica: {str(e)}")
             return f"Erro ao buscar informações: {str(e)}"
