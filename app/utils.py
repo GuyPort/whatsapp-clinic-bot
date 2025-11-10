@@ -2,10 +2,11 @@
 Funções utilitárias e helpers.
 """
 from datetime import datetime, timedelta
+import logging
 import re
 import json
 import pytz
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List, Mapping
 
 from app.simple_config import settings
 
@@ -195,3 +196,57 @@ def get_minimum_appointment_datetime() -> datetime:
     now = now_brazil()
     minimum_datetime = now + timedelta(hours=48)
     return minimum_datetime
+
+
+def log_event(
+    event_name: str,
+    details: Optional[Mapping[str, Any]] = None,
+    *,
+    logger: Optional[logging.Logger] = None,
+) -> None:
+    """
+    Emite um log estruturado para observabilidade do agente.
+
+    Args:
+        event_name: Nome do evento a ser registrado (snake_case).
+        details: Dicionário com informações adicionais do evento.
+        logger: Logger específico. Quando omitido utiliza logging.getLogger(__name__).
+    """
+    target_logger = logger or logging.getLogger(__name__)
+    payload = {"event": event_name}
+    if details:
+        try:
+            # Garantir serialização segura para logs
+            serializable = json.loads(json.dumps(details, default=str))
+            payload.update(serializable)
+        except (TypeError, ValueError):
+            payload["details_serialization_error"] = True
+    target_logger.info(payload)
+
+
+def compute_missing_fields(flow_data: Optional[Dict[str, Any]]) -> List[str]:
+    """
+    Calcula os campos obrigatórios ainda não preenchidos no flow_data.
+
+    Args:
+        flow_data: Dicionário persistido no contexto da conversa.
+
+    Returns:
+        Lista de campos pendentes.
+    """
+    required_keys = [
+        "patient_name",
+        "patient_birth_date",
+        "consultation_type",
+        "insurance_plan",
+        "appointment_date",
+        "appointment_time",
+    ]
+    if not flow_data:
+        return required_keys.copy()
+    missing = []
+    for key in required_keys:
+        value = flow_data.get(key)
+        if value in (None, "", []):
+            missing.append(key)
+    return missing
