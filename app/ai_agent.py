@@ -115,9 +115,10 @@ MENU INICIAL:
 "Olá! Eu sou a Beatriz, secretária do {clinic_name}! 😊
 Como posso te ajudar hoje?
 
-1️⃣ Marcar consulta
-2️⃣ Remarcar/Cancelar consulta  
-3️⃣ Receitas
+1️⃣ Marcar consulta (presencial na clínica)
+2️⃣ Atendimento domiciliar
+3️⃣ Remarcar/Cancelar consulta  
+4️⃣ Receitas
 
 Digite o número da opção desejada."
 - Se o usuário já estiver no meio de um fluxo, mantenha o contexto e continue naturalmente
@@ -154,13 +155,12 @@ Após o usuário escolher qualquer opção do menu inicial, siga esta sequência
    
    1️⃣ Clínica Geral - R$ 300
    2️⃣ Geriatria Clínica e Preventiva - R$ 300
-   3️⃣ Atendimento Domiciliar ao Paciente Idoso - R$ 500
    
    Digite o número da opção desejada."
-   - Aceite: "1", "2", "3", "primeira opção", "opção 1", etc
+   - Aceite: "1", "2", "primeira opção", "opção 1", etc
 
-3.1. FLUXO ESPECIAL - ATENDIMENTO DOMICILIAR:
-   Quando o usuário escolher "Atendimento Domiciliar" (opção 3):
+3.1. FLUXO ESPECIAL - ATENDIMENTO DOMICILIAR (opção 2 do menu inicial):
+   Quando o usuário escolher "Atendimento domiciliar" no menu inicial:
    1. NÃO chame find_next_available_slot (não precisa agendar horário específico)
    2. PRIMEIRO: Pergunte ao usuário com esta mensagem formatada (NÃO chame nenhuma tool ainda):
       "Perfeito! Para o atendimento domiciliar, preciso do seu endereço completo. Por favor, me informe:
@@ -753,8 +753,8 @@ Lembre-se: Seja natural, adaptável e prestativa. Use as tools disponíveis conf
                 
                 # 4. EXTRAÇÃO DE TIPO DE CONSULTA - SEMPRE atualizar quando escolha explícita
                 # Se mensagem é só "1", "2" ou "3" (escolha explícita de tipo)
-                if content in ["1", "2", "3"]:
-                    type_map = {"1": "clinica_geral", "2": "geriatria", "3": "domiciliar"}
+                if content in ["1", "2"]:
+                    type_map = {"1": "clinica_geral", "2": "geriatria"}
                     # Sempre atualizar (sobrescrever) quando usuário escolhe explicitamente
                     data["consultation_type"] = type_map[content]
                     logger.info(f"💾 Tipo de consulta atualizado (escolha explícita): {data['consultation_type']}")
@@ -1265,11 +1265,14 @@ Lembre-se: Seja natural, adaptável e prestativa. Use as tools disponíveis conf
         date_str = request.get("date")
         weekday_index = request.get("weekday")
         
+        inferred_from_weekday = False
+
         if not date_str and weekday_index is not None:
             next_date = self._get_next_available_date_for_weekday(weekday_index)
             if not next_date:
                 return "❌ Não consegui encontrar datas disponíveis para esse dia da semana. Pode informar uma data no formato DD/MM/AAAA?"
             date_str = format_date_br(next_date)
+            inferred_from_weekday = True
         
         if not date_str:
             return None
@@ -1290,7 +1293,10 @@ Lembre-se: Seja natural, adaptável e prestativa. Use as tools disponíveis conf
             )
         
         return self._handle_validate_date_and_show_slots(
-            {"date": date_str},
+            {
+                "date": date_str,
+                "auto_adjust_to_future": inferred_from_weekday or request.get("auto_adjust_to_future")
+            },
             db,
             phone
         )
@@ -1439,11 +1445,18 @@ Resposta (apenas o nome do convênio, nada mais):"""
 
         normalized = normalized.replace("opção", "opcao").replace("opções", "opcoes")
         digits_only = "".join(ch for ch in normalized if ch.isdigit())
-        if digits_only in {"1", "2", "3"} and len(normalized) <= 4:
-            return {"1": "booking", "2": "reschedule", "3": "prescription"}[digits_only]
+        if digits_only in {"1", "2", "3", "4"} and len(normalized) <= 4:
+            return {
+                "1": "booking",
+                "2": "home_visit",
+                "3": "reschedule",
+                "4": "prescription"
+            }[digits_only]
 
         if any(keyword in normalized for keyword in ["marcar consulta", "agendar", "nova consulta", "quero marcar", "agendamento"]):
             return "booking"
+        if any(keyword in normalized for keyword in ["domicílio", "domicilio", "domiciliar", "visita em casa", "atendimento em casa"]):
+            return "home_visit"
         if any(keyword in normalized for keyword in ["remarcar", "cancelar", "cancelamento", "remarcação", "remarcacao", "desmarcar"]):
             return "reschedule"
         if any(keyword in normalized for keyword in ["receita", "receitas", "prescrição", "prescricao"]):
@@ -1462,11 +1475,17 @@ Resposta (apenas o nome do convênio, nada mais):"""
         flow["awaiting_patient_birth_date"] = False
         flow.pop("patient_name", None)
         flow.pop("patient_birth_date", None)
+        flow.pop("consultation_type", None)
+        flow.pop("patient_address", None)
+        flow.pop("pending_home_address", None)
+        flow.pop("pending_doctor_notification", None)
         flow.pop("awaiting_birth_date_correction", None)
         flow.pop("pending_confirmation", None)
         flow.pop("alternative_slots", None)
         flow["alternatives_offered"] = False
         flow.pop("awaiting_custom_date", None)
+        if menu_choice == "home_visit":
+            flow["consultation_type"] = "domiciliar"
         context.current_flow = menu_choice
         flag_modified(context, "flow_data")
 
@@ -1474,6 +1493,7 @@ Resposta (apenas o nome do convênio, nada mais):"""
         """Retorna mensagem adequada para solicitar o nome completo."""
         prompts = {
             "booking": "Perfeito! Para começarmos, me informe seu nome completo, por favor.",
+            "home_visit": "Perfeito! Vamos organizar o atendimento domiciliar. Pode me informar seu nome completo, por favor?",
             "reschedule": "Claro! Para localizar o atendimento, me informe o nome completo do paciente, por favor.",
             "prescription": "Combinado! Para seguir com as receitas, me informe o nome completo do paciente, por favor."
         }
@@ -1485,9 +1505,17 @@ Resposta (apenas o nome do convênio, nada mais):"""
             return (
                 "Perfeito! Agora me informe qual tipo de consulta você deseja:\n\n"
                 "1️⃣ Clínica Geral - R$ 300\n"
-                "2️⃣ Geriatria Clínica e Preventiva - R$ 300\n"
-                "3️⃣ Atendimento Domiciliar ao Paciente Idoso - R$ 500\n\n"
+                "2️⃣ Geriatria Clínica e Preventiva - R$ 300\n\n"
                 "Digite o número da opção desejada."
+            )
+        if menu_choice == "home_visit":
+            return (
+                "Perfeito! Para o atendimento domiciliar, preciso do seu endereço completo. Por favor, me informe:\n\n"
+                "📍 Cidade\n"
+                "🏘️ Bairro\n"
+                "🛣️ Rua\n"
+                "🏠 Número da casa\n\n"
+                "Você pode enviar tudo junto ou separado, como preferir!"
             )
         if menu_choice == "reschedule":
             return (
@@ -2298,11 +2326,18 @@ Resposta (apenas o nome do convênio, nada mais):"""
             # SEMPRE atualizar tipo de consulta quando extraído (permite correção)
             if extracted.get("consultation_type"):
                 tipo_anterior = context.flow_data.get("consultation_type")
-                context.flow_data["consultation_type"] = extracted["consultation_type"]
-                if tipo_anterior:
-                    logger.info(f"💾 Tipo consulta ATUALIZADO no flow_data: {tipo_anterior} → {extracted['consultation_type']}")
+                if (
+                    context.flow_data.get("menu_choice") == "home_visit"
+                    and tipo_anterior == "domiciliar"
+                    and extracted["consultation_type"] != "domiciliar"
+                ):
+                    logger.info("↩️ Ignorando tipo de consulta extraído porque o fluxo atual é de atendimento domiciliar.")
                 else:
-                    logger.info(f"💾 Tipo consulta salvo no flow_data: {extracted['consultation_type']}")
+                    context.flow_data["consultation_type"] = extracted["consultation_type"]
+                    if tipo_anterior:
+                        logger.info(f"💾 Tipo consulta ATUALIZADO no flow_data: {tipo_anterior} → {extracted['consultation_type']}")
+                    else:
+                        logger.info(f"💾 Tipo consulta salvo no flow_data: {extracted['consultation_type']}")
             
             # INTERCEPTAÇÃO: Fluxo domiciliar
             consultation_type = context.flow_data.get("consultation_type")
@@ -3373,6 +3408,38 @@ Resposta (apenas o nome do convênio, nada mais):"""
             
             logger.info(f"📅 Validando data e buscando slots: {date_str}")
             
+            # ========== VALIDAÇÃO 0: DATA MÍNIMA (48 HORAS) ==========
+            minimum_datetime = get_minimum_appointment_datetime()
+            minimum_date = minimum_datetime.date()
+
+            if appointment_date.date() < minimum_date:
+                if tool_input.get("auto_adjust_to_future"):
+                    logger.info(
+                        "🔁 Data %s está antes do mínimo de 48 horas; ajustando automaticamente.",
+                        date_str
+                    )
+                    while appointment_date.date() < minimum_date:
+                        appointment_date += timedelta(days=7)
+                    date_str = appointment_date.strftime('%d/%m/%Y')
+                    logger.info("🔁 Nova data ajustada: %s", date_str)
+                else:
+                    next_available = minimum_datetime
+                    horarios = self.clinic_info.get('horario_funcionamento', {})
+                    dias_semana_pt = ['segunda', 'terca', 'quarta', 'quinta', 'sexta', 'sabado', 'domingo']
+
+                    while True:
+                        nome_dia = dias_semana_pt[next_available.weekday()]
+                        horario_dia = horarios.get(nome_dia, "FECHADO")
+                        if horario_dia != "FECHADO":
+                            break
+                        next_available += timedelta(days=1)
+
+                    return (
+                        "❌ A data informada já passou ou não atende nossa regra de antecedência mínima de 48 horas.\n"
+                        f"A partir de agora, a primeira data disponível é {next_available.strftime('%d/%m/%Y')}.\n"
+                        "Pode me informar uma nova data por favor?"
+                    )
+
             # ========== VALIDAÇÃO 1: DIA DA SEMANA ==========
             weekday = appointment_date.weekday()  # 0=segunda, 6=domingo
             dias_semana_pt = ['segunda', 'terca', 'quarta', 'quinta', 'sexta', 'sabado', 'domingo']
