@@ -75,6 +75,10 @@ class ClaudeToolAgent:
         self.timezone = get_brazil_timezone()
         self.tools = self._define_tools()
         self.system_prompt = self._create_system_prompt()
+        self.special_holiday_ranges = [
+            (datetime(2025, 12, 15).date(), datetime(2025, 12, 21).date()),
+            (datetime(2025, 12, 26).date(), datetime(2026, 1, 4).date()),
+        ]
         
     def _create_system_prompt(self) -> str:
         """Cria o prompt do sistema para o Claude"""
@@ -114,6 +118,8 @@ MENU INICIAL:
 
 "Olá! Eu sou a Beatriz, secretária do {clinic_name}! 😊
 Como posso te ajudar hoje?
+
+ℹ️ Para deixar o atendimento mais rápido, envie uma mensagem por vez e aguarde minha resposta antes de mandar a próxima, combinado?
 
 1️⃣ Marcar consulta (presencial na clínica)
 2️⃣ Atendimento domiciliar
@@ -611,6 +617,23 @@ Lembre-se: Seja natural, adaptável e prestativa. Use as tools disponíveis conf
                 }
             }
         ]
+
+    def _is_special_holiday_date(self, date_obj: datetime) -> bool:
+        if not date_obj:
+            return False
+        target = date_obj.date()
+        for start, end in self.special_holiday_ranges:
+            if start <= target <= end:
+                return True
+        return False
+
+    def _handoff_due_to_holiday(self, db: Session, phone: Optional[str]) -> str:
+        if phone:
+            return self._handle_request_human_assistance({}, db, phone)
+        return (
+            "Durante este período especial a secretária está cuidando dos agendamentos. "
+            "Vou pedir para ela entrar em contato com você, tudo bem?"
+        )
 
     def _normalize_and_validate_date(self, date_str: str) -> Optional[str]:
         """
@@ -2696,6 +2719,10 @@ Resposta (apenas o nome do convênio, nada mais):"""
                     days_checked += 1
                     continue
                 
+                if self._is_special_holiday_date(current_date):
+                    logger.info(f"⛱️ Alternativa em {format_date_br(current_date)} está em período de férias - encaminhando secretaria.")
+                    return self._handoff_due_to_holiday(db, phone)
+
                 # Verificar se funciona nesse dia
                 dias_semana_pt = ['segunda', 'terca', 'quarta', 'quinta', 'sexta', 'sabado', 'domingo']
                 dia_nome = dias_semana_pt[weekday]
@@ -2772,6 +2799,10 @@ Resposta (apenas o nome do convênio, nada mais):"""
             
             if not first_slot or not found_date:
                 return "❌ Não encontrei horários disponíveis nos próximos 30 dias. Por favor, entre em contato conosco para verificar outras opções."
+            
+            if self._is_special_holiday_date(found_date):
+                logger.info(f"⛱️ Data {format_date_br(found_date)} está em período de férias - encaminhando secretaria.")
+                return self._handoff_due_to_holiday(db, phone)
             
             # 4. Salvar dados no flow_data para confirmação
             if context:
@@ -3459,6 +3490,10 @@ Resposta (apenas o nome do convênio, nada mais):"""
                 return "Data inválida. Use o formato DD/MM/AAAA."
             
             logger.info(f"📅 Data convertida: {appointment_date}")
+
+            if self._is_special_holiday_date(appointment_date):
+                logger.info(f"⛱️ check_availability detectou período de férias em {date_str} - encaminhando secretaria.")
+                return self._handoff_due_to_holiday(db, phone=None)
             
             # Obter horários disponíveis
             duracao = self.clinic_info.get('regras_agendamento', {}).get('duracao_consulta_minutos', 45)
@@ -3522,6 +3557,10 @@ Resposta (apenas o nome do convênio, nada mais):"""
                 return f"O formato da data '{date_str}' não está correto. Por favor, use o formato DD/MM/AAAA (exemplo: 15/01/2024)."
             
             logger.info(f"📅 Validando data e buscando slots: {date_str}")
+
+            if self._is_special_holiday_date(appointment_date):
+                logger.info(f"⛱️ Data solicitada {date_str} está em período de férias - encaminhando secretaria.")
+                return self._handoff_due_to_holiday(db, phone)
             
             # ========== VALIDAÇÃO 0: DATA MÍNIMA (48 HORAS) ==========
             minimum_datetime = get_minimum_appointment_datetime()
@@ -3554,6 +3593,10 @@ Resposta (apenas o nome do convênio, nada mais):"""
                         f"A partir de agora, a primeira data disponível é {next_available.strftime('%d/%m/%Y')}.\n"
                         "Pode me informar uma nova data por favor?"
                     )
+
+            if self._is_special_holiday_date(appointment_date):
+                logger.info(f"⛱️ Data ajustada {appointment_date.strftime('%d/%m/%Y')} está em período de férias - encaminhando secretaria.")
+                return self._handoff_due_to_holiday(db, phone)
 
             # ========== VALIDAÇÃO DE CONVÊNIO (SEGUNDA-FEIRA / LIMITE IPE) ==========
             allowed_plan, reason_plan = appointment_rules.is_plan_allowed_on_date(appointment_date, insurance_plan)
@@ -3784,6 +3827,9 @@ Resposta (apenas o nome do convênio, nada mais):"""
             
             # Verificar disponibilidade no banco (segurança contra race condition)
             appointment_date = parse_date_br(date_str)
+            if self._is_special_holiday_date(appointment_date):
+                logger.info(f"⛱️ Horário solicitado para {date_str} está em período de férias - encaminhando secretaria.")
+                return self._handoff_due_to_holiday(db, phone)
             allowed_plan, reason_plan = appointment_rules.is_plan_allowed_on_date(appointment_date, insurance_plan)
             if not allowed_plan:
                 return f"❌ {reason_plan}\nPor favor, escolha outra data."
@@ -4299,8 +4345,8 @@ Resposta (apenas o nome do convênio, nada mais):"""
                 db.delete(existing_pause)
                 logger.info(f"🗑️ Pausa anterior removida para {phone}")
             
-            # 5. Criar nova pausa por 1 minuto (para teste)
-            paused_until = datetime.utcnow() + timedelta(hours=2)
+            # 5. Criar pausa para atendimento humano
+            paused_until = datetime.utcnow() + timedelta(hours=24)
             paused_contact = PausedContact(
                 phone=phone,
                 paused_until=paused_until,
