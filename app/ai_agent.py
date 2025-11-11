@@ -703,7 +703,26 @@ Return ONLY a JSON object with this structure:
                         raw_text += block.text
 
             import json
-            parsed = json.loads(raw_text.strip())
+            cleaned_output = raw_text.strip()
+
+            if not cleaned_output:
+                raise ValueError("Claude returned empty response")
+
+            if "```" in cleaned_output:
+                import re
+                matches = re.findall(r'```(?:json)?\s*(\{.*?\})\s*```', cleaned_output, re.DOTALL)
+                if matches:
+                    cleaned_output = matches[0]
+
+            cleaned_output = cleaned_output.strip()
+
+            if not cleaned_output.startswith('{'):
+                import re
+                json_match = re.search(r'\{.*\}', cleaned_output, re.DOTALL)
+                if json_match:
+                    cleaned_output = json_match.group(0)
+
+            parsed = json.loads(cleaned_output)
 
             if not isinstance(parsed, dict) or "fields" not in parsed:
                 raise ValueError("Unexpected response structure from Claude")
@@ -723,6 +742,10 @@ Return ONLY a JSON object with this structure:
             return {"fields": normalized}
         except Exception as exc:
             logger.error(f"❌ Erro ao analisar informações de receita com Claude: {exc}")
+            try:
+                logger.debug(f"Resposta completa do Claude para depuração: {raw_text!r}")
+            except Exception:
+                logger.debug("Resposta do Claude indisponível para depuração.")
             return result_template
 
     def _build_prescription_address_prompt(self, reminder: bool = False) -> str:
@@ -1955,7 +1978,6 @@ Resposta (apenas o nome do convênio, nada mais):"""
 
                 for field, data in fields.items():
                     status = data.get("status", "missing")
-                    value = data.get("value")
                     if status == "provided":
                         provided.append(field)
                     elif status == "missing":
@@ -1977,12 +1999,8 @@ Resposta (apenas o nome do convênio, nada mais):"""
                 if not essential_provided and missing:
                     missing_text = ", ".join(_humanize(field) for field in missing)
                     reminder = (
-                        "Para emitir a receita preciso de todas as informações na mesma mensagem:\n"
-                        "• Nome dos remédios\n"
-                        "• Receita/diagnóstico atual\n"
-                        "• Modo de uso\n"
-                        "• Dosagem ou miligramagem\n\n"
-                        f"Poderia me enviar também: {missing_text}? Se algum item não existir, é só me avisar."
+                        "Recebi suas informações, mas ainda preciso confirmar alguns itens: "
+                        f"{missing_text}. Se algum deles não existir, é só me dizer; caso contrário, pode enviar tudo juntinho (remédios, diagnóstico, modo de uso e dosagem)."
                     )
                     self._record_interaction(context, message, reminder, db)
                     return reminder
