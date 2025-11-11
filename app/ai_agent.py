@@ -635,6 +635,145 @@ Lembre-se: Seja natural, adaptável e prestativa. Use as tools disponíveis conf
             "Vou pedir para ela entrar em contato com você, tudo bem?"
         )
 
+    def _extract_prescription_details_from_message(self, message: str) -> Tuple[Dict[str, str], List[str]]:
+        details = {
+            "medications": None,
+            "current_prescription": None,
+            "usage": None,
+            "dosage": None,
+        }
+        if not message:
+            return details, list(details.keys())
+
+        normalized_text = message.strip()
+        patterns = {
+            "medications": ["remedio", "remédio", "remedios", "remédios", "medicamento", "medicamentos"],
+            "current_prescription": ["receita", "diagnostico", "diagnóstico", "indicacao", "indicação", "laudo"],
+            "usage": ["modo de uso", "posologia", "como usar", "frequencia", "frequência"],
+            "dosage": ["dosagem", "miligram", "miligramas", "mg"],
+        }
+
+        segments = [seg.strip() for seg in normalized_text.splitlines() if seg.strip()]
+        if len(segments) == 1:
+            segments = [seg.strip() for seg in normalized_text.split(';') if seg.strip()]
+        if not segments:
+            segments = [normalized_text]
+
+        def assign_if_match(segment: str):
+            lower = segment.lower()
+            for key, keywords in patterns.items():
+                if details[key]:
+                    continue
+                for keyword in keywords:
+                    if keyword in lower:
+                        value = segment.split(':', 1)[1] if ':' in segment else segment
+                        details[key] = value.strip()
+                        return
+
+        for segment in segments:
+            assign_if_match(segment)
+
+        if any(value is None for value in details.values()):
+            for part in [p.strip() for p in normalized_text.split(',') if p.strip()]:
+                assign_if_match(part)
+
+        missing = [field for field, value in details.items() if not value]
+        return details, missing
+
+    def _build_prescription_details_reminder(self, missing_fields: List[str]) -> str:
+        field_map = {
+            "medications": "nome dos remédios",
+            "current_prescription": "receita/diagnóstico atual",
+            "usage": "modo de uso",
+            "dosage": "dosagem/miligramagem",
+        }
+        missing_human = [field_map.get(field, field) for field in missing_fields]
+        missing_text = ", ".join(missing_human)
+        return (
+            "Para emitir a receita preciso de todas as informações na mesma mensagem:\n"
+            "• Nome dos remédios\n"
+            "• Receita/diagnóstico atual\n"
+            "• Modo de uso\n"
+            "• Dosagem ou miligramagem\n\n"
+            f"Você ainda não me enviou: {missing_text}. Por favor, envie tudo de uma vez para eu continuar."
+        )
+
+    def _build_prescription_address_prompt(self, reminder: bool = False) -> str:
+        base = (
+            "Obrigada! Agora me informe o endereço completo para entrega ou retirada:\n\n"
+            "📍 Cidade\n"
+            "🏘️ Bairro\n"
+            "🛣️ Rua\n"
+            "🏠 Número do imóvel\n\n"
+            "Pode enviar tudo junto em uma única mensagem."
+        )
+        if reminder:
+            return (
+                "Para prosseguir, preciso do endereço completo (cidade, bairro, rua e número). "
+                "Envie tudo em uma mesma mensagem, por favor."
+            )
+        return base
+
+    def _is_valid_address(self, address: str) -> bool:
+        if not address:
+            return False
+        if len(address) < 12:
+            return False
+        has_letter = any(ch.isalpha() for ch in address)
+        has_number = any(ch.isdigit() for ch in address)
+        return has_letter and has_number
+
+    def _build_prescription_payment_message(self) -> str:
+        return (
+            "Perfeito! Recebi as informações da sua receita.\n\n"
+            "💰 Valor: R$ 25,00\n"
+            "🔑 Chave Pix: 51999546355\n"
+            "⏳ Assim que o comprovante for enviado, a Dra. Rose prepara a receita em até 2 dias úteis.\n"
+            "📄 Receitas branca/controlada podem ser enviadas digitalmente.\n"
+            "📄 Receitas azul ou amarela precisam ser retiradas no consultório, de segunda a sexta das 14h às 18h.\n\n"
+            "Quando tiver o comprovante, é só me enviar por aqui. Posso ajudar com mais alguma coisa?"
+        )
+
+    def _notify_doctor_prescription(self, context: ConversationContext, db: Session, phone: Optional[str]) -> None:
+        if not context:
+            return
+        flow = context.flow_data or {}
+        if flow.get("prescription_notified"):
+            return
+
+        patient_name = flow.get("patient_name", "Não informado")
+        patient_birth_date = flow.get("patient_birth_date", "Não informado")
+        details = flow.get("prescription_details", {})
+        address = flow.get("prescription_address", "Não informado")
+        doctor_phone = self.clinic_info.get("informacoes_adicionais", {}).get("telefone_doutora")
+        if not doctor_phone:
+            logger.error("❌ Telefone da doutora não encontrado para notificação de receita.")
+            return
+
+        contact = phone or flow.get("patient_phone", "Não informado")
+        message = (
+            "📝 NOVA SOLICITAÇÃO DE RECEITA\n\n"
+            f"👤 Paciente: {patient_name}\n"
+            f"📅 Data de nascimento: {patient_birth_date}\n"
+            f"💊 Medicamentos: {details.get('medications', 'Não informado')}\n"
+            f"📄 Receita/diagnóstico: {details.get('current_prescription', 'Não informado')}\n"
+            f"🕒 Modo de uso: {details.get('usage', 'Não informado')}\n"
+            f"⚖️ Dosagem: {details.get('dosage', 'Não informado')}\n"
+            f"📍 Endereço: {address}\n"
+            f"📞 Contato: {contact}"
+        )
+
+        try:
+            from app.main import send_message_task
+            send_message_task.delay(normalize_phone(doctor_phone), message)
+            flow["prescription_notified"] = True
+            context.flow_data = flow
+            flag_modified(context, "flow_data")
+            db.commit()
+            logger.info("✅ Notificação de receita enviada para a doutora.")
+        except Exception as e:
+            logger.error(f"❌ Erro ao enviar notificação de receita: {e}")
+
     def _normalize_and_validate_date(self, date_str: str) -> Optional[str]:
         """
         Normaliza e valida uma string de data no formato DD/MM/YYYY.
@@ -1515,6 +1654,11 @@ Resposta (apenas o nome do convênio, nada mais):"""
         flow.pop("awaiting_custom_date", None)
         if menu_choice == "home_visit":
             flow["consultation_type"] = "domiciliar"
+        flow.pop("awaiting_prescription_details", None)
+        flow.pop("awaiting_prescription_address", None)
+        flow.pop("prescription_details", None)
+        flow.pop("prescription_address", None)
+        flow.pop("prescription_notified", None)
         context.current_flow = menu_choice
         flag_modified(context, "flow_data")
 
@@ -1553,8 +1697,12 @@ Resposta (apenas o nome do convênio, nada mais):"""
             )
         if menu_choice == "prescription":
             return (
-                "Perfeito! Qual receita você precisa renovar ou consultar? "
-                "Pode me informar o nome da medicação ou a indicação da receita."
+                "Perfeito! Para preparar sua receita, envie em UMA única mensagem as informações abaixo:\n\n"
+                "• Nome dos remédios que você usa\n"
+                "• Receita atual ou indicação médica\n"
+                "• Modo de uso (frequência e horários)\n"
+                "• Dosagem ou miligramagem\n\n"
+                "Por favor, envie tudo de uma vez para que eu possa prosseguir."
             )
         return "Obrigada! Como posso te ajudar a seguir?"
 
@@ -1742,6 +1890,12 @@ Resposta (apenas o nome do convênio, nada mais):"""
                     flow_data["patient_birth_date"] = birth_date
                     flow_data["awaiting_patient_birth_date"] = False
                     flow_data.pop("awaiting_birth_date_correction", None)
+                    if flow_data.get("menu_choice") == "prescription":
+                        flow_data["awaiting_prescription_details"] = True
+                        flow_data["prescription_details"] = {}
+                        flow_data.pop("prescription_address", None)
+                        flow_data["awaiting_prescription_address"] = False
+                        flag_modified(context, "flow_data")
                     flag_modified(context, "flow_data")
                     logger.info(f"📅 Data de nascimento registrada para {phone}: {birth_date}")
 
@@ -1754,6 +1908,44 @@ Resposta (apenas o nome do convênio, nada mais):"""
                     logger.warning(f"⚠️ Data de nascimento inválida informada por {phone}: {message}")
                     self._record_interaction(context, message, response, db)
                     return response
+
+            if flow_data.get("awaiting_prescription_details"):
+                details, missing_fields = self._extract_prescription_details_from_message(message)
+                if missing_fields:
+                    response = self._build_prescription_details_reminder(missing_fields)
+                    self._record_interaction(context, message, response, db)
+                    return response
+
+                flow_data["prescription_details"] = details
+                flow_data["awaiting_prescription_details"] = False
+                flow_data["awaiting_prescription_address"] = True
+                flag_modified(context, "flow_data")
+
+                address_prompt = self._build_prescription_address_prompt()
+                self._record_interaction(context, message, address_prompt, db, flow_modified=True)
+                return address_prompt
+
+            if flow_data.get("awaiting_prescription_address"):
+                address = message.strip()
+                if not self._is_valid_address(address):
+                    reminder = self._build_prescription_address_prompt(reminder=True)
+                    self._record_interaction(context, message, reminder, db)
+                    return reminder
+
+                flow_data["prescription_address"] = address
+                flow_data["awaiting_prescription_address"] = False
+                flag_modified(context, "flow_data")
+                db.commit()
+
+                instructions = self._build_prescription_payment_message()
+                self._record_interaction(context, message, instructions, db, flow_modified=True)
+
+                try:
+                    self._notify_doctor_prescription(context, db, phone)
+                except Exception as notify_error:
+                    logger.error(f"❌ Erro ao notificar doutora sobre receita: {notify_error}")
+
+                return instructions
 
             # 4. Verificar se há alternativas salvas e usuário escolheu uma (1, 2 ou 3)
             if context.flow_data and context.flow_data.get("alternative_slots"):
