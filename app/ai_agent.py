@@ -629,11 +629,53 @@ Lembre-se: Seja natural, adaptável e prestativa. Use as tools disponíveis conf
 
     def _handoff_due_to_holiday(self, db: Session, phone: Optional[str]) -> str:
         if phone:
-            return self._handle_request_human_assistance({}, db, phone)
+            return self._handle_request_special_holiday_pause(db, phone)
         return (
             "Durante este período especial a secretária está cuidando dos agendamentos. "
-            "Vou pedir para ela entrar em contato com você, tudo bem?"
+            "Vou pedir para ela entrar em contato com você em até 48 horas, tudo bem?"
         )
+
+    def _handle_request_special_holiday_pause(self, db: Session, phone: Optional[str]) -> str:
+        if not phone:
+            return (
+                "Esse período é tratado diretamente pela secretária. "
+                "Ela entrará em contato com você em até 48 horas. Posso ajudar com algo mais?"
+            )
+
+        try:
+            logger.info(f"⛱️ Aplicando pausa especial de férias para {phone}")
+
+            existing_context = db.query(ConversationContext).filter_by(phone=phone).first()
+            if existing_context:
+                db.delete(existing_context)
+                logger.info(f"🗑️ Contexto deletado para {phone} (pausa especial)")
+
+            existing_pause = db.query(PausedContact).filter_by(phone=phone).first()
+            if existing_pause:
+                db.delete(existing_pause)
+                logger.info(f"🗑️ Pausa anterior removida para {phone} (pausa especial)")
+
+            paused_until = datetime.utcnow() + timedelta(hours=48)
+            paused_contact = PausedContact(
+                phone=phone,
+                paused_until=paused_until,
+                reason="special_holiday_request"
+            )
+            db.add(paused_contact)
+            db.commit()
+
+            logger.info(f"⏸️ Pausa especial registrada para {phone} até {paused_until}")
+            return (
+                "Perfeito! Esse período é organizado diretamente com nossa secretária. "
+                "Ela vai entrar em contato com você em até 48 horas. Enquanto isso, posso ajudar com mais alguma coisa?"
+            )
+        except Exception as exc:
+            logger.error(f"❌ Erro ao aplicar pausa especial: {exc}")
+            db.rollback()
+            return (
+                "Houve um problema ao encaminhar para a secretária. "
+                "Por favor, tente novamente em instantes ou fale conosco por telefone."
+            )
 
     def _analyze_prescription_message_with_claude(self, message: str) -> Dict[str, Any]:
         """
@@ -2964,9 +3006,9 @@ Resposta (apenas o nome do convênio, nada mais):"""
                     days_checked += 1
                     continue
                 
-                # Verificar se está em dias_fechados
+                # Verificar se está em dias_fechados ou em período especial de férias
                 date_str_formatted = current_date.strftime('%d/%m/%Y')
-                if date_str_formatted in dias_fechados:
+                if date_str_formatted in dias_fechados or self._is_special_holiday_date(current_date):
                     current_date += timedelta(days=1)
                     days_checked += 1
                     continue
@@ -3000,10 +3042,6 @@ Resposta (apenas o nome do convênio, nada mais):"""
                     days_checked += 1
                     continue
                 
-                if self._is_special_holiday_date(current_date):
-                    logger.info(f"⛱️ Alternativa em {format_date_br(current_date)} está em período de férias - encaminhando secretaria.")
-                    return self._handoff_due_to_holiday(db, phone)
-
                 # Verificar se funciona nesse dia
                 dias_semana_pt = ['segunda', 'terca', 'quarta', 'quinta', 'sexta', 'sabado', 'domingo']
                 dia_nome = dias_semana_pt[weekday]
@@ -3080,10 +3118,6 @@ Resposta (apenas o nome do convênio, nada mais):"""
             
             if not first_slot or not found_date:
                 return "❌ Não encontrei horários disponíveis nos próximos 30 dias. Por favor, entre em contato conosco para verificar outras opções."
-            
-            if self._is_special_holiday_date(found_date):
-                logger.info(f"⛱️ Data {format_date_br(found_date)} está em período de férias - encaminhando secretaria.")
-                return self._handoff_due_to_holiday(db, phone)
             
             # 4. Salvar dados no flow_data para confirmação
             if context:
@@ -3205,9 +3239,9 @@ Resposta (apenas o nome do convênio, nada mais):"""
                     days_checked += 1
                     continue
                 
-                # Verificar se está em dias_fechados
+                # Verificar se está em dias_fechados ou período especial
                 date_str_formatted = current_date.strftime('%d/%m/%Y')
-                if date_str_formatted in dias_fechados:
+                if date_str_formatted in dias_fechados or self._is_special_holiday_date(current_date):
                     current_date += timedelta(days=1)
                     days_checked += 1
                     continue
