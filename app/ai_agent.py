@@ -1959,6 +1959,22 @@ Resposta (apenas o nome do convênio, nada mais):"""
 
             if menu_choice:
                 logger.info(f"🧭 Menu option '{menu_choice}' selecionada para {phone}")
+                if not context.flow_data:
+                    context.flow_data = {}
+                flow_ref = context.flow_data
+                if menu_choice == "reschedule":
+                    lower_msg = message.lower()
+                    if "cancel" in lower_msg and "remarc" not in lower_msg:
+                        flow_ref["cancel_intent"] = "cancel"
+                    elif "remarc" in lower_msg:
+                        flow_ref["cancel_intent"] = "reschedule"
+                    else:
+                        flow_ref["cancel_intent"] = "cancel"
+                    flow_ref.pop("pending_appointments_map", None)
+                    flow_ref.pop("awaiting_cancel_choice", None)
+                    flow_ref.pop("awaiting_cancel_reason", None)
+                    flow_ref.pop("selected_appointment", None)
+                    flag_modified(context, "flow_data")
                 self._start_identity_collection(context, menu_choice)
                 prompt = self._build_name_prompt(menu_choice)
                 self._record_interaction(context, message, prompt, db, flow_modified=True)
@@ -2004,6 +2020,40 @@ Resposta (apenas o nome do convênio, nada mais):"""
                         flag_modified(context, "flow_data")
                     flag_modified(context, "flow_data")
                     logger.info(f"📅 Data de nascimento registrada para {phone}: {birth_date}")
+
+                    if flow_data.get("menu_choice") == "reschedule":
+                        appointments_map: Dict[str, Dict[str, Any]] = {}
+                        search_response = self._handle_search_appointments(
+                            {
+                                "phone": phone,
+                                "name": flow_data.get("patient_name"),
+                                "birth_date": birth_date,
+                                "consultation_type": flow_data.get("consultation_type"),
+                                "insurance_plan": flow_data.get("insurance_plan"),
+                                "only_future": True,
+                                "flow_map": appointments_map
+                            },
+                            db
+                        )
+
+                        if appointments_map:
+                            flow_data["pending_appointments_map"] = appointments_map
+                            flow_data["awaiting_cancel_choice"] = True
+                            prompt = (
+                                search_response
+                                + "\nPor favor, digite o número da consulta que deseja cancelar ou remarcar."
+                            )
+                            self._record_interaction(context, message, prompt, db, flow_modified=True)
+                            return prompt
+
+                        flow_data.pop("pending_appointments_map", None)
+                        flow_data.pop("awaiting_cancel_choice", None)
+                        no_result_prompt = (
+                            search_response
+                            + "\nSe esses dados estiverem corretos, posso pedir para nossa secretária verificar manualmente."
+                        )
+                        self._record_interaction(context, message, no_result_prompt, db, flow_modified=True)
+                        return no_result_prompt
 
                     next_prompt = self._build_post_identity_prompt(flow_data.get("menu_choice"))
                     self._record_interaction(context, message, next_prompt, db, flow_modified=True)
@@ -2154,6 +2204,7 @@ Resposta (apenas o nome do convênio, nada mais):"""
                 flow_data["pending_confirmation"] = False
                 flow_data["alternatives_offered"] = False
                 flow_data.pop("awaiting_custom_date", None)
+                flow_data.pop("cancel_intent", None)
                 db.commit()
 
                 follow_up = result_message + "\n\nPosso ajudar com mais alguma coisa?"
