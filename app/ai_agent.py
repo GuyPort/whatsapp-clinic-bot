@@ -635,68 +635,95 @@ Lembre-se: Seja natural, adaptável e prestativa. Use as tools disponíveis conf
             "Vou pedir para ela entrar em contato com você, tudo bem?"
         )
 
-    def _extract_prescription_details_from_message(self, message: str) -> Tuple[Dict[str, str], List[str]]:
-        details = {
-            "medications": None,
-            "current_prescription": None,
-            "usage": None,
-            "dosage": None,
+    def _analyze_prescription_message_with_claude(self, message: str) -> Dict[str, Any]:
+        """
+        Usa o Claude para classificar se cada campo da receita foi informado.
+        Retorna estrutura:
+        {
+            "fields": {
+                "medications": {"status": "provided|missing|declared_none", "value": "..."},
+                "current_prescription": {...},
+                "usage": {...},
+                "dosage": {...}
+            }
         }
-        if not message:
-            return details, list(details.keys())
-
-        normalized_text = message.strip()
-        patterns = {
-            "medications": ["remedio", "remédio", "remedios", "remédios", "medicamento", "medicamentos"],
-            "current_prescription": ["receita", "diagnostico", "diagnóstico", "indicacao", "indicação", "laudo"],
-            "usage": ["modo de uso", "posologia", "como usar", "frequencia", "frequência"],
-            "dosage": ["dosagem", "miligram", "miligramas", "mg"],
+        """
+        result_template = {
+            "fields": {
+                "medications": {"status": "missing", "value": None},
+                "current_prescription": {"status": "missing", "value": None},
+                "usage": {"status": "missing", "value": None},
+                "dosage": {"status": "missing", "value": None},
+            }
         }
 
-        segments = [seg.strip() for seg in normalized_text.splitlines() if seg.strip()]
-        if len(segments) == 1:
-            segments = [seg.strip() for seg in normalized_text.split(';') if seg.strip()]
-        if not segments:
-            segments = [normalized_text]
+        cleaned_message = (message or "").strip()
+        if not cleaned_message:
+            return result_template
 
-        def assign_if_match(segment: str):
-            lower = segment.lower()
-            for key, keywords in patterns.items():
-                if details[key]:
-                    continue
-                for keyword in keywords:
-                    if keyword in lower:
-                        value = segment.split(':', 1)[1] if ':' in segment else segment
-                        details[key] = value.strip()
-                        return
+        prompt = f"""
+Analyze the patient's message below and determine whether they provided each required prescription field.
 
-        for segment in segments:
-            assign_if_match(segment)
+Message:
+\"\"\"{cleaned_message}\"\"\"
 
-        if any(value is None for value in details.values()):
-            for part in [p.strip() for p in normalized_text.split(',') if p.strip()]:
-                assign_if_match(part)
+For each field, decide:
+- status: "provided" if the patient supplied the information
+- status: "declared_none" if the patient explicitly says they do not have or cannot provide it
+- status: "missing" if the patient did not mention it or refused without explanation
 
-        missing = [field for field, value in details.items() if not value]
-        return details, missing
+Fields to check:
+1. medications (the medicines or drugs they take)
+2. current_prescription (diagnosis, existing prescription, or reason)
+3. usage (how and when they take it, frequency or schedule)
+4. dosage (amount, milligrams, drops, tablets, etc.)
 
-    def _build_prescription_details_reminder(self, missing_fields: List[str]) -> str:
-        field_map = {
-            "medications": "nome dos remédios",
-            "current_prescription": "receita/diagnóstico atual",
-            "usage": "modo de uso",
-            "dosage": "dosagem/miligramagem",
-        }
-        missing_human = [field_map.get(field, field) for field in missing_fields]
-        missing_text = ", ".join(missing_human)
-        return (
-            "Para emitir a receita preciso de todas as informações na mesma mensagem:\n"
-            "• Nome dos remédios\n"
-            "• Receita/diagnóstico atual\n"
-            "• Modo de uso\n"
-            "• Dosagem ou miligramagem\n\n"
-            f"Você ainda não me enviou: {missing_text}. Por favor, envie tudo de uma vez para eu continuar."
-        )
+Return ONLY a JSON object with this structure:
+{{
+  "fields": {{
+    "medications": {{"status": "...", "value": "..."}},
+    "current_prescription": {{"status": "...", "value": "..."}},
+    "usage": {{"status": "...", "value": "..."}},
+    "dosage": {{"status": "...", "value": "..."}}
+  }}
+}}
+"""
+
+        try:
+            response = self.client.messages.create(
+                model="claude-sonnet-4-20250514",
+                max_tokens=400,
+                temperature=0,
+                messages=[{"role": "user", "content": prompt}]
+            )
+            raw_text = ""
+            if response.content:
+                for block in response.content:
+                    if hasattr(block, "text"):
+                        raw_text += block.text
+
+            import json
+            parsed = json.loads(raw_text.strip())
+
+            if not isinstance(parsed, dict) or "fields" not in parsed:
+                raise ValueError("Unexpected response structure from Claude")
+
+            fields = parsed.get("fields", {})
+            normalized = {}
+            for key in ["medications", "current_prescription", "usage", "dosage"]:
+                data = fields.get(key, {})
+                status = data.get("status", "missing")
+                value = data.get("value")
+                if status not in {"provided", "missing", "declared_none"}:
+                    status = "missing"
+                if isinstance(value, str):
+                    value = value.strip() or None
+                normalized[key] = {"status": status, "value": value}
+
+            return {"fields": normalized}
+        except Exception as exc:
+            logger.error(f"❌ Erro ao analisar informações de receita com Claude: {exc}")
+            return result_template
 
     def _build_prescription_address_prompt(self, reminder: bool = False) -> str:
         base = (
@@ -751,14 +778,25 @@ Lembre-se: Seja natural, adaptável e prestativa. Use as tools disponíveis conf
             return
 
         contact = phone or flow.get("patient_phone", "Não informado")
+        def format_field(field_key: str) -> str:
+            field_data = details.get(field_key, {}) if isinstance(details, dict) else {}
+            status = field_data.get("status", "missing")
+            value = field_data.get("value")
+
+            if status == "provided" and value:
+                return value
+            if status == "declared_none":
+                return "Paciente informou que não possui"
+            return "Não informado"
+
         message = (
             "📝 NOVA SOLICITAÇÃO DE RECEITA\n\n"
             f"👤 Paciente: {patient_name}\n"
             f"📅 Data de nascimento: {patient_birth_date}\n"
-            f"💊 Medicamentos: {details.get('medications', 'Não informado')}\n"
-            f"📄 Receita/diagnóstico: {details.get('current_prescription', 'Não informado')}\n"
-            f"🕒 Modo de uso: {details.get('usage', 'Não informado')}\n"
-            f"⚖️ Dosagem: {details.get('dosage', 'Não informado')}\n"
+            f"💊 Medicamentos: {format_field('medications')}\n"
+            f"📄 Receita/diagnóstico: {format_field('current_prescription')}\n"
+            f"🕒 Modo de uso: {format_field('usage')}\n"
+            f"⚖️ Dosagem: {format_field('dosage')}\n"
             f"📍 Endereço: {address}\n"
             f"📞 Contato: {contact}"
         )
@@ -1910,13 +1948,46 @@ Resposta (apenas o nome do convênio, nada mais):"""
                     return response
 
             if flow_data.get("awaiting_prescription_details"):
-                details, missing_fields = self._extract_prescription_details_from_message(message)
-                if missing_fields:
-                    response = self._build_prescription_details_reminder(missing_fields)
-                    self._record_interaction(context, message, response, db)
-                    return response
+                analysis = self._analyze_prescription_message_with_claude(message)
+                fields = analysis.get("fields", {})
+                provided = []
+                missing = []
 
-                flow_data["prescription_details"] = details
+                for field, data in fields.items():
+                    status = data.get("status", "missing")
+                    value = data.get("value")
+                    if status == "provided":
+                        provided.append(field)
+                    elif status == "missing":
+                        missing.append(field)
+
+                def _humanize(field_key: str) -> str:
+                    mapping = {
+                        "medications": "nome dos remédios",
+                        "current_prescription": "receita/diagnóstico",
+                        "usage": "modo de uso",
+                        "dosage": "dosagem/miligramagem"
+                    }
+                    return mapping.get(field_key, field_key)
+
+                essential_provided = "medications" in provided and (
+                    "usage" in provided or "dosage" in provided
+                )
+
+                if not essential_provided and missing:
+                    missing_text = ", ".join(_humanize(field) for field in missing)
+                    reminder = (
+                        "Para emitir a receita preciso de todas as informações na mesma mensagem:\n"
+                        "• Nome dos remédios\n"
+                        "• Receita/diagnóstico atual\n"
+                        "• Modo de uso\n"
+                        "• Dosagem ou miligramagem\n\n"
+                        f"Poderia me enviar também: {missing_text}? Se algum item não existir, é só me avisar."
+                    )
+                    self._record_interaction(context, message, reminder, db)
+                    return reminder
+
+                flow_data["prescription_details"] = fields
                 flow_data["awaiting_prescription_details"] = False
                 flow_data["awaiting_prescription_address"] = True
                 flag_modified(context, "flow_data")
@@ -2859,7 +2930,7 @@ Resposta (apenas o nome do convênio, nada mais):"""
             
             # Começar a buscar a partir da data mínima
             current_date = minimum_datetime.replace(hour=0, minute=0, second=0, microsecond=0)
-            max_days_ahead = 30  # Limite de busca (30 dias)
+            max_days_ahead = 90  # Limite de busca (90 dias)
             days_checked = 0
             
             first_slot = None
@@ -3101,7 +3172,7 @@ Resposta (apenas o nome do convênio, nada mais):"""
             dias_fechados = self.clinic_info.get('dias_fechados', [])
             
             current_date = minimum_datetime.replace(hour=0, minute=0, second=0, microsecond=0)
-            max_days_ahead = 30
+            max_days_ahead = 90
             days_checked = 0
             
             alternatives = []  # Lista de (datetime, date) - (slot, data)
