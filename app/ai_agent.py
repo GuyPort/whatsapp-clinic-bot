@@ -1705,9 +1705,12 @@ Resposta (apenas o nome do convênio, nada mais):"""
             return None
 
         if context and context.flow_data:
-            if context.flow_data.get("awaiting_patient_name") or context.flow_data.get("awaiting_patient_birth_date"):
+            flow = context.flow_data
+            if flow.get("awaiting_patient_name") or flow.get("awaiting_patient_birth_date"):
                 return None
-            if context.flow_data.get("menu_choice") is not None:
+            if flow.get("alternative_slots") or flow.get("pending_confirmation") or flow.get("awaiting_custom_date"):
+                return None
+            if flow.get("menu_choice") is not None:
                 return None
 
         normalized = message.strip().lower()
@@ -2936,7 +2939,28 @@ Resposta (apenas o nome do convênio, nada mais):"""
             # Extrair dados coletados
             patient_name = context.flow_data.get("patient_name")
             consultation_type = context.flow_data.get("consultation_type", "clinica_geral")
-            insurance_plan = context.flow_data.get("insurance_plan", "particular")
+            insurance_plan = context.flow_data.get("insurance_plan")
+
+            if not insurance_plan or insurance_plan.lower() == "particular":
+                try:
+                    extracted = self._extract_patient_data_with_claude(context)
+                    if extracted.get("insurance_plan"):
+                        insurance_plan = extracted["insurance_plan"]
+                        context.flow_data["insurance_plan"] = insurance_plan
+                        db.commit()
+                        logger.info(f"💾 Convênio identificado para alternativas: {insurance_plan}")
+                except Exception as e:
+                    logger.warning(f"⚠️ Erro ao tentar extrair convênio para alternativas: {str(e)}")
+
+            if insurance_plan:
+                normalized_plan = appointment_rules._normalize_plan(insurance_plan)
+                if normalized_plan != insurance_plan:
+                    context.flow_data["insurance_plan"] = normalized_plan
+                    db.commit()
+                    logger.info(f"🔁 Convênio normalizado para alternativas: {insurance_plan} -> {normalized_plan}")
+                insurance_plan = normalized_plan
+            else:
+                insurance_plan = "Particular"
             
             # SALVAMENTO AUTOMÁTICO: Se insurance_plan foi identificado por Claude mas não está no flow_data,
             # tentar extrair do histórico recente (pode ter sido mencionado na última mensagem)
@@ -3434,11 +3458,13 @@ Resposta (apenas o nome do convênio, nada mais):"""
             resposta = [
                 f"🏥 {nome_clinica}",
                 "",
-                f"📍 Endereço:\n{endereco}",
+                "📍 **Endereço**",
+                endereco,
                 "",
-                f"📞 Telefone:\n{telefone}",
+                "📞 **Telefone**",
+                telefone,
                 "",
-                "📅 Horários de funcionamento:",
+                "🕒 **Horários de funcionamento**",
                 self._format_clinic_hours()
             ]
 
@@ -3446,7 +3472,7 @@ Resposta (apenas o nome do convênio, nada mais):"""
             if dias_fechados:
                 resposta.extend([
                     "",
-                    "🚫 Dias especiais fechados:",
+                    "🚫 **Dias especiais sem atendimento**",
                     self._format_closed_days()
                 ])
 
@@ -3454,7 +3480,16 @@ Resposta (apenas o nome do convênio, nada mais):"""
             if info_pagamento:
                 resposta.extend([
                     "",
-                    f"💳 Formas de pagamento: {', '.join(info_pagamento)}"
+                    "💳 **Formas de pagamento**",
+                    "\n".join(f"• {forma}" for forma in info_pagamento)
+                ])
+
+            convenios = self._format_insurance_list()
+            if convenios and "Convênios não informados." not in convenios:
+                resposta.extend([
+                    "",
+                    "💳 **Convênios atendidos**",
+                    convenios
                 ])
 
             return "\n".join(resposta)
@@ -3860,6 +3895,10 @@ Resposta (apenas o nome do convênio, nada mais):"""
                         db.commit()
                         logger.info("🧹 Flag appointment_completed removida - novo agendamento iniciado")
                     insurance_plan = context.flow_data.get("insurance_plan", insurance_plan)
+                    if context.flow_data.pop("awaiting_custom_date", None):
+                        flag_modified(context, "flow_data")
+                        db.commit()
+                        logger.info("🧹 awaiting_custom_date removido após nova data fornecida")
             
             date_str = tool_input.get("date")
             
