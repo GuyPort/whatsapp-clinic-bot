@@ -9,6 +9,7 @@ import json
 import logging
 import pytz
 import re
+import unicodedata
 from anthropic import Anthropic
 
 from sqlalchemy.orm import Session
@@ -161,14 +162,8 @@ Após o usuário escolher qualquer opção do menu inicial, siga esta sequência
    - Lembre-se: alguém pode agendar para outra pessoa; mantenha os dados informados pelo usuário.
 
 3. TIPO DE CONSULTA
-   - Após ter nome e data, mostre as opções:
-   "Perfeito! Agora me informe qual tipo de consulta você deseja:
-   
-   1️⃣ Clínica Geral - R$ 300
-   2️⃣ Geriatria Clínica e Preventiva - R$ 300
-   
-   Digite o número da opção desejada."
-   - Aceite: "1", "2", "primeira opção", "opção 1", etc
+   - Após ter nome e data, apresente apenas os nomes das consultas e peça para o paciente escrever o nome completo da opção desejada (ex.: "Clínica Geral" ou "Geriatria Clínica e Preventiva").
+   - Reforce que a escolha deve ser textual; números só devem ser usados no menu principal.
 
 3.1. FLUXO ESPECIAL - ATENDIMENTO DOMICILIAR (opção 2 do menu inicial):
    Quando o usuário escolher "Atendimento domiciliar" no menu inicial:
@@ -319,7 +314,15 @@ IMPORTANTE - FLUXO DE CONFirmaÇÃO:
 FERRAMENTAS E QUANDO USAR
 ═══════════════════════════════════════════════════════════
 
-- get_clinic_info: Quando usuário perguntar sobre horários, endereço, telefone, dias fechados, etc. Execute imediatamente.
+- get_clinic_info: Quando usuário perguntar sobre horários, endereço, telefone, dias fechados, etc. Antes de chamar, identifique a intenção e use o 'type' adequado:
+  * "prices": perguntas sobre valores, preços, custos, quanto custa.
+  * "hours": perguntas sobre horários, funcionamento, que horas atende.
+  * "address": pedidos de endereço, localização, onde fica.
+  * "phones": pedidos de telefone, contato, número.
+  * "insurances": perguntas sobre convênios, planos, se aceita IPE/CABERGS etc.
+  * "closed_days": perguntas sobre férias, feriados ou dias específicos sem atendimento.
+  * "overview": use apenas quando o paciente pedir explicitamente uma visão geral completa ou combinar vários itens em uma única pergunta.
+  Se a intenção não estiver clara, faça uma pergunta de esclarecimento antes de chamar a tool.
 
 - extract_patient_data: Use quando o usuário mencionar seu nome mas você não tiver certeza ou precisar validar. Também use quando precisar extrair nome/data do histórico de mensagens, especialmente se houver dúvida sobre se um texto é nome real ou frase de pedido. IMPORTANTE: O sistema já extrai automaticamente nome quando formato é "Nome, DD/MM/YYYY", então use esta tool apenas se houver dúvida ou se precisar validar.
 
@@ -1710,6 +1713,8 @@ Resposta (apenas o nome do convênio, nada mais):"""
                 return None
             if flow.get("alternative_slots") or flow.get("pending_confirmation") or flow.get("awaiting_custom_date"):
                 return None
+            if flow.get("awaiting_consultation_type"):
+                return None
             if flow.get("menu_choice") is not None:
                 return None
 
@@ -1760,6 +1765,7 @@ Resposta (apenas o nome do convênio, nada mais):"""
         flow.pop("awaiting_custom_date", None)
         if menu_choice == "home_visit":
             flow["consultation_type"] = "domiciliar"
+        flow.pop("awaiting_consultation_type", None)
         flow.pop("awaiting_prescription_details", None)
         flow.pop("awaiting_prescription_address", None)
         flow.pop("prescription_details", None)
@@ -1980,6 +1986,16 @@ Resposta (apenas o nome do convênio, nada mais):"""
                 self._record_interaction(context, message, prompt, db, flow_modified=True)
                 return prompt
 
+            if flow_data.get("menu_choice") == "booking" and flow_data.get("awaiting_consultation_type"):
+                normalized = message.strip().lower()
+                if normalized in {"1", "2", "opcao 1", "opção 1", "opcao 2", "opção 2"}:
+                    reminder = (
+                        "Para escolher o tipo de consulta, escreva o nome completo da opção, por exemplo: "
+                        "\"Clínica Geral\" ou \"Geriatria Clínica e Preventiva\"."
+                    )
+                    self._record_interaction(context, message, reminder, db)
+                    return reminder
+
             if flow_data.get("awaiting_patient_name"):
                 name_extraction = self._extrair_nome_e_data_robusto(message)
                 captured_name = name_extraction.get("nome")
@@ -2055,7 +2071,12 @@ Resposta (apenas o nome do convênio, nada mais):"""
                         self._record_interaction(context, message, no_result_prompt, db, flow_modified=True)
                         return no_result_prompt
 
-                    next_prompt = self._build_post_identity_prompt(flow_data.get("menu_choice"))
+                    menu_choice = flow_data.get("menu_choice")
+                    if menu_choice == "booking":
+                        flow_data["awaiting_consultation_type"] = True
+                        flag_modified(context, "flow_data")
+
+                    next_prompt = self._build_post_identity_prompt(menu_choice)
                     self._record_interaction(context, message, next_prompt, db, flow_modified=True)
                     return next_prompt
                 else:
@@ -2831,6 +2852,9 @@ Resposta (apenas o nome do convênio, nada mais):"""
                     logger.info("↩️ Ignorando tipo de consulta extraído porque o fluxo atual é de atendimento domiciliar.")
                 else:
                     context.flow_data["consultation_type"] = extracted["consultation_type"]
+                    if context.flow_data.get("awaiting_consultation_type"):
+                        context.flow_data["awaiting_consultation_type"] = False
+                        flag_modified(context, "flow_data")
                     if tipo_anterior:
                         logger.info(f"💾 Tipo consulta ATUALIZADO no flow_data: {tipo_anterior} → {extracted['consultation_type']}")
                     else:
@@ -3022,7 +3046,7 @@ Resposta (apenas o nome do convênio, nada mais):"""
             logger.info(f"🔧 Executando tool: {tool_name} com input: {tool_input}")
 
             if tool_name == "get_clinic_info":
-                return self._handle_get_clinic_info(tool_input)
+                return self._handle_get_clinic_info(tool_input, db, phone)
             elif tool_name == "validate_date_and_show_slots":
                 return self._handle_validate_date_and_show_slots(tool_input, db, phone)
             elif tool_name == "confirm_time_slot":
@@ -3556,11 +3580,96 @@ Resposta (apenas o nome do convênio, nada mais):"""
                 linhas.append(f"• {nome}")
         return "\n".join(linhas) if linhas else "Convênios não informados."
 
-    def _handle_get_clinic_info(self, tool_input: Dict) -> str:
+    def _infer_clinic_info_intent(self, question: Optional[str]) -> Optional[str]:
+        """Tenta identificar o tipo de informação de clínica solicitado pelo usuário."""
+        if not question:
+            return None
+
+        normalized = unicodedata.normalize("NFD", question)
+        normalized = "".join(ch for ch in normalized if unicodedata.category(ch) != "Mn").lower()
+
+        intent_keywords = {
+            "prices": [
+                "valor", "preco", "preços", "quanto custa", "custa", "custam", "valores",
+                "preço", "cobram", "cobranca"
+            ],
+            "hours": [
+                "horario", "horário", "funciona", "funcionamento", "que horas", "ate que horas",
+                "abre", "fecha", "horas", "qual horario", "quando atende"
+            ],
+            "address": [
+                "endereco", "endereço", "onde fica", "localizacao", "localização", "onde é",
+                "como chegar", "mapa", "local", "ficam situados"
+            ],
+            "phones": [
+                "telefone", "contato", "numero", "número", "whatsapp", "celular", "ligar",
+                "falar com vcs"
+            ],
+            "insurances": [
+                "convenio", "convênio", "planos", "plano", "aceita", "ipe", "cabergs",
+                "particular", "unimed"
+            ],
+            "closed_days": [
+                "feriado", "feriados", "ferias", "férias", "recesso", "dias fechados",
+                "quando nao atende", "quando não atende", "dia fechado"
+            ],
+            "overview": [
+                "tudo", "informacoes gerais", "informações gerais", "informacao completa",
+                "informações completas", "sobre a clinica", "sobre a clínica", "fale da clinica",
+                "detalhes da clinica"
+            ],
+        }
+
+        matched = {intent for intent, keywords in intent_keywords.items() if any(word in normalized for word in keywords)}
+
+        if not matched:
+            return None
+
+        if matched == {"overview"}:
+            return "overview"
+
+        matched.discard("overview")
+
+        if len(matched) == 1:
+            return matched.pop()
+
+        return None
+
+    def _handle_get_clinic_info(self, tool_input: Dict, db: Session, phone: Optional[str]) -> str:
         """Tool: get_clinic_info - Retorna informações da clínica conforme a intenção solicitada."""
         try:
             intent = (tool_input or {}).get("type") if isinstance(tool_input, dict) else None
-            intent = (intent or "overview").lower()
+            intent = (intent or "").lower()
+            user_question = ""
+
+            if isinstance(tool_input, dict):
+                for key in ("question", "query", "prompt", "user_input", "original_text"):
+                    if tool_input.get(key):
+                        user_question = str(tool_input[key]).strip()
+                        break
+
+            if not user_question and db and phone:
+                context = db.query(ConversationContext).filter_by(phone=phone).first()
+                if context:
+                    for message in reversed(context.messages or []):
+                        if message.get("role") == "user":
+                            user_question = (message.get("content") or "").strip()
+                            if user_question:
+                                break
+
+            if intent not in {"prices", "hours", "address", "phones", "insurances", "closed_days", "overview"}:
+                intent = ""
+
+            if not intent or intent == "overview":
+                inferred_intent = self._infer_clinic_info_intent(user_question)
+                if inferred_intent and inferred_intent != "overview":
+                    logger.info(
+                        f"🎯 Ajustando chamada get_clinic_info para '{inferred_intent}' "
+                        f"(pergunta: {user_question!r})"
+                    )
+                    intent = inferred_intent
+                elif not intent:
+                    intent = "overview"
 
             nome_clinica = self.clinic_info.get('nome_clinica', 'Clínica')
             endereco = self.clinic_info.get('endereco', 'Não informado')
@@ -3577,6 +3686,18 @@ Resposta (apenas o nome do convênio, nada mais):"""
                 return (
                     f"🕒 Horários de funcionamento:\n{self._format_clinic_hours()}"
                 )
+
+            if intent == "phones":
+                telefone_principal = telefone
+                telefones_extra = self.clinic_info.get("informacoes_adicionais", {}).get("telefones_secundarios", [])
+                linhas = []
+                if telefone_principal and telefone_principal.lower() != "não informado":
+                    linhas.append(f"• Principal: {telefone_principal}")
+                for idx, tel in enumerate(telefones_extra, start=1):
+                    linhas.append(f"• Secundário {idx}: {tel}")
+                if not linhas:
+                    linhas.append("• Não temos telefone disponível no momento.")
+                return "📞 Telefones para contato:\n" + "\n".join(linhas)
 
             if intent == "closed_days":
                 return (
