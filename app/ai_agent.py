@@ -2081,6 +2081,97 @@ Resposta (apenas o nome do convênio, nada mais):"""
 
                 return instructions
 
+            if flow_data.get("awaiting_cancel_choice"):
+                selection = message.strip()
+                mapping = flow_data.get("pending_appointments_map", {})
+                if selection in mapping:
+                    appointment_data = mapping[selection]
+                    logger.info(f"🗑️ Usuário {phone} selecionou agendamento {selection}: {appointment_data}")
+
+                    flow_data["selected_appointment"] = appointment_data
+                    flow_data.pop("awaiting_cancel_choice", None)
+                    flow_data.pop("pending_appointments_map", None)
+                    db.commit()
+
+                    if flow_data.get("cancel_intent") == "cancel":
+                        flow_data["awaiting_cancel_reason"] = True
+                        db.commit()
+                        prompt = (
+                            "Entendido. Pode me informar o motivo do cancelamento? "
+                            "Assim consigo registrar tudo direitinho."
+                        )
+                        self._record_interaction(context, message, prompt, db, flow_modified=True)
+                        return prompt
+                    else:
+                        flow_data["awaiting_reschedule_start"] = True
+                        appointment_date = appointment_data.get("date")
+                        appointment_time = appointment_data.get("time")
+                        tipo = appointment_data.get("consultation_type")
+                        conv = appointment_data.get("insurance_plan")
+
+                        prompt = (
+                            "Perfeito, vamos remarcar sua consulta. "
+                            "Você prefere manter o mesmo tipo de consulta e convênio? "
+                            "Se quiser alterar, me avise. Caso contrário, posso buscar novos horários."
+                        )
+
+                        if tipo:
+                            context.flow_data["consultation_type"] = tipo
+                        if conv:
+                            context.flow_data["insurance_plan"] = conv.strip().lower()
+
+                        context.flow_data["awaiting_custom_date"] = True
+                        db.commit()
+                        self._record_interaction(context, message, prompt, db, flow_modified=True)
+                        return prompt
+                else:
+                    reminder = (
+                        "Não reconheci essa opção. Por favor, escolha o número da consulta que deseja "
+                        "cancelar ou remarcar, conforme a lista anterior."
+                    )
+                    self._record_interaction(context, message, reminder, db)
+                    return reminder
+
+            if flow_data.get("awaiting_cancel_reason"):
+                reason = message.strip()
+                appointment_data = flow_data.get("selected_appointment")
+
+                if not appointment_data:
+                    flow_data.pop("awaiting_cancel_reason", None)
+                    db.commit()
+                    return "Não consegui localizar o agendamento selecionado. Pode tentar novamente?"
+
+                result_message = self._handle_cancel_appointment(
+                    {
+                        "appointment_id": appointment_data.get("id"),
+                        "reason": reason or "Cancelado pelo paciente via WhatsApp"
+                    },
+                    db
+                )
+
+                flow_data.pop("awaiting_cancel_reason", None)
+                flow_data.pop("selected_appointment", None)
+                flow_data["pending_confirmation"] = False
+                flow_data["alternatives_offered"] = False
+                flow_data.pop("awaiting_custom_date", None)
+                db.commit()
+
+                follow_up = result_message + "\n\nPosso ajudar com mais alguma coisa?"
+                self._record_interaction(context, message, follow_up, db, flow_modified=True)
+                return follow_up
+
+            if flow_data.get("awaiting_reschedule_start"):
+                flow_data.pop("awaiting_reschedule_start", None)
+                flow_data["awaiting_custom_date"] = True
+                db.commit()
+                prompt = (
+                    "Sem problemas! Qual dia funciona melhor para você? "
+                    "Pode informar a data no formato DD/MM/AAAA ou dizer, por exemplo, "
+                    "\"quinta-feira à tarde\"."
+                )
+                self._record_interaction(context, message, prompt, db, flow_modified=True)
+                return prompt
+
             # 4. Verificar se há alternativas salvas e usuário escolheu uma (1, 2 ou 3)
             if context.flow_data and context.flow_data.get("alternative_slots"):
                 message_stripped = message.strip()
@@ -4585,25 +4676,92 @@ Resposta (apenas o nome do convênio, nada mais):"""
         try:
             phone = tool_input.get("phone")
             name = tool_input.get("name")
+            birth_date = tool_input.get("birth_date")
+            consultation_type = tool_input.get("consultation_type")
+            insurance_plan = tool_input.get("insurance_plan")
+            only_future = tool_input.get("only_future", True)
             
-            if not phone and not name:
-                return "Informe o telefone ou nome do paciente para buscar."
+            if not phone and not name and not birth_date:
+                return "Preciso de pelo menos telefone, nome ou data de nascimento para localizar o agendamento."
             
-            query = db.query(Appointment)
+            def _normalize(text: str) -> str:
+                import unicodedata
+                return ''.join(
+                    ch for ch in unicodedata.normalize('NFD', text.lower())
+                    if unicodedata.category(ch) != 'Mn'
+                )
             
-            if phone:
-                normalized_phone = normalize_phone(phone)
-                query = query.filter(Appointment.patient_phone == normalized_phone)
+            filters_applied = []
+            normalized_phone = normalize_phone(phone) if phone else None
+            normalized_name = _normalize(name) if name else None
+            normalized_birth = birth_date.strip() if isinstance(birth_date, str) and birth_date.strip() else None
             
-            if name:
-                query = query.filter(Appointment.patient_name.ilike(f"%{name}%"))
+            base_query = db.query(Appointment)
+            if only_future:
+                today_str = now_brazil().strftime('%Y%m%d')
+                base_query = base_query.filter(Appointment.appointment_date >= today_str)
             
-            appointments = query.order_by(Appointment.appointment_date.desc(), Appointment.appointment_time.desc()).all()
+            if normalized_phone:
+                filters_applied.append("telefone")
+                appointments = base_query.filter(Appointment.patient_phone == normalized_phone).all()
+            else:
+                appointments = []
+            
+            if not appointments and normalized_name and normalized_birth:
+                filters_applied.append("nome + nascimento")
+                
+                candidates = base_query.filter(
+                    Appointment.patient_birth_date == normalized_birth
+                ).all()
+                
+                appointments = []
+                for apt in candidates:
+                    stored_name = apt.patient_name or ""
+                    if _normalize(stored_name).startswith(normalized_name.split()[0]):
+                        from difflib import SequenceMatcher
+                        score = SequenceMatcher(None, _normalize(stored_name), normalized_name).ratio()
+                        if score >= 0.65:
+                            appointments.append(apt)
+                
+                if not appointments:
+                    for apt in candidates:
+                        stored_name = apt.patient_name or ""
+                        if _normalize(stored_name).startswith(normalized_name.split()[0]):
+                            appointments.append(apt)
+                            break
+            
+            if not appointments and normalized_name:
+                filters_applied.append("nome aproximado")
+                candidates = base_query.filter(
+                    Appointment.patient_name.ilike(f"%{name}%")
+                ).all()
+                appointments = candidates
+            
+            if consultation_type:
+                appointments = [
+                    apt for apt in appointments
+                    if (apt.consultation_type or "").strip().lower() == consultation_type.strip().lower()
+                ]
+            if insurance_plan:
+                appointments = [
+                    apt for apt in appointments
+                    if (apt.insurance_plan or "").strip().lower() == insurance_plan.strip().lower()
+                ]
+            
+            if not appointments:
+                filtros = ", ".join(filters_applied) if filters_applied else "nenhum filtro aplicável"
+                return f"Não encontrei agendamentos usando {filtros}. Pode confirmar os dados ou falar com nossa secretária?"
+            
+            appointments = sorted(
+                appointments,
+                key=lambda apt: (apt.appointment_date, apt.appointment_time)
+            )
             
             if not appointments:
                 return "Nenhum agendamento encontrado."
             
             response = f"📅 **Agendamentos encontrados:**\n\n"
+            mapping = {}
             
             for i, apt in enumerate(appointments, 1):
                 status_emoji = {
@@ -4624,6 +4782,18 @@ Resposta (apenas o nome do convênio, nada mais):"""
                 if apt.notes:
                     response += f"   💬 {apt.notes}\n"
                 response += "\n"
+                mapping[str(i)] = {
+                    "id": apt.id,
+                    "status": apt.status.value,
+                    "date": app_date_formatted,
+                    "time": app_time_str,
+                    "consultation_type": apt.consultation_type,
+                    "insurance_plan": apt.insurance_plan
+                }
+            
+            flow_map = tool_input.get("flow_map")
+            if isinstance(flow_map, dict):
+                flow_map.update(mapping)
             
             return response
         
