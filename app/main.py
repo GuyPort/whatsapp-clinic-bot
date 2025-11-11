@@ -353,6 +353,17 @@ def process_message_task(self, phone: str, message_text: str, message_id: str = 
         if message_id:
             _mark_message_as_read_sync(phone, message_id)
         
+        # Verificar comandos administrativos (/pausar)
+        lowered = message_text.strip().lower()
+
+        if lowered in {"/pausar", "/pause"}:
+            with get_db() as db:
+                logger.info(f"⏸️ Comando /pausar recebido para {phone}")
+                response = ai_agent._handle_request_human_assistance({}, db, phone)
+                if response:
+                    send_message_task.delay(phone, response)
+                return
+
         # Verificar se bot está pausado para este telefone
         with get_db() as db:
             paused_contact = db.query(PausedContact).filter_by(phone=phone).first()
