@@ -137,11 +137,12 @@ PRINCÍPIOS DE COMUNICAÇÃO:
 - Se o usuário corrigir algo, agradeça e atualize os dados
 - Se informação estiver incompleta ou ambígua, pergunte de forma clara e educada
 - Se não entender algo, peça esclarecimento de forma amigável
-- Quando o usuário pedir informações sobre a clínica, primeiro identifique a intenção real:
-  • Se a pergunta for genérica (ex.: "me fala da clínica", "quais informações vocês têm?"), peça educadamente para ele especificar o que precisa (ex.: horários, valores, endereço, convênios).
-  • Se ficar claro o que o paciente quer (ex.: horários, valores, endereço, convênios, dias fechados), responda apenas com o bloco relevante, sem repetir informações desnecessárias.
-  • Combine blocos quando a pergunta mencionar mais de um item (ex.: endereço + horários).
-  • Mantenha o tom acolhedor de secretária e ofereça ajuda para mais detalhes quando fizer sentido.
+- Quando o usuário pedir informações sobre a clínica:
+  • Responda você mesma usando o que já sabe do clinic_info sempre que a resposta for curta (ex.: “Atendemos apenas no consultório”, “Sim, fazemos atendimento domiciliar”).  
+  • Só chame a tool `get_clinic_info` quando precisar montar blocos completos (horários, listas grandes) ou quando estiver em dúvida sobre a informação.
+  • Se a pergunta for genérica (ex.: “me fala da clínica”), peça para especificar ou responda de forma resumida; evite mandar o bloco completo sem necessidade.
+  • Combine blocos apenas quando a pergunta mencionar explicitamente mais de um item.
+  • Mantenha o tom acolhedor e ofereça ajuda adicional quando fizer sentido.
 
 ═══════════════════════════════════════════════════════════
 FLUXO DE AGENDAMENTO
@@ -3726,6 +3727,12 @@ Responda EXCLUSIVAMENTE com um JSON válido no formato:
                 "feriado", "feriados", "ferias", "férias", "recesso", "dias fechados",
                 "quando nao atende", "quando não atende", "dia fechado"
             ],
+            "practice_locations": [
+                "só no consultorio", "so no consultorio", "apenas no consultorio",
+                "consultório apenas", "consulta presencial", "atende em casa",
+                "domicilio", "domicílio", "visita domiciliar", "home care",
+                "vai até", "vem até", "atende fora", "vai em casa", "vem em casa"
+            ],
             "overview": [
                 "tudo", "informacoes gerais", "informações gerais", "informacao completa",
                 "informações completas", "sobre a clinica", "sobre a clínica", "fale da clinica",
@@ -3773,6 +3780,7 @@ Responda EXCLUSIVAMENTE com um JSON válido no formato:
             if intent not in {"prices", "hours", "address", "phones", "insurances", "closed_days", "overview"}:
                 intent = ""
 
+            inferred_intent = None
             if not intent or intent == "overview":
                 inferred_intent = self._infer_clinic_info_intent(user_question)
                 if inferred_intent and inferred_intent != "overview":
@@ -3830,7 +3838,22 @@ Responda EXCLUSIVAMENTE com um JSON válido no formato:
                     f"{self._format_insurance_list()}"
                 )
 
+            if intent == "practice_locations":
+                atendimento_domiciliar = self.clinic_info.get("informacoes_adicionais", {}).get("atendimento_domiciliar", False)
+                if atendimento_domiciliar:
+                    return (
+                        "👩‍⚕️ Atendemos no consultório e também oferecemos atendimento domiciliar para casos específicos. "
+                        "Podemos conversar sobre a disponibilidade caso você precise."
+                    )
+                return "👩‍⚕️ Atendemos apenas no consultório da doutora no momento."
+
             # Overview (ou fallback genérico)
+            if intent == "overview" and user_question and not inferred_intent:
+                return (
+                    "Posso te ajudar com informações como horários, valores, endereço, convênios ou atendimento domiciliar. "
+                    "Sobre o que exatamente você gostaria de saber?"
+                )
+
             resposta = [
                 f"🏥 {nome_clinica}",
                 "",
