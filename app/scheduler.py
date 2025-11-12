@@ -7,6 +7,9 @@ from datetime import datetime, timedelta
 from app.database import get_db
 from app.models import ConversationContext, Appointment, AppointmentStatus
 from app.whatsapp_service import whatsapp_service
+# ... existing code ...
+from datetime import datetime, time
+
 from app.utils import (
     now_brazil,
     parse_appointment_datetime,
@@ -107,6 +110,8 @@ async def send_appointment_reminders():
                 )
                 
                 if success:
+                    if isinstance(appointment.appointment_time, time):
+                        appointment.appointment_time = appointment.appointment_time.strftime("%H:%M")
                     appointment.reminder_sent_at = datetime.utcnow()
                     db.add(appointment)
                     db.commit()
