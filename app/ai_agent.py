@@ -1788,6 +1788,56 @@ Responda EXCLUSIVAMENTE com um JSON válido no formato:
         
         return mapping.get(normalized_text)
 
+    def _should_auto_trigger_slot_search(self, context: ConversationContext) -> bool:
+        if not context or not context.flow_data:
+            return False
+        
+        flow = context.flow_data
+        if flow.get("menu_choice") != "booking":
+            return False
+        
+        plan = flow.get("insurance_plan")
+        if not plan:
+            return False
+        
+        if flow.get("auto_slot_last_plan") == plan:
+            return False
+        
+        required_keys = ["patient_name", "patient_birth_date", "consultation_type"]
+        if not all(flow.get(key) for key in required_keys):
+            return False
+        
+        blocking_flags = [
+            "awaiting_patient_name",
+            "awaiting_patient_birth_date",
+            "awaiting_consultation_type",
+            "awaiting_custom_date",
+            "awaiting_home_address",
+        ]
+        if any(flow.get(flag) for flag in blocking_flags):
+            return False
+        
+        return True
+
+    def _trigger_auto_slot_search(self, context: ConversationContext, db: Session, phone: str) -> Optional[str]:
+        if not self._should_auto_trigger_slot_search(context):
+            return None
+        
+        flow = context.flow_data
+        plan = flow.get("insurance_plan")
+        
+        logger.info(f"🚀 Disparando busca automática de horários após captura do convênio: {plan}")
+        
+        flow["auto_slot_last_plan"] = plan
+        flow.pop("appointment_date", None)
+        flow.pop("appointment_time", None)
+        flow.pop("alternative_slots", None)
+        flow["alternatives_offered"] = False
+        flow["pending_confirmation"] = False
+        flag_modified(context, "flow_data")
+        
+        return self._handle_find_next_available_slot({}, db, phone)
+
     def _extract_insurance_from_message(self, message: str, context: ConversationContext) -> Optional[str]:
         """
         Extrai o novo convênio mencionado na mensagem usando o mini prompt centralizado.
@@ -2981,6 +3031,11 @@ Responda EXCLUSIVAMENTE com um JSON válido no formato:
                     logger.info(f"💾 Convênio ATUALIZADO no flow_data: {convenio_anterior} → {extracted['insurance_plan']}")
                 else:
                     logger.info(f"💾 Convênio salvo no flow_data: {extracted['insurance_plan']}")
+
+                auto_response = self._trigger_auto_slot_search(context, db, phone)
+                if auto_response:
+                    self._record_interaction(context, message, auto_response, db, flow_modified=True)
+                    return auto_response
             else:
                 # NOVO: Se não encontrou via extração normal, verificar última mensagem do usuário
                 # para detectar menções diretas de convênio (ex: "IPE", "CABERGS")
@@ -3006,6 +3061,11 @@ Responda EXCLUSIVAMENTE com um JSON válido no formato:
                                 logger.info(f"💾 Convênio detectado na última mensagem e ATUALIZADO no flow_data: {convenio_anterior} → {detected_insurance}")
                             else:
                                 logger.info(f"💾 Convênio detectado na última mensagem e salvo no flow_data: {detected_insurance}")
+
+                            auto_response = self._trigger_auto_slot_search(context, db, phone)
+                            if auto_response:
+                                self._record_interaction(context, message, auto_response, db, flow_modified=True)
+                                return auto_response
             
             # 8. FALLBACK: Verificar se Claude deveria ter chamado confirm_time_slot mas não chamou
             # Isso acontece quando: temos data + horário, mas não tem pending_confirmation
