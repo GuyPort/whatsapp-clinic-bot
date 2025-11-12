@@ -3702,6 +3702,7 @@ Responda EXCLUSIVAMENTE com um JSON válido no formato:
             response += f"👤 Nome: {patient_name}\n"
             response += f"🏥 Tipo: {tipo_nome} - R$ {tipo_valor}\n"
             response += f"💳 Convênio: {convenio_nome}\n\n"
+            response += "Se nenhum desses horários funcionar, me indique uma data no formato DD/MM/AAAA ou descreva o período que prefere 😉\n\n"
             response += f"Qual opção você prefere? Digite o número (1, 2 ou 3) ou me diga se prefere outra data/horário."
             
             return response
