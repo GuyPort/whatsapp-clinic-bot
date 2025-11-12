@@ -217,16 +217,23 @@ def parse_appointment_datetime(
     if "-" in appointment_date:
         date_candidates.append(appointment_date.replace("-", ""))
     
+    time_candidates = [appointment_time]
+    if len(appointment_time) == 8 and appointment_time.endswith(":00"):
+        time_candidates.append(appointment_time[:5])
+    
     naive_dt = None
     for date_value in date_candidates:
-        try:
-            naive_dt = datetime.strptime(
-                f"{date_value}{appointment_time}",
-                "%Y%m%d%H:%M"
-            )
+        for time_value in time_candidates:
+            try:
+                naive_dt = datetime.strptime(
+                    f"{date_value}{time_value}",
+                    "%Y%m%d%H:%M"
+                )
+                break
+            except (ValueError, TypeError):
+                continue
+        if naive_dt:
             break
-        except (ValueError, TypeError):
-            continue
     if not naive_dt:
         return None
     
