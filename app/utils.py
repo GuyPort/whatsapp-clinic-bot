@@ -213,12 +213,21 @@ def parse_appointment_datetime(
     
     timezone = timezone or get_brazil_timezone()
     
-    try:
-        naive_dt = datetime.strptime(
-            f"{appointment_date}{appointment_time}",
-            "%Y%m%d%H:%M"
-        )
-    except (ValueError, TypeError):
+    date_candidates = [appointment_date]
+    if "-" in appointment_date:
+        date_candidates.append(appointment_date.replace("-", ""))
+    
+    naive_dt = None
+    for date_value in date_candidates:
+        try:
+            naive_dt = datetime.strptime(
+                f"{date_value}{appointment_time}",
+                "%Y%m%d%H:%M"
+            )
+            break
+        except (ValueError, TypeError):
+            continue
+    if not naive_dt:
         return None
     
     if naive_dt.tzinfo:
