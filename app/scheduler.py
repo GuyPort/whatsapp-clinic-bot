@@ -156,11 +156,11 @@ def start_scheduler():
     scheduler.add_job(
         run_send_reminders,
         'interval',
-        minutes=1,
+        hours=2,
         id='send_appointment_reminders'
     )
     scheduler.start()
-    logger.info("✅ Scheduler iniciado: timeout (20 min) e lembretes (1 min)")
+    logger.info("✅ Scheduler iniciado: timeout (20 min) e lembretes (2 h)")
 
 def stop_scheduler():
     """Para o scheduler"""
