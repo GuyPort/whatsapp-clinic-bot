@@ -198,6 +198,70 @@ def get_minimum_appointment_datetime() -> datetime:
     return minimum_datetime
 
 
+def parse_appointment_datetime(
+    appointment_date: Optional[str],
+    appointment_time: Optional[str],
+    *,
+    timezone: Optional[pytz.BaseTzInfo] = None
+) -> Optional[datetime]:
+    """
+    Converte os campos `appointment_date` (YYYYMMDD) e `appointment_time` (HH:MM)
+    em um datetime timezone-aware.
+    """
+    if not appointment_date or not appointment_time:
+        return None
+    
+    timezone = timezone or get_brazil_timezone()
+    
+    try:
+        naive_dt = datetime.strptime(
+            f"{appointment_date}{appointment_time}",
+            "%Y%m%d%H:%M"
+        )
+    except (ValueError, TypeError):
+        return None
+    
+    if naive_dt.tzinfo:
+        return naive_dt.astimezone(timezone)
+    
+    return timezone.localize(naive_dt)
+
+
+def format_pre_appointment_reminder(
+    patient_name: str,
+    appointment_dt: datetime,
+    *,
+    clinic_info: Optional[Mapping[str, Any]] = None
+) -> str:
+    """
+    Monta o texto padrão de lembrete pré-consulta 24 horas antes.
+    """
+    if appointment_dt.tzinfo is None:
+        appointment_dt = get_brazil_timezone().localize(appointment_dt)
+    else:
+        appointment_dt = appointment_dt.astimezone(get_brazil_timezone())
+    
+    clinic_info = clinic_info or load_clinic_info()
+    address = clinic_info.get(
+        "endereco",
+        "Rua Dr. Edmundo Lauffer, 299 - Bom Pastor - Igrejinha/RS - CEP 95650-000"
+    )
+    
+    date_str = appointment_dt.strftime("%d/%m/%Y")
+    time_str = appointment_dt.strftime("%H:%M")
+    
+    message_lines = [
+        f"Olá, {patient_name}! Passando para confirmar sua consulta referente ao dia {date_str} às {time_str}.",
+        "Compareça 15 minutos antes, traga seus últimos exames e, se possível, uma lista com as medicações que você usa.",
+        f"Endereço: {address}",
+        "Caso precise de cadeira de rodas na chegada, é só nos avisar!",
+        "",
+        "Esta é uma mensagem automática de confirmação — por favor, não responda."
+    ]
+    
+    return "\n".join(message_lines)
+
+
 def log_event(
     event_name: str,
     details: Optional[Mapping[str, Any]] = None,

@@ -173,6 +173,20 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 
 Acesse: `http://localhost:8000`
 
+### 5. Atualização de banco – lembretes 24h
+
+Ao atualizar para a versão que envia lembretes automáticos, adicione a coluna `reminder_sent_at` na tabela `appointments`:
+
+```sql
+ALTER TABLE appointments ADD COLUMN reminder_sent_at TIMESTAMP NULL;
+CREATE INDEX ix_appointments_reminder_sent_at ON appointments(reminder_sent_at);
+```
+
+- **PostgreSQL**: execute os comandos acima antes de reiniciar o serviço.
+- **SQLite (ambiental local)**: abra `sqlite3 data/appointments.db` e rode as mesmas instruções.
+
+Somente após aplicar a migração reinicie o bot para evitar falhas ao persistir novos agendamentos.
+
 ## 🌐 Deploy (Railway)
 
 ### 1. Preparação

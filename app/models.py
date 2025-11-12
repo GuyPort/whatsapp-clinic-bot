@@ -48,6 +48,9 @@ class Appointment(Base):
     cancelled_at = Column(DateTime, nullable=True)  # Quando foi cancelada
     cancelled_reason = Column(String(500), nullable=True)  # Motivo do cancelamento
     
+    # Lembrete pré-consulta
+    reminder_sent_at = Column(DateTime, nullable=True, index=True)  # Quando o lembrete 24h foi enviado
+    
     # Timestamps
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
