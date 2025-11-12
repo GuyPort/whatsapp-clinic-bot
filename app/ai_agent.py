@@ -1540,7 +1540,7 @@ Return ONLY a JSON object with this structure:
         weekday_index = request.get("weekday")
         
         inferred_from_weekday = False
-
+        
         if not date_str and weekday_index is not None:
             next_date = self._get_next_available_date_for_weekday(weekday_index)
             if not next_date:
@@ -2962,6 +2962,9 @@ Resposta (apenas o nome do convênio, nada mais):"""
             if appointment_completed_flag:
                 should_skip_fallback = True
                 logger.info("⏭️ Pulando fallback - flag appointment_completed existe no flow_data")
+            elif context.flow_data.get("pending_confirmation") is False:
+                should_skip_fallback = True
+                logger.info("⏭️ Pulando fallback - confirmação já resolvida (pending_confirmation=False)")
             
             # Verificar se última resposta foi erro de create_appointment
             last_assistant_msg = ""
@@ -3756,7 +3759,7 @@ Resposta (apenas o nome do convênio, nada mais):"""
                 ])
 
             return "\n".join(resposta)
-
+            
         except Exception as e:
             logger.error(f"Erro ao obter info da clínica: {str(e)}")
             return f"Erro ao buscar informações: {str(e)}"
@@ -4111,7 +4114,7 @@ Resposta (apenas o nome do convênio, nada mais):"""
             # Obter horários disponíveis
             duracao = self.clinic_info.get('regras_agendamento', {}).get('duracao_consulta_minutos', 45)
             logger.info(f"⏱️ Duração da consulta: {duracao} minutos")
-
+            
             insurance_plan = tool_input.get("insurance_plan", "Particular") if isinstance(tool_input, dict) else "Particular"
             
             available_slots = appointment_rules.get_available_slots(
@@ -4155,6 +4158,7 @@ Resposta (apenas o nome do convênio, nada mais):"""
                 if context and context.flow_data:
                     if context.flow_data.get("appointment_completed"):
                         context.flow_data.pop("appointment_completed", None)
+                        flag_modified(context, "flow_data")
                         db.commit()
                         logger.info("🧹 Flag appointment_completed removida - novo agendamento iniciado")
                     insurance_plan = context.flow_data.get("insurance_plan", insurance_plan)
@@ -4174,7 +4178,7 @@ Resposta (apenas o nome do convênio, nada mais):"""
                 return f"O formato da data '{date_str}' não está correto. Por favor, use o formato DD/MM/AAAA (exemplo: 15/01/2024)."
             
             logger.info(f"📅 Validando data e buscando slots: {date_str}")
-
+            
             if self._is_special_holiday_date(appointment_date):
                 logger.info(f"⛱️ Data solicitada {date_str} está em período de férias - encaminhando secretaria.")
                 return self._handoff_due_to_holiday(db, phone)
@@ -4790,6 +4794,7 @@ Resposta (apenas o nome do convênio, nada mais):"""
                     context.flow_data.pop("pending_confirmation", None)
                     # Adicionar flag para indicar que agendamento foi completado
                     context.flow_data["appointment_completed"] = True
+                    flag_modified(context, "flow_data")
                     db.commit()
                     logger.info("🧹 Limpeza do flow_data: appointment_date, appointment_time e pending_confirmation removidos")
                     logger.info("✅ Flag appointment_completed adicionada ao flow_data")
