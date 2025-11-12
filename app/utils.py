@@ -1,7 +1,7 @@
 """
 Funções utilitárias e helpers.
 """
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time
 import logging
 import re
 import json
@@ -212,6 +212,9 @@ def parse_appointment_datetime(
         return None
     
     timezone = timezone or get_brazil_timezone()
+    
+    if isinstance(appointment_time, time):
+        appointment_time = appointment_time.strftime("%H:%M:%S")
     
     date_candidates = [appointment_date]
     if "-" in appointment_date:
