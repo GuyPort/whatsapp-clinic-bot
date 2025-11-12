@@ -1602,33 +1602,36 @@ Return ONLY a JSON object with this structure:
         
         return False
 
-    def _detect_insurance_in_message(self, message: str) -> Optional[str]:
+    def _detect_insurance_in_message(self, message: str, context: Optional[ConversationContext] = None) -> Optional[str]:
         """
-        Detecta convênio mencionado diretamente em uma mensagem específica.
-        Usa detecção simples para casos óbvios (IPE, CABERGS, particular).
-        
-        Args:
-            message: Mensagem do usuário para analisar
-            
-        Returns:
-            Convênio normalizado (IPE, CABERGS, Particular) ou None se não encontrar
+        Resolve o convênio mencionado em uma mensagem utilizando o mini prompt do Claude.
+        Mantém uma detecção regex simples apenas como fallback emergencial.
         """
         if not message:
             return None
         
-        message_lower = message.lower().strip()
+        resolved = self._resolve_insurance_with_claude(message, context=context)
+        if resolved:
+            return resolved
         
-        # Detectar IPE (garantir que não é parte de outra palavra)
-        # Verificar se "ipe" está sozinho ou como palavra completa
-        import re
-        if re.search(r'\bipe\b', message_lower) and "cabergs" not in message_lower:
-            return "IPE"
+        return self._detect_insurance_with_regex(message)
+
+    def _detect_insurance_with_regex(self, message: str) -> Optional[str]:
+        """
+        Fallback mínimo baseado em regex para identificar convênio em casos óbvios.
+        Deve ser usado apenas quando o Claude não conseguir interpretar a mensagem.
+        """
+        if not message:
+            return None
         
-        # Detectar CABERGS
+        message_lower = message.lower()
+        
         if "cabergs" in message_lower:
             return "CABERGS"
         
-        # Detectar particular/frases negativas
+        if re.search(r'\bipe\b', message_lower):
+            return "IPE"
+        
         negative_phrases = [
             "não tenho", "nao tenho", "não possuo", "nao possuo",
             "sem convênio", "sem convenio", "não tenho convênio", "nao tenho convenio",
@@ -1636,71 +1639,159 @@ Return ONLY a JSON object with this structure:
             "sem plano", "não uso", "nao uso", "particular"
         ]
         
-        for phrase in negative_phrases:
-            if phrase in message_lower:
-                return "Particular"
+        if any(phrase in message_lower for phrase in negative_phrases):
+            return "Particular"
         
         return None
 
-    def _extract_insurance_from_message(self, message: str, context: ConversationContext) -> Optional[str]:
+    def _resolve_insurance_with_claude(
+        self,
+        message: str,
+        context: Optional[ConversationContext] = None,
+        *,
+        extra_metadata: Optional[Dict[str, Any]] = None
+    ) -> Optional[str]:
         """
-        Extrai o novo convênio mencionado na mensagem usando Claude.
+        Resolve o convênio usando um mini prompt dedicado no Claude e retorna o valor normalizado.
+        """
+        if not message:
+            return None
         
-        Args:
-            message: Mensagem do usuário
-            context: Contexto da conversa
-            
-        Returns:
-            Convênio normalizado (IPE, CABERGS, Particular) ou None se não encontrar
-        """
         try:
-            # Criar prompt para Claude extrair apenas o convênio
-            extraction_prompt = f"""Analise a seguinte mensagem do usuário e identifique qual convênio ele mencionou:
+            recent_context = ""
+            if context and context.messages:
+                # Considerar apenas últimas 2 interações (assistant + user) para dar mínimo contexto
+                last_turns = []
+                for msg in reversed(context.messages):
+                    if msg.get("role") == "assistant":
+                        last_turns.append(f"Secretária: {msg.get('content', '').strip()}")
+                    elif msg.get("role") == "user":
+                        last_turns.append(f"Paciente: {msg.get('content', '').strip()}")
+                    if len(last_turns) >= 4:
+                        break
+                last_turns.reverse()
+                recent_context = "\n".join(last_turns)
+            
+            metadata_hint = ""
+            if extra_metadata:
+                try:
+                    metadata_hint = json.dumps(extra_metadata, ensure_ascii=False)
+                except Exception:
+                    metadata_hint = ""
+            
+            instructions = f"""Você é responsável por identificar o convênio médico mencionado pelo paciente.
+Analise a mensagem mais recente considerando estas regras:
+- Dê prioridade para afirmações positivas como "só CABERGS", "apenas CABERGS", "mas tenho CABERGS".
+- Se o paciente negar um convênio, mas afirmar outro, retorne o afirmado.
+- Se o paciente reforçar que não possui convênio ou quer pagar por conta, retorne "Particular".
+- Caso não haja informação suficiente ou a mensagem seja ambígua, retorne null.
+- Não invente nomes de convênios fora da lista.
 
-Mensagem: "{message}"
+Convênios aceitos: CABERGS, IPE, Particular (sem convênio).
 
-Convênios aceitos:
-- CABERGS
-- IPE
-- Particular (sem convênio)
+Histórico recente (caso exista):
+{recent_context or '[sem histórico adicional]'}
 
-Retorne APENAS o nome do convênio em formato normalizado: CABERGS, IPE ou Particular.
-Se não mencionar nenhum convênio ou for ambíguo, retorne "None".
+Mensagem atual do paciente:
+\"\"\"{message}\"\"\"
 
-Resposta (apenas o nome do convênio, nada mais):"""
+Metadados opcionais:
+{metadata_hint or '[sem metadados]'}
 
-            # Chamar Claude para extrair
+Responda EXCLUSIVAMENTE com um JSON válido no formato:
+{{
+  "insurance_plan": "CABERGS|IPE|Particular|null",
+  "confidence": "low|medium|high",
+  "justification": "explicação curta em português"
+}}
+"""
             response = self.client.messages.create(
                 model="claude-sonnet-4-20250514",
-                max_tokens=50,
+                max_tokens=200,
                 temperature=0.1,
-                messages=[
-                    {"role": "user", "content": extraction_prompt}
-                ]
+                messages=[{"role": "user", "content": instructions}]
             )
             
-            # Extrair resposta do Claude
-            claude_response = ""
-            if response.content:
+            raw_output = ""
+            if response and response.content:
                 for content_block in response.content:
-                    if hasattr(content_block, 'text'):
-                        claude_response += content_block.text.strip()
+                    text_block = getattr(content_block, "text", None)
+                    if text_block:
+                        raw_output += text_block.strip() + "\n"
+            raw_output = raw_output.strip()
             
-            # Normalizar resposta
-            claude_response_lower = claude_response.lower().strip()
+            if not raw_output:
+                logger.warning("⚠️ Claude não retornou conteúdo ao resolver convênio.")
+                return None
             
-            if "ipe" in claude_response_lower and "cabergs" not in claude_response_lower:
-                return "IPE"
-            elif "cabergs" in claude_response_lower:
-                return "CABERGS"
-            elif "particular" in claude_response_lower or "none" in claude_response_lower:
-                return "Particular"
+            payload_str = raw_output
+            code_block_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", raw_output, flags=re.DOTALL | re.IGNORECASE)
+            if code_block_match:
+                payload_str = code_block_match.group(1)
+            else:
+                # Tentar isolar JSON caso haja texto extra fora do bloco
+                first_brace = raw_output.find("{")
+                last_brace = raw_output.rfind("}")
+                if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
+                    payload_str = raw_output[first_brace:last_brace + 1]
             
+            try:
+                payload = json.loads(payload_str)
+            except json.JSONDecodeError:
+                logger.warning(f"⚠️ Falha ao converter resposta do Claude em JSON: {raw_output}")
+                return None
+            
+            plan_value = payload.get("insurance_plan")
+            normalized_plan = self._normalize_insurance_candidate(plan_value)
+            
+            confidence = payload.get("confidence")
+            justification = payload.get("justification")
+            logger.info(
+                "🤖 Claude mini prompt para convênio",
+                extra={
+                    "user_message": message,
+                    "raw_output": raw_output,
+                    "normalized_plan": normalized_plan,
+                    "confidence": confidence,
+                    "justification": justification
+                }
+            )
+            
+            return normalized_plan
+        except Exception as exc:
+            logger.error(f"❌ Erro ao resolver convênio com Claude: {exc}")
             return None
-            
-        except Exception as e:
-            logger.error(f"Erro ao extrair convênio da mensagem: {e}")
+
+    def _normalize_insurance_candidate(self, plan_value: Optional[Any]) -> Optional[str]:
+        """Normaliza o valor retornado pelo Claude para os convênios suportados."""
+        if plan_value is None:
             return None
+        
+        if isinstance(plan_value, str):
+            normalized_text = plan_value.strip().lower()
+            if not normalized_text:
+                return None
+        else:
+            # Se o tipo não for string, tentar converter
+            normalized_text = str(plan_value).strip().lower()
+        
+        normalized_text = normalized_text.replace('"', "").replace("'", "")
+        
+        mapping = {
+            "cabergs": "CABERGS",
+            "ipe": "IPE",
+            "particular": "Particular",
+            "null": None,
+            "none": None
+        }
+        
+        return mapping.get(normalized_text)
+
+    def _extract_insurance_from_message(self, message: str, context: ConversationContext) -> Optional[str]:
+        """
+        Extrai o novo convênio mencionado na mensagem usando o mini prompt centralizado.
+        """
+        return self._resolve_insurance_with_claude(message, context=context)
 
     def _detect_main_menu_choice(self, message: str, context: ConversationContext) -> Optional[str]:
         """Detecta se a mensagem corresponde a uma escolha do menu principal."""
@@ -2855,10 +2946,10 @@ Resposta (apenas o nome do convênio, nada mais):"""
                     if context.flow_data.get("awaiting_consultation_type"):
                         context.flow_data["awaiting_consultation_type"] = False
                         flag_modified(context, "flow_data")
-                    if tipo_anterior:
-                        logger.info(f"💾 Tipo consulta ATUALIZADO no flow_data: {tipo_anterior} → {extracted['consultation_type']}")
-                    else:
-                        logger.info(f"💾 Tipo consulta salvo no flow_data: {extracted['consultation_type']}")
+                if tipo_anterior:
+                    logger.info(f"💾 Tipo consulta ATUALIZADO no flow_data: {tipo_anterior} → {extracted['consultation_type']}")
+                else:
+                    logger.info(f"💾 Tipo consulta salvo no flow_data: {extracted['consultation_type']}")
             
             # INTERCEPTAÇÃO: Fluxo domiciliar
             consultation_type = context.flow_data.get("consultation_type")
@@ -2900,55 +2991,20 @@ Resposta (apenas o nome do convênio, nada mais):"""
                             break
                     
                     if last_user_message:
-                        # Tentar detecção direta primeiro (rápida e eficiente)
-                        detected_insurance = self._detect_insurance_in_message(last_user_message)
+                        detected_insurance = self._detect_insurance_in_message(last_user_message, context)
                         
                         if detected_insurance:
-                            # detected_insurance já vem normalizado da função (IPE, CABERGS, Particular)
-                            # Salvar no flow_data
                             convenio_anterior = context.flow_data.get("insurance_plan")
-                            context.flow_data["insurance_plan"] = detected_insurance
-                            db.commit()
+                            
+                            if convenio_anterior != detected_insurance:
+                                context.flow_data["insurance_plan"] = detected_insurance
+                                flag_modified(context, "flow_data")
+                                db.commit()
                             
                             if convenio_anterior:
                                 logger.info(f"💾 Convênio detectado na última mensagem e ATUALIZADO no flow_data: {convenio_anterior} → {detected_insurance}")
                             else:
                                 logger.info(f"💾 Convênio detectado na última mensagem e salvo no flow_data: {detected_insurance}")
-                        else:
-                            # FALLBACK: Se detecção direta não encontrou, mas mensagem parece ser sobre convênio,
-                            # tentar com Claude (mais robusto para variações linguísticas)
-                            if any(keyword in last_user_message.lower() for keyword in ["convênio", "convenio", "plano", "ipe", "cabergs", "particular"]):
-                                try:
-                                    # Criar contexto temporário apenas com última mensagem
-                                    temp_context = ConversationContext(
-                                        phone=context.phone,
-                                        messages=[{"role": "user", "content": last_user_message}],
-                                        flow_data={}
-                                    )
-                                    extracted_data = self._extract_patient_data_with_claude(temp_context)
-                                    
-                                    if extracted_data and extracted_data.get("insurance_plan"):
-                                        detected_insurance = extracted_data["insurance_plan"]
-                                        
-                                        # Normalizar valor
-                                        if detected_insurance.lower() == "ipe":
-                                            detected_insurance = "IPE"
-                                        elif detected_insurance.lower() == "cabergs":
-                                            detected_insurance = "CABERGS"
-                                        elif detected_insurance.lower() in ["particular", "particula"]:
-                                            detected_insurance = "Particular"
-                                        
-                                        # Salvar no flow_data
-                                        convenio_anterior = context.flow_data.get("insurance_plan")
-                                        context.flow_data["insurance_plan"] = detected_insurance
-                                        db.commit()
-                                        
-                                        if convenio_anterior:
-                                            logger.info(f"💾 Convênio detectado via Claude e ATUALIZADO no flow_data: {convenio_anterior} → {detected_insurance}")
-                                        else:
-                                            logger.info(f"💾 Convênio detectado via Claude e salvo no flow_data: {detected_insurance}")
-                                except Exception as e:
-                                    logger.warning(f"⚠️ Erro ao tentar extrair convênio com Claude: {e}")
             
             # 8. FALLBACK: Verificar se Claude deveria ter chamado confirm_time_slot mas não chamou
             # Isso acontece quando: temos data + horário, mas não tem pending_confirmation
@@ -3110,21 +3166,37 @@ Resposta (apenas o nome do convênio, nada mais):"""
             consultation_type = context.flow_data.get("consultation_type", "clinica_geral")
             insurance_plan = context.flow_data.get("insurance_plan")
 
-            if not insurance_plan or insurance_plan.lower() == "particular":
-                try:
-                    extracted = self._extract_patient_data_with_claude(context)
-                    if extracted.get("insurance_plan"):
-                        insurance_plan = extracted["insurance_plan"]
-                        context.flow_data["insurance_plan"] = insurance_plan
-                        db.commit()
-                        logger.info(f"💾 Convênio identificado para alternativas: {insurance_plan}")
-                except Exception as e:
-                    logger.warning(f"⚠️ Erro ao tentar extrair convênio para alternativas: {str(e)}")
+            if not insurance_plan or str(insurance_plan).strip().lower() == "particular":
+                last_user_message = None
+                if context.messages:
+                    for msg in reversed(context.messages):
+                        if msg.get("role") == "user":
+                            last_user_message = msg.get("content", "")
+                            if last_user_message:
+                                break
+                resolved_plan = None
+                if last_user_message:
+                    resolved_plan = self._detect_insurance_in_message(last_user_message, context)
+                
+                if not resolved_plan:
+                    try:
+                        extracted = self._extract_patient_data_with_claude(context)
+                        resolved_plan = extracted.get("insurance_plan") if extracted else None
+                    except Exception as e:
+                        logger.warning(f"⚠️ Erro ao tentar extrair convênio para alternativas: {str(e)}")
+                
+                if resolved_plan:
+                    insurance_plan = resolved_plan
+                    context.flow_data["insurance_plan"] = insurance_plan
+                    flag_modified(context, "flow_data")
+                    db.commit()
+                    logger.info(f"💾 Convênio identificado para alternativas: {insurance_plan}")
 
             if insurance_plan:
                 normalized_plan = appointment_rules._normalize_plan(insurance_plan)
                 if normalized_plan != insurance_plan:
                     context.flow_data["insurance_plan"] = normalized_plan
+                    flag_modified(context, "flow_data")
                     db.commit()
                     logger.info(f"🔁 Convênio normalizado para alternativas: {insurance_plan} -> {normalized_plan}")
                 insurance_plan = normalized_plan
@@ -3140,6 +3212,7 @@ Resposta (apenas o nome do convênio, nada mais):"""
                     if extracted.get("insurance_plan"):
                         insurance_plan = extracted["insurance_plan"]
                         context.flow_data["insurance_plan"] = insurance_plan
+                        flag_modified(context, "flow_data")
                         db.commit()
                         logger.info(f"💾 Convênio identificado e salvo no flow_data: {insurance_plan}")
                 except Exception as e:
@@ -3404,7 +3477,44 @@ Resposta (apenas o nome do convênio, nada mais):"""
             # Extrair dados coletados
             patient_name = context.flow_data.get("patient_name")
             consultation_type = context.flow_data.get("consultation_type", "clinica_geral")
-            insurance_plan = context.flow_data.get("insurance_plan", "particular")
+            insurance_plan = context.flow_data.get("insurance_plan")
+            
+            if not insurance_plan or str(insurance_plan).strip().lower() == "particular":
+                last_user_message = None
+                if context.messages:
+                    for msg in reversed(context.messages):
+                        if msg.get("role") == "user":
+                            last_user_message = msg.get("content", "")
+                            if last_user_message:
+                                break
+                resolved_plan = None
+                if last_user_message:
+                    resolved_plan = self._detect_insurance_in_message(last_user_message, context)
+                
+                if not resolved_plan:
+                    try:
+                        extracted = self._extract_patient_data_with_claude(context)
+                        resolved_plan = extracted.get("insurance_plan") if extracted else None
+                    except Exception as e:
+                        logger.warning(f"⚠️ Erro ao tentar extrair convênio para alternativas: {str(e)}")
+                
+                if resolved_plan:
+                    insurance_plan = resolved_plan
+                    context.flow_data["insurance_plan"] = insurance_plan
+                    flag_modified(context, "flow_data")
+                    db.commit()
+                    logger.info(f"💾 Convênio atualizado para alternativas: {insurance_plan}")
+            
+            if insurance_plan:
+                normalized_plan = appointment_rules._normalize_plan(insurance_plan)
+                if normalized_plan != insurance_plan:
+                    context.flow_data["insurance_plan"] = normalized_plan
+                    flag_modified(context, "flow_data")
+                    db.commit()
+                    logger.info(f"🔁 Convênio normalizado para alternativas: {insurance_plan} -> {normalized_plan}")
+                insurance_plan = normalized_plan
+            else:
+                insurance_plan = "Particular"
             
             if not patient_name:
                 return "Para continuar com o agendamento, preciso do seu nome completo. Pode me informar?"
@@ -4227,7 +4337,7 @@ Resposta (apenas o nome do convênio, nada mais):"""
             capacity_ok, capacity_message = appointment_rules.has_capacity_for_insurance(appointment_date, insurance_plan, db)
             if not capacity_ok:
                 return f"❌ {capacity_message}\nPoderia escolher outra data, por favor?"
-
+            
             # ========== VALIDAÇÃO 1: DIA DA SEMANA ==========
             weekday = appointment_date.weekday()  # 0=segunda, 6=domingo
             dias_semana_pt = ['segunda', 'terca', 'quarta', 'quinta', 'sexta', 'sabado', 'domingo']
