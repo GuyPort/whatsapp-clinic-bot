@@ -65,12 +65,20 @@ async def send_appointment_reminders():
     """Envia lembretes automáticos 24h antes das consultas agendadas."""
     try:
         now = now_brazil()
-        window_start = now + timedelta(hours=24) - timedelta(hours=2)
-        window_end = now + timedelta(hours=24) + timedelta(minutes=5)
+        # Expandir janela: 20h antes até 26h depois (6h de tolerância)
+        window_start = now + timedelta(hours=24) - timedelta(hours=4)  # 20h antes
+        window_end = now + timedelta(hours=24) + timedelta(hours=2)    # 26h antes
+        
+        # Expandir datas candidatas para cobrir toda a janela (20h-26h antes)
+        # Incluir data atual, amanhã e depois de amanhã para garantir cobertura
+        today_str = now.strftime("%Y%m%d")
+        tomorrow_str = (now + timedelta(days=1)).strftime("%Y%m%d")
+        day_after_tomorrow_str = (now + timedelta(days=2)).strftime("%Y%m%d")
         
         candidate_dates = {
-            window_start.strftime("%Y%m%d"),
-            window_end.strftime("%Y%m%d"),
+            today_str,
+            tomorrow_str,
+            day_after_tomorrow_str,
         }
         
         sent_count = 0
@@ -97,6 +105,12 @@ async def send_appointment_reminders():
                     continue
                 
                 if not (window_start <= appointment_dt <= window_end):
+                    logger.debug(
+                        f"⚠️ Consulta {appointment.id} fora da janela: "
+                        f"appointment_dt={appointment_dt.isoformat()}, "
+                        f"window_start={window_start.isoformat()}, "
+                        f"window_end={window_end.isoformat()}"
+                    )
                     continue
                 
                 message = format_pre_appointment_reminder(
@@ -156,11 +170,11 @@ def start_scheduler():
     scheduler.add_job(
         run_send_reminders,
         'interval',
-        hours=2,
+        hours=1,  # Reduzir para 1h para garantir maior cobertura
         id='send_appointment_reminders'
     )
     scheduler.start()
-    logger.info("✅ Scheduler iniciado: timeout (20 min) e lembretes (2 h)")
+    logger.info("✅ Scheduler iniciado: timeout (20 min) e lembretes (1 h)")
 
 def stop_scheduler():
     """Para o scheduler"""
