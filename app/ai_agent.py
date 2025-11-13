@@ -3,7 +3,7 @@ Agente de IA com Claude SDK + Tools para agendamento de consultas.
 Versão completa com menu estruturado e gerenciamento de contexto.
 Corrigido: persistência de contexto + loop de processamento de tools.
 """
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time
 from typing import Optional, Dict, Any, List, Tuple
 import json
 import logging
@@ -5352,6 +5352,10 @@ Responda EXCLUSIVAMENTE com um JSON válido no formato:
             appointment.cancelled_at = now_brazil()
             appointment.cancelled_reason = reason
             appointment.updated_at = now_brazil()
+            
+            # Garantir que appointment_time seja string antes do commit (evita erro na validação)
+            if isinstance(appointment.appointment_time, time):
+                appointment.appointment_time = appointment.appointment_time.strftime('%H:%M')
             
             db.commit()
             

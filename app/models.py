@@ -90,17 +90,22 @@ def validate_appointment_data(mapper, connection, target):
     if not re.match(r'^\d{2}/\d{2}/\d{4}$', target.patient_birth_date):
         raise ValueError("Data de nascimento deve estar no formato DD/MM/AAAA")
     
-    # Validar formato do horário
-    if not re.match(r'^\d{2}:\d{2}$', target.appointment_time):
+    # Validar formato do horário - converter para string se necessário
+    if isinstance(target.appointment_time, time):
+        appointment_time_str = target.appointment_time.strftime('%H:%M')
+    else:
+        appointment_time_str = str(target.appointment_time)
+    
+    if not re.match(r'^\d{2}:\d{2}$', appointment_time_str):
         raise ValueError("Horário deve estar no formato HH:MM")
     
     # Validar hora (00-23)
-    hour = int(target.appointment_time.split(':')[0])
+    hour = int(appointment_time_str.split(':')[0])
     if not (0 <= hour <= 23):
         raise ValueError("Hora deve estar entre 00 e 23")
     
     # Validar minuto (00-59)
-    minute = int(target.appointment_time.split(':')[1])
+    minute = int(appointment_time_str.split(':')[1])
     if not (0 <= minute <= 59):
         raise ValueError("Minuto deve estar entre 00 e 59")
     
