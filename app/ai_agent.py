@@ -2345,10 +2345,12 @@ Responda EXCLUSIVAMENTE com um JSON válido no formato:
                     flow_data["selected_appointment"] = appointment_data
                     flow_data.pop("awaiting_cancel_choice", None)
                     flow_data.pop("pending_appointments_map", None)
+                    flag_modified(context, "flow_data")
                     db.commit()
 
                     if flow_data.get("cancel_intent") == "cancel":
                         flow_data["awaiting_cancel_reason"] = True
+                        flag_modified(context, "flow_data")
                         db.commit()
                         prompt = (
                             "Entendido. Pode me informar o motivo do cancelamento? "
@@ -2375,6 +2377,7 @@ Responda EXCLUSIVAMENTE com um JSON válido no formato:
                             context.flow_data["insurance_plan"] = conv.strip().lower()
 
                         context.flow_data["awaiting_custom_date"] = True
+                        flag_modified(context, "flow_data")
                         db.commit()
                         self._record_interaction(context, message, prompt, db, flow_modified=True)
                         return prompt
@@ -2392,6 +2395,7 @@ Responda EXCLUSIVAMENTE com um JSON válido no formato:
 
                 if not appointment_data:
                     flow_data.pop("awaiting_cancel_reason", None)
+                    flag_modified(context, "flow_data")
                     db.commit()
                     return "Não consegui localizar o agendamento selecionado. Pode tentar novamente?"
 
@@ -2409,6 +2413,7 @@ Responda EXCLUSIVAMENTE com um JSON válido no formato:
                 flow_data["alternatives_offered"] = False
                 flow_data.pop("awaiting_custom_date", None)
                 flow_data.pop("cancel_intent", None)
+                flag_modified(context, "flow_data")
                 db.commit()
 
                 follow_up = result_message + "\n\nPosso ajudar com mais alguma coisa?"
@@ -2418,6 +2423,7 @@ Responda EXCLUSIVAMENTE com um JSON válido no formato:
             if flow_data.get("awaiting_reschedule_start"):
                 flow_data.pop("awaiting_reschedule_start", None)
                 flow_data["awaiting_custom_date"] = True
+                flag_modified(context, "flow_data")
                 db.commit()
                 prompt = (
                     "Sem problemas! Qual dia funciona melhor para você? "
