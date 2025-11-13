@@ -1920,6 +1920,38 @@ Responda EXCLUSIVAMENTE com um JSON válido no formato:
 
         return None
 
+    def _detect_no_appointments_response_intent(self, message: str) -> Optional[str]:
+        """Detecta intenção do usuário após mensagem de erro de não encontrar consultas"""
+        if not message:
+            return None
+        
+        normalized = message.strip().lower()
+        
+        # Palavras-chave para falar com secretária
+        human_keywords = [
+            "secretária", "secretaria", "atendente", "humano", "pessoa",
+            "falar com alguém", "falar com alguem", "verificar manualmente",
+            "analisar manualmente", "secretária verificar", "secretaria verificar",
+            "quero falar", "preciso falar", "prefiro secretária", "prefiro secretaria",
+            "secretária analisar", "secretaria analisar"
+        ]
+        
+        # Palavras-chave para marcar consulta
+        booking_keywords = [
+            "marcar", "agendar", "consultar", "quero marcar", "preciso marcar",
+            "nova consulta", "marcar nova", "agendar nova", "consultar nova",
+            "quero agendar", "preciso agendar", "marcar consulta", "agendar consulta",
+            "marcar uma consulta", "agendar uma consulta", "quero consulta", "preciso consulta"
+        ]
+        
+        if any(keyword in normalized for keyword in human_keywords):
+            return "human"
+        
+        if any(keyword in normalized for keyword in booking_keywords):
+            return "booking"
+        
+        return None
+
     def _start_identity_collection(self, context: ConversationContext, menu_choice: str):
         """Inicia fluxo de coleta de identidade (nome e data) após seleção de menu."""
         if not context.flow_data:
@@ -2109,6 +2141,39 @@ Responda EXCLUSIVAMENTE com um JSON válido no formato:
                 flag_modified(context, "flow_data")
             flow_data = context.flow_data
 
+            # Verificar resposta à mensagem de erro quando não encontra consultas
+            if flow_data.get("awaiting_no_appointments_response"):
+                intent = self._detect_no_appointments_response_intent(message)
+                
+                if intent == "human":
+                    # Limpar flag e chamar tool de assistência humana
+                    flow_data.pop("awaiting_no_appointments_response", None)
+                    flag_modified(context, "flow_data")
+                    db.commit()
+                    return self._handle_request_human_assistance({}, db, phone)
+                
+                elif intent == "booking":
+                    # Limpar flags de cancelamento/remarcação e iniciar fluxo de agendamento
+                    flow_data.pop("awaiting_no_appointments_response", None)
+                    flow_data.pop("pending_appointments_map", None)
+                    flow_data.pop("awaiting_cancel_choice", None)
+                    flow_data.pop("cancel_intent", None)
+                    flow_data["menu_choice"] = "booking"
+                    flag_modified(context, "flow_data")
+                    db.commit()
+                    
+                    # Iniciar coleta de identidade para agendamento
+                    self._start_identity_collection(context, "booking")
+                    prompt = self._build_name_prompt("booking")
+                    self._record_interaction(context, message, prompt, db, flow_modified=True)
+                    return prompt
+                
+                # Se não detectar intenção clara, remover flag e deixar Claude processar normalmente
+                # (ele pode usar as tools apropriadas como request_human_assistance baseado no contexto)
+                flow_data.pop("awaiting_no_appointments_response", None)
+                flag_modified(context, "flow_data")
+                db.commit()
+
             # Detectar solicitações naturais de data/horário personalizadas
             custom_request = None
             if flow_data and (
@@ -2241,12 +2306,13 @@ Responda EXCLUSIVAMENTE com um JSON válido no formato:
 
                         flow_data.pop("pending_appointments_map", None)
                         flow_data.pop("awaiting_cancel_choice", None)
-                        no_result_prompt = (
-                            search_response
-                            + "\nSe esses dados estiverem corretos, posso pedir para nossa secretária verificar manualmente."
-                        )
-                        self._record_interaction(context, message, no_result_prompt, db, flow_modified=True)
-                        return no_result_prompt
+                        # A mensagem de erro já inclui as opções, então apenas adicionar flag
+                        flow_data["awaiting_no_appointments_response"] = True
+                        flag_modified(context, "flow_data")
+                        db.commit()
+                        # Retornar a mensagem de erro que já inclui as opções
+                        self._record_interaction(context, message, search_response, db, flow_modified=True)
+                        return search_response
 
                     menu_choice = flow_data.get("menu_choice")
                     if menu_choice == "booking":
@@ -2342,16 +2408,18 @@ Responda EXCLUSIVAMENTE com um JSON válido no formato:
                     appointment_data = mapping[selection]
                     logger.info(f"🗑️ Usuário {phone} selecionou agendamento {selection}: {appointment_data}")
 
+                    # Fazer TODAS as modificações antes de flag_modified e commit
                     flow_data["selected_appointment"] = appointment_data
                     flow_data.pop("awaiting_cancel_choice", None)
                     flow_data.pop("pending_appointments_map", None)
-                    flag_modified(context, "flow_data")
-                    db.commit()
-
+                    
                     if flow_data.get("cancel_intent") == "cancel":
+                        # Fluxo de cancelamento - fazer todas as modificações
                         flow_data["awaiting_cancel_reason"] = True
+                        # Fazer flag_modified e commit UMA vez
                         flag_modified(context, "flow_data")
                         db.commit()
+                        
                         prompt = (
                             "Entendido. Pode me informar o motivo do cancelamento? "
                             "Assim consigo registrar tudo direitinho."
@@ -2359,6 +2427,7 @@ Responda EXCLUSIVAMENTE com um JSON válido no formato:
                         self._record_interaction(context, message, prompt, db, flow_modified=True)
                         return prompt
                     else:
+                        # Fluxo de remarcação - fazer todas as modificações necessárias
                         flow_data["awaiting_reschedule_start"] = True
                         appointment_date = appointment_data.get("date")
                         appointment_time = appointment_data.get("time")
@@ -2372,13 +2441,16 @@ Responda EXCLUSIVAMENTE com um JSON válido no formato:
                         )
 
                         if tipo:
-                            context.flow_data["consultation_type"] = tipo
+                            flow_data["consultation_type"] = tipo
                         if conv:
-                            context.flow_data["insurance_plan"] = conv.strip().lower()
+                            flow_data["insurance_plan"] = conv.strip().lower()
 
-                        context.flow_data["awaiting_custom_date"] = True
+                        flow_data["awaiting_custom_date"] = True
+                        
+                        # Fazer flag_modified e commit UMA vez
                         flag_modified(context, "flow_data")
                         db.commit()
+                        
                         self._record_interaction(context, message, prompt, db, flow_modified=True)
                         return prompt
                 else:
@@ -5167,8 +5239,25 @@ Responda EXCLUSIVAMENTE com um JSON válido no formato:
                 ]
             
             if not appointments:
-                filtros = ", ".join(filters_applied) if filters_applied else "nenhum filtro aplicável"
-                return f"Não encontrei agendamentos usando {filtros}. Pode confirmar os dados ou falar com nossa secretária?"
+                # Mensagem contextual baseada nos dados disponíveis
+                if normalized_name and normalized_birth:
+                    return (
+                        "Não encontramos nenhuma consulta com esse nome e data de nascimento. "
+                        "Se você quiser, posso pedir para nossa secretária analisar manualmente, "
+                        "ou posso te ajudar a marcar uma consulta nova. O que prefere?"
+                    )
+                elif normalized_phone:
+                    return (
+                        "Não encontramos nenhuma consulta com esse telefone. "
+                        "Se você quiser, posso pedir para nossa secretária analisar manualmente, "
+                        "ou posso te ajudar a marcar uma consulta nova. O que prefere?"
+                    )
+                else:
+                    return (
+                        "Não encontramos nenhuma consulta com os dados fornecidos. "
+                        "Se você quiser, posso pedir para nossa secretária analisar manualmente, "
+                        "ou posso te ajudar a marcar uma consulta nova. O que prefere?"
+                    )
             
             appointments = sorted(
                 appointments,
