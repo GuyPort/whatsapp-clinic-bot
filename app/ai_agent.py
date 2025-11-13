@@ -681,6 +681,41 @@ Lembre-se: Seja natural, adaptável e prestativa. Use as tools disponíveis conf
                 "Por favor, tente novamente em instantes ou fale conosco por telefone."
             )
 
+    def _pause_contact_for_prescription(self, db: Session, phone: Optional[str]) -> None:
+        """Pausa o contato por 48 horas após receita - deleta contexto e cria pausa"""
+        if not phone:
+            return
+        
+        try:
+            logger.info(f"💊 Aplicando pausa de receita para {phone}")
+            
+            # Deletar contexto
+            existing_context = db.query(ConversationContext).filter_by(phone=phone).first()
+            if existing_context:
+                db.delete(existing_context)
+                logger.info(f"🗑️ Contexto deletado para {phone} (pausa de receita)")
+            
+            # Remover pausas anteriores
+            existing_pause = db.query(PausedContact).filter_by(phone=phone).first()
+            if existing_pause:
+                db.delete(existing_pause)
+                logger.info(f"🗑️ Pausa anterior removida para {phone} (pausa de receita)")
+            
+            # Criar pausa de 48 horas
+            paused_until = datetime.utcnow() + timedelta(hours=48)
+            paused_contact = PausedContact(
+                phone=phone,
+                paused_until=paused_until,
+                reason="prescription_payment"
+            )
+            db.add(paused_contact)
+            db.commit()
+            
+            logger.info(f"⏸️ Pausa de receita registrada para {phone} até {paused_until}")
+        except Exception as exc:
+            logger.error(f"❌ Erro ao aplicar pausa de receita: {exc}")
+            db.rollback()
+
     def _analyze_prescription_message_with_claude(self, message: str) -> Dict[str, Any]:
         """
         Usa o Claude para classificar se cada campo da receita foi informado.
@@ -827,7 +862,7 @@ Return ONLY a JSON object with this structure:
             "⏳ Assim que o comprovante for enviado, a Dra. Rose prepara a receita em até 2 dias úteis.\n"
             "📄 Receitas branca/controlada podem ser enviadas digitalmente.\n"
             "📄 Receitas azul ou amarela precisam ser retiradas no consultório, de segunda a sexta das 14h às 18h.\n\n"
-            "Quando tiver o comprovante, é só me enviar por aqui. Posso ajudar com mais alguma coisa?"
+            "Quando tiver o comprovante, é só me enviar por aqui."
         )
 
     def _notify_doctor_prescription(self, context: ConversationContext, db: Session, phone: Optional[str]) -> None:
@@ -2291,6 +2326,12 @@ Responda EXCLUSIVAMENTE com um JSON válido no formato:
                     self._notify_doctor_prescription(context, db, phone)
                 except Exception as notify_error:
                     logger.error(f"❌ Erro ao notificar doutora sobre receita: {notify_error}")
+
+                # Pausar contato por 48 horas após enviar instruções de pagamento
+                try:
+                    self._pause_contact_for_prescription(db, phone)
+                except Exception as pause_error:
+                    logger.error(f"❌ Erro ao pausar contato após receita: {pause_error}")
 
                 return instructions
 
