@@ -865,6 +865,26 @@ Return ONLY a JSON object with this structure:
             "Quando tiver o comprovante, é só me enviar por aqui."
         )
 
+    def _format_appointment_date_safe(self, date_value) -> str:
+        """Converte qualquer formato de data para DD/MM/YYYY de forma segura"""
+        if isinstance(date_value, str):
+            # Se for string YYYYMMDD (ex: "20251022")
+            if len(date_value) == 8 and date_value.isdigit():
+                return f"{date_value[6:8]}/{date_value[4:6]}/{date_value[0:4]}"
+            # Se for string DD-MM-YYYY ou DD/MM/YYYY
+            elif '-' in date_value or '/' in date_value:
+                return date_value.replace('-', '/')
+            return date_value
+        elif hasattr(date_value, 'strftime'):
+            # Se for datetime.date ou datetime.datetime
+            return date_value.strftime('%d/%m/%Y')
+        else:
+            # Fallback: converter para string e tentar formatar
+            date_str = str(date_value)
+            if len(date_str) == 8 and date_str.isdigit():
+                return f"{date_str[6:8]}/{date_str[4:6]}/{date_str[0:4]}"
+            return date_str
+
     def _notify_doctor_prescription(self, context: ConversationContext, db: Session, phone: Optional[str]) -> None:
         if not context:
             return
@@ -2471,6 +2491,17 @@ Responda EXCLUSIVAMENTE com um JSON válido no formato:
                     db.commit()
                     return "Não consegui localizar o agendamento selecionado. Pode tentar novamente?"
 
+                # Fazer TODAS as modificações no flow_data ANTES de chamar _handle_cancel_appointment
+                flow_data.pop("awaiting_cancel_reason", None)
+                flow_data.pop("selected_appointment", None)
+                flow_data["pending_confirmation"] = False
+                flow_data["alternatives_offered"] = False
+                flow_data.pop("awaiting_custom_date", None)
+                flow_data.pop("cancel_intent", None)
+                flag_modified(context, "flow_data")
+                db.commit()  # Commit ANTES de chamar _handle_cancel_appointment
+
+                # Agora chamar _handle_cancel_appointment (que fará commit do appointment)
                 result_message = self._handle_cancel_appointment(
                     {
                         "appointment_id": appointment_data.get("id"),
@@ -2479,17 +2510,8 @@ Responda EXCLUSIVAMENTE com um JSON válido no formato:
                     db
                 )
 
-                flow_data.pop("awaiting_cancel_reason", None)
-                flow_data.pop("selected_appointment", None)
-                flow_data["pending_confirmation"] = False
-                flow_data["alternatives_offered"] = False
-                flow_data.pop("awaiting_custom_date", None)
-                flow_data.pop("cancel_intent", None)
-                flag_modified(context, "flow_data")
-                db.commit()
-
                 follow_up = result_message + "\n\nPosso ajudar com mais alguma coisa?"
-                self._record_interaction(context, message, follow_up, db, flow_modified=True)
+                self._record_interaction(context, message, follow_up, db, flow_modified=False)
                 return follow_up
 
             if flow_data.get("awaiting_reschedule_start"):
@@ -5279,8 +5301,8 @@ Responda EXCLUSIVAMENTE com um JSON válido no formato:
                 
                 response += f"{i}. {status_emoji} **{apt.patient_name}**\n"
                 
-                # Formatar appointment_date (string YYYYMMDD) e appointment_time (string HH:MM)
-                app_date_formatted = f"{apt.appointment_date[6:8]}/{apt.appointment_date[4:6]}/{apt.appointment_date[:4]}"
+                # Formatar appointment_date usando função helper segura
+                app_date_formatted = self._format_appointment_date_safe(apt.appointment_date)
                 app_time_str = apt.appointment_time if isinstance(apt.appointment_time, str) else apt.appointment_time.strftime('%H:%M')
                 
                 response += f"   📅 {app_date_formatted} às {app_time_str}\n"
@@ -5333,8 +5355,9 @@ Responda EXCLUSIVAMENTE com um JSON válido no formato:
             
             db.commit()
             
-            # Formatar appointment_date (string YYYYMMDD) e appointment_time (string HH:MM)
-            app_date_formatted = f"{appointment.appointment_date[6:8]}/{appointment.appointment_date[4:6]}/{appointment.appointment_date[:4]}"
+            # Formatar appointment_date usando função helper segura
+            app_date_formatted = self._format_appointment_date_safe(appointment.appointment_date)
+            # Formatar appointment_time (já está correto, mas manter verificação)
             app_time_str = appointment.appointment_time if isinstance(appointment.appointment_time, str) else appointment.appointment_time.strftime('%H:%M')
             
             return f"✅ **Agendamento cancelado com sucesso!**\n\n" + \
