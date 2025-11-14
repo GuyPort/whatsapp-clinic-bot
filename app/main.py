@@ -216,22 +216,9 @@ async def whatsapp_webhook(request: Request):
         messages = data.get('messages', {})
         key = messages.get('key', {})
         message_data = messages.get('message', {})
+        remote_jid = key.get('remoteJid', '')
         
-        # Ignorar mensagens enviadas por nós
-        if key.get('fromMe', False):
-            return {"status": "ignored", "reason": "message from bot"}
-        
-        # Extrair informações
-        phone = key.get('remoteJid', '')
-        
-        # Ignorar mensagens de newsletter e grupos
-        if '@newsletter' in phone or '@g.us' in phone:
-            logger.info(f"Ignorando mensagem de newsletter/grupo: {phone}")
-            return {"status": "ignored", "reason": "newsletter or group message"}
-        
-        phone = phone.replace('@s.whatsapp.net', '')
-        
-        # Extrair texto da mensagem
+        # Extrair texto da mensagem (antes de tratar fromMe)
         message_text = None
         if 'conversation' in message_data:
             message_text = message_data['conversation']
@@ -239,6 +226,31 @@ async def whatsapp_webhook(request: Request):
             message_text = message_data['extendedTextMessage'].get('text', '')
         elif 'imageMessage' in message_data:
             message_text = message_data['imageMessage'].get('caption', '')
+        
+        is_from_me = key.get('fromMe', False)
+        
+        # Tratar comando /pause da secretária (mensagens enviadas pelo número da clínica)
+        if is_from_me:
+            lowered = (message_text or '').strip().lower()
+            if lowered in {"/pausar", "/pause"} and remote_jid and '@newsletter' not in remote_jid and '@g.us' not in remote_jid:
+                patient_phone = remote_jid.replace('@s.whatsapp.net', '')
+                if patient_phone:
+                    logger.info(f"⏸️ Comando /pause recebido da secretária para {patient_phone}")
+                    with get_db() as db:
+                        ai_agent._handle_secretary_pause(db, patient_phone)
+                    return {"status": "processed", "action": "secretary_pause", "patient": patient_phone}
+            # Outras mensagens enviadas por nós devem ser ignoradas
+            return {"status": "ignored", "reason": "message from bot"}
+        
+        # Extrair informações
+        phone = remote_jid
+        
+        # Ignorar mensagens de newsletter e grupos
+        if '@newsletter' in phone or '@g.us' in phone:
+            logger.info(f"Ignorando mensagem de newsletter/grupo: {phone}")
+            return {"status": "ignored", "reason": "newsletter or group message"}
+        
+        phone = phone.replace('@s.whatsapp.net', '')
         
         if not message_text or not phone:
             logger.warning("Mensagem sem texto ou telefone")

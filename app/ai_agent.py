@@ -716,6 +716,38 @@ Lembre-se: Seja natural, adaptável e prestativa. Use as tools disponíveis conf
             logger.error(f"❌ Erro ao aplicar pausa de receita: {exc}")
             db.rollback()
 
+    def _handle_secretary_pause(self, db: Session, phone: Optional[str]) -> None:
+        """Pausa silenciosamente o contato por 24 horas quando secretária envia /pause"""
+        if not phone:
+            return
+
+        try:
+            logger.info(f"⏸️ Pausa manual da secretária aplicada para {phone}")
+
+            existing_context = db.query(ConversationContext).filter_by(phone=phone).first()
+            if existing_context:
+                db.delete(existing_context)
+                logger.info(f"🗑️ Contexto deletado para {phone} (pausa manual da secretária)")
+
+            existing_pause = db.query(PausedContact).filter_by(phone=phone).first()
+            if existing_pause:
+                db.delete(existing_pause)
+                logger.info(f"🗑️ Pausa anterior removida para {phone} (pausa manual da secretária)")
+
+            paused_until = datetime.utcnow() + timedelta(hours=24)
+            paused_contact = PausedContact(
+                phone=phone,
+                paused_until=paused_until,
+                reason="secretary_manual_pause"
+            )
+            db.add(paused_contact)
+            db.commit()
+
+            logger.info(f"⏸️ Contato {phone} pausado pela secretária até {paused_until}")
+        except Exception as exc:
+            logger.error(f"❌ Erro ao aplicar pausa manual da secretária: {exc}")
+            db.rollback()
+
     def _analyze_prescription_message_with_claude(self, message: str) -> Dict[str, Any]:
         """
         Usa o Claude para classificar se cada campo da receita foi informado.
