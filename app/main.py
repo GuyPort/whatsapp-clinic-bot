@@ -991,7 +991,7 @@ async def update_appointment_admin(
 @app.get("/dashboard")
 async def dashboard(admin: str = Depends(verify_admin_credentials)):
     """Dashboard moderno para visualizar consultas agendadas"""
-    return HTMLResponse(content="""
+    html_content = """
     <!DOCTYPE html>
     <html lang="pt-BR">
     <head>
@@ -1594,7 +1594,7 @@ async def dashboard(admin: str = Depends(verify_admin_credentials)):
             function getActionButtons(appointment) {
                 const buttons = [];
 
-                if (appointment.status === 'AGENDADA') {
+                if (appointment.status === 'agendada') {  // lowercase to match API response
                     buttons.push(`
                         <button class="btn btn-sm btn-success" onclick="completeAppointment(${appointment.id})">
                             <i class="fas fa-check"></i> Concluir
@@ -1803,7 +1803,16 @@ async def dashboard(admin: str = Depends(verify_admin_credentials)):
         </script>
     </body>
     </html>
-    """)
+    """
+
+    return HTMLResponse(
+        content=html_content,
+        headers={
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Pragma": "no-cache",
+            "Expires": "0"
+        }
+    )
 
 
 if __name__ == "__main__":
