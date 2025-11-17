@@ -24,6 +24,9 @@ if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
 # Configuração Redis
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 
+# Autenticação Admin
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")  # ALTERAR EM PRODUÇÃO!
+
 ENVIRONMENT = "production"
 LOG_LEVEL = "INFO"
 TIMEZONE = "America/Sao_Paulo"
@@ -36,6 +39,7 @@ class Settings:
     evolution_instance_name = EVOLUTION_INSTANCE_NAME
     database_url = DATABASE_URL
     redis_url = REDIS_URL
+    admin_password = ADMIN_PASSWORD
     environment = ENVIRONMENT
     log_level = LOG_LEVEL
     timezone = TIMEZONE

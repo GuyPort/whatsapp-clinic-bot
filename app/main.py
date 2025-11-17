@@ -1,10 +1,12 @@
 """
 Aplicação FastAPI principal com webhooks do WhatsApp.
 """
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException, Depends
 from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from contextlib import asynccontextmanager
 import logging
+import secrets
 from typing import Dict, Any, List
 from datetime import datetime, date
 
@@ -50,6 +52,28 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan
 )
+
+# Sistema de autenticação HTTP Basic Auth
+security = HTTPBasic()
+
+def verify_admin_credentials(credentials: HTTPBasicCredentials = Depends(security)):
+    """
+    Verifica as credenciais de admin usando HTTP Basic Auth.
+    Username pode ser qualquer coisa, apenas a senha é verificada.
+    """
+    correct_password = secrets.compare_digest(
+        credentials.password.encode("utf8"),
+        settings.admin_password.encode("utf8")
+    )
+
+    if not correct_password:
+        raise HTTPException(
+            status_code=401,
+            detail="Credenciais inválidas",
+            headers={"WWW-Authenticate": "Basic"},
+        )
+
+    return credentials.username
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -464,7 +488,7 @@ async def status():
 
 
 @app.post("/admin/reload-config")
-async def reload_config():
+async def reload_config(admin: str = Depends(verify_admin_credentials)):
     """
     Recarrega configurações da clínica sem reiniciar o servidor.
     Útil para atualizar valores, horários, etc.
@@ -480,7 +504,7 @@ async def reload_config():
 # ==================== ENDPOINTS DO BANCO DE DADOS ====================
 
 @app.get("/admin/patients")
-async def get_patients():
+async def get_patients(admin: str = Depends(verify_admin_credentials)):
     """Lista todos os pacientes únicos baseado nas consultas"""
     try:
         with get_db() as db:
@@ -535,7 +559,7 @@ def _format_appointment_date(date_value):
     return str(date_value)
 
 @app.get("/admin/appointments")
-async def get_appointments():
+async def get_appointments(admin: str = Depends(verify_admin_credentials)):
     """Lista todas as consultas agendadas"""
     try:
         with get_db() as db:
@@ -634,7 +658,7 @@ async def get_scheduled_appointments():
 
 @app.get("/admin/init-db")
 @app.post("/admin/init-db")
-async def init_database():
+async def init_database(admin: str = Depends(verify_admin_credentials)):
     """Força a criação das tabelas no banco de dados"""
     try:
         from app.database import init_db
@@ -647,7 +671,7 @@ async def init_database():
 
 @app.get("/admin/clean-db")
 @app.post("/admin/clean-db")
-async def clean_database():
+async def clean_database(admin: str = Depends(verify_admin_credentials)):
     """Remove tabelas antigas e mantém apenas appointments"""
     try:
         from app.database import engine
@@ -669,7 +693,7 @@ async def clean_database():
 
 
 @app.post("/admin/migrate-add-consultation-type")
-async def migrate_add_consultation_type():
+async def migrate_add_consultation_type(admin: str = Depends(verify_admin_credentials)):
     """Endpoint para executar migração que adiciona coluna consultation_type"""
     try:
         from migrate_add_consultation_type import migrate_add_consultation_type
@@ -685,7 +709,7 @@ async def migrate_add_consultation_type():
         return {"success": False, "error": str(e)}
 
 @app.post("/admin/migrate-add-insurance-plan")
-async def migrate_add_insurance_plan():
+async def migrate_add_insurance_plan(admin: str = Depends(verify_admin_credentials)):
     """Endpoint para executar migração que adiciona coluna insurance_plan"""
     try:
         from migrate_add_insurance_plan import migrate_add_insurance_plan
@@ -701,7 +725,7 @@ async def migrate_add_insurance_plan():
         return {"success": False, "error": str(e)}
 
 @app.get("/admin/dashboard")
-async def get_dashboard():
+async def get_dashboard(admin: str = Depends(verify_admin_credentials)):
     """Dashboard com estatísticas gerais"""
     try:
         with get_db() as db:
@@ -739,8 +763,233 @@ async def get_dashboard():
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ==================== ENDPOINTS DE MANIPULAÇÃO DE CONSULTAS ====================
+
+@app.post("/admin/appointments/{appointment_id}/cancel")
+async def cancel_appointment_admin(
+    appointment_id: int,
+    request: Request,
+    admin: str = Depends(verify_admin_credentials)
+):
+    """Cancela uma consulta via painel admin"""
+    try:
+        body = await request.json()
+        reason = body.get("reason", "Cancelado pelo admin")
+
+        with get_db() as db:
+            appointment = db.query(Appointment).filter(Appointment.id == appointment_id).first()
+
+            if not appointment:
+                raise HTTPException(status_code=404, detail="Consulta não encontrada")
+
+            if appointment.status == AppointmentStatus.CANCELADA:
+                raise HTTPException(status_code=400, detail="Esta consulta já foi cancelada")
+
+            # Cancelar agendamento
+            from app.utils import now_brazil
+            appointment.status = AppointmentStatus.CANCELADA
+            appointment.cancelled_at = now_brazil()
+            appointment.cancelled_reason = reason
+
+            db.commit()
+
+            logger.info(f"Admin {admin} cancelou consulta #{appointment_id}: {appointment.patient_name}")
+
+            return {
+                "success": True,
+                "message": "Consulta cancelada com sucesso",
+                "appointment": {
+                    "id": appointment.id,
+                    "patient_name": appointment.patient_name,
+                    "status": appointment.status.value
+                }
+            }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Erro ao cancelar consulta: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/admin/appointments/{appointment_id}/complete")
+async def complete_appointment_admin(
+    appointment_id: int,
+    admin: str = Depends(verify_admin_credentials)
+):
+    """Marca uma consulta como realizada"""
+    try:
+        with get_db() as db:
+            appointment = db.query(Appointment).filter(Appointment.id == appointment_id).first()
+
+            if not appointment:
+                raise HTTPException(status_code=404, detail="Consulta não encontrada")
+
+            if appointment.status == AppointmentStatus.REALIZADA:
+                raise HTTPException(status_code=400, detail="Esta consulta já foi marcada como realizada")
+
+            if appointment.status == AppointmentStatus.CANCELADA:
+                raise HTTPException(status_code=400, detail="Não é possível marcar uma consulta cancelada como realizada")
+
+            # Marcar como realizada
+            appointment.status = AppointmentStatus.REALIZADA
+
+            db.commit()
+
+            logger.info(f"Admin {admin} marcou consulta #{appointment_id} como realizada: {appointment.patient_name}")
+
+            return {
+                "success": True,
+                "message": "Consulta marcada como realizada",
+                "appointment": {
+                    "id": appointment.id,
+                    "patient_name": appointment.patient_name,
+                    "status": appointment.status.value
+                }
+            }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Erro ao marcar consulta como realizada: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/admin/appointments/{appointment_id}/reschedule")
+async def reschedule_appointment_admin(
+    appointment_id: int,
+    request: Request,
+    admin: str = Depends(verify_admin_credentials)
+):
+    """Remarca uma consulta para nova data/hora"""
+    try:
+        body = await request.json()
+        new_date = body.get("new_date")  # Formato: YYYYMMDD
+        new_time = body.get("new_time")  # Formato: HH:MM
+
+        if not new_date or not new_time:
+            raise HTTPException(status_code=400, detail="Nova data e hora são obrigatórias")
+
+        with get_db() as db:
+            appointment = db.query(Appointment).filter(Appointment.id == appointment_id).first()
+
+            if not appointment:
+                raise HTTPException(status_code=404, detail="Consulta não encontrada")
+
+            if appointment.status == AppointmentStatus.CANCELADA:
+                raise HTTPException(status_code=400, detail="Não é possível remarcar uma consulta cancelada")
+
+            # Validar disponibilidade do novo horário
+            from app.appointment_rules import AppointmentRules
+            from app.utils import load_clinic_info, parse_appointment_datetime
+
+            clinic_info = load_clinic_info()
+            rules = AppointmentRules(clinic_info)
+
+            # Verificar se o horário é válido
+            new_datetime = parse_appointment_datetime(new_date, new_time)
+
+            if not rules.is_valid_appointment_date(new_datetime):
+                raise HTTPException(status_code=400, detail="Data/hora inválida (fora do horário de funcionamento ou no passado)")
+
+            # Verificar disponibilidade (excluindo a própria consulta sendo remarcada)
+            duration = appointment.duration_minutes or 60
+            if not rules.check_slot_availability(new_datetime, duration, db, exclude_appointment_id=appointment_id):
+                raise HTTPException(status_code=400, detail="Horário já está ocupado")
+
+            # Verificar regras de convênio
+            insurance_plan = appointment.insurance_plan or "particular"
+            if not rules.is_plan_allowed_on_date(new_datetime, insurance_plan):
+                raise HTTPException(status_code=400, detail=f"Convênio {insurance_plan} não permitido nesta data")
+
+            if not rules.has_capacity_for_insurance(new_datetime, insurance_plan, db, exclude_appointment_id=appointment_id):
+                raise HTTPException(status_code=400, detail=f"Capacidade diária para {insurance_plan} atingida")
+
+            # Atualizar consulta
+            appointment.appointment_date = new_date
+            appointment.appointment_time = new_time
+            appointment.status = AppointmentStatus.AGENDADA  # Reset status se estava como realizada
+
+            db.commit()
+
+            logger.info(f"Admin {admin} remarcou consulta #{appointment_id} para {new_date} {new_time}")
+
+            return {
+                "success": True,
+                "message": "Consulta remarcada com sucesso",
+                "appointment": {
+                    "id": appointment.id,
+                    "patient_name": appointment.patient_name,
+                    "appointment_date": new_date,
+                    "appointment_time": new_time,
+                    "status": appointment.status.value
+                }
+            }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Erro ao remarcar consulta: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.patch("/admin/appointments/{appointment_id}")
+async def update_appointment_admin(
+    appointment_id: int,
+    request: Request,
+    admin: str = Depends(verify_admin_credentials)
+):
+    """Atualiza detalhes de uma consulta (nome, telefone, tipo, etc)"""
+    try:
+        body = await request.json()
+
+        with get_db() as db:
+            appointment = db.query(Appointment).filter(Appointment.id == appointment_id).first()
+
+            if not appointment:
+                raise HTTPException(status_code=404, detail="Consulta não encontrada")
+
+            # Atualizar campos permitidos
+            if "patient_name" in body:
+                appointment.patient_name = body["patient_name"]
+
+            if "patient_phone" in body:
+                appointment.patient_phone = body["patient_phone"]
+
+            if "patient_birth_date" in body:
+                appointment.patient_birth_date = body["patient_birth_date"]
+
+            if "consultation_type" in body:
+                appointment.consultation_type = body["consultation_type"]
+
+            if "insurance_plan" in body:
+                appointment.insurance_plan = body["insurance_plan"]
+
+            db.commit()
+
+            logger.info(f"Admin {admin} atualizou consulta #{appointment_id}")
+
+            return {
+                "success": True,
+                "message": "Consulta atualizada com sucesso",
+                "appointment": {
+                    "id": appointment.id,
+                    "patient_name": appointment.patient_name,
+                    "patient_phone": appointment.patient_phone,
+                    "consultation_type": appointment.consultation_type,
+                    "insurance_plan": appointment.insurance_plan
+                }
+            }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Erro ao atualizar consulta: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/dashboard")
-async def dashboard():
+async def dashboard(admin: str = Depends(verify_admin_credentials)):
     """Dashboard moderno para visualizar consultas agendadas"""
     return HTMLResponse(content="""
     <!DOCTYPE html>
@@ -751,6 +1000,7 @@ async def dashboard():
         <title>Dashboard - Consultas Agendadas</title>
         <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
         <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+        <script src="https://cdn.jsdelivr.net/npm/sweetalert2@11"></script>
         <style>
             /* ESTILOS MODERNOS E LIMPOS */
             
@@ -922,17 +1172,33 @@ async def dashboard():
                 padding: 1.5rem;
                 margin-bottom: 1rem;
                 display: grid;
-                grid-template-columns: 80px 1fr auto;
+                grid-template-columns: 80px 1fr auto auto;
                 gap: 1.5rem;
                 align-items: center;
                 transition: all 0.2s;
                 box-shadow: 0 1px 3px rgba(0,0,0,0.05);
             }
-            
+
             .appointment-card:hover {
                 transform: translateX(4px);
                 box-shadow: 0 4px 12px rgba(0,0,0,0.1);
                 border-color: var(--primary);
+            }
+
+            .appointment-actions {
+                display: flex;
+                gap: 0.5rem;
+                flex-direction: column;
+            }
+
+            .appointment-actions .btn {
+                padding: 0.4rem 0.8rem;
+                font-size: 0.85rem;
+                white-space: nowrap;
+            }
+
+            .appointment-actions .btn i {
+                margin-right: 0.3rem;
             }
             
             .appointment-time {
@@ -1299,8 +1565,9 @@ async def dashboard():
             }
 
             function renderAppointmentCard(appointment) {
+                const actionButtons = getActionButtons(appointment);
                 return `
-                    <div class="appointment-card">
+                    <div class="appointment-card" data-id="${appointment.id}">
                         <div class="appointment-time">
                             <div class="time">${formatTime(appointment.appointment_time)}</div>
                             <div class="duration">${appointment.duration_minutes}min</div>
@@ -1317,8 +1584,35 @@ async def dashboard():
                             <span class="badge-custom badge-insurance">${getInsurancePlanText(appointment.insurance_plan)}</span>
                             <span class="badge-custom badge-status-${appointment.status}">${getStatusText(appointment.status)}</span>
                         </div>
+                        <div class="appointment-actions">
+                            ${actionButtons}
+                        </div>
                     </div>
                 `;
+            }
+
+            function getActionButtons(appointment) {
+                const buttons = [];
+
+                if (appointment.status === 'AGENDADA') {
+                    buttons.push(`
+                        <button class="btn btn-sm btn-success" onclick="completeAppointment(${appointment.id})">
+                            <i class="fas fa-check"></i> Concluir
+                        </button>
+                    `);
+                    buttons.push(`
+                        <button class="btn btn-sm btn-primary" onclick="openRescheduleModal(${appointment.id}, '${appointment.appointment_date}', '${appointment.appointment_time}')">
+                            <i class="fas fa-calendar-alt"></i> Remarcar
+                        </button>
+                    `);
+                    buttons.push(`
+                        <button class="btn btn-sm btn-danger" onclick="cancelAppointment(${appointment.id}, '${appointment.patient_name}')">
+                            <i class="fas fa-times"></i> Cancelar
+                        </button>
+                    `);
+                }
+
+                return buttons.join('');
             }
 
             function formatTime(timeStr) {
@@ -1368,6 +1662,143 @@ async def dashboard():
                     'cancelada': 'Cancelada'
                 };
                 return statusMap[status] || status;
+            }
+
+            // ========== FUNÇÕES DE AÇÃO ==========
+
+            async function cancelAppointment(id, patientName) {
+                const result = await Swal.fire({
+                    title: 'Cancelar Consulta?',
+                    html: `
+                        <p>Tem certeza que deseja cancelar a consulta de <strong>${patientName}</strong>?</p>
+                        <textarea id="cancel-reason" class="swal2-input" placeholder="Motivo do cancelamento (opcional)" style="height: 80px;"></textarea>
+                    `,
+                    icon: 'warning',
+                    showCancelButton: true,
+                    confirmButtonColor: '#EF4444',
+                    cancelButtonColor: '#6B7280',
+                    confirmButtonText: 'Sim, cancelar',
+                    cancelButtonText: 'Não',
+                    preConfirm: () => {
+                        return document.getElementById('cancel-reason').value;
+                    }
+                });
+
+                if (result.isConfirmed) {
+                    try {
+                        const response = await fetch(`/admin/appointments/${id}/cancel`, {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ reason: result.value || 'Cancelado pelo admin' })
+                        });
+
+                        const data = await response.json();
+
+                        if (response.ok) {
+                            Swal.fire('Cancelada!', 'Consulta cancelada com sucesso.', 'success');
+                            loadAppointments(); // Recarregar lista
+                        } else {
+                            throw new Error(data.detail || 'Erro ao cancelar consulta');
+                        }
+                    } catch (error) {
+                        Swal.fire('Erro!', error.message, 'error');
+                    }
+                }
+            }
+
+            async function completeAppointment(id) {
+                const result = await Swal.fire({
+                    title: 'Marcar como realizada?',
+                    text: 'Esta consulta será marcada como concluída.',
+                    icon: 'question',
+                    showCancelButton: true,
+                    confirmButtonColor: '#10B981',
+                    cancelButtonColor: '#6B7280',
+                    confirmButtonText: 'Sim, concluir',
+                    cancelButtonText: 'Cancelar'
+                });
+
+                if (result.isConfirmed) {
+                    try {
+                        const response = await fetch(`/admin/appointments/${id}/complete`, {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' }
+                        });
+
+                        const data = await response.json();
+
+                        if (response.ok) {
+                            Swal.fire('Concluída!', 'Consulta marcada como realizada.', 'success');
+                            loadAppointments(); // Recarregar lista
+                        } else {
+                            throw new Error(data.detail || 'Erro ao concluir consulta');
+                        }
+                    } catch (error) {
+                        Swal.fire('Erro!', error.message, 'error');
+                    }
+                }
+            }
+
+            async function openRescheduleModal(id, currentDate, currentTime) {
+                const { value: formValues } = await Swal.fire({
+                    title: 'Remarcar Consulta',
+                    html: `
+                        <div style="text-align: left;">
+                            <label style="display: block; margin-bottom: 5px; font-weight: 500;">Nova Data</label>
+                            <input type="date" id="new-date" class="swal2-input" style="margin-top: 0;">
+                            <label style="display: block; margin-top: 15px; margin-bottom: 5px; font-weight: 500;">Novo Horário</label>
+                            <input type="time" id="new-time" class="swal2-input" style="margin-top: 0;" step="3600">
+                        </div>
+                    `,
+                    focusConfirm: false,
+                    showCancelButton: true,
+                    confirmButtonColor: '#4F46E5',
+                    cancelButtonColor: '#6B7280',
+                    confirmButtonText: 'Remarcar',
+                    cancelButtonText: 'Cancelar',
+                    preConfirm: () => {
+                        const newDate = document.getElementById('new-date').value;
+                        const newTime = document.getElementById('new-time').value;
+
+                        if (!newDate || !newTime) {
+                            Swal.showValidationMessage('Por favor, preencha data e horário');
+                            return false;
+                        }
+
+                        return { newDate, newTime };
+                    }
+                });
+
+                if (formValues) {
+                    await rescheduleAppointment(id, formValues.newDate, formValues.newTime);
+                }
+            }
+
+            async function rescheduleAppointment(id, newDate, newTime) {
+                try {
+                    // Converter data de YYYY-MM-DD para YYYYMMDD
+                    const dateFormatted = newDate.replace(/-/g, '');
+
+                    const response = await fetch(`/admin/appointments/${id}/reschedule`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            new_date: dateFormatted,
+                            new_time: newTime
+                        })
+                    });
+
+                    const data = await response.json();
+
+                    if (response.ok) {
+                        Swal.fire('Remarcada!', 'Consulta remarcada com sucesso.', 'success');
+                        loadAppointments(); // Recarregar lista
+                    } else {
+                        throw new Error(data.detail || 'Erro ao remarcar consulta');
+                    }
+                } catch (error) {
+                    Swal.fire('Erro!', error.message, 'error');
+                }
             }
         </script>
     </body>

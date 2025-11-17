@@ -55,18 +55,24 @@ class AppointmentRules:
             return False, "Segundas-feiras atendemos apenas consultas particulares."
         return True, ""
 
-    def has_capacity_for_insurance(self, appointment_date: datetime, insurance_plan: Optional[str], db: Session) -> Tuple[bool, str]:
+    def has_capacity_for_insurance(self, appointment_date: datetime, insurance_plan: Optional[str], db: Session, exclude_appointment_id: int = None) -> Tuple[bool, str]:
         """Verifica se ainda há vagas para o convênio na data (limite diário IPE)."""
         plan = self._normalize_plan(insurance_plan)
         if plan != "IPE":
             return True, ""
 
         date_str = appointment_date.strftime('%Y%m%d')
-        count = db.query(Appointment).filter(
+        query = db.query(Appointment).filter(
             Appointment.appointment_date == date_str,
             Appointment.status == AppointmentStatus.AGENDADA,
             Appointment.insurance_plan.ilike("ipe")
-        ).count()
+        )
+
+        # Excluir consulta específica se fornecida (para remarcação)
+        if exclude_appointment_id is not None:
+            query = query.filter(Appointment.id != exclude_appointment_id)
+
+        count = query.count()
 
         if count >= self.ipe_daily_limit:
             return False, "Já atingimos o limite diário de atendimentos IPE para essa data."
@@ -441,16 +447,18 @@ class AppointmentRules:
         self,
         target_datetime: datetime,
         consultation_duration: int,
-        db: Session
+        db: Session,
+        exclude_appointment_id: int = None
     ) -> bool:
         """
         Verifica se um horário específico está disponível.
-        
+
         Args:
             target_datetime: Data e hora exata da consulta desejada
             consultation_duration: Duração da consulta em minutos
             db: Sessão do banco de dados
-            
+            exclude_appointment_id: ID de consulta a excluir da verificação (para remarcação)
+
         Returns:
             True se disponível, False se conflita
         """
@@ -465,11 +473,17 @@ class AppointmentRules:
         
         # 3. Buscar consultas do dia - USAR FORMATO COM HÍFEN
         target_date_str = target_datetime.strftime('%Y%m%d')  # Formato YYYYMMDD "20251022"
-        
-        existing_appointments = db.query(Appointment).filter(
+
+        query = db.query(Appointment).filter(
             Appointment.appointment_date == target_date_str,
             Appointment.status == AppointmentStatus.AGENDADA
-        ).all()
+        )
+
+        # Excluir consulta específica se fornecida (para remarcação)
+        if exclude_appointment_id is not None:
+            query = query.filter(Appointment.id != exclude_appointment_id)
+
+        existing_appointments = query.all()
         
         # 4. Calcular fim da nova consulta
         slot_end = target_datetime + timedelta(minutes=consultation_duration)
