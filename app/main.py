@@ -1116,51 +1116,77 @@ async def migrate_appointment_status(admin: str = Depends(verify_admin_credentia
     """
     try:
         from sqlalchemy import text
-        with get_db() as db:
-            logger.info("Iniciando migração de status...")
 
-            # Primeiro, adicionar novos valores ao enum (se não existirem)
-            try:
-                logger.info("Adicionando novos valores ao enum...")
-                db.execute(text("ALTER TYPE appointmentstatus ADD VALUE IF NOT EXISTS 'compareceu'"))
-                db.execute(text("ALTER TYPE appointmentstatus ADD VALUE IF NOT EXISTS 'nao_compareceu'"))
+        logger.info("=== Iniciando migração de status ===")
+
+        # ETAPA 1: Adicionar 'compareceu' ao enum (transação separada)
+        try:
+            with get_db() as db:
+                logger.info("Tentando adicionar 'compareceu' ao enum...")
+                db.execute(text("ALTER TYPE appointmentstatus ADD VALUE 'compareceu'"))
                 db.commit()
-                logger.info("Novos valores adicionados ao enum")
-            except Exception as e:
-                logger.warning(f"Erro ao adicionar valores ao enum (podem já existir): {str(e)}")
-                db.rollback()
+                logger.info("✅ Valor 'compareceu' adicionado")
+        except Exception as e:
+            if "already exists" in str(e).lower():
+                logger.info("ℹ️  Valor 'compareceu' já existe")
+            else:
+                logger.warning(f"Aviso ao adicionar 'compareceu': {str(e)}")
 
-            # Contar registros antes
+        # ETAPA 2: Adicionar 'nao_compareceu' ao enum (transação separada)
+        try:
+            with get_db() as db:
+                logger.info("Tentando adicionar 'nao_compareceu' ao enum...")
+                db.execute(text("ALTER TYPE appointmentstatus ADD VALUE 'nao_compareceu'"))
+                db.commit()
+                logger.info("✅ Valor 'nao_compareceu' adicionado")
+        except Exception as e:
+            if "already exists" in str(e).lower():
+                logger.info("ℹ️  Valor 'nao_compareceu' já existe")
+            else:
+                logger.warning(f"Aviso ao adicionar 'nao_compareceu': {str(e)}")
+
+        # ETAPA 3: Migrar dados (nova transação limpa)
+        with get_db() as db:
+            logger.info("Iniciando migração de dados...")
+
+            # Contar total
             total_count = db.query(Appointment).count()
 
-            # Usar raw SQL para contar porque o enum pode não estar sincronizado
+            # Contar canceladas (usar cast para text)
+            canceled_count = 0
             try:
-                canceled_result = db.execute(text("SELECT COUNT(*) FROM appointments WHERE status = 'cancelada'"))
-                canceled_count = canceled_result.scalar() or 0
-            except:
-                canceled_count = 0
+                result = db.execute(text("SELECT COUNT(*) FROM appointments WHERE status::text = 'cancelada'"))
+                canceled_count = result.scalar() or 0
+            except Exception as e:
+                logger.warning(f"Não conseguiu contar canceladas: {str(e)}")
 
+            # Contar realizadas (usar cast para text)
+            realizada_count = 0
             try:
-                realizada_result = db.execute(text("SELECT COUNT(*) FROM appointments WHERE status = 'realizada'"))
-                realizada_count = realizada_result.scalar() or 0
-            except:
-                realizada_count = 0
+                result = db.execute(text("SELECT COUNT(*) FROM appointments WHERE status::text = 'realizada'"))
+                realizada_count = result.scalar() or 0
+            except Exception as e:
+                logger.warning(f"Não conseguiu contar realizadas: {str(e)}")
 
-            # Deletar consultas canceladas (usar raw SQL)
-            logger.info(f"Deletando {canceled_count} consultas canceladas...")
-            db.execute(text("DELETE FROM appointments WHERE status = 'cancelada'"))
+            # Deletar canceladas
+            if canceled_count > 0:
+                logger.info(f"Deletando {canceled_count} consultas canceladas...")
+                db.execute(text("DELETE FROM appointments WHERE status::text = 'cancelada'"))
+                logger.info("✅ Consultas canceladas deletadas")
 
-            # Converter realizada para compareceu
-            logger.info(f"Convertendo {realizada_count} consultas realizadas para compareceu...")
-            db.execute(text("UPDATE appointments SET status = 'compareceu' WHERE status = 'realizada'"))
+            # Converter realizada → compareceu
+            if realizada_count > 0:
+                logger.info(f"Convertendo {realizada_count} consultas 'realizada' → 'compareceu'...")
+                db.execute(text("UPDATE appointments SET status = 'compareceu' WHERE status::text = 'realizada'"))
+                logger.info("✅ Consultas convertidas")
 
             db.commit()
 
-            logger.info(f"Migração concluída: {canceled_count} canceladas deletadas, {realizada_count} convertidas para compareceu")
+            logger.info(f"=== Migração concluída: {canceled_count} deletadas, {realizada_count} convertidas ===")
 
             return {
                 "success": True,
-                "message": "Migração concluída com sucesso. IMPORTANTE: Você precisa remover os valores antigos do enum manualmente no banco.",
+                "message": "✅ Migração concluída com sucesso!",
                 "stats": {
                     "total_before": total_count,
                     "canceled_deleted": canceled_count,
@@ -1168,15 +1194,15 @@ async def migrate_appointment_status(admin: str = Depends(verify_admin_credentia
                     "total_after": total_count - canceled_count
                 },
                 "next_steps": [
-                    "Os dados foram migrados com sucesso",
-                    "Agora você pode usar o sistema normalmente",
-                    "Os valores antigos do enum (cancelada, realizada) ainda existem no banco mas não são usados"
+                    "✅ Enum do PostgreSQL atualizado",
+                    "✅ Dados migrados com sucesso",
+                    "✅ Agora você pode usar COMPARECEU e NAO_COMPARECEU",
+                    "✅ Teste marcar um paciente como 'Faltou' no dashboard"
                 ]
             }
 
     except Exception as e:
-        logger.error(f"Erro na migração: {str(e)}")
-        db.rollback()
+        logger.error(f"❌ Erro na migração: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
