@@ -900,10 +900,9 @@ async def reschedule_appointment_admin(
 
             # Validar disponibilidade do novo horário
             from app.appointment_rules import AppointmentRules
-            from app.utils import load_clinic_info, parse_appointment_datetime
+            from app.utils import parse_appointment_datetime
 
-            clinic_info = load_clinic_info()
-            rules = AppointmentRules(clinic_info)
+            rules = AppointmentRules()
 
             # Verificar se o horário é válido
             new_datetime = parse_appointment_datetime(new_date, new_time)
@@ -1025,7 +1024,7 @@ async def create_appointment_admin(
                 raise HTTPException(status_code=400, detail=f"Campo obrigatório: {field}")
 
         # Validar e normalizar dados
-        from app.utils import normalize_phone, load_clinic_info, parse_appointment_datetime
+        from app.utils import normalize_phone, parse_appointment_datetime
         from app.appointment_rules import AppointmentRules
 
         patient_phone = normalize_phone(body["patient_phone"])
@@ -1035,8 +1034,7 @@ async def create_appointment_admin(
 
         with get_db() as db:
             # Validar disponibilidade
-            clinic_info = load_clinic_info()
-            rules = AppointmentRules(clinic_info)
+            rules = AppointmentRules()
 
             appointment_datetime = parse_appointment_datetime(appointment_date, appointment_time)
 
