@@ -1106,7 +1106,7 @@ async def create_appointment_admin(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/admin/migrate-status")
+@app.api_route("/admin/migrate-status", methods=["GET", "POST"])
 async def migrate_appointment_status(admin: str = Depends(verify_admin_credentials)):
     """
     Migração única para atualizar status antigos:
