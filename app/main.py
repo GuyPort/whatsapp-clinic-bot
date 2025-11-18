@@ -1112,29 +1112,47 @@ async def migrate_appointment_status(admin: str = Depends(verify_admin_credentia
     Migração única para atualizar status antigos:
     - Deleta consultas com status 'cancelada'
     - Converte 'realizada' para 'compareceu'
+    - Atualiza o tipo ENUM do PostgreSQL
     """
     try:
         from sqlalchemy import text
         with get_db() as db:
+            logger.info("Iniciando migração de status...")
+
+            # Primeiro, adicionar novos valores ao enum (se não existirem)
+            try:
+                logger.info("Adicionando novos valores ao enum...")
+                db.execute(text("ALTER TYPE appointmentstatus ADD VALUE IF NOT EXISTS 'compareceu'"))
+                db.execute(text("ALTER TYPE appointmentstatus ADD VALUE IF NOT EXISTS 'nao_compareceu'"))
+                db.commit()
+                logger.info("Novos valores adicionados ao enum")
+            except Exception as e:
+                logger.warning(f"Erro ao adicionar valores ao enum (podem já existir): {str(e)}")
+                db.rollback()
+
             # Contar registros antes
             total_count = db.query(Appointment).count()
-            canceled_count = db.query(Appointment).filter(
-                Appointment.status == 'cancelada'
-            ).count()
-            realizada_count = db.query(Appointment).filter(
-                Appointment.status == 'realizada'
-            ).count()
 
-            # Deletar consultas canceladas
-            db.query(Appointment).filter(
-                Appointment.status == 'cancelada'
-            ).delete()
+            # Usar raw SQL para contar porque o enum pode não estar sincronizado
+            try:
+                canceled_result = db.execute(text("SELECT COUNT(*) FROM appointments WHERE status = 'cancelada'"))
+                canceled_count = canceled_result.scalar() or 0
+            except:
+                canceled_count = 0
+
+            try:
+                realizada_result = db.execute(text("SELECT COUNT(*) FROM appointments WHERE status = 'realizada'"))
+                realizada_count = realizada_result.scalar() or 0
+            except:
+                realizada_count = 0
+
+            # Deletar consultas canceladas (usar raw SQL)
+            logger.info(f"Deletando {canceled_count} consultas canceladas...")
+            db.execute(text("DELETE FROM appointments WHERE status = 'cancelada'"))
 
             # Converter realizada para compareceu
-            # Precisamos usar raw SQL porque o enum mudou
-            db.execute(
-                text("UPDATE appointments SET status = 'compareceu' WHERE status = 'realizada'")
-            )
+            logger.info(f"Convertendo {realizada_count} consultas realizadas para compareceu...")
+            db.execute(text("UPDATE appointments SET status = 'compareceu' WHERE status = 'realizada'"))
 
             db.commit()
 
@@ -1142,17 +1160,23 @@ async def migrate_appointment_status(admin: str = Depends(verify_admin_credentia
 
             return {
                 "success": True,
-                "message": "Migração concluída com sucesso",
+                "message": "Migração concluída com sucesso. IMPORTANTE: Você precisa remover os valores antigos do enum manualmente no banco.",
                 "stats": {
                     "total_before": total_count,
                     "canceled_deleted": canceled_count,
                     "realizada_converted": realizada_count,
                     "total_after": total_count - canceled_count
-                }
+                },
+                "next_steps": [
+                    "Os dados foram migrados com sucesso",
+                    "Agora você pode usar o sistema normalmente",
+                    "Os valores antigos do enum (cancelada, realizada) ainda existem no banco mas não são usados"
+                ]
             }
 
     except Exception as e:
         logger.error(f"Erro na migração: {str(e)}")
+        db.rollback()
         raise HTTPException(status_code=500, detail=str(e))
 
 
