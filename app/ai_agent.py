@@ -5363,45 +5363,37 @@ Responda EXCLUSIVAMENTE com um JSON válido no formato:
             return f"Erro ao buscar agendamentos: {str(e)}"
 
     def _handle_cancel_appointment(self, tool_input: Dict, db: Session) -> str:
-        """Tool: cancel_appointment"""
+        """Tool: cancel_appointment - Deleta a consulta do banco de dados"""
         try:
             appointment_id = tool_input.get("appointment_id")
             reason = tool_input.get("reason")
-            
+
             if not appointment_id or not reason:
                 return "ID do agendamento e motivo são obrigatórios."
-            
+
             appointment = db.query(Appointment).filter(Appointment.id == appointment_id).first()
-            
+
             if not appointment:
                 return "Agendamento não encontrado."
-            
-            if appointment.status == AppointmentStatus.CANCELADA:
-                return "Este agendamento já foi cancelado."
-            
-            # Cancelar agendamento
-            appointment.status = AppointmentStatus.CANCELADA
-            appointment.cancelled_at = now_brazil()
-            appointment.cancelled_reason = reason
-            appointment.updated_at = now_brazil()
-            
-            # Garantir que appointment_time seja string antes do commit (evita erro na validação)
-            if isinstance(appointment.appointment_time, time):
-                appointment.appointment_time = appointment.appointment_time.strftime('%H:%M')
-            
-            db.commit()
-            
-            # Formatar appointment_date usando função helper segura
+
+            # Salvar dados antes de deletar para mostrar na mensagem
+            patient_name = appointment.patient_name
             app_date_formatted = self._format_appointment_date_safe(appointment.appointment_date)
-            # Formatar appointment_time (já está correto, mas manter verificação)
             app_time_str = appointment.appointment_time if isinstance(appointment.appointment_time, str) else appointment.appointment_time.strftime('%H:%M')
-            
+
+            # Log antes de deletar para auditoria
+            logger.info(f"Cancelando (deletando) consulta #{appointment_id}: {patient_name} - {appointment.appointment_date} {app_time_str} - Motivo: {reason}")
+
+            # Deletar do banco de dados
+            db.delete(appointment)
+            db.commit()
+
             return f"✅ **Agendamento cancelado com sucesso!**\n\n" + \
-                   f"👤 **Paciente:** {appointment.patient_name}\n" + \
+                   f"👤 **Paciente:** {patient_name}\n" + \
                    f"📅 **Data:** {app_date_formatted} às {app_time_str}\n" + \
                    f"📝 **Motivo:** {reason}\n\n" + \
                    "Se precisar reagendar, estarei aqui para ajudar! 😊"
-                   
+
         except Exception as e:
             logger.error(f"Erro ao cancelar agendamento: {str(e)}")
             db.rollback()

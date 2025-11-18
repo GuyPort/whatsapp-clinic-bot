@@ -765,59 +765,44 @@ async def get_dashboard(admin: str = Depends(verify_admin_credentials)):
 
 # ==================== ENDPOINTS DE MANIPULAÇÃO DE CONSULTAS ====================
 
-@app.post("/admin/appointments/{appointment_id}/cancel")
-async def cancel_appointment_admin(
+@app.delete("/admin/appointments/{appointment_id}")
+async def delete_appointment_admin(
     appointment_id: int,
-    request: Request,
     admin: str = Depends(verify_admin_credentials)
 ):
-    """Cancela uma consulta via painel admin"""
+    """Deleta uma consulta permanentemente do banco de dados"""
     try:
-        body = await request.json()
-        reason = body.get("reason", "Cancelado pelo admin")
-
         with get_db() as db:
             appointment = db.query(Appointment).filter(Appointment.id == appointment_id).first()
 
             if not appointment:
                 raise HTTPException(status_code=404, detail="Consulta não encontrada")
 
-            if appointment.status == AppointmentStatus.CANCELADA:
-                raise HTTPException(status_code=400, detail="Esta consulta já foi cancelada")
+            # Log antes de deletar
+            logger.info(f"Admin {admin} deletou consulta #{appointment_id}: {appointment.patient_name} - {appointment.appointment_date} {appointment.appointment_time}")
 
-            # Cancelar agendamento
-            from app.utils import now_brazil
-            appointment.status = AppointmentStatus.CANCELADA
-            appointment.cancelled_at = now_brazil()
-            appointment.cancelled_reason = reason
-
+            # Deletar do banco
+            db.delete(appointment)
             db.commit()
-
-            logger.info(f"Admin {admin} cancelou consulta #{appointment_id}: {appointment.patient_name}")
 
             return {
                 "success": True,
-                "message": "Consulta cancelada com sucesso",
-                "appointment": {
-                    "id": appointment.id,
-                    "patient_name": appointment.patient_name,
-                    "status": appointment.status.value
-                }
+                "message": "Consulta deletada com sucesso"
             }
 
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Erro ao cancelar consulta: {str(e)}")
+        logger.error(f"Erro ao deletar consulta: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/admin/appointments/{appointment_id}/complete")
-async def complete_appointment_admin(
+@app.post("/admin/appointments/{appointment_id}/mark-attended")
+async def mark_attended_appointment_admin(
     appointment_id: int,
     admin: str = Depends(verify_admin_credentials)
 ):
-    """Marca uma consulta como realizada"""
+    """Marca que o paciente compareceu à consulta"""
     try:
         with get_db() as db:
             appointment = db.query(Appointment).filter(Appointment.id == appointment_id).first()
@@ -825,22 +810,19 @@ async def complete_appointment_admin(
             if not appointment:
                 raise HTTPException(status_code=404, detail="Consulta não encontrada")
 
-            if appointment.status == AppointmentStatus.REALIZADA:
-                raise HTTPException(status_code=400, detail="Esta consulta já foi marcada como realizada")
+            if appointment.status == AppointmentStatus.COMPARECEU:
+                raise HTTPException(status_code=400, detail="Esta consulta já foi marcada como compareceu")
 
-            if appointment.status == AppointmentStatus.CANCELADA:
-                raise HTTPException(status_code=400, detail="Não é possível marcar uma consulta cancelada como realizada")
-
-            # Marcar como realizada
-            appointment.status = AppointmentStatus.REALIZADA
+            # Marcar como compareceu
+            appointment.status = AppointmentStatus.COMPARECEU
 
             db.commit()
 
-            logger.info(f"Admin {admin} marcou consulta #{appointment_id} como realizada: {appointment.patient_name}")
+            logger.info(f"Admin {admin} marcou consulta #{appointment_id} como compareceu: {appointment.patient_name}")
 
             return {
                 "success": True,
-                "message": "Consulta marcada como realizada",
+                "message": "Paciente marcado como compareceu",
                 "appointment": {
                     "id": appointment.id,
                     "patient_name": appointment.patient_name,
@@ -851,7 +833,47 @@ async def complete_appointment_admin(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Erro ao marcar consulta como realizada: {str(e)}")
+        logger.error(f"Erro ao marcar presença: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/admin/appointments/{appointment_id}/mark-missed")
+async def mark_missed_appointment_admin(
+    appointment_id: int,
+    admin: str = Depends(verify_admin_credentials)
+):
+    """Marca que o paciente não compareceu à consulta (faltou)"""
+    try:
+        with get_db() as db:
+            appointment = db.query(Appointment).filter(Appointment.id == appointment_id).first()
+
+            if not appointment:
+                raise HTTPException(status_code=404, detail="Consulta não encontrada")
+
+            if appointment.status == AppointmentStatus.NAO_COMPARECEU:
+                raise HTTPException(status_code=400, detail="Esta consulta já foi marcada como não compareceu")
+
+            # Marcar como não compareceu
+            appointment.status = AppointmentStatus.NAO_COMPARECEU
+
+            db.commit()
+
+            logger.info(f"Admin {admin} marcou consulta #{appointment_id} como não compareceu (falta): {appointment.patient_name}")
+
+            return {
+                "success": True,
+                "message": "Paciente marcado como faltou",
+                "appointment": {
+                    "id": appointment.id,
+                    "patient_name": appointment.patient_name,
+                    "status": appointment.status.value
+                }
+            }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Erro ao marcar falta: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -875,9 +897,6 @@ async def reschedule_appointment_admin(
 
             if not appointment:
                 raise HTTPException(status_code=404, detail="Consulta não encontrada")
-
-            if appointment.status == AppointmentStatus.CANCELADA:
-                raise HTTPException(status_code=400, detail="Não é possível remarcar uma consulta cancelada")
 
             # Validar disponibilidade do novo horário
             from app.appointment_rules import AppointmentRules
@@ -985,6 +1004,143 @@ async def update_appointment_admin(
         raise
     except Exception as e:
         logger.error(f"Erro ao atualizar consulta: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/admin/appointments")
+async def create_appointment_admin(
+    request: Request,
+    admin: str = Depends(verify_admin_credentials)
+):
+    """Cria uma nova consulta via painel admin"""
+    try:
+        body = await request.json()
+
+        # Validar campos obrigatórios
+        required_fields = ["patient_name", "patient_phone", "patient_birth_date",
+                          "appointment_date", "appointment_time", "consultation_type", "insurance_plan"]
+
+        for field in required_fields:
+            if not body.get(field):
+                raise HTTPException(status_code=400, detail=f"Campo obrigatório: {field}")
+
+        # Validar e normalizar dados
+        from app.utils import normalize_phone, load_clinic_info, parse_appointment_datetime
+        from app.appointment_rules import AppointmentRules
+
+        patient_phone = normalize_phone(body["patient_phone"])
+        appointment_date = body["appointment_date"]  # YYYYMMDD
+        appointment_time = body["appointment_time"]  # HH:MM
+        duration_minutes = body.get("duration_minutes", 60)
+
+        with get_db() as db:
+            # Validar disponibilidade
+            clinic_info = load_clinic_info()
+            rules = AppointmentRules(clinic_info)
+
+            appointment_datetime = parse_appointment_datetime(appointment_date, appointment_time)
+
+            if not rules.is_valid_appointment_date(appointment_datetime):
+                raise HTTPException(status_code=400, detail="Data/hora inválida (fora do horário de funcionamento ou no passado)")
+
+            if not rules.check_slot_availability(appointment_datetime, duration_minutes, db):
+                raise HTTPException(status_code=400, detail="Horário já está ocupado")
+
+            insurance_plan = body["insurance_plan"]
+            if not rules.is_plan_allowed_on_date(appointment_datetime, insurance_plan):
+                raise HTTPException(status_code=400, detail=f"Convênio {insurance_plan} não permitido nesta data")
+
+            if not rules.has_capacity_for_insurance(appointment_datetime, insurance_plan, db):
+                raise HTTPException(status_code=400, detail=f"Capacidade diária para {insurance_plan} atingida")
+
+            # Criar consulta
+            new_appointment = Appointment(
+                patient_name=body["patient_name"],
+                patient_phone=patient_phone,
+                patient_birth_date=body["patient_birth_date"],
+                appointment_date=appointment_date,
+                appointment_time=appointment_time,
+                duration_minutes=duration_minutes,
+                consultation_type=body["consultation_type"],
+                insurance_plan=insurance_plan,
+                status=AppointmentStatus.AGENDADA
+            )
+
+            db.add(new_appointment)
+            db.commit()
+            db.refresh(new_appointment)
+
+            logger.info(f"Admin {admin} criou nova consulta #{new_appointment.id}: {new_appointment.patient_name} - {appointment_date} {appointment_time}")
+
+            return {
+                "success": True,
+                "message": "Consulta criada com sucesso",
+                "appointment": {
+                    "id": new_appointment.id,
+                    "patient_name": new_appointment.patient_name,
+                    "patient_phone": new_appointment.patient_phone,
+                    "appointment_date": new_appointment.appointment_date,
+                    "appointment_time": new_appointment.appointment_time,
+                    "consultation_type": new_appointment.consultation_type,
+                    "insurance_plan": new_appointment.insurance_plan,
+                    "status": new_appointment.status.value
+                }
+            }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Erro ao criar consulta: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/admin/migrate-status")
+async def migrate_appointment_status(admin: str = Depends(verify_admin_credentials)):
+    """
+    Migração única para atualizar status antigos:
+    - Deleta consultas com status 'cancelada'
+    - Converte 'realizada' para 'compareceu'
+    """
+    try:
+        from sqlalchemy import text
+        with get_db() as db:
+            # Contar registros antes
+            total_count = db.query(Appointment).count()
+            canceled_count = db.query(Appointment).filter(
+                Appointment.status == 'cancelada'
+            ).count()
+            realizada_count = db.query(Appointment).filter(
+                Appointment.status == 'realizada'
+            ).count()
+
+            # Deletar consultas canceladas
+            db.query(Appointment).filter(
+                Appointment.status == 'cancelada'
+            ).delete()
+
+            # Converter realizada para compareceu
+            # Precisamos usar raw SQL porque o enum mudou
+            db.execute(
+                text("UPDATE appointments SET status = 'compareceu' WHERE status = 'realizada'")
+            )
+
+            db.commit()
+
+            logger.info(f"Migração concluída: {canceled_count} canceladas deletadas, {realizada_count} convertidas para compareceu")
+
+            return {
+                "success": True,
+                "message": "Migração concluída com sucesso",
+                "stats": {
+                    "total_before": total_count,
+                    "canceled_deleted": canceled_count,
+                    "realizada_converted": realizada_count,
+                    "total_after": total_count - canceled_count
+                }
+            }
+
+    except Exception as e:
+        logger.error(f"Erro na migração: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -1322,9 +1478,14 @@ async def dashboard(admin: str = Depends(verify_admin_credentials)):
     <body>
         <div class="dashboard-container">
             <!-- Header -->
-            <div class="header">
-                <h1><i class="fas fa-calendar-check"></i> Dashboard - Consultas Agendadas</h1>
-                <p class="text-muted mb-0">Consultório Dra. Rose</p>
+            <div class="header" style="display: flex; justify-content: space-between; align-items: center;">
+                <div>
+                    <h1><i class="fas fa-calendar-check"></i> Dashboard - Consultas Agendadas</h1>
+                    <p class="text-muted mb-0">Consultório Dra. Rose</p>
+                </div>
+                <button class="btn btn-primary" onclick="openCreateModal()" style="height: fit-content;">
+                    <i class="fas fa-plus"></i> Criar Consulta
+                </button>
             </div>
 
             <!-- Estatísticas -->
@@ -1594,10 +1755,15 @@ async def dashboard(admin: str = Depends(verify_admin_credentials)):
             function getActionButtons(appointment) {
                 const buttons = [];
 
-                if (appointment.status === 'agendada') {  // lowercase to match API response
+                if (appointment.status === 'agendada') {
                     buttons.push(`
-                        <button class="btn btn-sm btn-success" onclick="completeAppointment(${appointment.id})">
-                            <i class="fas fa-check"></i> Concluir
+                        <button class="btn btn-sm btn-success" onclick="markAttended(${appointment.id})">
+                            <i class="fas fa-check"></i> Paciente Compareceu
+                        </button>
+                    `);
+                    buttons.push(`
+                        <button class="btn btn-sm btn-warning" onclick="markMissed(${appointment.id})">
+                            <i class="fas fa-user-times"></i> Paciente Faltou
                         </button>
                     `);
                     buttons.push(`
@@ -1606,8 +1772,8 @@ async def dashboard(admin: str = Depends(verify_admin_credentials)):
                         </button>
                     `);
                     buttons.push(`
-                        <button class="btn btn-sm btn-danger" onclick="cancelAppointment(${appointment.id}, '${appointment.patient_name}')">
-                            <i class="fas fa-times"></i> Cancelar
+                        <button class="btn btn-sm btn-danger" onclick="deleteAppointment(${appointment.id}, '${appointment.patient_name}')">
+                            <i class="fas fa-trash"></i> Deletar
                         </button>
                     `);
                 }
@@ -1658,47 +1824,40 @@ async def dashboard(admin: str = Depends(verify_admin_credentials)):
             function getStatusText(status) {
                 const statusMap = {
                     'agendada': 'Agendada',
-                    'realizada': 'Realizada',
-                    'cancelada': 'Cancelada'
+                    'compareceu': 'Compareceu',
+                    'nao_compareceu': 'Não Compareceu'
                 };
                 return statusMap[status] || status;
             }
 
             // ========== FUNÇÕES DE AÇÃO ==========
 
-            async function cancelAppointment(id, patientName) {
+            async function deleteAppointment(id, patientName) {
                 const result = await Swal.fire({
-                    title: 'Cancelar Consulta?',
-                    html: `
-                        <p>Tem certeza que deseja cancelar a consulta de <strong>${patientName}</strong>?</p>
-                        <textarea id="cancel-reason" class="swal2-input" placeholder="Motivo do cancelamento (opcional)" style="height: 80px;"></textarea>
-                    `,
+                    title: 'Deletar Consulta?',
+                    html: `<p>Tem certeza que deseja <strong>deletar permanentemente</strong> a consulta de <strong>${patientName}</strong>?</p><p class="text-danger">Esta ação não pode ser desfeita!</p>`,
                     icon: 'warning',
                     showCancelButton: true,
                     confirmButtonColor: '#EF4444',
                     cancelButtonColor: '#6B7280',
-                    confirmButtonText: 'Sim, cancelar',
-                    cancelButtonText: 'Não',
-                    preConfirm: () => {
-                        return document.getElementById('cancel-reason').value;
-                    }
+                    confirmButtonText: 'Sim, deletar',
+                    cancelButtonText: 'Não'
                 });
 
                 if (result.isConfirmed) {
                     try {
-                        const response = await fetch(`/admin/appointments/${id}/cancel`, {
-                            method: 'POST',
-                            headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify({ reason: result.value || 'Cancelado pelo admin' })
+                        const response = await fetch(`/admin/appointments/${id}`, {
+                            method: 'DELETE',
+                            headers: { 'Content-Type': 'application/json' }
                         });
 
                         const data = await response.json();
 
                         if (response.ok) {
-                            Swal.fire('Cancelada!', 'Consulta cancelada com sucesso.', 'success');
-                            loadAppointments(); // Recarregar lista
+                            Swal.fire('Deletada!', 'Consulta deletada com sucesso.', 'success');
+                            loadAppointments();
                         } else {
-                            throw new Error(data.detail || 'Erro ao cancelar consulta');
+                            throw new Error(data.detail || 'Erro ao deletar consulta');
                         }
                     } catch (error) {
                         Swal.fire('Erro!', error.message, 'error');
@@ -1706,21 +1865,21 @@ async def dashboard(admin: str = Depends(verify_admin_credentials)):
                 }
             }
 
-            async function completeAppointment(id) {
+            async function markAttended(id) {
                 const result = await Swal.fire({
-                    title: 'Marcar como realizada?',
-                    text: 'Esta consulta será marcada como concluída.',
+                    title: 'Paciente Compareceu?',
+                    text: 'Marcar que o paciente compareceu à consulta.',
                     icon: 'question',
                     showCancelButton: true,
                     confirmButtonColor: '#10B981',
                     cancelButtonColor: '#6B7280',
-                    confirmButtonText: 'Sim, concluir',
+                    confirmButtonText: 'Sim, compareceu',
                     cancelButtonText: 'Cancelar'
                 });
 
                 if (result.isConfirmed) {
                     try {
-                        const response = await fetch(`/admin/appointments/${id}/complete`, {
+                        const response = await fetch(`/admin/appointments/${id}/mark-attended`, {
                             method: 'POST',
                             headers: { 'Content-Type': 'application/json' }
                         });
@@ -1732,6 +1891,39 @@ async def dashboard(admin: str = Depends(verify_admin_credentials)):
                             loadAppointments(); // Recarregar lista
                         } else {
                             throw new Error(data.detail || 'Erro ao concluir consulta');
+                        }
+                    } catch (error) {
+                        Swal.fire('Erro!', error.message, 'error');
+                    }
+                }
+            }
+
+            async function markMissed(id) {
+                const result = await Swal.fire({
+                    title: 'Paciente Faltou?',
+                    text: 'Marcar que o paciente NÃO compareceu à consulta.',
+                    icon: 'warning',
+                    showCancelButton: true,
+                    confirmButtonColor: '#F59E0B',
+                    cancelButtonColor: '#6B7280',
+                    confirmButtonText: 'Sim, faltou',
+                    cancelButtonText: 'Cancelar'
+                });
+
+                if (result.isConfirmed) {
+                    try {
+                        const response = await fetch(`/admin/appointments/${id}/mark-missed`, {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' }
+                        });
+
+                        const data = await response.json();
+
+                        if (response.ok) {
+                            Swal.fire('Registrado!', 'Falta do paciente registrada.', 'success');
+                            loadAppointments();
+                        } else {
+                            throw new Error(data.detail || 'Erro ao marcar falta');
                         }
                     } catch (error) {
                         Swal.fire('Erro!', error.message, 'error');
@@ -1795,6 +1987,105 @@ async def dashboard(admin: str = Depends(verify_admin_credentials)):
                         loadAppointments(); // Recarregar lista
                     } else {
                         throw new Error(data.detail || 'Erro ao remarcar consulta');
+                    }
+                } catch (error) {
+                    Swal.fire('Erro!', error.message, 'error');
+                }
+            }
+
+            async function openCreateModal() {
+                const { value: formValues } = await Swal.fire({
+                    title: 'Criar Nova Consulta',
+                    html: `
+                        <div style="text-align: left;">
+                            <label style="display: block; margin-bottom: 5px; font-weight: 500;">Nome do Paciente</label>
+                            <input type="text" id="patient-name" class="swal2-input" placeholder="Nome completo" style="margin-top: 0;">
+
+                            <label style="display: block; margin-top: 15px; margin-bottom: 5px; font-weight: 500;">Telefone</label>
+                            <input type="tel" id="patient-phone" class="swal2-input" placeholder="(51) 99999-9999" style="margin-top: 0;">
+
+                            <label style="display: block; margin-top: 15px; margin-bottom: 5px; font-weight: 500;">Data de Nascimento</label>
+                            <input type="text" id="patient-birth" class="swal2-input" placeholder="DD/MM/AAAA" style="margin-top: 0;">
+
+                            <label style="display: block; margin-top: 15px; margin-bottom: 5px; font-weight: 500;">Convênio</label>
+                            <select id="insurance-plan" class="swal2-input" style="margin-top: 0;">
+                                <option value="">Selecione...</option>
+                                <option value="CABERGS">CABERGS</option>
+                                <option value="IPE">IPE</option>
+                                <option value="particular">Particular</option>
+                            </select>
+
+                            <label style="display: block; margin-top: 15px; margin-bottom: 5px; font-weight: 500;">Tipo de Consulta</label>
+                            <select id="consultation-type" class="swal2-input" style="margin-top: 0;">
+                                <option value="">Selecione...</option>
+                                <option value="clinica_geral">Clínica Geral</option>
+                                <option value="geriatria">Geriatria</option>
+                                <option value="domiciliar">Atendimento Domiciliar</option>
+                            </select>
+
+                            <label style="display: block; margin-top: 15px; margin-bottom: 5px; font-weight: 500;">Data da Consulta</label>
+                            <input type="date" id="appointment-date" class="swal2-input" style="margin-top: 0;">
+
+                            <label style="display: block; margin-top: 15px; margin-bottom: 5px; font-weight: 500;">Horário</label>
+                            <input type="time" id="appointment-time" class="swal2-input" style="margin-top: 0;" step="3600">
+                        </div>
+                    `,
+                    focusConfirm: false,
+                    showCancelButton: true,
+                    confirmButtonColor: '#4F46E5',
+                    cancelButtonColor: '#6B7280',
+                    confirmButtonText: 'Criar Consulta',
+                    cancelButtonText: 'Cancelar',
+                    width: '600px',
+                    preConfirm: () => {
+                        const name = document.getElementById('patient-name').value;
+                        const phone = document.getElementById('patient-phone').value;
+                        const birth = document.getElementById('patient-birth').value;
+                        const insurance = document.getElementById('insurance-plan').value;
+                        const type = document.getElementById('consultation-type').value;
+                        const date = document.getElementById('appointment-date').value;
+                        const time = document.getElementById('appointment-time').value;
+
+                        if (!name || !phone || !birth || !insurance || !type || !date || !time) {
+                            Swal.showValidationMessage('Por favor, preencha todos os campos');
+                            return false;
+                        }
+
+                        return { name, phone, birth, insurance, type, date, time };
+                    }
+                });
+
+                if (formValues) {
+                    await createAppointment(formValues);
+                }
+            }
+
+            async function createAppointment(data) {
+                try {
+                    // Converter data de YYYY-MM-DD para YYYYMMDD
+                    const dateFormatted = data.date.replace(/-/g, '');
+
+                    const response = await fetch('/admin/appointments', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            patient_name: data.name,
+                            patient_phone: data.phone,
+                            patient_birth_date: data.birth,
+                            insurance_plan: data.insurance,
+                            consultation_type: data.type,
+                            appointment_date: dateFormatted,
+                            appointment_time: data.time
+                        })
+                    });
+
+                    const result = await response.json();
+
+                    if (response.ok) {
+                        Swal.fire('Criada!', 'Consulta criada com sucesso.', 'success');
+                        loadAppointments();
+                    } else {
+                        throw new Error(result.detail || 'Erro ao criar consulta');
                     }
                 } catch (error) {
                     Swal.fire('Erro!', error.message, 'error');

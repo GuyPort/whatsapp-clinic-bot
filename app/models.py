@@ -15,8 +15,8 @@ Base = declarative_base()
 class AppointmentStatus(enum.Enum):
     """Status possíveis de uma consulta"""
     AGENDADA = "agendada"
-    CANCELADA = "cancelada"
-    REALIZADA = "realizada"
+    COMPARECEU = "compareceu"
+    NAO_COMPARECEU = "nao_compareceu"
 
 
 class Appointment(Base):
