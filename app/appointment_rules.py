@@ -48,15 +48,21 @@ class AppointmentRules:
             return "CABERGS"
         return plan
 
-    def is_plan_allowed_on_date(self, appointment_date: datetime, insurance_plan: Optional[str]) -> Tuple[bool, str]:
+    def is_plan_allowed_on_date(self, appointment_date: datetime, insurance_plan: Optional[str], admin_override: bool = False) -> Tuple[bool, str]:
         """Verifica se o convênio é permitido nesta data (ex.: segunda-feira só particular)."""
+        if admin_override:
+            return True, ""  # Admin pode agendar qualquer convênio em qualquer dia
+
         plan = self._normalize_plan(insurance_plan)
         if appointment_date.weekday() == 0 and plan != "Particular":
             return False, "Segundas-feiras atendemos apenas consultas particulares."
         return True, ""
 
-    def has_capacity_for_insurance(self, appointment_date: datetime, insurance_plan: Optional[str], db: Session, exclude_appointment_id: int = None) -> Tuple[bool, str]:
+    def has_capacity_for_insurance(self, appointment_date: datetime, insurance_plan: Optional[str], db: Session, exclude_appointment_id: int = None, admin_override: bool = False) -> Tuple[bool, str]:
         """Verifica se ainda há vagas para o convênio na data (limite diário IPE)."""
+        if admin_override:
+            return True, ""  # Admin pode ultrapassar limites de convênio
+
         plan = self._normalize_plan(insurance_plan)
         if plan != "IPE":
             return True, ""
@@ -78,65 +84,70 @@ class AppointmentRules:
             return False, "Já atingimos o limite diário de atendimentos IPE para essa data."
         return True, ""
     
-    def is_valid_appointment_date(self, appointment_date: datetime) -> Tuple[bool, str]:
+    def is_valid_appointment_date(self, appointment_date: datetime, admin_override: bool = False) -> Tuple[bool, str]:
         """
         Valida se uma data/hora é válida para agendamento.
-        
+
         Args:
             appointment_date: Data/hora proposta
-            
+            admin_override: Se True, pula validações de horário/dia (apenas admin)
+
         Returns:
             (válido, mensagem_erro)
         """
         now = now_brazil()
-        
-        # 1. Data não pode ser no passado
+
+        # 1. Data não pode ser no passado (SEMPRE validar, mesmo admin)
         # Converter para timezone-aware se necessário
         if appointment_date.tzinfo is None:
             appointment_date = self.timezone.localize(appointment_date)
         if now.tzinfo is None:
             now = self.timezone.localize(now)
-            
+
         if appointment_date <= now:
             return False, "A data deve ser no futuro."
-        
+
+        # Se admin_override está ativo, pular todas as outras validações
+        if admin_override:
+            return True, ""
+
         # 2. Verificar dia da semana
         weekday = appointment_date.weekday()  # 0=segunda, 6=domingo
-        
+
         # Domingo sempre fechado
         if weekday == 6:
             return False, "A clínica não atende aos domingos."
-        
+
         # 4. Verificar horário de funcionamento
         horarios = self.clinic_info.get('horario_funcionamento', {})
         dias_semana = ['segunda', 'terca', 'quarta', 'quinta', 'sexta', 'sabado', 'domingo']
         dia_nome = dias_semana[weekday]
-        
+
         horario_dia = horarios.get(dia_nome, "FECHADO")
         if horario_dia == "FECHADO":
             return False, f"A clínica não atende às {dias_semana[weekday]}s."
-        
+
         # 5. Verificar se está dentro do horário de funcionamento
         if '-' in horario_dia:
             inicio_str, fim_str = horario_dia.split('-')
             inicio_h, inicio_m = map(int, inicio_str.split(':'))
             fim_h, fim_m = map(int, fim_str.split(':'))
-            
+
             inicio = time(inicio_h, inicio_m)
             fim = time(fim_h, fim_m)
-            
+
             hora_consulta = appointment_date.time()
-            
+
             if not (inicio <= hora_consulta <= fim):
                 return False, f"Horário fora do expediente. Horário de atendimento: {horario_dia}"
-        
+
         # 6. Sábado: verificar se não é tarde
         if weekday == 5:  # Sábado
             ultima_hora_sabado = self.rules.get('horario_ultima_consulta_sabado', '11:30')
             h, m = map(int, ultima_hora_sabado.split(':'))
             if appointment_date.time() > time(h, m):
                 return False, f"No sábado, a última consulta é às {ultima_hora_sabado}."
-        
+
         return True, ""
     
     def get_available_slots(
@@ -448,7 +459,8 @@ class AppointmentRules:
         target_datetime: datetime,
         consultation_duration: int,
         db: Session,
-        exclude_appointment_id: int = None
+        exclude_appointment_id: int = None,
+        admin_override: bool = False
     ) -> bool:
         """
         Verifica se um horário específico está disponível.
@@ -458,18 +470,20 @@ class AppointmentRules:
             consultation_duration: Duração da consulta em minutos
             db: Sessão do banco de dados
             exclude_appointment_id: ID de consulta a excluir da verificação (para remarcação)
+            admin_override: Se True, pula validações de horário/minutos (apenas admin)
 
         Returns:
             True se disponível, False se conflita
         """
-        # 1. Validar se está dentro do horário de funcionamento
-        is_valid, error_msg = self.is_valid_appointment_date(target_datetime)
-        if not is_valid:
-            return False
-        
-        # 2. Validar minutos (deve ser múltiplo de 5)
-        if target_datetime.minute % 5 != 0:
-            return False
+        # 1. Validar se está dentro do horário de funcionamento (pular se admin)
+        if not admin_override:
+            is_valid, error_msg = self.is_valid_appointment_date(target_datetime, admin_override=False)
+            if not is_valid:
+                return False
+
+            # 2. Validar minutos (deve ser múltiplo de 5) - pular se admin
+            if target_datetime.minute % 5 != 0:
+                return False
         
         # 3. Buscar consultas do dia - USAR FORMATO COM HÍFEN
         target_date_str = target_datetime.strftime('%Y%m%d')  # Formato YYYYMMDD "20251022"

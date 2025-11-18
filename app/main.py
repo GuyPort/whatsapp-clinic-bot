@@ -904,29 +904,36 @@ async def reschedule_appointment_admin(
 
             rules = AppointmentRules()
 
-            # Verificar se o horário é válido
+            # Verificar se o horário é válido (COM ADMIN OVERRIDE)
             new_datetime = parse_appointment_datetime(new_date, new_time)
 
-            if not rules.is_valid_appointment_date(new_datetime):
-                raise HTTPException(status_code=400, detail="Data/hora inválida (fora do horário de funcionamento ou no passado)")
+            is_valid, error_msg = rules.is_valid_appointment_date(new_datetime, admin_override=True)
+            if not is_valid:
+                raise HTTPException(status_code=400, detail=error_msg)
 
             # Verificar disponibilidade (excluindo a própria consulta sendo remarcada)
+            # MANTÉM verificação de conflito mesmo com admin override
             duration = appointment.duration_minutes or 60
-            if not rules.check_slot_availability(new_datetime, duration, db, exclude_appointment_id=appointment_id):
+            if not rules.check_slot_availability(new_datetime, duration, db, exclude_appointment_id=appointment_id, admin_override=True):
                 raise HTTPException(status_code=400, detail="Horário já está ocupado")
 
-            # Verificar regras de convênio
+            # Verificar regras de convênio (COM ADMIN OVERRIDE)
             insurance_plan = appointment.insurance_plan or "particular"
-            if not rules.is_plan_allowed_on_date(new_datetime, insurance_plan):
-                raise HTTPException(status_code=400, detail=f"Convênio {insurance_plan} não permitido nesta data")
+            allowed, msg = rules.is_plan_allowed_on_date(new_datetime, insurance_plan, admin_override=True)
+            if not allowed:
+                raise HTTPException(status_code=400, detail=msg)
 
-            if not rules.has_capacity_for_insurance(new_datetime, insurance_plan, db, exclude_appointment_id=appointment_id):
-                raise HTTPException(status_code=400, detail=f"Capacidade diária para {insurance_plan} atingida")
+            capacity_ok, msg = rules.has_capacity_for_insurance(new_datetime, insurance_plan, db, exclude_appointment_id=appointment_id, admin_override=True)
+            if not capacity_ok:
+                raise HTTPException(status_code=400, detail=msg)
 
             # Atualizar consulta
             appointment.appointment_date = new_date
             appointment.appointment_time = new_time
             appointment.status = AppointmentStatus.AGENDADA  # Reset status se estava como realizada
+
+            # Permitir horários não-inteiros para admin
+            appointment._skip_time_validation = True
 
             db.commit()
 
@@ -1033,23 +1040,27 @@ async def create_appointment_admin(
         duration_minutes = body.get("duration_minutes", 60)
 
         with get_db() as db:
-            # Validar disponibilidade
+            # Validar disponibilidade (COM ADMIN OVERRIDE)
             rules = AppointmentRules()
 
             appointment_datetime = parse_appointment_datetime(appointment_date, appointment_time)
 
-            if not rules.is_valid_appointment_date(appointment_datetime):
-                raise HTTPException(status_code=400, detail="Data/hora inválida (fora do horário de funcionamento ou no passado)")
+            is_valid, error_msg = rules.is_valid_appointment_date(appointment_datetime, admin_override=True)
+            if not is_valid:
+                raise HTTPException(status_code=400, detail=error_msg)
 
-            if not rules.check_slot_availability(appointment_datetime, duration_minutes, db):
+            # MANTÉM verificação de conflito mesmo com admin override
+            if not rules.check_slot_availability(appointment_datetime, duration_minutes, db, admin_override=True):
                 raise HTTPException(status_code=400, detail="Horário já está ocupado")
 
             insurance_plan = body["insurance_plan"]
-            if not rules.is_plan_allowed_on_date(appointment_datetime, insurance_plan):
-                raise HTTPException(status_code=400, detail=f"Convênio {insurance_plan} não permitido nesta data")
+            allowed, msg = rules.is_plan_allowed_on_date(appointment_datetime, insurance_plan, admin_override=True)
+            if not allowed:
+                raise HTTPException(status_code=400, detail=msg)
 
-            if not rules.has_capacity_for_insurance(appointment_datetime, insurance_plan, db):
-                raise HTTPException(status_code=400, detail=f"Capacidade diária para {insurance_plan} atingida")
+            capacity_ok, msg = rules.has_capacity_for_insurance(appointment_datetime, insurance_plan, db, admin_override=True)
+            if not capacity_ok:
+                raise HTTPException(status_code=400, detail=msg)
 
             # Criar consulta
             new_appointment = Appointment(
@@ -1063,6 +1074,9 @@ async def create_appointment_admin(
                 insurance_plan=insurance_plan,
                 status=AppointmentStatus.AGENDADA
             )
+
+            # Permitir horários não-inteiros para admin
+            new_appointment._skip_time_validation = True
 
             db.add(new_appointment)
             db.commit()

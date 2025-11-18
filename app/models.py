@@ -108,9 +108,11 @@ def validate_appointment_data(mapper, connection, target):
     minute = int(appointment_time_str.split(':')[1])
     if not (0 <= minute <= 59):
         raise ValueError("Minuto deve estar entre 00 e 59")
-    
+
     # Validar que é horário inteiro (minutos == 00)
-    if minute != 0:
+    # PULAR esta validação se for admin override (sinalizado por atributo especial)
+    skip_validation = getattr(target, '_skip_time_validation', False)
+    if not skip_validation and minute != 0:
         raise ValueError("Apenas horários inteiros são aceitos (minutos deve ser 00)")
 
 
