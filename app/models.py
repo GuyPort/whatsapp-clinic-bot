@@ -41,7 +41,7 @@ class Appointment(Base):
     insurance_plan = Column(String(50), nullable=True)  # Convênio (CABERGS, IPE, particular)
     
     # Status e controle
-    status = Column(Enum(AppointmentStatus), default=AppointmentStatus.AGENDADA, nullable=False, index=True)
+    status = Column(Enum(AppointmentStatus, values_callable=lambda x: [e.value for e in x]), default=AppointmentStatus.AGENDADA, nullable=False, index=True)
     notes = Column(Text, nullable=True)  # Observações adicionais
     
     # Campos de cancelamento
