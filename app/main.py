@@ -2002,10 +2002,10 @@ async def dashboard(admin: str = Depends(verify_admin_credentials)):
                             <input type="text" id="patient-name" class="swal2-input" placeholder="Nome completo" style="margin-top: 0;">
 
                             <label style="display: block; margin-top: 15px; margin-bottom: 5px; font-weight: 500;">Telefone</label>
-                            <input type="tel" id="patient-phone" class="swal2-input" placeholder="(51) 99999-9999" style="margin-top: 0;">
+                            <input type="tel" id="patient-phone" class="swal2-input" placeholder="+55 (51) 99999-9999" style="margin-top: 0;" value="+55 ">
 
                             <label style="display: block; margin-top: 15px; margin-bottom: 5px; font-weight: 500;">Data de Nascimento</label>
-                            <input type="text" id="patient-birth" class="swal2-input" placeholder="DD/MM/AAAA" style="margin-top: 0;">
+                            <input type="text" id="patient-birth" class="swal2-input" placeholder="DD/MM/AAAA" style="margin-top: 0;" maxlength="10">
 
                             <label style="display: block; margin-top: 15px; margin-bottom: 5px; font-weight: 500;">Convênio</label>
                             <select id="insurance-plan" class="swal2-input" style="margin-top: 0;">
@@ -2037,6 +2037,74 @@ async def dashboard(admin: str = Depends(verify_admin_credentials)):
                     confirmButtonText: 'Criar Consulta',
                     cancelButtonText: 'Cancelar',
                     width: '600px',
+                    didOpen: () => {
+                        // Formatar telefone automaticamente
+                        const phoneInput = document.getElementById('patient-phone');
+                        phoneInput.addEventListener('input', (e) => {
+                            let value = e.target.value;
+
+                            // Remove tudo exceto números
+                            let numbers = value.replace(/\D/g, '');
+
+                            // Se o usuário tentar apagar o +55, restaura
+                            if (!value.startsWith('+55')) {
+                                value = '+55 ' + numbers;
+                                numbers = value.replace(/\D/g, '');
+                            }
+
+                            // Remove o código do país (55) dos números para formatar o resto
+                            if (numbers.startsWith('55')) {
+                                numbers = numbers.substring(2);
+                            }
+
+                            // Formata como +55 (XX) XXXXX-XXXX
+                            let formatted = '+55 ';
+                            if (numbers.length > 0) {
+                                formatted += '(' + numbers.substring(0, 2);
+                            }
+                            if (numbers.length >= 2) {
+                                formatted += ') ' + numbers.substring(2, 7);
+                            }
+                            if (numbers.length >= 7) {
+                                formatted += '-' + numbers.substring(7, 11);
+                            }
+
+                            e.target.value = formatted;
+                        });
+
+                        // Impedir que o usuário delete o +55
+                        phoneInput.addEventListener('keydown', (e) => {
+                            if ((e.key === 'Backspace' || e.key === 'Delete') && e.target.selectionStart <= 4) {
+                                e.preventDefault();
+                            }
+                        });
+
+                        // Formatar data de nascimento automaticamente
+                        const birthInput = document.getElementById('patient-birth');
+                        birthInput.addEventListener('input', (e) => {
+                            let value = e.target.value;
+
+                            // Remove tudo exceto números
+                            let numbers = value.replace(/\D/g, '');
+
+                            // Limita a 8 dígitos (DDMMAAAA)
+                            numbers = numbers.substring(0, 8);
+
+                            // Formata como DD/MM/AAAA
+                            let formatted = '';
+                            if (numbers.length > 0) {
+                                formatted = numbers.substring(0, 2);
+                            }
+                            if (numbers.length >= 3) {
+                                formatted += '/' + numbers.substring(2, 4);
+                            }
+                            if (numbers.length >= 5) {
+                                formatted += '/' + numbers.substring(4, 8);
+                            }
+
+                            e.target.value = formatted;
+                        });
+                    },
                     preConfirm: () => {
                         const name = document.getElementById('patient-name').value;
                         const phone = document.getElementById('patient-phone').value;
@@ -2048,6 +2116,18 @@ async def dashboard(admin: str = Depends(verify_admin_credentials)):
 
                         if (!name || !phone || !birth || !insurance || !type || !date || !time) {
                             Swal.showValidationMessage('Por favor, preencha todos os campos');
+                            return false;
+                        }
+
+                        // Validar formato da data de nascimento
+                        if (birth.length !== 10 || !birth.match(/^\d{2}\/\d{2}\/\d{4}$/)) {
+                            Swal.showValidationMessage('Data de nascimento deve estar no formato DD/MM/AAAA');
+                            return false;
+                        }
+
+                        // Validar telefone completo
+                        if (phone.length < 19) {  // +55 (XX) XXXXX-XXXX = 19 caracteres
+                            Swal.showValidationMessage('Telefone incompleto. Use o formato +55 (XX) XXXXX-XXXX');
                             return false;
                         }
 
