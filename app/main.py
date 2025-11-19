@@ -848,6 +848,9 @@ async def delete_appointment_admin(
             appointment.status = AppointmentStatus.CANCELADA
             appointment.cancelled_at = datetime.utcnow()
             appointment.cancelled_reason = "Cancelada pelo administrador"
+
+            # Bypass validação de horário (permite cancelar consultas com horários quebrados criadas por admin)
+            appointment._skip_time_validation = True
             db.commit()
 
             return {
@@ -881,6 +884,8 @@ async def mark_attended_appointment_admin(
             # Marcar como compareceu
             appointment.status = AppointmentStatus.COMPARECEU
 
+            # Bypass validação de horário (permite marcar consultas com horários quebrados criadas por admin)
+            appointment._skip_time_validation = True
             db.commit()
 
             logger.info(f"Admin {admin} marcou consulta #{appointment_id} como compareceu: {appointment.patient_name}")
@@ -921,6 +926,8 @@ async def mark_missed_appointment_admin(
             # Marcar como não compareceu
             appointment.status = AppointmentStatus.NAO_COMPARECEU
 
+            # Bypass validação de horário (permite marcar consultas com horários quebrados criadas por admin)
+            appointment._skip_time_validation = True
             db.commit()
 
             logger.info(f"Admin {admin} marcou consulta #{appointment_id} como não compareceu (falta): {appointment.patient_name}")
