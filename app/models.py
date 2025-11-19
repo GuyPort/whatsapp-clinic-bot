@@ -42,7 +42,7 @@ class Appointment(Base):
     
     # Status e controle
     status = Column(
-        Enum(AppointmentStatus, name='appointmentstatus'),
+        Enum(AppointmentStatus, name='appointmentstatus', values_callable=lambda x: [e.value for e in x]),
         default=AppointmentStatus.AGENDADA,
         nullable=False,
         index=True
