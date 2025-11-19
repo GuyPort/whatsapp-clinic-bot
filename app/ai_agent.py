@@ -5363,7 +5363,7 @@ Responda EXCLUSIVAMENTE com um JSON válido no formato:
             return f"Erro ao buscar agendamentos: {str(e)}"
 
     def _handle_cancel_appointment(self, tool_input: Dict, db: Session) -> str:
-        """Tool: cancel_appointment - Deleta a consulta do banco de dados"""
+        """Tool: cancel_appointment - Marca a consulta como cancelada"""
         try:
             appointment_id = tool_input.get("appointment_id")
             reason = tool_input.get("reason")
@@ -5376,16 +5376,18 @@ Responda EXCLUSIVAMENTE com um JSON válido no formato:
             if not appointment:
                 return "Agendamento não encontrado."
 
-            # Salvar dados antes de deletar para mostrar na mensagem
+            # Salvar dados para mostrar na mensagem
             patient_name = appointment.patient_name
             app_date_formatted = self._format_appointment_date_safe(appointment.appointment_date)
             app_time_str = appointment.appointment_time if isinstance(appointment.appointment_time, str) else appointment.appointment_time.strftime('%H:%M')
 
-            # Log antes de deletar para auditoria
-            logger.info(f"Cancelando (deletando) consulta #{appointment_id}: {patient_name} - {appointment.appointment_date} {app_time_str} - Motivo: {reason}")
+            # Log do cancelamento para auditoria
+            logger.info(f"Cancelando consulta #{appointment_id}: {patient_name} - {appointment.appointment_date} {app_time_str} - Motivo: {reason}")
 
-            # Deletar do banco de dados
-            db.delete(appointment)
+            # Marcar como cancelada em vez de deletar
+            appointment.status = AppointmentStatus.CANCELADA
+            appointment.cancelled_at = datetime.utcnow()
+            appointment.cancelled_reason = reason
             db.commit()
 
             return f"✅ **Agendamento cancelado com sucesso!**\n\n" + \

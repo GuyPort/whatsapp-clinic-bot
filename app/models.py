@@ -17,6 +17,7 @@ class AppointmentStatus(enum.Enum):
     AGENDADA = "agendada"
     COMPARECEU = "compareceu"
     NAO_COMPARECEU = "nao_compareceu"
+    CANCELADA = "cancelada"
 
 
 class Appointment(Base):

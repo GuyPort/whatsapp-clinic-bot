@@ -591,34 +591,38 @@ async def get_scheduled_appointments():
         with get_db() as db:
             from datetime import datetime, timedelta
             
-            # Buscar todas as consultas ORDENADAS POR DATA DA CONSULTA (crescente)
-            appointments = db.query(Appointment).order_by(
+            # Buscar apenas consultas AGENDADAS, ordenadas por data (crescente)
+            appointments = db.query(Appointment).filter(
+                Appointment.status == AppointmentStatus.AGENDADA
+            ).order_by(
                 Appointment.appointment_date.asc(),  # Data crescente
                 Appointment.appointment_time.asc()   # Horário crescente
             ).all()
-            
+
             # Calcular estatísticas
             today = datetime.now().date()
             week_start = today - timedelta(days=today.weekday())  # Início da semana
             week_end = week_start + timedelta(days=6)  # Fim da semana
-            
-            # Contar pacientes únicos
+
+            # Contar pacientes únicos (apenas agendadas)
             unique_patients = set()
             for apt in appointments:
                 unique_patients.add(f"{apt.patient_name}_{apt.patient_birth_date}")
-            
-            # Calcular estatísticas com formato com hífen
+
+            # Calcular estatísticas com formato com hífen (apenas agendadas)
             today_str = today.strftime('%Y%m%d')
             week_start_str = week_start.strftime('%Y%m%d')
             week_end_str = week_end.strftime('%Y%m%d')
-            
+
             stats = {
                 "scheduled": len(appointments),
                 "total_patients": len(unique_patients),
                 "today": db.query(Appointment).filter(
+                    Appointment.status == AppointmentStatus.AGENDADA,
                     Appointment.appointment_date == today_str
                 ).count(),
                 "this_week": db.query(Appointment).filter(
+                    Appointment.status == AppointmentStatus.AGENDADA,
                     Appointment.appointment_date >= week_start_str,
                     Appointment.appointment_date <= week_end_str
                 ).count()
@@ -653,6 +657,65 @@ async def get_scheduled_appointments():
             
     except Exception as e:
         logger.error(f"Erro ao buscar consultas agendadas: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/appointments/history")
+async def get_appointments_history():
+    """API para página de histórico - TODAS as consultas (todos os status)"""
+    try:
+        with get_db() as db:
+            from datetime import datetime, timedelta
+
+            # Buscar TODAS as consultas, ordenadas por data decrescente (mais recentes primeiro)
+            appointments = db.query(Appointment).order_by(
+                Appointment.appointment_date.desc(),  # Data decrescente
+                Appointment.appointment_time.desc()   # Horário decrescente
+            ).all()
+
+            # Calcular estatísticas por status
+            status_counts = {
+                "agendada": 0,
+                "compareceu": 0,
+                "nao_compareceu": 0,
+                "cancelada": 0
+            }
+
+            for apt in appointments:
+                status_value = apt.status.value
+                if status_value in status_counts:
+                    status_counts[status_value] += 1
+
+            # Formatar consultas
+            formatted_appointments = []
+            for apt in appointments:
+                formatted_appointments.append({
+                    "id": apt.id,
+                    "patient_name": apt.patient_name,
+                    "patient_phone": apt.patient_phone,
+                    "patient_birth_date": apt.patient_birth_date,
+                    "appointment_date": _format_appointment_date(apt.appointment_date),  # DD/MM/YYYY
+                    "appointment_date_sortable": apt.appointment_date,  # YYYYMMDD para sort
+                    "appointment_time": apt.appointment_time,  # String HH:MM
+                    "consultation_type": apt.consultation_type,
+                    "insurance_plan": apt.insurance_plan,
+                    "status": apt.status.value,
+                    "duration_minutes": apt.duration_minutes,
+                    "notes": apt.notes,
+                    "cancelled_at": apt.cancelled_at.isoformat() if apt.cancelled_at else None,
+                    "cancelled_reason": apt.cancelled_reason,
+                    "created_at": apt.created_at.isoformat(),
+                    "updated_at": apt.updated_at.isoformat()
+                })
+
+            return {
+                "total": len(appointments),
+                "status_counts": status_counts,
+                "appointments": formatted_appointments
+            }
+
+    except Exception as e:
+        logger.error(f"Erro ao buscar histórico de consultas: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -770,7 +833,7 @@ async def delete_appointment_admin(
     appointment_id: int,
     admin: str = Depends(verify_admin_credentials)
 ):
-    """Deleta uma consulta permanentemente do banco de dados"""
+    """Cancela uma consulta (marca como cancelada ao invés de deletar)"""
     try:
         with get_db() as db:
             appointment = db.query(Appointment).filter(Appointment.id == appointment_id).first()
@@ -778,22 +841,24 @@ async def delete_appointment_admin(
             if not appointment:
                 raise HTTPException(status_code=404, detail="Consulta não encontrada")
 
-            # Log antes de deletar
-            logger.info(f"Admin {admin} deletou consulta #{appointment_id}: {appointment.patient_name} - {appointment.appointment_date} {appointment.appointment_time}")
+            # Log do cancelamento
+            logger.info(f"Admin {admin} cancelou consulta #{appointment_id}: {appointment.patient_name} - {appointment.appointment_date} {appointment.appointment_time}")
 
-            # Deletar do banco
-            db.delete(appointment)
+            # Marcar como cancelada em vez de deletar
+            appointment.status = AppointmentStatus.CANCELADA
+            appointment.cancelled_at = datetime.utcnow()
+            appointment.cancelled_reason = "Cancelada pelo administrador"
             db.commit()
 
             return {
                 "success": True,
-                "message": "Consulta deletada com sucesso"
+                "message": "Consulta cancelada com sucesso"
             }
 
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Erro ao deletar consulta: {str(e)}")
+        logger.error(f"Erro ao cancelar consulta: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -1262,6 +1327,26 @@ async def fix_enum_values(admin: str = Depends(verify_admin_credentials)):
         else:
             results["acoes"].append("ℹ️ Valor 'agendada' já existe no enum")
 
+        # ETAPA 2.5: Adicionar 'cancelada' se não existir
+        if 'cancelada' not in current_values:
+            try:
+                with get_db() as db:
+                    logger.info("Adicionando valor 'cancelada' ao enum...")
+                    db.execute(text("ALTER TYPE appointmentstatus ADD VALUE 'cancelada'"))
+                    db.commit()
+                    logger.info("✅ Valor 'cancelada' adicionado com sucesso")
+                    results["acoes"].append("✅ Valor 'cancelada' adicionado ao enum")
+            except Exception as e:
+                if "already exists" in str(e).lower():
+                    logger.info("ℹ️ Valor 'cancelada' já existe")
+                    results["acoes"].append("ℹ️ Valor 'cancelada' já existia")
+                else:
+                    logger.error(f"Erro ao adicionar 'cancelada': {str(e)}")
+                    results["acoes"].append(f"❌ Erro ao adicionar 'cancelada': {str(e)}")
+                    results["success"] = False
+        else:
+            results["acoes"].append("ℹ️ Valor 'cancelada' já existe no enum")
+
         # ETAPA 3: Verificar valores após correção
         with get_db() as db:
             query = text("""
@@ -1300,10 +1385,10 @@ async def fix_enum_values(admin: str = Depends(verify_admin_credentials)):
             "diagnostico": results["diagnostico"],
             "acoes_realizadas": results["acoes"],
             "proximos_passos": [
-                "1️⃣ Verificar se os valores finais do enum incluem: 'agendada', 'compareceu', 'nao_compareceu'",
-                "2️⃣ Corrigir app/models.py removendo native_enum=False",
-                "3️⃣ Fazer restart da aplicação no Railway",
-                "4️⃣ Testar queries novamente"
+                "1️⃣ Verificar se os valores finais do enum incluem: 'agendada', 'compareceu', 'nao_compareceu', 'cancelada'",
+                "2️⃣ Fazer restart da aplicação no Railway para aplicar mudanças",
+                "3️⃣ Testar cancelamento (deve mudar status em vez de deletar)",
+                "4️⃣ Testar dashboard e histórico"
             ] if results["success"] else [
                 "❌ Verifique os erros acima",
                 "⚠️ Talvez seja necessário dropar e recriar o enum manualmente"
@@ -1652,11 +1737,16 @@ async def dashboard(admin: str = Depends(verify_admin_credentials)):
             <div class="header" style="display: flex; justify-content: space-between; align-items: center;">
                 <div>
                     <h1><i class="fas fa-calendar-check"></i> Dashboard - Consultas Agendadas</h1>
-                    <p class="text-muted mb-0">Consultório Dra. Rose</p>
+                    <p class="text-muted mb-0">Consultório Dra. Rose • Apenas consultas ativas</p>
                 </div>
-                <button class="btn btn-primary" onclick="openCreateModal()" style="height: fit-content;">
-                    <i class="fas fa-plus"></i> Criar Consulta
-                </button>
+                <div style="display: flex; gap: 12px;">
+                    <a href="/dashboard/historico" class="btn btn-outline-secondary" style="height: fit-content;">
+                        <i class="fas fa-history"></i> Ver Histórico Completo
+                    </a>
+                    <button class="btn btn-primary" onclick="openCreateModal()" style="height: fit-content;">
+                        <i class="fas fa-plus"></i> Criar Consulta
+                    </button>
+                </div>
             </div>
 
             <!-- Estatísticas -->
@@ -2342,6 +2432,512 @@ async def dashboard(admin: str = Depends(verify_admin_credentials)):
                     Swal.fire('Erro!', error.message, 'error');
                 }
             }
+        </script>
+    </body>
+    </html>
+    """
+
+    return HTMLResponse(
+        content=html_content,
+        headers={
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Pragma": "no-cache",
+            "Expires": "0"
+        }
+    )
+
+
+@app.get("/dashboard/historico")
+async def dashboard_historico(admin: str = Depends(verify_admin_credentials)):
+    """Página de histórico completo - TODAS as consultas (todos os status)"""
+    # Copiar todo o HTML do dashboard mas adaptar para histórico
+    html_content = """
+    <!DOCTYPE html>
+    <html lang="pt-BR">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Histórico Completo - Consultas</title>
+        <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+        <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+        <script src="https://cdn.jsdelivr.net/npm/sweetalert2@11"></script>
+        <style>
+            /* ESTILOS MODERNOS E LIMPOS - Mesmo do dashboard */
+
+            :root {
+                --primary: #4F46E5;
+                --success: #10B981;
+                --warning: #F59E0B;
+                --danger: #EF4444;
+                --info: #3B82F6;
+                --dark: #1F2937;
+                --light: #F9FAFB;
+                --gray: #6B7280;
+
+                /* Cores por status */
+                --status-agendada: #3B82F6;
+                --status-compareceu: #10B981;
+                --status-faltou: #EF4444;
+                --status-cancelada: #6B7280;
+            }
+
+            body {
+                font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                min-height: 100vh;
+                padding: 20px;
+            }
+
+            .dashboard-container {
+                max-width: 1400px;
+                margin: 0 auto;
+            }
+
+            .header {
+                background: white;
+                border-radius: 16px;
+                padding: 24px;
+                margin-bottom: 24px;
+                box-shadow: 0 4px 6px rgba(0,0,0,0.07);
+            }
+
+            .header h1 {
+                margin: 0;
+                color: var(--dark);
+                font-size: 28px;
+                font-weight: 700;
+            }
+
+            .header .subtitle {
+                color: var(--gray);
+                font-size: 14px;
+                margin-top: 4px;
+            }
+
+            .back-btn {
+                background: var(--info);
+                color: white;
+                border: none;
+                padding: 10px 20px;
+                border-radius: 8px;
+                text-decoration: none;
+                display: inline-flex;
+                align-items: center;
+                gap: 8px;
+                font-weight: 500;
+                transition: all 0.2s;
+            }
+
+            .back-btn:hover {
+                background: #2563eb;
+                transform: translateY(-1px);
+                box-shadow: 0 4px 12px rgba(59, 130, 246, 0.4);
+                color: white;
+            }
+
+            .stats-grid {
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+                gap: 16px;
+                margin-bottom: 24px;
+            }
+
+            .stat-card {
+                background: white;
+                border-radius: 12px;
+                padding: 20px;
+                box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+                transition: transform 0.2s, box-shadow 0.2s;
+            }
+
+            .stat-card:hover {
+                transform: translateY(-2px);
+                box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+            }
+
+            .stat-card.agendada { border-left: 4px solid var(--status-agendada); }
+            .stat-card.compareceu { border-left: 4px solid var(--status-compareceu); }
+            .stat-card.faltou { border-left: 4px solid var(--status-faltou); }
+            .stat-card.cancelada { border-left: 4px solid var(--status-cancelada); }
+
+            .stat-label {
+                font-size: 12px;
+                color: var(--gray);
+                text-transform: uppercase;
+                font-weight: 600;
+                letter-spacing: 0.5px;
+            }
+
+            .stat-value {
+                font-size: 32px;
+                font-weight: 700;
+                color: var(--dark);
+                margin-top: 8px;
+            }
+
+            .appointments-table {
+                background: white;
+                border-radius: 12px;
+                padding: 24px;
+                box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+            }
+
+            .table {
+                margin: 0;
+            }
+
+            .table thead th {
+                background: var(--light);
+                color: var(--dark);
+                font-weight: 600;
+                font-size: 12px;
+                text-transform: uppercase;
+                letter-spacing: 0.5px;
+                border: none;
+                padding: 12px 16px;
+            }
+
+            .table tbody tr {
+                border-bottom: 1px solid #E5E7EB;
+                transition: background-color 0.15s;
+            }
+
+            .table tbody tr:hover {
+                background-color: #F9FAFB;
+            }
+
+            .table tbody td {
+                padding: 16px;
+                vertical-align: middle;
+                border: none;
+            }
+
+            /* Cores por status nas linhas */
+            tr.status-agendada { border-left: 4px solid var(--status-agendada); }
+            tr.status-compareceu { border-left: 4px solid var(--status-compareceu); }
+            tr.status-nao_compareceu { border-left: 4px solid var(--status-faltou); }
+            tr.status-cancelada { border-left: 4px solid var(--status-cancelada); background-color: #F9FAFB; }
+
+            .badge {
+                padding: 6px 12px;
+                border-radius: 6px;
+                font-size: 11px;
+                font-weight: 600;
+                text-transform: uppercase;
+                letter-spacing: 0.5px;
+            }
+
+            .badge.status-agendada {
+                background: #DBEAFE;
+                color: #1E40AF;
+            }
+
+            .badge.status-compareceu {
+                background: #D1FAE5;
+                color: #065F46;
+            }
+
+            .badge.status-nao_compareceu {
+                background: #FEE2E2;
+                color: #991B1B;
+            }
+
+            .badge.status-cancelada {
+                background: #E5E7EB;
+                color: #374151;
+                text-decoration: line-through;
+            }
+
+            .btn-sm {
+                padding: 6px 12px;
+                font-size: 12px;
+                border-radius: 6px;
+                font-weight: 500;
+            }
+
+            .loading {
+                text-align: center;
+                padding: 40px;
+                color: var(--gray);
+            }
+
+            .spinner-border {
+                width: 3rem;
+                height: 3rem;
+            }
+
+            .empty-state {
+                text-align: center;
+                padding: 60px 20px;
+                color: var(--gray);
+            }
+
+            .empty-state i {
+                font-size: 48px;
+                margin-bottom: 16px;
+                opacity: 0.5;
+            }
+        </style>
+    </head>
+    <body>
+        <div class="dashboard-container">
+            <!-- Header -->
+            <div class="header">
+                <div class="d-flex justify-content-between align-items-center">
+                    <div>
+                        <h1><i class="fas fa-history"></i> Histórico Completo de Consultas</h1>
+                        <div class="subtitle">Visualize todas as consultas: agendadas, realizadas, faltadas e canceladas</div>
+                    </div>
+                    <a href="/dashboard" class="back-btn">
+                        <i class="fas fa-arrow-left"></i>
+                        Voltar para Consultas Ativas
+                    </a>
+                </div>
+            </div>
+
+            <!-- Estatísticas por Status -->
+            <div class="stats-grid" id="stats-grid">
+                <div class="stat-card agendada">
+                    <div class="stat-label">🔵 Agendadas</div>
+                    <div class="stat-value" id="stat-agendada">-</div>
+                </div>
+                <div class="stat-card compareceu">
+                    <div class="stat-label">🟢 Compareceram</div>
+                    <div class="stat-value" id="stat-compareceu">-</div>
+                </div>
+                <div class="stat-card faltou">
+                    <div class="stat-label">🔴 Faltaram</div>
+                    <div class="stat-value" id="stat-faltou">-</div>
+                </div>
+                <div class="stat-card cancelada">
+                    <div class="stat-label">⚫ Canceladas</div>
+                    <div class="stat-value" id="stat-cancelada">-</div>
+                </div>
+            </div>
+
+            <!-- Tabela de Consultas -->
+            <div class="appointments-table">
+                <div id="loading" class="loading">
+                    <div class="spinner-border text-primary" role="status"></div>
+                    <p class="mt-3">Carregando histórico...</p>
+                </div>
+
+                <div id="empty-state" class="empty-state" style="display: none;">
+                    <i class="fas fa-inbox"></i>
+                    <h3>Nenhuma consulta encontrada</h3>
+                    <p>O histórico está vazio.</p>
+                </div>
+
+                <div id="appointments-container" style="display: none;">
+                    <table class="table">
+                        <thead>
+                            <tr>
+                                <th>Paciente</th>
+                                <th>Data</th>
+                                <th>Horário</th>
+                                <th>Tipo</th>
+                                <th>Convênio</th>
+                                <th>Status</th>
+                                <th class="text-end">Ações</th>
+                            </tr>
+                        </thead>
+                        <tbody id="appointments-tbody">
+                            <!-- Preenchido via JavaScript -->
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <script>
+            // Autenticação
+            const adminPassword = prompt("Senha de administrador:");
+            if (!adminPassword) {
+                window.location.href = "/";
+            }
+
+            // Carregar histórico
+            async function loadHistory() {
+                try {
+                    const response = await fetch('/api/appointments/history');
+                    if (!response.ok) throw new Error('Erro ao carregar histórico');
+
+                    const data = await response.json();
+
+                    document.getElementById('loading').style.display = 'none';
+
+                    if (data.appointments.length === 0) {
+                        document.getElementById('empty-state').style.display = 'block';
+                        return;
+                    }
+
+                    // Atualizar estatísticas
+                    document.getElementById('stat-agendada').textContent = data.status_counts.agendada || 0;
+                    document.getElementById('stat-compareceu').textContent = data.status_counts.compareceu || 0;
+                    document.getElementById('stat-faltou').textContent = data.status_counts.nao_compareceu || 0;
+                    document.getElementById('stat-cancelada').textContent = data.status_counts.cancelada || 0;
+
+                    // Renderizar tabela
+                    const tbody = document.getElementById('appointments-tbody');
+                    tbody.innerHTML = '';
+
+                    data.appointments.forEach(appointment => {
+                        const tr = document.createElement('tr');
+                        tr.className = `status-${appointment.status}`;
+
+                        const statusLabels = {
+                            'agendada': '🔵 Agendada',
+                            'compareceu': '🟢 Compareceu',
+                            'nao_compareceu': '🔴 Faltou',
+                            'cancelada': '⚫ Cancelada'
+                        };
+
+                        const statusBadge = `<span class="badge status-${appointment.status}">${statusLabels[appointment.status]}</span>`;
+
+                        // Botões de ação baseados no status
+                        let actionButtons = '';
+
+                        if (appointment.status === 'agendada') {
+                            actionButtons = `
+                                <button class="btn btn-sm btn-warning" onclick="editAppointment(${appointment.id})">
+                                    <i class="fas fa-edit"></i>
+                                </button>
+                                <button class="btn btn-sm btn-success" onclick="markAttended(${appointment.id}, '${appointment.patient_name}')">
+                                    <i class="fas fa-check"></i>
+                                </button>
+                                <button class="btn btn-sm btn-danger" onclick="markMissed(${appointment.id}, '${appointment.patient_name}')">
+                                    <i class="fas fa-times"></i>
+                                </button>
+                                <button class="btn btn-sm btn-secondary" onclick="cancelAppointment(${appointment.id}, '${appointment.patient_name}')">
+                                    <i class="fas fa-ban"></i>
+                                </button>
+                            `;
+                        } else {
+                            actionButtons = `<span class="text-muted">-</span>`;
+                        }
+
+                        tr.innerHTML = `
+                            <td><strong>${appointment.patient_name}</strong><br><small class="text-muted">${appointment.patient_phone}</small></td>
+                            <td>${appointment.appointment_date}</td>
+                            <td>${appointment.appointment_time}</td>
+                            <td>${appointment.consultation_type || '-'}</td>
+                            <td>${appointment.insurance_plan || '-'}</td>
+                            <td>${statusBadge}</td>
+                            <td class="text-end">${actionButtons}</td>
+                        `;
+
+                        tbody.appendChild(tr);
+                    });
+
+                    document.getElementById('appointments-container').style.display = 'block';
+
+                } catch (error) {
+                    console.error('Erro:', error);
+                    document.getElementById('loading').innerHTML = `
+                        <i class="fas fa-exclamation-circle text-danger" style="font-size: 48px;"></i>
+                        <p class="mt-3 text-danger">Erro ao carregar consultas. Tente novamente.</p>
+                    `;
+                }
+            }
+
+            // Funções de ação (mesmas do dashboard principal)
+            async function editAppointment(id) {
+                // TODO: Implementar edição
+                alert('Edição em desenvolvimento');
+            }
+
+            async function markAttended(id, patientName) {
+                const confirmed = await Swal.fire({
+                    title: 'Marcar como Compareceu?',
+                    text: `Confirmar que ${patientName} compareceu à consulta?`,
+                    icon: 'question',
+                    showCancelButton: true,
+                    confirmButtonText: 'Sim, compareceu',
+                    cancelButtonText: 'Cancelar',
+                    confirmButtonColor: '#10B981'
+                });
+
+                if (confirmed.isConfirmed) {
+                    try {
+                        const response = await fetch(`/admin/appointments/${id}/mark-attended?admin=${adminPassword}`, {
+                            method: 'POST'
+                        });
+
+                        if (response.ok) {
+                            Swal.fire('Sucesso!', 'Paciente marcado como compareceu', 'success');
+                            loadHistory();
+                        } else {
+                            throw new Error('Erro ao marcar presença');
+                        }
+                    } catch (error) {
+                        Swal.fire('Erro!', error.message, 'error');
+                    }
+                }
+            }
+
+            async function markMissed(id, patientName) {
+                const confirmed = await Swal.fire({
+                    title: 'Marcar como Faltou?',
+                    text: `Confirmar que ${patientName} não compareceu à consulta?`,
+                    icon: 'warning',
+                    showCancelButton: true,
+                    confirmButtonText: 'Sim, faltou',
+                    cancelButtonText: 'Cancelar',
+                    confirmButtonColor: '#EF4444'
+                });
+
+                if (confirmed.isConfirmed) {
+                    try {
+                        const response = await fetch(`/admin/appointments/${id}/mark-missed?admin=${adminPassword}`, {
+                            method: 'POST'
+                        });
+
+                        if (response.ok) {
+                            Swal.fire('Registrado!', 'Falta registrada', 'success');
+                            loadHistory();
+                        } else {
+                            throw new Error('Erro ao marcar falta');
+                        }
+                    } catch (error) {
+                        Swal.fire('Erro!', error.message, 'error');
+                    }
+                }
+            }
+
+            async function cancelAppointment(id, patientName) {
+                const confirmed = await Swal.fire({
+                    title: 'Cancelar Consulta?',
+                    text: `Tem certeza que deseja cancelar a consulta de ${patientName}?`,
+                    icon: 'warning',
+                    showCancelButton: true,
+                    confirmButtonText: 'Sim, cancelar',
+                    cancelButtonText: 'Não',
+                    confirmButtonColor: '#EF4444'
+                });
+
+                if (confirmed.isConfirmed) {
+                    try {
+                        const response = await fetch(`/admin/appointments/${id}?admin=${adminPassword}`, {
+                            method: 'DELETE'
+                        });
+
+                        if (response.ok) {
+                            Swal.fire('Cancelada!', 'Consulta cancelada com sucesso', 'success');
+                            loadHistory();
+                        } else {
+                            throw new Error('Erro ao cancelar');
+                        }
+                    } catch (error) {
+                        Swal.fire('Erro!', error.message, 'error');
+                    }
+                }
+            }
+
+            // Carregar ao iniciar
+            loadHistory();
+
+            // Auto-refresh a cada 30 segundos
+            setInterval(loadHistory, 30000);
         </script>
     </body>
     </html>
