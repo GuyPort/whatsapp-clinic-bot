@@ -1206,6 +1206,115 @@ async def migrate_appointment_status(admin: str = Depends(verify_admin_credentia
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.api_route("/admin/fix-enum", methods=["GET", "POST"])
+async def fix_enum_values(admin: str = Depends(verify_admin_credentials)):
+    """
+    Corrige o enum appointmentstatus adicionando o valor 'agendada' que está faltando.
+    Também mostra diagnóstico dos valores atuais do enum.
+    """
+    try:
+        from sqlalchemy import text
+
+        logger.info("=== Diagnóstico e correção do enum appointmentstatus ===")
+
+        results = {
+            "diagnostico": {},
+            "acoes": [],
+            "success": True
+        }
+
+        # ETAPA 1: Verificar valores atuais do enum
+        with get_db() as db:
+            logger.info("Consultando valores atuais do enum...")
+            try:
+                query = text("""
+                    SELECT e.enumlabel
+                    FROM pg_enum e
+                    JOIN pg_type t ON e.enumtypid = t.oid
+                    WHERE t.typname = 'appointmentstatus'
+                    ORDER BY e.enumsortorder
+                """)
+                result = db.execute(query)
+                current_values = [row[0] for row in result]
+                results["diagnostico"]["valores_atuais"] = current_values
+                logger.info(f"Valores atuais do enum: {current_values}")
+            except Exception as e:
+                logger.error(f"Erro ao consultar valores do enum: {str(e)}")
+                results["diagnostico"]["erro"] = str(e)
+
+        # ETAPA 2: Adicionar 'agendada' se não existir
+        if 'agendada' not in current_values:
+            try:
+                with get_db() as db:
+                    logger.info("Adicionando valor 'agendada' ao enum...")
+                    db.execute(text("ALTER TYPE appointmentstatus ADD VALUE 'agendada'"))
+                    db.commit()
+                    logger.info("✅ Valor 'agendada' adicionado com sucesso")
+                    results["acoes"].append("✅ Valor 'agendada' adicionado ao enum")
+            except Exception as e:
+                if "already exists" in str(e).lower():
+                    logger.info("ℹ️ Valor 'agendada' já existe")
+                    results["acoes"].append("ℹ️ Valor 'agendada' já existia")
+                else:
+                    logger.error(f"Erro ao adicionar 'agendada': {str(e)}")
+                    results["acoes"].append(f"❌ Erro ao adicionar 'agendada': {str(e)}")
+                    results["success"] = False
+        else:
+            results["acoes"].append("ℹ️ Valor 'agendada' já existe no enum")
+
+        # ETAPA 3: Verificar valores após correção
+        with get_db() as db:
+            query = text("""
+                SELECT e.enumlabel
+                FROM pg_enum e
+                JOIN pg_type t ON e.enumtypid = t.oid
+                WHERE t.typname = 'appointmentstatus'
+                ORDER BY e.enumsortorder
+            """)
+            result = db.execute(query)
+            final_values = [row[0] for row in result]
+            results["diagnostico"]["valores_finais"] = final_values
+            logger.info(f"Valores finais do enum: {final_values}")
+
+        # ETAPA 4: Contar registros por status atual
+        with get_db() as db:
+            logger.info("Contando registros por status...")
+            try:
+                # Usar cast para text para evitar problemas de enum
+                query = text("""
+                    SELECT status::text, COUNT(*)
+                    FROM appointments
+                    GROUP BY status::text
+                """)
+                result = db.execute(query)
+                status_counts = {row[0]: row[1] for row in result}
+                results["diagnostico"]["contagem_por_status"] = status_counts
+                logger.info(f"Contagem por status: {status_counts}")
+            except Exception as e:
+                logger.error(f"Erro ao contar status: {str(e)}")
+                results["diagnostico"]["erro_contagem"] = str(e)
+
+        return {
+            "success": results["success"],
+            "message": "✅ Diagnóstico e correção concluídos!" if results["success"] else "⚠️ Correção parcial",
+            "diagnostico": results["diagnostico"],
+            "acoes_realizadas": results["acoes"],
+            "proximos_passos": [
+                "1️⃣ Verificar se os valores finais do enum incluem: 'agendada', 'compareceu', 'nao_compareceu'",
+                "2️⃣ Corrigir app/models.py removendo native_enum=False",
+                "3️⃣ Fazer restart da aplicação no Railway",
+                "4️⃣ Testar queries novamente"
+            ] if results["success"] else [
+                "❌ Verifique os erros acima",
+                "⚠️ Talvez seja necessário dropar e recriar o enum manualmente"
+            ]
+        }
+
+    except Exception as e:
+        logger.error(f"❌ Erro no diagnóstico/correção: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/dashboard")
 async def dashboard(admin: str = Depends(verify_admin_credentials)):
     """Dashboard moderno para visualizar consultas agendadas"""
