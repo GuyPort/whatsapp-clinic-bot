@@ -5075,7 +5075,38 @@ Responda EXCLUSIVAMENTE com um JSON válido no formato:
             
             # Normalizar telefone
             normalized_phone = normalize_phone(patient_phone)
-            
+
+            # VERIFICAÇÃO DE FALTAS RECORRENTES (bloqueio automático)
+            no_show_count = db.query(Appointment).filter(
+                Appointment.patient_phone == normalized_phone,
+                Appointment.status == AppointmentStatus.NAO_COMPARECEU
+            ).count()
+
+            if no_show_count >= 2:
+                # Remover pausa anterior se existir
+                existing_pause = db.query(PausedContact).filter_by(phone=normalized_phone).first()
+                if existing_pause:
+                    db.delete(existing_pause)
+
+                # Criar pausa de 48 horas
+                paused_until = datetime.utcnow() + timedelta(hours=48)
+                paused_contact = PausedContact(
+                    phone=normalized_phone,
+                    paused_until=paused_until,
+                    reason="bloqueio_automatico_faltas_recorrentes"
+                )
+                db.add(paused_contact)
+                db.commit()
+
+                logger.info(f"🚫 Bloqueio automático ativado para {normalized_phone} - {no_show_count} faltas registradas")
+
+                # Retornar mensagem de bloqueio (Claude incorpora na conversa)
+                return (
+                    f"Identificamos que você já marcou e não compareceu a {no_show_count} consultas anteriormente. "
+                    "Por isso, vamos encaminhar você para nossa secretária para regularizar sua situação. "
+                    "Ela entrará em contato em breve. 😊"
+                )
+
             # Converter datas COM VALIDAÇÃO
             birth_date = parse_date_br(patient_birth_date)
             appointment_datetime = parse_date_br(appointment_date)
