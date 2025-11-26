@@ -433,6 +433,26 @@ VALIDAÇÕES CRÍTICAS
 
 ═══════════════════════════════════════════════════════════
 
+═══════════════════════════════════════════════════════════
+REGRA CRÍTICA - REQUISIÇÃO DE EXAMES
+═══════════════════════════════════════════════════════════
+
+Quando o paciente PEDIR uma requisição de exames, você DEVE chamar a tool `block_requisition_request` imediatamente.
+
+IDENTIFICAR variações da palavra:
+- "requisição", "requisições", "requisiçao", "requisicao", "requisiçoes"
+
+DISTINGUIR PEDIDO vs MENÇÃO:
+- PEDIDO (bloquear): "preciso de requisição", "pode fazer uma requisição", "quero requisição", "me manda uma requisição"
+- MENÇÃO (NÃO bloquear): "vou levar a requisição que tenho", "já peguei a requisição", "tenho a requisição aqui"
+
+QUANDO FOR PEDIDO:
+1. Chame a tool `block_requisition_request` IMEDIATAMENTE
+2. NÃO envie nenhuma mensagem ao paciente
+3. O bot será pausado silenciosamente por 48 horas
+
+═══════════════════════════════════════════════════════════
+
 Lembre-se: Seja natural, adaptável e prestativa. Use as tools disponíveis conforme necessário e mantenha uma conversa fluida e educada. Sempre complete a tarefa até o final."""
 
     def _define_tools(self) -> List[Dict]:
@@ -614,6 +634,15 @@ Lembre-se: Seja natural, adaptável e prestativa. Use as tools disponíveis conf
             {
                 "name": "end_conversation",
                 "description": "Encerrar conversa e limpar contexto do banco de dados quando usuário indicar claramente que não precisa de mais nada (ex: 'não', 'não preciso', 'não obrigado', 'só isso', 'tchau'). Use APENAS após perguntar 'Posso te ajudar com mais alguma coisa?' e receber resposta negativa. NÃO use para perguntas do usuário ou quando ele está pedindo ajuda.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {},
+                    "required": []
+                }
+            },
+            {
+                "name": "block_requisition_request",
+                "description": "Bloquear paciente que PEDIU requisição de exames. Use APENAS quando paciente pedir requisição (não quando apenas mencionar). Bloqueia silenciosamente por 48h sem enviar nenhuma mensagem.",
                 "input_schema": {
                     "type": "object",
                     "properties": {},
@@ -3356,6 +3385,8 @@ Responda EXCLUSIVAMENTE com um JSON válido no formato:
                 return self._handle_find_alternative_slots(tool_input, db, phone)
             elif tool_name == "request_human_assistance":
                 return self._handle_request_human_assistance(tool_input, db, phone)
+            elif tool_name == "block_requisition_request":
+                return self._handle_block_requisition_request(tool_input, db, phone)
             elif tool_name == "extract_patient_data":
                 return self._handle_extract_patient_data(tool_input, db, phone)
             elif tool_name == "request_home_address":
@@ -5477,6 +5508,41 @@ Responda EXCLUSIVAMENTE com um JSON válido no formato:
             logger.error(f"Erro ao pausar bot para humano: {str(e)}")
             db.rollback()
             return f"Erro ao transferir para humano: {str(e)}"
+
+    def _handle_block_requisition_request(self, tool_input: Dict, db: Session, phone: str) -> str:
+        """Tool: block_requisition_request - Bloquear silenciosamente por 48h quando pedir requisição"""
+        try:
+            logger.info(f"🚫 Bloqueio por requisição chamado para {phone}")
+
+            # Deletar contexto existente
+            existing_context = db.query(ConversationContext).filter_by(phone=phone).first()
+            if existing_context:
+                db.delete(existing_context)
+                logger.info(f"🗑️ Contexto deletado para {phone} (requisição)")
+
+            # Remover pausa anterior se existir
+            existing_pause = db.query(PausedContact).filter_by(phone=phone).first()
+            if existing_pause:
+                db.delete(existing_pause)
+                logger.info(f"🗑️ Pausa anterior removida para {phone}")
+
+            # Criar pausa de 48 horas
+            paused_until = datetime.utcnow() + timedelta(hours=48)
+            paused_contact = PausedContact(
+                phone=phone,
+                paused_until=paused_until,
+                reason="requisicao_exames"
+            )
+            db.add(paused_contact)
+            db.commit()
+
+            logger.info(f"⏸️ Paciente {phone} bloqueado por requisição até {paused_until}")
+            return ""  # Retorna vazio = sem mensagem ao paciente
+
+        except Exception as e:
+            logger.error(f"Erro ao bloquear por requisição: {str(e)}")
+            db.rollback()
+            return ""
 
     def _extract_patient_data_with_claude(self, context: ConversationContext, return_dict: bool = False) -> Dict[str, Any]:
         """Usa Claude para extrair dados do paciente do histórico (função auxiliar interna)"""
