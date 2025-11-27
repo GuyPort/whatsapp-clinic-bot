@@ -76,10 +76,6 @@ class ClaudeToolAgent:
         self.timezone = get_brazil_timezone()
         self.tools = self._define_tools()
         self.system_prompt = self._create_system_prompt()
-        self.special_holiday_ranges = [
-            (datetime(2025, 12, 15).date(), datetime(2025, 12, 21).date()),
-            (datetime(2025, 12, 26).date(), datetime(2026, 1, 4).date()),
-        ]
         
     def _create_system_prompt(self) -> str:
         """Cria o prompt do sistema para o Claude"""
@@ -651,24 +647,24 @@ Lembre-se: Seja natural, adaptável e prestativa. Use as tools disponíveis conf
             }
         ]
 
-    def _is_special_holiday_date(self, date_obj: datetime) -> bool:
+    def _is_manual_booking_date(self, date_obj: datetime) -> bool:
+        """Verifica se a data está no período de agendamento manual (secretária marca)"""
         if not date_obj:
             return False
-        target = date_obj.date()
-        for start, end in self.special_holiday_ranges:
-            if start <= target <= end:
-                return True
-        return False
+        date_str = date_obj.strftime('%d/%m/%Y')
+        periodo_manual = self.clinic_info.get('periodo_agendamento_manual', [])
+        return date_str in periodo_manual
 
-    def _handoff_due_to_holiday(self, db: Session, phone: Optional[str]) -> str:
+    def _handoff_to_secretary_manual_booking(self, db: Session, phone: Optional[str]) -> str:
+        """Encaminha para a secretária fazer o agendamento manualmente"""
         if phone:
-            return self._handle_request_special_holiday_pause(db, phone)
+            return self._handle_request_manual_booking_pause(db, phone)
         return (
             "Durante este período especial a secretária está cuidando dos agendamentos. "
             "Vou pedir para ela entrar em contato com você em até 48 horas, tudo bem?"
         )
 
-    def _handle_request_special_holiday_pause(self, db: Session, phone: Optional[str]) -> str:
+    def _handle_request_manual_booking_pause(self, db: Session, phone: Optional[str]) -> str:
         if not phone:
             return (
                 "Esse período é tratado diretamente pela secretária. "
@@ -3539,7 +3535,7 @@ Responda EXCLUSIVAMENTE com um JSON válido no formato:
                 
                 # Verificar se está em dias_fechados ou em período especial de férias
                 date_str_formatted = current_date.strftime('%d/%m/%Y')
-                if date_str_formatted in dias_fechados or self._is_special_holiday_date(current_date):
+                if date_str_formatted in dias_fechados or self._is_manual_booking_date(current_date):
                     current_date += timedelta(days=1)
                     days_checked += 1
                     continue
@@ -3809,7 +3805,7 @@ Responda EXCLUSIVAMENTE com um JSON válido no formato:
                 
                 # Verificar se está em dias_fechados ou período especial
                 date_str_formatted = current_date.strftime('%d/%m/%Y')
-                if date_str_formatted in dias_fechados or self._is_special_holiday_date(current_date):
+                if date_str_formatted in dias_fechados or self._is_manual_booking_date(current_date):
                     current_date += timedelta(days=1)
                     days_checked += 1
                     continue
@@ -4505,9 +4501,9 @@ Responda EXCLUSIVAMENTE com um JSON válido no formato:
             
             logger.info(f"📅 Data convertida: {appointment_date}")
 
-            if self._is_special_holiday_date(appointment_date):
+            if self._is_manual_booking_date(appointment_date):
                 logger.info(f"⛱️ check_availability detectou período de férias em {date_str} - encaminhando secretaria.")
-                return self._handoff_due_to_holiday(db, phone=None)
+                return self._handoff_to_secretary_manual_booking(db, phone=None)
             
             # Obter horários disponíveis
             duracao = self.clinic_info.get('regras_agendamento', {}).get('duracao_consulta_minutos', 45)
@@ -4577,9 +4573,9 @@ Responda EXCLUSIVAMENTE com um JSON válido no formato:
             
             logger.info(f"📅 Validando data e buscando slots: {date_str}")
             
-            if self._is_special_holiday_date(appointment_date):
+            if self._is_manual_booking_date(appointment_date):
                 logger.info(f"⛱️ Data solicitada {date_str} está em período de férias - encaminhando secretaria.")
-                return self._handoff_due_to_holiday(db, phone)
+                return self._handoff_to_secretary_manual_booking(db, phone)
             
             # ========== VALIDAÇÃO 0: DATA MÍNIMA (48 HORAS) ==========
             minimum_datetime = get_minimum_appointment_datetime()
@@ -4613,9 +4609,9 @@ Responda EXCLUSIVAMENTE com um JSON válido no formato:
                         "Pode me informar uma nova data por favor?"
                     )
 
-            if self._is_special_holiday_date(appointment_date):
+            if self._is_manual_booking_date(appointment_date):
                 logger.info(f"⛱️ Data ajustada {appointment_date.strftime('%d/%m/%Y')} está em período de férias - encaminhando secretaria.")
-                return self._handoff_due_to_holiday(db, phone)
+                return self._handoff_to_secretary_manual_booking(db, phone)
 
             # ========== VALIDAÇÃO DE CONVÊNIO (SEGUNDA-FEIRA / LIMITE IPE) ==========
             allowed_plan, reason_plan = appointment_rules.is_plan_allowed_on_date(appointment_date, insurance_plan)
@@ -4846,9 +4842,9 @@ Responda EXCLUSIVAMENTE com um JSON válido no formato:
             
             # Verificar disponibilidade no banco (segurança contra race condition)
             appointment_date = parse_date_br(date_str)
-            if self._is_special_holiday_date(appointment_date):
+            if self._is_manual_booking_date(appointment_date):
                 logger.info(f"⛱️ Horário solicitado para {date_str} está em período de férias - encaminhando secretaria.")
-                return self._handoff_due_to_holiday(db, phone)
+                return self._handoff_to_secretary_manual_booking(db, phone)
             allowed_plan, reason_plan = appointment_rules.is_plan_allowed_on_date(appointment_date, insurance_plan)
             if not allowed_plan:
                 return f"❌ {reason_plan}\nPor favor, escolha outra data."
