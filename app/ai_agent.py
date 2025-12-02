@@ -166,7 +166,7 @@ Como posso te ajudar hoje?
 ℹ️ Para deixar o atendimento mais rápido, envie uma mensagem por vez e aguarde minha resposta antes de mandar a próxima, combinado?
 
 1️⃣ Marcar consulta (presencial na clínica)
-2️⃣ Atendimento domiciliar
+2️⃣ Atendimento domiciliar (R$ 500)
 3️⃣ Remarcar/Cancelar consulta  
 4️⃣ Receitas
 
@@ -2973,7 +2973,7 @@ Responda EXCLUSIVAMENTE com um JSON válido no formato:
                                         
                                         if "sucesso" in notify_result.lower() or "enviada" in notify_result.lower():
                                             # Notificação enviada com sucesso
-                                            confirmation_message = "Perfeito! Registrei sua solicitação de atendimento domiciliar. A doutora vai entrar em contato com você em breve para agendar o melhor horário.\n\nPosso te ajudar com mais alguma coisa?"
+                                            confirmation_message = "Perfeito! A doutora vai verificar a disponibilidade na agenda e entrará em contato em breve para combinar o melhor horário com você.\n\nPosso te ajudar com mais alguma coisa?"
                                             
                                             # Construir contexto completo para Claude processar a confirmação
                                             # Incluir: histórico + request_home_address tool_use + tool_result + notify_doctor_home_visit tool_use + tool_result + mensagem de confirmação

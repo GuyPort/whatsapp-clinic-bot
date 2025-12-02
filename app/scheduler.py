@@ -62,14 +62,14 @@ def run_check():
 
 
 async def send_appointment_reminders():
-    """Envia lembretes automáticos 24h antes das consultas agendadas."""
+    """Envia lembretes automáticos 48h antes das consultas agendadas."""
     try:
         now = now_brazil()
-        # Expandir janela: 20h antes até 26h depois (6h de tolerância)
-        window_start = now + timedelta(hours=24) - timedelta(hours=4)  # 20h antes
-        window_end = now + timedelta(hours=24) + timedelta(hours=2)    # 26h antes
-        
-        # Expandir datas candidatas para cobrir toda a janela (20h-26h antes)
+        # Janela de 40h a 48h antes da consulta
+        window_start = now + timedelta(hours=48) - timedelta(hours=8)  # 40h antes
+        window_end = now + timedelta(hours=48)                          # 48h antes
+
+        # Expandir datas candidatas para cobrir toda a janela (40h-48h antes)
         # Incluir data atual, amanhã e depois de amanhã para garantir cobertura
         today_str = now.strftime("%Y%m%d")
         tomorrow_str = (now + timedelta(days=1)).strftime("%Y%m%d")
@@ -170,11 +170,11 @@ def start_scheduler():
     scheduler.add_job(
         run_send_reminders,
         'interval',
-        hours=1,  # Reduzir para 1h para garantir maior cobertura
+        minutes=1,  # TESTE: rodando a cada 1 minuto
         id='send_appointment_reminders'
     )
     scheduler.start()
-    logger.info("✅ Scheduler iniciado: timeout (20 min) e lembretes (1 h)")
+    logger.info("✅ Scheduler iniciado: timeout (20 min) e lembretes (1 min - TESTE)")
 
 def stop_scheduler():
     """Para o scheduler"""
