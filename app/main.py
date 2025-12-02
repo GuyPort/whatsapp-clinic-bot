@@ -2960,6 +2960,826 @@ async def dashboard_historico(admin: str = Depends(verify_admin_credentials)):
     )
 
 
+# ==================== GERENCIAMENTO DE PAUSAS ====================
+
+@app.get("/api/paused-contacts")
+async def get_paused_contacts(admin: str = Depends(verify_admin_credentials)):
+    """Lista todos os contatos pausados ativos"""
+    from datetime import datetime, timedelta
+
+    with get_db() as db:
+        now = datetime.utcnow()
+        paused = db.query(PausedContact).filter(
+            PausedContact.paused_until > now
+        ).order_by(PausedContact.paused_until.asc()).all()
+
+        result = []
+        for p in paused:
+            remaining = p.paused_until - now
+            remaining_hours = remaining.total_seconds() / 3600
+            result.append({
+                "phone": p.phone,
+                "reason": p.reason or "manual",
+                "paused_at": p.paused_at.isoformat() if p.paused_at else None,
+                "paused_until": p.paused_until.isoformat(),
+                "remaining_hours": round(remaining_hours, 1),
+                "remaining_formatted": f"{int(remaining_hours)}h {int((remaining_hours % 1) * 60)}min"
+            })
+
+        return {"paused_contacts": result, "count": len(result)}
+
+
+@app.post("/api/paused-contacts")
+async def pause_contact(request: Request, admin: str = Depends(verify_admin_credentials)):
+    """Pausar um contato manualmente"""
+    from datetime import datetime, timedelta
+
+    data = await request.json()
+    phone = data.get("phone", "").strip()
+    hours = data.get("hours", 24)
+    reason = data.get("reason", "secretary_dashboard_pause")
+
+    if not phone:
+        raise HTTPException(status_code=400, detail="Telefone é obrigatório")
+
+    # Normalizar telefone
+    phone = normalize_phone(phone)
+
+    with get_db() as db:
+        # Verificar se já existe
+        existing = db.query(PausedContact).filter(PausedContact.phone == phone).first()
+
+        paused_until = datetime.utcnow() + timedelta(hours=hours)
+
+        if existing:
+            existing.paused_until = paused_until
+            existing.reason = reason
+            existing.paused_at = datetime.utcnow()
+        else:
+            new_pause = PausedContact(
+                phone=phone,
+                paused_until=paused_until,
+                reason=reason,
+                paused_at=datetime.utcnow()
+            )
+            db.add(new_pause)
+
+        db.commit()
+
+        logger.info(f"⏸️ Contato {phone} pausado via dashboard até {paused_until}")
+        return {"success": True, "phone": phone, "paused_until": paused_until.isoformat()}
+
+
+@app.delete("/api/paused-contacts/{phone}")
+async def unpause_contact(phone: str, admin: str = Depends(verify_admin_credentials)):
+    """Despausar um contato"""
+    phone = normalize_phone(phone)
+
+    with get_db() as db:
+        existing = db.query(PausedContact).filter(PausedContact.phone == phone).first()
+
+        if not existing:
+            raise HTTPException(status_code=404, detail="Contato não encontrado na lista de pausados")
+
+        db.delete(existing)
+        db.commit()
+
+        logger.info(f"▶️ Contato {phone} despausado via dashboard")
+        return {"success": True, "phone": phone}
+
+
+@app.put("/api/paused-contacts/{phone}/extend")
+async def extend_pause(phone: str, request: Request, admin: str = Depends(verify_admin_credentials)):
+    """Estender pausa de um contato"""
+    from datetime import datetime, timedelta
+
+    data = await request.json()
+    hours = data.get("hours", 24)
+    phone = normalize_phone(phone)
+
+    with get_db() as db:
+        existing = db.query(PausedContact).filter(PausedContact.phone == phone).first()
+
+        if not existing:
+            raise HTTPException(status_code=404, detail="Contato não encontrado na lista de pausados")
+
+        # Adicionar horas ao tempo atual de pausa
+        existing.paused_until = existing.paused_until + timedelta(hours=hours)
+        db.commit()
+
+        logger.info(f"⏸️ Pausa do contato {phone} estendida por +{hours}h até {existing.paused_until}")
+        return {"success": True, "phone": phone, "paused_until": existing.paused_until.isoformat()}
+
+
+@app.get("/api/active-conversations")
+async def get_active_conversations(admin: str = Depends(verify_admin_credentials)):
+    """Lista conversas ativas (contextos ativos na última hora)"""
+    from datetime import datetime, timedelta
+
+    with get_db() as db:
+        one_hour_ago = datetime.utcnow() - timedelta(hours=1)
+
+        conversations = db.query(ConversationContext).filter(
+            ConversationContext.status == "active",
+            ConversationContext.last_activity > one_hour_ago
+        ).order_by(ConversationContext.last_activity.desc()).all()
+
+        # Também buscar se o contato está pausado
+        paused_phones = {p.phone for p in db.query(PausedContact).filter(
+            PausedContact.paused_until > datetime.utcnow()
+        ).all()}
+
+        result = []
+        for c in conversations:
+            # Extrair nome do flow_data se disponível
+            flow_data = c.flow_data or {}
+            patient_name = flow_data.get("patient_name")
+
+            # Calcular tempo desde última atividade
+            time_diff = datetime.utcnow() - c.last_activity
+            minutes_ago = int(time_diff.total_seconds() / 60)
+
+            if minutes_ago < 1:
+                time_ago = "agora"
+            elif minutes_ago < 60:
+                time_ago = f"há {minutes_ago} min"
+            else:
+                hours_ago = int(minutes_ago / 60)
+                time_ago = f"há {hours_ago}h"
+
+            result.append({
+                "phone": c.phone,
+                "patient_name": patient_name,
+                "last_activity": c.last_activity.isoformat(),
+                "time_ago": time_ago,
+                "current_flow": c.current_flow,
+                "message_count": len(c.messages) if c.messages else 0,
+                "is_paused": c.phone in paused_phones
+            })
+
+        return {"conversations": result, "count": len(result)}
+
+
+@app.get("/pausas")
+async def pausas_dashboard(admin: str = Depends(verify_admin_credentials)):
+    """Dashboard de gerenciamento de pausas e conversas ativas"""
+    html_content = """
+    <!DOCTYPE html>
+    <html lang="pt-BR">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Gerenciamento de Pausas</title>
+        <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+        <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+        <script src="https://cdn.jsdelivr.net/npm/sweetalert2@11"></script>
+        <style>
+            :root {
+                --primary: #4F46E5;
+                --success: #10B981;
+                --warning: #F59E0B;
+                --danger: #EF4444;
+                --info: #3B82F6;
+                --bg: #F9FAFB;
+                --card-bg: #FFFFFF;
+                --text: #1F2937;
+                --text-muted: #6B7280;
+                --border: #E5E7EB;
+            }
+
+            body {
+                background: var(--bg);
+                font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+                color: var(--text);
+            }
+
+            .dashboard-container {
+                max-width: 1400px;
+                margin: 0 auto;
+                padding: 2rem;
+            }
+
+            .header {
+                background: var(--card-bg);
+                border-radius: 16px;
+                padding: 1.5rem 2rem;
+                margin-bottom: 2rem;
+                box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+            }
+
+            .header h1 {
+                font-size: 1.75rem;
+                font-weight: 700;
+                color: var(--primary);
+                margin: 0;
+            }
+
+            .header h1 i {
+                margin-right: 0.5rem;
+            }
+
+            .refresh-info {
+                color: var(--text-muted);
+                font-size: 0.875rem;
+            }
+
+            .section {
+                background: var(--card-bg);
+                border-radius: 16px;
+                padding: 1.5rem;
+                margin-bottom: 1.5rem;
+                box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+            }
+
+            .section-header {
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                margin-bottom: 1rem;
+                padding-bottom: 1rem;
+                border-bottom: 1px solid var(--border);
+            }
+
+            .section-title {
+                font-size: 1.25rem;
+                font-weight: 600;
+                margin: 0;
+                display: flex;
+                align-items: center;
+                gap: 0.5rem;
+            }
+
+            .badge-count {
+                background: var(--primary);
+                color: white;
+                padding: 0.25rem 0.75rem;
+                border-radius: 20px;
+                font-size: 0.875rem;
+                font-weight: 600;
+            }
+
+            .badge-count.warning {
+                background: var(--warning);
+            }
+
+            .table-container {
+                overflow-x: auto;
+            }
+
+            table {
+                width: 100%;
+                border-collapse: collapse;
+            }
+
+            th {
+                text-align: left;
+                padding: 0.75rem 1rem;
+                background: var(--bg);
+                color: var(--text-muted);
+                font-weight: 600;
+                font-size: 0.875rem;
+                text-transform: uppercase;
+                letter-spacing: 0.05em;
+            }
+
+            td {
+                padding: 1rem;
+                border-bottom: 1px solid var(--border);
+                vertical-align: middle;
+            }
+
+            tr:hover {
+                background: var(--bg);
+            }
+
+            .phone-cell {
+                font-family: monospace;
+                font-size: 0.95rem;
+            }
+
+            .name-cell {
+                font-weight: 500;
+            }
+
+            .badge-reason {
+                padding: 0.25rem 0.5rem;
+                border-radius: 6px;
+                font-size: 0.75rem;
+                font-weight: 500;
+            }
+
+            .badge-reason.manual { background: #E0E7FF; color: #4338CA; }
+            .badge-reason.prescription { background: #FEF3C7; color: #92400E; }
+            .badge-reason.holiday { background: #DBEAFE; color: #1E40AF; }
+            .badge-reason.human { background: #D1FAE5; color: #065F46; }
+            .badge-reason.requisicao { background: #FCE7F3; color: #9D174D; }
+
+            .time-badge {
+                display: inline-flex;
+                align-items: center;
+                gap: 0.25rem;
+                padding: 0.25rem 0.5rem;
+                border-radius: 6px;
+                font-size: 0.875rem;
+                font-weight: 500;
+            }
+
+            .time-badge.urgent { background: #FEE2E2; color: #B91C1C; }
+            .time-badge.normal { background: #FEF3C7; color: #92400E; }
+            .time-badge.relaxed { background: #D1FAE5; color: #065F46; }
+
+            .action-btn {
+                padding: 0.375rem 0.75rem;
+                border-radius: 6px;
+                border: none;
+                font-size: 0.875rem;
+                font-weight: 500;
+                cursor: pointer;
+                transition: all 0.2s;
+                margin-right: 0.5rem;
+            }
+
+            .action-btn:hover {
+                transform: translateY(-1px);
+            }
+
+            .btn-pause {
+                background: var(--warning);
+                color: white;
+            }
+
+            .btn-unpause {
+                background: var(--success);
+                color: white;
+            }
+
+            .btn-extend {
+                background: var(--info);
+                color: white;
+            }
+
+            .btn-add {
+                background: var(--primary);
+                color: white;
+                padding: 0.5rem 1rem;
+            }
+
+            .empty-state {
+                text-align: center;
+                padding: 3rem;
+                color: var(--text-muted);
+            }
+
+            .empty-state i {
+                font-size: 3rem;
+                margin-bottom: 1rem;
+                opacity: 0.5;
+            }
+
+            .paused-badge {
+                background: var(--danger);
+                color: white;
+                padding: 0.125rem 0.5rem;
+                border-radius: 4px;
+                font-size: 0.75rem;
+                margin-left: 0.5rem;
+            }
+
+            .nav-links {
+                display: flex;
+                gap: 1rem;
+            }
+
+            .nav-link {
+                color: var(--text-muted);
+                text-decoration: none;
+                font-size: 0.875rem;
+                transition: color 0.2s;
+            }
+
+            .nav-link:hover {
+                color: var(--primary);
+            }
+
+            @keyframes pulse {
+                0%, 100% { opacity: 1; }
+                50% { opacity: 0.5; }
+            }
+
+            .live-indicator {
+                display: inline-flex;
+                align-items: center;
+                gap: 0.5rem;
+                color: var(--success);
+                font-size: 0.875rem;
+            }
+
+            .live-dot {
+                width: 8px;
+                height: 8px;
+                background: var(--success);
+                border-radius: 50%;
+                animation: pulse 2s infinite;
+            }
+        </style>
+    </head>
+    <body>
+        <div class="dashboard-container">
+            <div class="header">
+                <h1><i class="fas fa-pause-circle"></i> Gerenciamento de Pausas</h1>
+                <div class="nav-links">
+                    <a href="/dashboard" class="nav-link"><i class="fas fa-calendar"></i> Consultas</a>
+                    <a href="/dashboard/historico" class="nav-link"><i class="fas fa-history"></i> Histórico</a>
+                </div>
+            </div>
+
+            <!-- Conversas Ativas -->
+            <div class="section">
+                <div class="section-header">
+                    <h2 class="section-title">
+                        <i class="fas fa-comments" style="color: var(--success)"></i>
+                        Conversas Ativas
+                        <span class="live-indicator"><span class="live-dot"></span> Ao vivo</span>
+                    </h2>
+                    <span class="badge-count" id="conversations-count">0</span>
+                </div>
+                <div class="table-container">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Telefone</th>
+                                <th>Nome</th>
+                                <th>Última Atividade</th>
+                                <th>Mensagens</th>
+                                <th>Ações</th>
+                            </tr>
+                        </thead>
+                        <tbody id="conversations-table">
+                            <tr>
+                                <td colspan="5" class="empty-state">
+                                    <i class="fas fa-spinner fa-spin"></i>
+                                    <p>Carregando...</p>
+                                </td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- Contatos Pausados -->
+            <div class="section">
+                <div class="section-header">
+                    <h2 class="section-title">
+                        <i class="fas fa-pause" style="color: var(--warning)"></i>
+                        Contatos Pausados
+                    </h2>
+                    <div>
+                        <span class="badge-count warning" id="paused-count">0</span>
+                        <button class="action-btn btn-add" onclick="showAddPauseModal()">
+                            <i class="fas fa-plus"></i> Pausar Contato
+                        </button>
+                    </div>
+                </div>
+                <div class="table-container">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Telefone</th>
+                                <th>Motivo</th>
+                                <th>Tempo Restante</th>
+                                <th>Desbloqueia em</th>
+                                <th>Ações</th>
+                            </tr>
+                        </thead>
+                        <tbody id="paused-table">
+                            <tr>
+                                <td colspan="5" class="empty-state">
+                                    <i class="fas fa-spinner fa-spin"></i>
+                                    <p>Carregando...</p>
+                                </td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+            <div class="refresh-info" style="text-align: center; margin-top: 1rem;">
+                <i class="fas fa-sync-alt"></i> Atualização automática a cada 10 segundos
+            </div>
+        </div>
+
+        <script>
+            // Formatadores
+            function formatPhone(phone) {
+                if (phone.length === 13) {
+                    return `+${phone.slice(0,2)} (${phone.slice(2,4)}) ${phone.slice(4,9)}-${phone.slice(9)}`;
+                }
+                return phone;
+            }
+
+            function getReasonBadge(reason) {
+                const reasons = {
+                    'secretary_dashboard_pause': { label: 'Manual', class: 'manual' },
+                    'secretary_manual_pause': { label: 'Manual', class: 'manual' },
+                    'prescription_payment': { label: 'Receita', class: 'prescription' },
+                    'special_holiday_request': { label: 'Período Especial', class: 'holiday' },
+                    'user_requested_human_assistance': { label: 'Pediu Atendente', class: 'human' },
+                    'requisicao_exames': { label: 'Requisição', class: 'requisicao' }
+                };
+                const r = reasons[reason] || { label: reason || 'Manual', class: 'manual' };
+                return `<span class="badge-reason ${r.class}">${r.label}</span>`;
+            }
+
+            function getTimeBadge(hours) {
+                let cls = 'relaxed';
+                if (hours < 2) cls = 'urgent';
+                else if (hours < 12) cls = 'normal';
+                return cls;
+            }
+
+            function formatDateTime(isoString) {
+                const date = new Date(isoString);
+                return date.toLocaleString('pt-BR', {
+                    day: '2-digit',
+                    month: '2-digit',
+                    hour: '2-digit',
+                    minute: '2-digit'
+                });
+            }
+
+            // Carregar dados
+            async function loadData() {
+                try {
+                    const [pausedRes, convsRes] = await Promise.all([
+                        fetch('/api/paused-contacts'),
+                        fetch('/api/active-conversations')
+                    ]);
+
+                    const pausedData = await pausedRes.json();
+                    const convsData = await convsRes.json();
+
+                    renderPausedTable(pausedData.paused_contacts);
+                    renderConversationsTable(convsData.conversations);
+
+                    document.getElementById('paused-count').textContent = pausedData.count;
+                    document.getElementById('conversations-count').textContent = convsData.count;
+                } catch (error) {
+                    console.error('Erro ao carregar dados:', error);
+                }
+            }
+
+            function renderPausedTable(contacts) {
+                const tbody = document.getElementById('paused-table');
+
+                if (!contacts || contacts.length === 0) {
+                    tbody.innerHTML = `
+                        <tr>
+                            <td colspan="5" class="empty-state">
+                                <i class="fas fa-check-circle"></i>
+                                <p>Nenhum contato pausado</p>
+                            </td>
+                        </tr>
+                    `;
+                    return;
+                }
+
+                tbody.innerHTML = contacts.map(c => `
+                    <tr>
+                        <td class="phone-cell">${formatPhone(c.phone)}</td>
+                        <td>${getReasonBadge(c.reason)}</td>
+                        <td>
+                            <span class="time-badge ${getTimeBadge(c.remaining_hours)}">
+                                <i class="fas fa-clock"></i> ${c.remaining_formatted}
+                            </span>
+                        </td>
+                        <td>${formatDateTime(c.paused_until)}</td>
+                        <td>
+                            <button class="action-btn btn-extend" onclick="extendPause('${c.phone}')">
+                                <i class="fas fa-plus"></i> Estender
+                            </button>
+                            <button class="action-btn btn-unpause" onclick="unpauseContact('${c.phone}')">
+                                <i class="fas fa-play"></i> Despausar
+                            </button>
+                        </td>
+                    </tr>
+                `).join('');
+            }
+
+            function renderConversationsTable(conversations) {
+                const tbody = document.getElementById('conversations-table');
+
+                if (!conversations || conversations.length === 0) {
+                    tbody.innerHTML = `
+                        <tr>
+                            <td colspan="5" class="empty-state">
+                                <i class="fas fa-comment-slash"></i>
+                                <p>Nenhuma conversa ativa no momento</p>
+                            </td>
+                        </tr>
+                    `;
+                    return;
+                }
+
+                tbody.innerHTML = conversations.map(c => `
+                    <tr>
+                        <td class="phone-cell">
+                            ${formatPhone(c.phone)}
+                            ${c.is_paused ? '<span class="paused-badge">PAUSADO</span>' : ''}
+                        </td>
+                        <td class="name-cell">${c.patient_name || '<span style="color: var(--text-muted)">-</span>'}</td>
+                        <td>${c.time_ago}</td>
+                        <td>${c.message_count}</td>
+                        <td>
+                            ${c.is_paused ?
+                                `<button class="action-btn btn-unpause" onclick="unpauseContact('${c.phone}')">
+                                    <i class="fas fa-play"></i> Despausar
+                                </button>` :
+                                `<button class="action-btn btn-pause" onclick="pauseContact('${c.phone}')">
+                                    <i class="fas fa-pause"></i> Pausar
+                                </button>`
+                            }
+                        </td>
+                    </tr>
+                `).join('');
+            }
+
+            // Ações
+            async function pauseContact(phone) {
+                const { value: hours } = await Swal.fire({
+                    title: 'Pausar Contato',
+                    text: `Pausar ${formatPhone(phone)} por quantas horas?`,
+                    input: 'select',
+                    inputOptions: {
+                        '2': '2 horas',
+                        '6': '6 horas',
+                        '12': '12 horas',
+                        '24': '24 horas',
+                        '48': '48 horas'
+                    },
+                    inputValue: '24',
+                    showCancelButton: true,
+                    confirmButtonText: 'Pausar',
+                    cancelButtonText: 'Cancelar',
+                    confirmButtonColor: '#F59E0B'
+                });
+
+                if (hours) {
+                    try {
+                        const res = await fetch('/api/paused-contacts', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ phone, hours: parseInt(hours) })
+                        });
+
+                        if (res.ok) {
+                            Swal.fire('Pausado!', 'Contato pausado com sucesso.', 'success');
+                            loadData();
+                        } else {
+                            throw new Error('Erro ao pausar');
+                        }
+                    } catch (error) {
+                        Swal.fire('Erro', 'Não foi possível pausar o contato.', 'error');
+                    }
+                }
+            }
+
+            async function unpauseContact(phone) {
+                const result = await Swal.fire({
+                    title: 'Despausar Contato?',
+                    text: `O bot voltará a responder para ${formatPhone(phone)}`,
+                    icon: 'question',
+                    showCancelButton: true,
+                    confirmButtonText: 'Sim, despausar',
+                    cancelButtonText: 'Cancelar',
+                    confirmButtonColor: '#10B981'
+                });
+
+                if (result.isConfirmed) {
+                    try {
+                        const res = await fetch(`/api/paused-contacts/${phone}`, {
+                            method: 'DELETE'
+                        });
+
+                        if (res.ok) {
+                            Swal.fire('Despausado!', 'Contato liberado.', 'success');
+                            loadData();
+                        } else {
+                            throw new Error('Erro ao despausar');
+                        }
+                    } catch (error) {
+                        Swal.fire('Erro', 'Não foi possível despausar o contato.', 'error');
+                    }
+                }
+            }
+
+            async function extendPause(phone) {
+                const { value: hours } = await Swal.fire({
+                    title: 'Estender Pausa',
+                    text: `Adicionar mais quantas horas para ${formatPhone(phone)}?`,
+                    input: 'select',
+                    inputOptions: {
+                        '2': '+2 horas',
+                        '6': '+6 horas',
+                        '12': '+12 horas',
+                        '24': '+24 horas'
+                    },
+                    inputValue: '24',
+                    showCancelButton: true,
+                    confirmButtonText: 'Estender',
+                    cancelButtonText: 'Cancelar',
+                    confirmButtonColor: '#3B82F6'
+                });
+
+                if (hours) {
+                    try {
+                        const res = await fetch(`/api/paused-contacts/${phone}/extend`, {
+                            method: 'PUT',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ hours: parseInt(hours) })
+                        });
+
+                        if (res.ok) {
+                            Swal.fire('Estendido!', `Pausa estendida por +${hours} horas.`, 'success');
+                            loadData();
+                        } else {
+                            throw new Error('Erro ao estender');
+                        }
+                    } catch (error) {
+                        Swal.fire('Erro', 'Não foi possível estender a pausa.', 'error');
+                    }
+                }
+            }
+
+            async function showAddPauseModal() {
+                const { value: formValues } = await Swal.fire({
+                    title: 'Pausar Novo Contato',
+                    html: `
+                        <input id="swal-phone" class="swal2-input" placeholder="Telefone (ex: 5551999999999)">
+                        <select id="swal-hours" class="swal2-select">
+                            <option value="2">2 horas</option>
+                            <option value="6">6 horas</option>
+                            <option value="12">12 horas</option>
+                            <option value="24" selected>24 horas</option>
+                            <option value="48">48 horas</option>
+                        </select>
+                    `,
+                    focusConfirm: false,
+                    showCancelButton: true,
+                    confirmButtonText: 'Pausar',
+                    cancelButtonText: 'Cancelar',
+                    confirmButtonColor: '#F59E0B',
+                    preConfirm: () => {
+                        const phone = document.getElementById('swal-phone').value.replace(/\\D/g, '');
+                        const hours = document.getElementById('swal-hours').value;
+                        if (!phone || phone.length < 10) {
+                            Swal.showValidationMessage('Digite um telefone válido');
+                            return false;
+                        }
+                        return { phone, hours: parseInt(hours) };
+                    }
+                });
+
+                if (formValues) {
+                    try {
+                        const res = await fetch('/api/paused-contacts', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify(formValues)
+                        });
+
+                        if (res.ok) {
+                            Swal.fire('Pausado!', 'Contato pausado com sucesso.', 'success');
+                            loadData();
+                        } else {
+                            throw new Error('Erro ao pausar');
+                        }
+                    } catch (error) {
+                        Swal.fire('Erro', 'Não foi possível pausar o contato.', 'error');
+                    }
+                }
+            }
+
+            // Inicialização
+            loadData();
+            setInterval(loadData, 10000); // Refresh a cada 10 segundos
+        </script>
+    </body>
+    </html>
+    """
+
+    return HTMLResponse(
+        content=html_content,
+        headers={
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Pragma": "no-cache",
+            "Expires": "0"
+        }
+    )
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)

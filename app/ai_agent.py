@@ -694,10 +694,7 @@ Lembre-se: Seja natural, adaptável e prestativa. Use as tools disponíveis conf
             db.commit()
 
             logger.info(f"⏸️ Pausa especial registrada para {phone} até {paused_until}")
-            return (
-                "Perfeito! Esse período é organizado diretamente com nossa secretária. "
-                "Ela vai entrar em contato com você em até 48 horas. Enquanto isso, posso ajudar com mais alguma coisa?"
-            )
+            return "Perfeito! Nossa secretária vai entrar em contato para agendar. Obrigada!"
         except Exception as exc:
             logger.error(f"❌ Erro ao aplicar pausa especial: {exc}")
             db.rollback()
