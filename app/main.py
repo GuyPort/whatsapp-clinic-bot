@@ -1747,8 +1747,11 @@ async def dashboard(admin: str = Depends(verify_admin_credentials)):
                     <p class="text-muted mb-0">Consultório Dra. Rose • Apenas consultas ativas</p>
                 </div>
                 <div style="display: flex; gap: 12px;">
+                    <a href="/pausas" class="btn btn-outline-warning" style="height: fit-content;">
+                        <i class="fas fa-pause-circle"></i> Pausas
+                    </a>
                     <a href="/dashboard/historico" class="btn btn-outline-secondary" style="height: fit-content;">
-                        <i class="fas fa-history"></i> Ver Histórico Completo
+                        <i class="fas fa-history"></i> Histórico
                     </a>
                     <button class="btn btn-primary" onclick="openCreateModal()" style="height: fit-content;">
                         <i class="fas fa-plus"></i> Criar Consulta
@@ -3151,19 +3154,20 @@ async def pausas_dashboard(admin: str = Depends(verify_admin_credentials)):
                 background: var(--bg);
                 font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
                 color: var(--text);
+                font-size: 0.9rem;
             }
 
             .dashboard-container {
-                max-width: 1400px;
+                max-width: 1200px;
                 margin: 0 auto;
-                padding: 2rem;
+                padding: 1rem;
             }
 
             .header {
                 background: var(--card-bg);
-                border-radius: 16px;
-                padding: 1.5rem 2rem;
-                margin-bottom: 2rem;
+                border-radius: 12px;
+                padding: 0.75rem 1.25rem;
+                margin-bottom: 1rem;
                 box-shadow: 0 1px 3px rgba(0,0,0,0.1);
                 display: flex;
                 justify-content: space-between;
@@ -3171,7 +3175,7 @@ async def pausas_dashboard(admin: str = Depends(verify_admin_credentials)):
             }
 
             .header h1 {
-                font-size: 1.75rem;
+                font-size: 1.25rem;
                 font-weight: 700;
                 color: var(--primary);
                 margin: 0;
@@ -3183,14 +3187,14 @@ async def pausas_dashboard(admin: str = Depends(verify_admin_credentials)):
 
             .refresh-info {
                 color: var(--text-muted);
-                font-size: 0.875rem;
+                font-size: 0.75rem;
             }
 
             .section {
                 background: var(--card-bg);
-                border-radius: 16px;
-                padding: 1.5rem;
-                margin-bottom: 1.5rem;
+                border-radius: 12px;
+                padding: 1rem;
+                margin-bottom: 1rem;
                 box-shadow: 0 1px 3px rgba(0,0,0,0.1);
             }
 
@@ -3198,13 +3202,13 @@ async def pausas_dashboard(admin: str = Depends(verify_admin_credentials)):
                 display: flex;
                 justify-content: space-between;
                 align-items: center;
-                margin-bottom: 1rem;
-                padding-bottom: 1rem;
+                margin-bottom: 0.75rem;
+                padding-bottom: 0.5rem;
                 border-bottom: 1px solid var(--border);
             }
 
             .section-title {
-                font-size: 1.25rem;
+                font-size: 1rem;
                 font-weight: 600;
                 margin: 0;
                 display: flex;
@@ -3215,9 +3219,9 @@ async def pausas_dashboard(admin: str = Depends(verify_admin_credentials)):
             .badge-count {
                 background: var(--primary);
                 color: white;
-                padding: 0.25rem 0.75rem;
+                padding: 0.15rem 0.5rem;
                 border-radius: 20px;
-                font-size: 0.875rem;
+                font-size: 0.75rem;
                 font-weight: 600;
             }
 
@@ -3236,17 +3240,17 @@ async def pausas_dashboard(admin: str = Depends(verify_admin_credentials)):
 
             th {
                 text-align: left;
-                padding: 0.75rem 1rem;
+                padding: 0.5rem 0.75rem;
                 background: var(--bg);
                 color: var(--text-muted);
                 font-weight: 600;
-                font-size: 0.875rem;
+                font-size: 0.75rem;
                 text-transform: uppercase;
                 letter-spacing: 0.05em;
             }
 
             td {
-                padding: 1rem;
+                padding: 0.5rem 0.75rem;
                 border-bottom: 1px solid var(--border);
                 vertical-align: middle;
             }
@@ -3257,7 +3261,7 @@ async def pausas_dashboard(admin: str = Depends(verify_admin_credentials)):
 
             .phone-cell {
                 font-family: monospace;
-                font-size: 0.95rem;
+                font-size: 0.85rem;
             }
 
             .name-cell {
@@ -3265,9 +3269,9 @@ async def pausas_dashboard(admin: str = Depends(verify_admin_credentials)):
             }
 
             .badge-reason {
-                padding: 0.25rem 0.5rem;
-                border-radius: 6px;
-                font-size: 0.75rem;
+                padding: 0.15rem 0.4rem;
+                border-radius: 4px;
+                font-size: 0.7rem;
                 font-weight: 500;
             }
 
@@ -3280,10 +3284,10 @@ async def pausas_dashboard(admin: str = Depends(verify_admin_credentials)):
             .time-badge {
                 display: inline-flex;
                 align-items: center;
-                gap: 0.25rem;
-                padding: 0.25rem 0.5rem;
-                border-radius: 6px;
-                font-size: 0.875rem;
+                gap: 0.2rem;
+                padding: 0.15rem 0.4rem;
+                border-radius: 4px;
+                font-size: 0.75rem;
                 font-weight: 500;
             }
 
@@ -3292,14 +3296,14 @@ async def pausas_dashboard(admin: str = Depends(verify_admin_credentials)):
             .time-badge.relaxed { background: #D1FAE5; color: #065F46; }
 
             .action-btn {
-                padding: 0.375rem 0.75rem;
-                border-radius: 6px;
+                padding: 0.25rem 0.5rem;
+                border-radius: 4px;
                 border: none;
-                font-size: 0.875rem;
+                font-size: 0.75rem;
                 font-weight: 500;
                 cursor: pointer;
                 transition: all 0.2s;
-                margin-right: 0.5rem;
+                margin-right: 0.25rem;
             }
 
             .action-btn:hover {
@@ -3324,39 +3328,45 @@ async def pausas_dashboard(admin: str = Depends(verify_admin_credentials)):
             .btn-add {
                 background: var(--primary);
                 color: white;
-                padding: 0.5rem 1rem;
+                padding: 0.25rem 0.75rem;
+                font-size: 0.75rem;
             }
 
             .empty-state {
                 text-align: center;
-                padding: 3rem;
+                padding: 1.5rem;
                 color: var(--text-muted);
             }
 
             .empty-state i {
-                font-size: 3rem;
-                margin-bottom: 1rem;
+                font-size: 2rem;
+                margin-bottom: 0.5rem;
                 opacity: 0.5;
+            }
+
+            .empty-state p {
+                margin: 0;
+                font-size: 0.85rem;
             }
 
             .paused-badge {
                 background: var(--danger);
                 color: white;
-                padding: 0.125rem 0.5rem;
-                border-radius: 4px;
-                font-size: 0.75rem;
-                margin-left: 0.5rem;
+                padding: 0.1rem 0.35rem;
+                border-radius: 3px;
+                font-size: 0.65rem;
+                margin-left: 0.35rem;
             }
 
             .nav-links {
                 display: flex;
-                gap: 1rem;
+                gap: 0.75rem;
             }
 
             .nav-link {
                 color: var(--text-muted);
                 text-decoration: none;
-                font-size: 0.875rem;
+                font-size: 0.8rem;
                 transition: color 0.2s;
             }
 
@@ -3372,14 +3382,14 @@ async def pausas_dashboard(admin: str = Depends(verify_admin_credentials)):
             .live-indicator {
                 display: inline-flex;
                 align-items: center;
-                gap: 0.5rem;
+                gap: 0.35rem;
                 color: var(--success);
-                font-size: 0.875rem;
+                font-size: 0.75rem;
             }
 
             .live-dot {
-                width: 8px;
-                height: 8px;
+                width: 6px;
+                height: 6px;
                 background: var(--success);
                 border-radius: 50%;
                 animation: pulse 2s infinite;
