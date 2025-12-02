@@ -927,30 +927,51 @@ Return ONLY a JSON object with this structure:
                 logger.debug("Resposta do Claude indisponível para depuração.")
             return result_template
 
-    def _build_prescription_address_prompt(self, reminder: bool = False) -> str:
+    def _build_prescription_phone_prompt(self, current_phone: str, reminder: bool = False) -> str:
+        """Constrói prompt perguntando se pode enviar receita para o número atual."""
+        # Formatar número para exibição (ex: 5551999999999 -> (51) 99999-9999)
+        formatted_phone = current_phone
+        if current_phone and len(current_phone) >= 11:
+            # Remove código do país (55) se presente para formatar
+            phone_digits = current_phone[-11:] if len(current_phone) >= 11 else current_phone
+            if len(phone_digits) == 11:
+                formatted_phone = f"({phone_digits[0:2]}) {phone_digits[2:7]}-{phone_digits[7:11]}"
+
         base = (
-            "Obrigada! Agora me informe o endereço completo para entrega ou retirada:\n\n"
-            "📍 Cidade\n"
-            "🏘️ Bairro\n"
-            "🛣️ Rua\n"
-            "🏠 Número do imóvel\n\n"
-            "Pode enviar tudo junto em uma única mensagem."
+            f"Obrigada! Podemos enviar a receita para este número: {formatted_phone}?\n\n"
+            "Responda *Sim* para confirmar ou informe outro número de telefone."
         )
         if reminder:
             return (
-                "Para prosseguir, preciso do endereço completo (cidade, bairro, rua e número). "
-                "Envie tudo em uma mesma mensagem, por favor."
+                f"Por favor, confirme se podemos enviar a receita para {formatted_phone} "
+                "respondendo *Sim*, ou informe outro número de telefone."
             )
         return base
 
-    def _is_valid_address(self, address: str) -> bool:
-        if not address:
-            return False
-        if len(address) < 12:
-            return False
-        has_letter = any(ch.isalpha() for ch in address)
-        has_number = any(ch.isdigit() for ch in address)
-        return has_letter and has_number
+    def _parse_phone_response(self, response: str, current_phone: str) -> tuple:
+        """
+        Analisa resposta do paciente sobre número de telefone.
+
+        Returns:
+            (is_valid, phone_number) - se válido, retorna o número a ser usado
+        """
+        response_lower = response.strip().lower()
+
+        # Se confirmou o número atual
+        if response_lower in ["sim", "s", "yes", "pode", "isso", "confirmo", "ok", "pode sim", "sim pode", "este mesmo", "esse mesmo", "esse", "este"]:
+            return (True, current_phone)
+
+        # Tentar extrair número de telefone da resposta
+        digits = re.sub(r'\D', '', response)
+
+        # Número válido brasileiro: 10-11 dígitos (com DDD) ou 12-13 (com código do país)
+        if len(digits) >= 10 and len(digits) <= 13:
+            # Normalizar para formato com código do país
+            if not digits.startswith('55') and len(digits) <= 11:
+                digits = '55' + digits
+            return (True, digits)
+
+        return (False, "")
 
     def _build_prescription_payment_message(self) -> str:
         return (
@@ -993,13 +1014,14 @@ Return ONLY a JSON object with this structure:
         patient_name = flow.get("patient_name", "Não informado")
         patient_birth_date = flow.get("patient_birth_date", "Não informado")
         details = flow.get("prescription_details", {})
-        address = flow.get("prescription_address", "Não informado")
         doctor_phone = self.clinic_info.get("informacoes_adicionais", {}).get("telefone_doutora")
         if not doctor_phone:
             logger.error("❌ Telefone da doutora não encontrado para notificação de receita.")
             return
 
         contact = phone or flow.get("patient_phone", "Não informado")
+        prescription_phone = flow.get("prescription_phone", contact)
+
         def format_field(field_key: str) -> str:
             field_data = details.get(field_key, {}) if isinstance(details, dict) else {}
             status = field_data.get("status", "missing")
@@ -1019,8 +1041,8 @@ Return ONLY a JSON object with this structure:
             f"📄 Receita/diagnóstico: {format_field('current_prescription')}\n"
             f"🕒 Modo de uso: {format_field('usage')}\n"
             f"⚖️ Dosagem: {format_field('dosage')}\n"
-            f"📍 Endereço: {address}\n"
-            f"📞 Contato: {contact}"
+            f"📱 Enviar receita para: {prescription_phone}\n"
+            f"📞 Contato original: {contact}"
         )
 
         try:
@@ -2094,9 +2116,9 @@ Responda EXCLUSIVAMENTE com um JSON válido no formato:
             flow["consultation_type"] = "domiciliar"
         flow.pop("awaiting_consultation_type", None)
         flow.pop("awaiting_prescription_details", None)
-        flow.pop("awaiting_prescription_address", None)
+        flow.pop("awaiting_prescription_phone", None)
         flow.pop("prescription_details", None)
-        flow.pop("prescription_address", None)
+        flow.pop("prescription_phone", None)
         flow.pop("prescription_notified", None)
         context.current_flow = menu_choice
         flag_modified(context, "flow_data")
@@ -2391,8 +2413,8 @@ Responda EXCLUSIVAMENTE com um JSON válido no formato:
                     if flow_data.get("menu_choice") == "prescription":
                         flow_data["awaiting_prescription_details"] = True
                         flow_data["prescription_details"] = {}
-                        flow_data.pop("prescription_address", None)
-                        flow_data["awaiting_prescription_address"] = False
+                        flow_data.pop("prescription_phone", None)
+                        flow_data["awaiting_prescription_phone"] = False
                         flag_modified(context, "flow_data")
                     flag_modified(context, "flow_data")
                     logger.info(f"📅 Data de nascimento registrada para {phone}: {birth_date}")
@@ -2484,22 +2506,22 @@ Responda EXCLUSIVAMENTE com um JSON válido no formato:
 
                 flow_data["prescription_details"] = fields
                 flow_data["awaiting_prescription_details"] = False
-                flow_data["awaiting_prescription_address"] = True
+                flow_data["awaiting_prescription_phone"] = True
                 flag_modified(context, "flow_data")
 
-                address_prompt = self._build_prescription_address_prompt()
-                self._record_interaction(context, message, address_prompt, db, flow_modified=True)
-                return address_prompt
+                phone_prompt = self._build_prescription_phone_prompt(phone)
+                self._record_interaction(context, message, phone_prompt, db, flow_modified=True)
+                return phone_prompt
 
-            if flow_data.get("awaiting_prescription_address"):
-                address = message.strip()
-                if not self._is_valid_address(address):
-                    reminder = self._build_prescription_address_prompt(reminder=True)
+            if flow_data.get("awaiting_prescription_phone"):
+                is_valid, prescription_phone = self._parse_phone_response(message, phone)
+                if not is_valid:
+                    reminder = self._build_prescription_phone_prompt(phone, reminder=True)
                     self._record_interaction(context, message, reminder, db)
                     return reminder
 
-                flow_data["prescription_address"] = address
-                flow_data["awaiting_prescription_address"] = False
+                flow_data["prescription_phone"] = prescription_phone
+                flow_data["awaiting_prescription_phone"] = False
                 flag_modified(context, "flow_data")
                 db.commit()
 
@@ -5303,7 +5325,7 @@ Responda EXCLUSIVAMENTE com um JSON válido no formato:
             ]
             if cadeira_rodas:
                 message_lines.append("• Temos cadeira de rodas disponível se necessário")
-            message_lines.append("• Você receberá uma mensagem de lembrete no dia da consulta")
+            message_lines.append("• Você receberá uma mensagem de lembrete 48 horas antes da sua consulta")
             message_lines.append("")
             message_lines.append("Posso te ajudar com mais alguma coisa?")
 
