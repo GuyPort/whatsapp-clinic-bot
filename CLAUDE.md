@@ -43,7 +43,7 @@ The application runs two processes on Railway:
 ## Architecture Overview
 
 ### Message Processing Pipeline
-1. **Webhook Reception** ([main.py:webhook_whatsapp](app/main.py)): Evolution API posts incoming WhatsApp messages
+1. **Webhook Reception** ([main.py:203](app/main.py)): Evolution API posts incoming WhatsApp messages
 2. **Celery Task Queue**: `process_message_task()` enqueued with phone/message/ID
 3. **Redis Locking**: Per-contact lock ensures serial processing (prevents race conditions)
 4. **AI Agent** ([ai_agent.py](app/ai_agent.py)): Claude SDK processes message with 15+ tools
@@ -52,9 +52,9 @@ The application runs two processes on Railway:
 
 ### Key Architectural Patterns
 
-**Tool-Based AI Agent** ([ai_agent.py:5764 LOC](app/ai_agent.py))
+**Tool-Based AI Agent** ([ai_agent.py](app/ai_agent.py))
 - Claude receives system prompt defining "Beatriz" personality and business rules
-- 15+ tools available: `create_appointment`, `cancel_appointment`, `find_next_available_slot`, etc.
+- 15 tools available: `get_clinic_info`, `validate_date_and_show_slots`, `confirm_time_slot`, `create_appointment`, `search_appointments`, `cancel_appointment`, `find_next_available_slot`, `find_alternative_slots`, `request_human_assistance`, `extract_patient_data`, `request_home_address`, `notify_doctor_home_visit`, `end_conversation`, `block_requisition_request`
 - Tools execute within SQLAlchemy session context
 - Claude returns JSON with tool_use blocks → agent parses and executes locally
 
@@ -105,6 +105,7 @@ The application runs two processes on Railway:
 
 **[data/clinic_info.json](data/clinic_info.json)** - Editable clinic configuration
 - Clinic hours, closed dates, consultation types, insurance plans
+- Includes `periodo_agendamento_manual` for dates requiring manual scheduling
 - Modified dynamically via `POST /admin/reload-config`
 - Changes take effect immediately without restart
 
@@ -121,7 +122,7 @@ Required for operation:
 
 1. **Appointment** - Scheduled consultations
    - Indexed by: `patient_phone`, `appointment_date`, `status`, `reminder_sent_at`
-   - Status enum: `AGENDADA`, `CANCELADA`, `REALIZADA`
+   - Status enum: `AGENDADA`, `CANCELADA`, `COMPARECEU`, `NAO_COMPARECEU`
    - Validation hooks ensure: name present, proper date/time formats, birth date valid
 
 2. **ConversationContext** - Per-contact chat state
@@ -142,6 +143,7 @@ Required for operation:
 | Modify appointment duration | [data/clinic_info.json](data/clinic_info.json) + [appointment_rules.py](app/appointment_rules.py) |
 | Change insurance rules | [appointment_rules.py](app/appointment_rules.py) + [ai_agent.py](app/ai_agent.py) system prompt |
 | Add/remove holidays | [data/clinic_info.json](data/clinic_info.json) `dias_fechados` array |
+| Add manual scheduling period | [data/clinic_info.json](data/clinic_info.json) `periodo_agendamento_manual` array |
 | Modify conversation flow | [ai_agent.py](app/ai_agent.py) system prompt + tool definitions |
 | Change rate limiting | [whatsapp_service.py](app/whatsapp_service.py) `send_message()` Redis lock timeout |
 | Adjust reminder timing | [scheduler.py](app/scheduler.py) `send_appointment_reminders()` window |
@@ -170,17 +172,11 @@ Required for operation:
 - `GET /admin/appointments` - List all appointments
 - `GET /api/appointments/scheduled` - JSON API for dashboard
 
-## Testing Notes
-
-- Test framework: pytest
-- For local testing, SQLite fallback is available (`data/appointments.db`)
-- Production uses PostgreSQL via Railway
-- Test environment should set `DATABASE_URL` to SQLite or test PostgreSQL instance
-
 ## Important Constraints
 
 1. **48-Hour Rule**: Appointments must be booked ≥48 hours in advance (enforced in `find_next_available_slot()`)
 2. **Identity Verification**: Requires name + birth date match for cancellation/rescheduling
-3. **Holiday Closure**: Currently closed Nov 14 - Dec 30, 2025 and Jan 13, 2026 (Thanksgiving through New Year)
-4. **Insurance Limits**: IPE max 3 appointments/day, Particular only on Mondays
-5. **Time Slots**: Only whole hours available (14:00, 15:00, etc. - no 14:30)
+3. **Insurance Limits**: IPE max 3 appointments/day, Particular only on Mondays
+4. **Time Slots**: Only whole hours available (14:00, 15:00, etc. - no 14:30)
+5. **Closed Dates**: Check `dias_fechados` in clinic_info.json for holidays
+6. **Manual Scheduling Period**: Check `periodo_agendamento_manual` - bot redirects to human during these dates
