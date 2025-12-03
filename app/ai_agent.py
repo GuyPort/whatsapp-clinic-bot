@@ -81,7 +81,9 @@ class ClaudeToolAgent:
         """Cria o prompt do sistema para o Claude"""
         clinic_name = self.clinic_info.get('nome_clinica', 'Clínica')
         endereco = self.clinic_info.get('endereco', 'Endereço não informado')
-        horarios = self.clinic_info.get('horario_funcionamento', {})
+        # Usar horario_atendimento para informar horários reais da clínica
+        # (horario_funcionamento é usado para agendamento e pode ter restrições)
+        horarios = self.clinic_info.get('horario_atendimento', self.clinic_info.get('horario_funcionamento', {}))
         
         horarios_str = ""
         for dia, horario in horarios.items():
