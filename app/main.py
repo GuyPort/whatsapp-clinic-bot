@@ -276,15 +276,19 @@ async def whatsapp_webhook(request: Request):
 
         # Tratar números @lid (Linked Device ID)
         if '@lid' in phone:
-            lid = phone.replace('@lid', '')
-            logger.info(f"🔄 Detectado LID: {lid}, convertendo para número real...")
-            real_phone = await whatsapp_service.get_phone_from_lid(lid)
-            if real_phone:
-                phone = real_phone.replace('@s.whatsapp.net', '').replace('@c.us', '')
-                logger.info(f"✅ LID convertido para: {phone}")
+            # O número real vem no campo senderPn ou cleanedSenderPn do payload
+            cleaned_sender = key.get('cleanedSenderPn')
+            sender_pn = key.get('senderPn', '')
+
+            if cleaned_sender:
+                phone = cleaned_sender
+                logger.info(f"✅ LID detectado, usando cleanedSenderPn: {phone}")
+            elif sender_pn:
+                phone = sender_pn.replace('@s.whatsapp.net', '').replace('@c.us', '')
+                logger.info(f"✅ LID detectado, usando senderPn: {phone}")
             else:
-                logger.warning(f"⚠️ Não foi possível converter LID {lid}, ignorando mensagem")
-                return {"status": "ignored", "reason": "could not resolve LID to phone number"}
+                logger.warning(f"⚠️ LID detectado mas senderPn não disponível, ignorando")
+                return {"status": "ignored", "reason": "LID without senderPn"}
         else:
             phone = phone.replace('@s.whatsapp.net', '').replace('@c.us', '')
         

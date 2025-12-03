@@ -995,8 +995,8 @@ Return ONLY a JSON object with this structure:
             "💰 Valor: R$ 25,00\n"
             "🔑 Chave Pix: 51999546355\n"
             "⏳ Assim que o comprovante for enviado, a Dra. Rose prepara a receita em até 2 dias úteis.\n"
-            "📄 Receitas branca/controlada podem ser enviadas digitalmente.\n"
-            "📄 Receitas azul ou amarela precisam ser retiradas no consultório, de segunda a sexta das 14h às 18h.\n\n"
+            "📄 Receitas branca controlada, azul e simples podem ser enviadas digitalmente.\n"
+            "📄 Receitas amarela precisam ser retiradas no consultório, de segunda a sexta das 14h às 18h.\n\n"
             "Quando tiver o comprovante, é só me enviar por aqui."
         )
 
