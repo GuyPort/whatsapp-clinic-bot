@@ -155,6 +155,36 @@ class WhatsAppService:
     
 # send_message_with_buttons removido - não utilizado
     
+    async def get_phone_from_lid(self, lid: str) -> Optional[str]:
+        """
+        Converte um LID (Linked ID) para o número de telefone real.
+
+        Args:
+            lid: O identificador LID (ex: 197319555301440)
+
+        Returns:
+            Número de telefone real ou None se não encontrado
+        """
+        try:
+            url = f"{self.base_url}/api/pn-from-lid/{lid}"
+
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                response = await client.get(url, headers=self.headers)
+
+                if response.status_code == 200:
+                    data = response.json()
+                    phone = data.get('phoneNumber') or data.get('pn') or data.get('phone')
+                    if phone:
+                        logger.info(f"✅ LID {lid} convertido para {phone}")
+                        return phone
+
+                logger.warning(f"⚠️ Não foi possível converter LID {lid}: {response.status_code}")
+                return None
+
+        except Exception as e:
+            logger.error(f"❌ Erro ao converter LID {lid}: {str(e)}")
+            return None
+
     async def get_instance_status(self) -> Dict[str, Any]:
         """
         Verifica o status da instância Evolution API.

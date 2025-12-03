@@ -268,13 +268,25 @@ async def whatsapp_webhook(request: Request):
         
         # Extrair informações
         phone = remote_jid
-        
+
         # Ignorar mensagens de newsletter e grupos
         if '@newsletter' in phone or '@g.us' in phone:
             logger.info(f"Ignorando mensagem de newsletter/grupo: {phone}")
             return {"status": "ignored", "reason": "newsletter or group message"}
-        
-        phone = phone.replace('@s.whatsapp.net', '')
+
+        # Tratar números @lid (Linked Device ID)
+        if '@lid' in phone:
+            lid = phone.replace('@lid', '')
+            logger.info(f"🔄 Detectado LID: {lid}, convertendo para número real...")
+            real_phone = await whatsapp_service.get_phone_from_lid(lid)
+            if real_phone:
+                phone = real_phone.replace('@s.whatsapp.net', '').replace('@c.us', '')
+                logger.info(f"✅ LID convertido para: {phone}")
+            else:
+                logger.warning(f"⚠️ Não foi possível converter LID {lid}, ignorando mensagem")
+                return {"status": "ignored", "reason": "could not resolve LID to phone number"}
+        else:
+            phone = phone.replace('@s.whatsapp.net', '').replace('@c.us', '')
         
         if not message_text or not phone:
             logger.warning("Mensagem sem texto ou telefone")

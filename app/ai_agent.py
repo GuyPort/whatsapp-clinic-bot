@@ -931,11 +931,17 @@ Return ONLY a JSON object with this structure:
         """Constrói prompt perguntando se pode enviar receita para o número atual."""
         # Formatar número para exibição (ex: 5551999999999 -> (51) 99999-9999)
         formatted_phone = current_phone
-        if current_phone and len(current_phone) >= 11:
-            # Remove código do país (55) se presente para formatar
-            phone_digits = current_phone[-11:] if len(current_phone) >= 11 else current_phone
-            if len(phone_digits) == 11:
-                formatted_phone = f"({phone_digits[0:2]}) {phone_digits[2:7]}-{phone_digits[7:11]}"
+        if current_phone and len(current_phone) >= 10:
+            # Remover código do país 55 se presente
+            digits = current_phone
+            if digits.startswith('55') and len(digits) >= 12:
+                digits = digits[2:]  # Remove o 55
+
+            # Agora digits deve ter 10-11 dígitos (DDD + telefone)
+            if len(digits) == 11:  # Celular com 9 dígitos
+                formatted_phone = f"({digits[0:2]}) {digits[2:7]}-{digits[7:11]}"
+            elif len(digits) == 10:  # Fixo com 8 dígitos
+                formatted_phone = f"({digits[0:2]}) {digits[2:6]}-{digits[6:10]}"
 
         base = (
             f"Obrigada! Podemos enviar a receita para este número: {formatted_phone}?\n\n"
@@ -943,8 +949,8 @@ Return ONLY a JSON object with this structure:
         )
         if reminder:
             return (
-                f"Por favor, confirme se podemos enviar a receita para {formatted_phone} "
-                "respondendo *Sim*, ou informe outro número de telefone."
+                "O número informado não parece ser válido. Por favor, informe um número de celular "
+                f"com DDD (ex: 51 99999-9999) ou responda *Sim* para usar o número {formatted_phone}."
             )
         return base
 
@@ -964,12 +970,22 @@ Return ONLY a JSON object with this structure:
         # Tentar extrair número de telefone da resposta
         digits = re.sub(r'\D', '', response)
 
-        # Número válido brasileiro: 10-11 dígitos (com DDD) ou 12-13 (com código do país)
-        if len(digits) >= 10 and len(digits) <= 13:
-            # Normalizar para formato com código do país
-            if not digits.startswith('55') and len(digits) <= 11:
-                digits = '55' + digits
-            return (True, digits)
+        # Remover código do país se presente
+        if digits.startswith('55') and len(digits) >= 12:
+            digits = digits[2:]
+
+        # Validar número brasileiro
+        # DDD válido: 11-99 (não existe 10 ou menos)
+        # Celular: 11 dígitos, terceiro dígito = 9
+        # Fixo: 10 dígitos, terceiro dígito = 2,3,4 ou 5
+        if len(digits) == 11:  # Celular
+            ddd = digits[0:2]
+            if int(ddd) >= 11 and digits[2] == '9':
+                return (True, '55' + digits)
+        elif len(digits) == 10:  # Fixo
+            ddd = digits[0:2]
+            if int(ddd) >= 11 and digits[2] in '2345':
+                return (True, '55' + digits)
 
         return (False, "")
 
