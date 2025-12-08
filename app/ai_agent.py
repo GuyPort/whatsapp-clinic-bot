@@ -239,11 +239,7 @@ Após o usuário escolher qualquer opção do menu inicial, siga esta sequência
    • CABERGS
    • IPE
 
-   Como responder:
-   • Se você TEM um desses convênios → Digite o nome (CABERGS ou IPE)
-   • Se você NÃO TEM convênio → Responda apenas "Não"
-
-   Vamos prosseguir com consulta particular se você não tiver convênio."
+   Se você tiver alguns dos dois, basta digitar qual, caso não tenha nenhum, vamos continuar com consulta particular."
    
    IMPORTANTE - INTERPRETAÇÃO DE CONVÊNIO:
    - Você DEVE identificar e interpretar o convênio quando o usuário mencionar durante a conversa
@@ -2407,8 +2403,7 @@ Responda EXCLUSIVAMENTE com um JSON válido no formato:
                     flag_modified(context, "flow_data")
                     first_name = captured_name.split()[0]
                     response = (
-                        f"Muito obrigada, {first_name}! Agora, para manter o cadastro certinho, "
-                        "me informe sua data de nascimento no formato DD/MM/AAAA."
+                        f"Muito obrigada, {first_name}! Agora, me informe sua data de nascimento no formato DD/MM/AAAA."                   
                     )
                     logger.info(f"👤 Nome registrado para {phone}: {captured_name}")
                     self._record_interaction(context, message, response, db, flow_modified=True)
@@ -3777,7 +3772,6 @@ Responda EXCLUSIVAMENTE com um JSON válido no formato:
                 logger.error(f"❌ Erro ao formatar horário: {str(e)}")
                 horario_str = "N/A"
             
-            response = f"✅ Encontrei o próximo horário disponível para você!\n\n"
             response += f"📋 *Resumo da consulta:*\n"
             response += f"👤 Nome: {patient_name}\n"
             response += f"🏥 Tipo: {tipo_nome} - R$ {tipo_valor}\n"
@@ -3984,7 +3978,7 @@ Responda EXCLUSIVAMENTE com um JSON válido no formato:
             response += f"🏥 Tipo: {tipo_nome} - R$ {tipo_valor}\n"
             response += f"💳 Convênio: {convenio_nome}\n\n"
             response += "Se nenhum desses horários funcionar, me indique uma data no formato DD/MM/AAAA ou descreva o período que prefere 😉\n\n"
-            response += f"Qual opção você prefere? Digite o número (1, 2 ou 3) ou me diga se prefere outra data/horário."
+            response += f"Qual opção você prefere? Digite o número (1, 2 ou 3)."
             
             return response
             
@@ -5333,12 +5327,12 @@ Responda EXCLUSIVAMENTE com um JSON válido no formato:
             message_lines = [
                 "✅ Agendamento confirmado com sucesso!",
                 "",
-                f"A consulta do {patient_name} está marcada para *{data_formatada} às {appointment_time}*.",
+                f"A consulta está marcada para *{data_formatada} às {appointment_time}*.",
                 "",
                 "📋 Informações importantes:",
                 "",
                 "• Por favor, traga os últimos exames realizados",
-                "• Traga também a lista de medicações que ele está tomando atualmente",
+                "• Lista de medicações que está tomando atualmente",
                 f"• Nossa clínica fica na {endereco}",
             ]
             if cadeira_rodas:
@@ -5465,9 +5459,10 @@ Responda EXCLUSIVAMENTE com um JSON válido no formato:
             
             for i, apt in enumerate(appointments, 1):
                 status_emoji = {
-                    AppointmentStatus.AGENDADA: "✅",
-                    AppointmentStatus.CANCELADA: "❌",
-                    AppointmentStatus.REALIZADA: "✅"
+                    AppointmentStatus.AGENDADA: "📅",
+                    AppointmentStatus.COMPARECEU: "✅",
+                    AppointmentStatus.NAO_COMPARECEU: "⚠️",
+                    AppointmentStatus.CANCELADA: "❌"
                 }.get(apt.status, "❓")
                 
                 response += f"{i}. {status_emoji} **{apt.patient_name}**\n"
