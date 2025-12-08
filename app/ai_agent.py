@@ -162,10 +162,10 @@ ABORDAGEM DE COMUNICAÇÃO
 MENU INICIAL:
 - Quando não houver contexto claro de agendamento ou o usuário iniciar nova conversa, apresente o menu:
 
-"Olá! Eu sou a Beatriz, secretária do {clinic_name}! 😊
+"Olá! Eu sou a Beatriz, secretária do {clinic_name}! 
 Como posso te ajudar hoje?
 
-ℹ️ Para deixar o atendimento mais rápido, envie uma mensagem por vez e aguarde minha resposta antes de mandar a próxima, combinado?
+Para deixar o atendimento mais rápido, envie uma mensagem por vez e aguarde minha resposta antes de mandar a próxima, combinado?
 
 1️⃣ Marcar consulta (presencial na clínica)
 2️⃣ Atendimento domiciliar (R$ 500)
@@ -239,7 +239,7 @@ Após o usuário escolher qualquer opção do menu inicial, siga esta sequência
    • CABERGS
    • IPE
 
-   📋 Como responder:
+   Como responder:
    • Se você TEM um desses convênios → Digite o nome (CABERGS ou IPE)
    • Se você NÃO TEM convênio → Responda apenas "Não"
 
@@ -872,7 +872,7 @@ Return ONLY a JSON object with this structure:
 
         try:
             response = self.client.messages.create(
-                model="claude-3-5-haiku-20241022",
+                model="claude-sonnet-4-20250514",
                 max_tokens=400,
                 temperature=0,
                 messages=[{"role": "user", "content": prompt}]
@@ -1900,7 +1900,7 @@ Responda EXCLUSIVAMENTE com um JSON válido no formato:
 }}
 """
             response = self.client.messages.create(
-                model="claude-3-5-haiku-20241022",
+                model="claude-sonnet-4-20250514",
                 max_tokens=200,
                 temperature=0.1,
                 messages=[{"role": "user", "content": instructions}]
@@ -2937,7 +2937,7 @@ Responda EXCLUSIVAMENTE com um JSON válido no formato:
             # 6. Fazer chamada para o Claude com histórico completo
             logger.info(f"🤖 Enviando {len(claude_messages)} mensagens para Claude")
             response = self.client.messages.create(
-                model="claude-3-5-haiku-20241022",
+                model="claude-sonnet-4-20250514",
                 max_tokens=2000,
                 temperature=0.3,
                 system=self.system_prompt,
@@ -3018,7 +3018,7 @@ Responda EXCLUSIVAMENTE com um JSON válido no formato:
                                             # Construir contexto completo para Claude processar a confirmação
                                             # Incluir: histórico + request_home_address tool_use + tool_result + notify_doctor_home_visit tool_use + tool_result + mensagem de confirmação
                                             current_response = self.client.messages.create(
-                                                model="claude-3-5-haiku-20241022",
+                                                model="claude-sonnet-4-20250514",
                                                 max_tokens=2000,
                                                 temperature=0.3,
                                                 system=self.system_prompt,
@@ -3083,7 +3083,7 @@ Responda EXCLUSIVAMENTE com um JSON válido no formato:
                             
                             # Fazer follow-up com o resultado
                             current_response = self.client.messages.create(
-                                model="claude-3-5-haiku-20241022",
+                                model="claude-sonnet-4-20250514",
                                 max_tokens=2000,
                                 temperature=0.3,
                                 system=self.system_prompt,
@@ -5669,7 +5669,7 @@ IMPORTANTE: Se identificar que "patient_name" é uma frase de pedido (ex: "Eu Pr
 
             # Chamar Claude para extrair
             response = self.client.messages.create(
-                model="claude-3-5-haiku-20241022",
+                model="claude-sonnet-4-20250514",
                 max_tokens=500,
                 temperature=0.3,
                 messages=[
