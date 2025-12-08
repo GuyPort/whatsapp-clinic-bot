@@ -4,179 +4,91 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-WhatsApp clinic bot for automated appointment scheduling using Claude AI, Evolution API (WhatsApp), FastAPI, PostgreSQL, and Celery task queues. The bot acts as "Beatriz" (secretary) for Consultório Dra. Rose.
+WhatsApp Clinic Bot - An AI-powered appointment scheduling chatbot for medical clinics (currently configured for "Consultório Dra. Rose"). Built with FastAPI, Claude 3.5 Sonnet, and Evolution API/WAsender for WhatsApp integration.
 
-## Common Commands
+## Commands
 
 ### Development
 ```bash
+# Activate virtual environment (Windows)
+venv\Scripts\activate
+
 # Install dependencies
 pip install -r requirements.txt
 
-# Run development server (checks required env vars first)
-python run.py
-
-# Run with uvicorn directly
+# Run locally with hot reload
 uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 
-# Run tests
-pytest
+# Run via entry point (validates environment first)
+python run.py
 
-# Run Celery worker locally
+# Run Celery worker for async tasks
 celery -A app.celery_app worker --loglevel=info --concurrency=10 -Q celery,send_queue
 ```
 
-### Database Operations
+### Testing
 ```bash
-# Initialize database (creates tables)
-POST /admin/init-db
-
-# Reload clinic configuration without restart
-POST /admin/reload-config
+pytest
 ```
 
-### Production Deployment
-The application runs two processes on Railway:
-- `web`: FastAPI server (python run.py)
-- `worker`: Celery worker for async message processing
+## Architecture
 
-## Architecture Overview
+### Core Flow
+1. WhatsApp messages arrive at `POST /webhook/whatsapp` (main.py)
+2. Message extracted, phone normalized, conversation context loaded/created
+3. ClaudeToolAgent (ai_agent.py) processes message with tool-use loop
+4. Response sent via WhatsAppService (whatsapp_service.py) with Redis-based rate limiting
+5. Context and appointments persisted to PostgreSQL
 
-### Message Processing Pipeline
-1. **Webhook Reception** ([main.py:203](app/main.py)): Evolution API posts incoming WhatsApp messages
-2. **Celery Task Queue**: `process_message_task()` enqueued with phone/message/ID
-3. **Redis Locking**: Per-contact lock ensures serial processing (prevents race conditions)
-4. **AI Agent** ([ai_agent.py](app/ai_agent.py)): Claude SDK processes message with 15+ tools
-5. **Response Queue**: `send_message_task()` enqueued for rate-limited sending
-6. **WhatsApp Delivery**: Evolution API sends response (5s min interval between messages)
+### Key Components
 
-### Key Architectural Patterns
+- **app/main.py**: FastAPI app with webhook handlers, health endpoints, and admin routes (HTTP Basic Auth)
+- **app/ai_agent.py**: ClaudeToolAgent - core AI logic with tool definitions for appointment CRUD, availability checking
+- **app/models.py**: SQLAlchemy models (Appointment, ConversationContext, PausedContact) with status enum
+- **app/appointment_rules.py**: Business logic for appointment validation (insurance restrictions, quotas, time slots)
+- **app/whatsapp_service.py**: Evolution API client with Redis locks and rate limiting (1 msg/5s)
+- **app/scheduler.py**: APScheduler jobs for inactive context cleanup (1h) and 24h appointment reminders
+- **app/celery_app.py**: Celery config with separate queues for message sending and processing
+- **data/clinic_info.json**: Clinic configuration (hours, consultation types, insurance plans, pricing)
 
-**Tool-Based AI Agent** ([ai_agent.py](app/ai_agent.py))
-- Claude receives system prompt defining "Beatriz" personality and business rules
-- 15 tools available: `get_clinic_info`, `validate_date_and_show_slots`, `confirm_time_slot`, `create_appointment`, `search_appointments`, `cancel_appointment`, `find_next_available_slot`, `find_alternative_slots`, `request_human_assistance`, `extract_patient_data`, `request_home_address`, `notify_doctor_home_visit`, `end_conversation`, `block_requisition_request`
-- Tools execute within SQLAlchemy session context
-- Claude returns JSON with tool_use blocks → agent parses and executes locally
+### State Management
+- Conversation flows tracked via `current_flow` field: `agendamento`, `cancelamento`, `duvidas`
+- Message history stored as JSON in ConversationContext
+- Appointment statuses: `AGENDADA`, `COMPARECEU`, `NAO_COMPARECEU`, `CANCELADA`
 
-**Conversation State Management**
-- `ConversationContext` model stores per-contact message history and flow state
-- Auto-expires after 1 hour of inactivity (scheduler job)
-- Flow data tracks: patient name, birth date, consultation type, insurance plan
+### External Services
+- **Anthropic API**: Claude 3.5 Sonnet for conversational AI
+- **WAsender/Evolution API**: WhatsApp messaging (configured at wasenderapi.com)
+- **PostgreSQL**: Production database (Railway), SQLite fallback locally
+- **Redis**: Message broker for Celery, rate limiting locks
 
-**Appointment Business Rules** ([appointment_rules.py](app/appointment_rules.py))
-- 48-hour minimum advance booking (calculated from current time + 48h)
-- Insurance-specific rules:
-  - **IPE**: Max 3 appointments/day
-  - **Particular**: Only option on Mondays
-  - **CABERGS**: No restrictions
-- Clinic hours: Mon 14-16h, Tue-Fri 14-19h (closed weekends)
-- Appointments must be on whole hours (:00 minutes only)
+## Configuration
 
-**Rate Limiting & Concurrency**
-- Redis distributed locks prevent concurrent processing of same contact
-- 5-second minimum interval between WhatsApp messages (prevents API throttling)
-- Celery task routing: `send_queue` for sending, `celery` for processing
+### Required Environment Variables
+```
+ANTHROPIC_API_KEY
+WASENDER_API_KEY
+WASENDER_PROJECT_NAME=clinica-bot
+WASENDER_URL=https://wasenderapi.com
+DATABASE_URL
+REDIS_URL
+ADMIN_PASSWORD
+```
 
-### Critical Implementation Details
+### Clinic Configuration
+Edit `data/clinic_info.json` to modify:
+- Operating hours (`horario_funcionamento`, `horario_atendimento`)
+- Consultation types and pricing (`tipos_consulta`)
+- Insurance plans and restrictions (`convenios_aceitos`)
+- Closed dates and manual scheduling periods (`dias_fechados`, `periodo_agendamento_manual`)
+- Scheduling rules (intervals, durations)
 
-**Date/Time Formats** (INCONSISTENT - be careful!)
-- Storage: `appointment_date` is **YYYYMMDD string** (e.g., "20251122")
-- Display: Converted to **DD/MM/YYYY** (e.g., "22/11/2025") for user-facing text
-- Birth dates: Always DD/MM/YYYY
-- Time: HH:MM string, must be whole hours (e.g., "14:00", "15:00")
+Reload config at runtime: `POST /admin/reload-config` (requires admin auth)
 
-**Phone Normalization**
-- Stored with country code: `5511999999999` (Brazil +55)
-- WhatsApp format: `5511999999999@s.whatsapp.net`
-- Use `normalize_phone()` from [utils.py](app/utils.py) for consistency
+## Business Rules
 
-**Timezone Handling**
-- Database stores UTC timestamps
-- All business logic uses `America/Sao_Paulo` timezone
-- Use `now_brazil()` from [utils.py](app/utils.py) for Brazil-aware current time
-
-**Secretary /pause Command**
-- Secretary sends `/pause` to patient contact via WhatsApp
-- Webhook detects `is_from_me: true` flag
-- Creates `PausedContact` record (2-hour expiry)
-- Bot ignores messages from paused contacts until expiry
-
-## Configuration Files
-
-**[data/clinic_info.json](data/clinic_info.json)** - Editable clinic configuration
-- Clinic hours, closed dates, consultation types, insurance plans
-- Includes `periodo_agendamento_manual` for dates requiring manual scheduling
-- Modified dynamically via `POST /admin/reload-config`
-- Changes take effect immediately without restart
-
-**Environment Variables** (`.env` not in repo)
-Required for operation:
-- `ANTHROPIC_API_KEY` - Claude API access
-- `WASENDER_API_KEY`, `WASENDER_URL`, `WASENDER_PROJECT_NAME` - WaSender (Evolution API fork)
-- `DATABASE_URL` - PostgreSQL connection string
-- `REDIS_URL` - Redis for Celery broker and distributed locks
-
-## Database Schema
-
-**Three Core Models** ([models.py](app/models.py)):
-
-1. **Appointment** - Scheduled consultations
-   - Indexed by: `patient_phone`, `appointment_date`, `status`, `reminder_sent_at`
-   - Status enum: `AGENDADA`, `CANCELADA`, `COMPARECEU`, `NAO_COMPARECEU`
-   - Validation hooks ensure: name present, proper date/time formats, birth date valid
-
-2. **ConversationContext** - Per-contact chat state
-   - Primary key: `phone` (WhatsApp number)
-   - `messages` (JSON array): Full conversation history
-   - `flow_data` (JSON dict): Collected data during current flow
-
-3. **PausedContact** - Temporary bot silence
-   - Used when secretary needs to take over conversation
-   - Auto-expires after 2 hours
-
-## Common Modification Tasks
-
-| Task | Files to Modify |
-|------|----------------|
-| Change clinic hours | [data/clinic_info.json](data/clinic_info.json) |
-| Add consultation type | [data/clinic_info.json](data/clinic_info.json) + [ai_agent.py](app/ai_agent.py) system prompt |
-| Modify appointment duration | [data/clinic_info.json](data/clinic_info.json) + [appointment_rules.py](app/appointment_rules.py) |
-| Change insurance rules | [appointment_rules.py](app/appointment_rules.py) + [ai_agent.py](app/ai_agent.py) system prompt |
-| Add/remove holidays | [data/clinic_info.json](data/clinic_info.json) `dias_fechados` array |
-| Add manual scheduling period | [data/clinic_info.json](data/clinic_info.json) `periodo_agendamento_manual` array |
-| Modify conversation flow | [ai_agent.py](app/ai_agent.py) system prompt + tool definitions |
-| Change rate limiting | [whatsapp_service.py](app/whatsapp_service.py) `send_message()` Redis lock timeout |
-| Adjust reminder timing | [scheduler.py](app/scheduler.py) `send_appointment_reminders()` window |
-
-## Background Jobs
-
-**APScheduler Tasks** ([scheduler.py](app/scheduler.py)):
-- **check_inactive_contexts()**: Every 20 min - expires conversations inactive >1h
-- **send_appointment_reminders()**: Every 1h - sends 24h prior reminder (20-26h window)
-
-## API Endpoints
-
-**Public**:
-- `GET /` - HTML homepage
-- `GET /health` - Health check
-- `GET /status` - System status (WhatsApp, DB, Calendar)
-- `GET /dashboard` - Modern appointment dashboard
-
-**Webhooks**:
-- `POST /webhook/whatsapp` - Main webhook for Evolution API
-
-**Admin**:
-- `POST /admin/reload-config` - Hot-reload [clinic_info.json](data/clinic_info.json)
-- `GET/POST /admin/init-db` - Initialize database tables
-- `GET /admin/patients` - List all patients
-- `GET /admin/appointments` - List all appointments
-- `GET /api/appointments/scheduled` - JSON API for dashboard
-
-## Important Constraints
-
-1. **48-Hour Rule**: Appointments must be booked ≥48 hours in advance (enforced in `find_next_available_slot()`)
-2. **Identity Verification**: Requires name + birth date match for cancellation/rescheduling
-3. **Insurance Limits**: IPE max 3 appointments/day, Particular only on Mondays
-4. **Time Slots**: Only whole hours available (14:00, 15:00, etc. - no 14:30)
-5. **Closed Dates**: Check `dias_fechados` in clinic_info.json for holidays
-6. **Manual Scheduling Period**: Check `periodo_agendamento_manual` - bot redirects to human during these dates
+- Insurance-based restrictions: Mondays = Particular only
+- IPE daily quota: max 3 appointments
+- Cancellation policy: 24 hours notice required
+- Appointment slots: hourly increments, configurable duration (default 60min)
+- Timezone: America/Sao_Paulo (all date/time operations)
