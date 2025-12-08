@@ -170,7 +170,7 @@ Para deixar o atendimento mais rápido, envie uma mensagem por vez e aguarde min
 1️⃣ Marcar consulta (presencial na clínica)
 2️⃣ Atendimento domiciliar (R$ 500)
 3️⃣ Remarcar/Cancelar consulta  
-4️⃣ Receitas
+4️⃣ Receitas (R$25)
 
 Digite o número da opção desejada."
 - Se o usuário já estiver no meio de um fluxo, mantenha o contexto e continue naturalmente
@@ -959,13 +959,7 @@ Return ONLY a JSON object with this structure:
         Returns:
             (is_valid, phone_number) - se válido, retorna o número a ser usado
         """
-        response_lower = response.strip().lower()
-
-        # Se confirmou o número atual
-        if response_lower in ["sim", "s", "yes", "pode", "isso", "confirmo", "ok", "pode sim", "sim pode", "este mesmo", "esse mesmo", "esse", "este"]:
-            return (True, current_phone)
-
-        # Tentar extrair número de telefone da resposta
+        # Tentar extrair número de telefone da resposta primeiro
         digits = re.sub(r'\D', '', response)
 
         # Remover código do país se presente
@@ -985,7 +979,40 @@ Return ONLY a JSON object with this structure:
             if int(ddd) >= 11 and digits[2] in '2345':
                 return (True, '55' + digits)
 
+        # Se não encontrou número, usar Claude para interpretar se é confirmação
+        is_confirmation = self._classify_phone_confirmation_with_llm(response)
+        if is_confirmation:
+            return (True, current_phone)
+
         return (False, "")
+
+    def _classify_phone_confirmation_with_llm(self, message: str) -> bool:
+        """
+        Usa o Claude para interpretar se a mensagem é uma confirmação
+        de que o usuário quer manter o número de telefone atual.
+        """
+        prompt = f"""Analise a mensagem abaixo e determine se o usuário está CONFIRMANDO que quer usar/manter o número de telefone sugerido.
+
+Mensagem do usuário: "{message}"
+
+Contexto: O bot perguntou se pode enviar algo para um número de telefone específico e pediu para responder "Sim" para confirmar ou informar outro número.
+
+Responda APENAS com uma palavra:
+- "SIM" se o usuário está confirmando/aceitando o número sugerido
+- "NAO" se o usuário está recusando, quer mudar, ou a mensagem não é uma confirmação clara"""
+
+        try:
+            response = self.client.messages.create(
+                model="claude-sonnet-4-20250514",
+                max_tokens=10,
+                temperature=0,
+                messages=[{"role": "user", "content": prompt}]
+            )
+            result = response.content[0].text.strip().upper()
+            return result == "SIM"
+        except Exception as e:
+            logger.error(f"Erro ao classificar confirmação de telefone: {e}")
+            return False
 
     def _build_prescription_payment_message(self) -> str:
         return (
