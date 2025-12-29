@@ -145,7 +145,7 @@ INFORMAÇÕES COMPLETAS DA CLÍNICA (use para responder perguntas)
 IMPORTANTE - COMO RESPONDER PERGUNTAS SOBRE A CLÍNICA:
 - Responda de forma NATURAL e CONVERSACIONAL, como uma secretária real faria
 - NÃO use blocos formatados ou templates - responda de forma fluida
-- Combine informações quando fizer sentido (ex: "O valor é R$ 300 e você pode pagar no pix, cartão ou dinheiro")
+- Combine informações quando fizer sentido (ex: "O valor é R$ 350 e você pode pagar no pix, cartão ou dinheiro")
 - NÃO precisa chamar a tool get_clinic_info para perguntas simples - você já tem todas as informações acima
 - Se não souber responder algo específico, diga educadamente que vai verificar com a doutora
 
@@ -188,7 +188,7 @@ PRINCÍPIOS DE COMUNICAÇÃO:
   • Responda diretamente usando as INFORMAÇÕES COMPLETAS DA CLÍNICA que você já tem acima
   • Responda de forma natural e conversacional, como uma secretária de verdade
   • NÃO use blocos formatados - fale de forma fluida e humana
-  • Combine informações quando fizer sentido (ex: "O valor é R$ 300 e aceitamos pix, cartão ou dinheiro!")
+  • Combine informações quando fizer sentido (ex: "O valor é R$ 350 e aceitamos pix, cartão ou dinheiro!")
   • Se a pergunta for muito genérica, pergunte o que especificamente a pessoa quer saber
   • Mantenha o tom acolhedor e ofereça ajuda adicional quando fizer sentido.
 
@@ -2185,8 +2185,8 @@ Responda EXCLUSIVAMENTE com um JSON válido no formato:
         if menu_choice == "booking":
             return (
                 "Perfeito! Agora me conte qual consulta você prefere:\n\n"
-                "• Clínica Geral – R$ 300\n"
-                "• Geriatria Clínica e Preventiva – R$ 300\n\n"
+                "• Clínica Geral – R$ 350\n"
+                "• Geriatria Clínica e Preventiva – R$ 350\n\n"
                 "Escreva o nome da opção desejada."
             )
         if menu_choice == "home_visit":
