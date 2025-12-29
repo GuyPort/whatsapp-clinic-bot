@@ -62,12 +62,12 @@ def run_check():
 
 
 async def send_appointment_reminders():
-    """Envia lembretes automáticos 48h antes das consultas agendadas."""
+    """Envia lembretes automáticos 24h antes das consultas agendadas."""
     try:
         now = now_brazil()
-        # Janela de 40h a 48h antes da consulta
-        window_start = now + timedelta(hours=48) - timedelta(hours=8)  # 40h antes
-        window_end = now + timedelta(hours=48)                          # 48h antes
+        # Janela de 16h a 24h antes da consulta
+        window_start = now + timedelta(hours=24) - timedelta(hours=8)  # 16h antes
+        window_end = now + timedelta(hours=24)                          # 24h antes
 
         # Expandir datas candidatas para cobrir toda a janela (40h-48h antes)
         # Incluir data atual, amanhã e depois de amanhã para garantir cobertura
@@ -127,6 +127,7 @@ async def send_appointment_reminders():
                     if isinstance(appointment.appointment_time, time):
                         appointment.appointment_time = appointment.appointment_time.strftime("%H:%M")
                     appointment.reminder_sent_at = datetime.utcnow()
+                    appointment.awaiting_confirmation = True
                     db.add(appointment)
                     db.commit()
                     sent_count += 1

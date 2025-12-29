@@ -169,8 +169,10 @@ Para deixar o atendimento mais rápido, envie uma mensagem por vez e aguarde min
 
 1️⃣ Marcar consulta (presencial na clínica)
 2️⃣ Atendimento domiciliar (R$ 500)
-3️⃣ Remarcar/Cancelar consulta  
-4️⃣ Receitas (R$25)
+3️⃣ Remarcar/Cancelar consulta
+4️⃣ Receitas
+
+🚨 Em caso de emergência, ligue para a Dra. Rose: (51) 99954-6355
 
 Digite o número da opção desejada."
 - Se o usuário já estiver no meio de um fluxo, mantenha o contexto e continue naturalmente
@@ -693,6 +695,11 @@ Lembre-se: Seja natural, adaptável e prestativa. Use as tools disponíveis conf
         """Verifica se a data está no período de agendamento manual (secretária marca)"""
         if not date_obj:
             return False
+
+        # Quinta-feira (weekday 3) = agendamento manual
+        if date_obj.weekday() == 3:
+            return True
+
         date_str = date_obj.strftime('%d/%m/%Y')
         periodo_manual = self.clinic_info.get('periodo_agendamento_manual', [])
         return date_str in periodo_manual
@@ -1017,12 +1024,10 @@ Responda APENAS com uma palavra:
     def _build_prescription_payment_message(self) -> str:
         return (
             "Perfeito! Recebi as informações da sua receita.\n\n"
-            "💰 Valor: R$ 25,00\n"
-            "🔑 Chave Pix: 51999546355\n"
-            "⏳ Assim que o comprovante for enviado, a Dra. Rose prepara a receita em até 2 dias úteis.\n"
+            "Entraremos em contato quando a receita estiver pronta.\n\n"
             "📄 Receitas branca controlada, azul e simples podem ser enviadas digitalmente.\n"
             "📄 Receitas amarela precisam ser retiradas no consultório, de segunda a sexta das 14h às 18h.\n\n"
-            "Quando tiver o comprovante, é só me enviar por aqui."
+            "Posso te ajudar com mais alguma coisa?"
         )
 
     def _format_appointment_date_safe(self, date_value) -> str:
@@ -2026,6 +2031,7 @@ Responda EXCLUSIVAMENTE com um JSON válido no formato:
         blocking_flags = [
             "awaiting_patient_name",
             "awaiting_patient_birth_date",
+            "awaiting_is_new_patient",
             "awaiting_consultation_type",
             "awaiting_custom_date",
             "awaiting_home_address",
@@ -2254,6 +2260,7 @@ Responda EXCLUSIVAMENTE com um JSON válido no formato:
         appointment_time = context.flow_data.get("appointment_time", "")
         consultation_type = context.flow_data.get("consultation_type", "clinica_geral")
         insurance_plan = context.flow_data.get("insurance_plan", "particular")
+        is_new_patient = context.flow_data.get("is_new_patient")
         
         # Normalizar convênio
         if insurance_plan.lower() == "ipe":
@@ -2287,7 +2294,7 @@ Responda EXCLUSIVAMENTE com um JSON válido no formato:
             msg += f"⏰ Horário: {appointment_time}\n"
         msg += f"🏥 Tipo: {tipo_nome}\n"
         msg += f"💳 Convênio: {convenio_nome}\n"
-        
+
         return msg
 
     def process_message(self, message: str, phone: str, db: Session) -> str:
@@ -2306,9 +2313,39 @@ Responda EXCLUSIVAMENTE com um JSON válido no formato:
                 logger.info(f"🆕 Novo contexto criado para {phone}")
             else:
                 logger.info(f"📱 Contexto carregado para {phone}: {len(context.messages)} mensagens")
-            
+
             # 2. Verificação de timeout removida - agora é proativa via scheduler
-            
+
+            # 2.1 Verificar se paciente tem consulta aguardando confirmação de lembrete
+            appointment_awaiting = db.query(Appointment).filter(
+                Appointment.patient_phone == phone,
+                Appointment.awaiting_confirmation == True,
+                Appointment.status == AppointmentStatus.AGENDADA
+            ).first()
+
+            if appointment_awaiting:
+                intent = self._detect_confirmation_intent(message)
+
+                if intent == "positive":
+                    # Confirma presença
+                    appointment_awaiting.awaiting_confirmation = False
+                    db.commit()
+                    logger.info(f"✅ Confirmação de presença para consulta {appointment_awaiting.id}")
+                    return "Perfeito! Estaremos te aguardando. Até logo! 😊"
+
+                elif intent == "negative":
+                    # Cancela consulta
+                    appointment_awaiting.status = AppointmentStatus.CANCELADA
+                    appointment_awaiting.cancelled_at = datetime.utcnow()
+                    appointment_awaiting.cancelled_reason = "Cancelada via confirmação de lembrete"
+                    appointment_awaiting.awaiting_confirmation = False
+                    db.commit()
+                    logger.info(f"❌ Consulta {appointment_awaiting.id} cancelada via confirmação de lembrete")
+                    return "Entendido! Sua consulta foi cancelada. Quando precisar, é só chamar! 😊"
+
+                # Se intent == "unclear", continua processamento normal
+                logger.info(f"❓ Resposta não clara para confirmação de lembrete: {message}")
+
             # 3. Decidir se deve encerrar contexto por resposta negativa
             if self._should_end_context(context, message):
                 logger.info(f"🔚 Encerrando contexto para {phone} por resposta negativa do usuário")
@@ -2409,6 +2446,36 @@ Responda EXCLUSIVAMENTE com um JSON válido no formato:
                 self._record_interaction(context, message, prompt, db, flow_modified=True)
                 return prompt
 
+            # Handler para resposta "É paciente novo?"
+            if flow_data.get("awaiting_is_new_patient"):
+                intent = self._detect_confirmation_intent(message)
+
+                if intent == "positive":
+                    flow_data["is_new_patient"] = True
+                    flow_data["awaiting_is_new_patient"] = False
+                    flow_data["awaiting_consultation_type"] = True
+                    flag_modified(context, "flow_data")
+                    logger.info(f"👤 Paciente novo: SIM para {phone}")
+                    prompt = self._build_post_identity_prompt("booking")
+                    self._record_interaction(context, message, prompt, db, flow_modified=True)
+                    return prompt
+
+                elif intent == "negative":
+                    flow_data["is_new_patient"] = False
+                    flow_data["awaiting_is_new_patient"] = False
+                    flow_data["awaiting_consultation_type"] = True
+                    flag_modified(context, "flow_data")
+                    logger.info(f"👤 Paciente novo: NÃO para {phone}")
+                    prompt = self._build_post_identity_prompt("booking")
+                    self._record_interaction(context, message, prompt, db, flow_modified=True)
+                    return prompt
+
+                else:
+                    # Resposta não clara, pedir novamente
+                    prompt = "Não entendi. É a primeira vez que você marca consulta com a Dra. Rose? Responda SIM ou NÃO."
+                    self._record_interaction(context, message, prompt, db)
+                    return prompt
+
             if flow_data.get("menu_choice") == "booking" and flow_data.get("awaiting_consultation_type"):
                 normalized = message.strip().lower()
                 if normalized in {"1", "2", "opcao 1", "opção 1", "opcao 2", "opção 2"}:
@@ -2496,8 +2563,12 @@ Responda EXCLUSIVAMENTE com um JSON válido no formato:
 
                     menu_choice = flow_data.get("menu_choice")
                     if menu_choice == "booking":
-                        flow_data["awaiting_consultation_type"] = True
+                        # Perguntar se é paciente novo ANTES do tipo de consulta
+                        flow_data["awaiting_is_new_patient"] = True
                         flag_modified(context, "flow_data")
+                        prompt = "É a primeira vez que você marca consulta com a Dra. Rose?"
+                        self._record_interaction(context, message, prompt, db, flow_modified=True)
+                        return prompt
 
                     next_prompt = self._build_post_identity_prompt(menu_choice)
                     self._record_interaction(context, message, next_prompt, db, flow_modified=True)
@@ -2572,12 +2643,6 @@ Responda EXCLUSIVAMENTE com um JSON válido no formato:
                     self._notify_doctor_prescription(context, db, phone)
                 except Exception as notify_error:
                     logger.error(f"❌ Erro ao notificar doutora sobre receita: {notify_error}")
-
-                # Pausar contato por 48 horas após enviar instruções de pagamento
-                try:
-                    self._pause_contact_for_prescription(db, phone)
-                except Exception as pause_error:
-                    logger.error(f"❌ Erro ao pausar contato após receita: {pause_error}")
 
                 return instructions
 
@@ -4565,7 +4630,7 @@ Responda EXCLUSIVAMENTE com um JSON válido no formato:
                         convenio_data = convenios_aceitos.get(convenio, {})
                         convenio_nome = convenio_data.get('nome', '')
                         tipo_info += f"💳 Convênio: {convenio_nome}\n"
-                
+
                 # Retornar mensagem de confirmação
                 return f"✅ Horário {hora_consulta.strftime('%H:%M')} disponível!{ajuste_msg}\n\n" \
                        f"📋 *Resumo da sua consulta:*\n" \
@@ -4982,12 +5047,14 @@ Responda EXCLUSIVAMENTE com um JSON válido no formato:
             nascimento = ""
             tipo = "clinica_geral"
             convenio = "particular"
-            
+            is_new_patient = None
+
             if context and context.flow_data:
                 nome = context.flow_data.get("patient_name", "")
                 nascimento = context.flow_data.get("patient_birth_date", "")
                 tipo = context.flow_data.get("consultation_type", "clinica_geral")
                 convenio = context.flow_data.get("insurance_plan", "particular")
+                is_new_patient = context.flow_data.get("is_new_patient")
             
             # Se flow_data está incompleto, extrair dados básicos do histórico (mas não nome)
             # Para nome, preferir que Claude use tool extract_patient_data, mas aqui fazemos fallback básico
@@ -5073,7 +5140,7 @@ Responda EXCLUSIVAMENTE com um JSON válido no formato:
                 convenio_data = convenios_aceitos.get(convenio, {})
                 convenio_nome = convenio_data.get('nome', convenio)
                 msg += f"💳 Convênio: {convenio_nome}\n"
-            
+
             msg += "\nPosso confirmar o agendamento?"
             return msg
             
@@ -5092,6 +5159,7 @@ Responda EXCLUSIVAMENTE com um JSON válido no formato:
             notes = tool_input.get("notes", "")
             consultation_type = tool_input.get("consultation_type", "clinica_geral")
             insurance_plan = tool_input.get("insurance_plan", "particular")
+            is_new_patient = tool_input.get("is_new_patient")  # Paciente novo ou retorno
             
             # Buscar dados do contexto se não fornecidos na tool
             # CRÍTICO: Priorizar tool_input (dados do Claude) sobre flow_data (fallback)
@@ -5124,6 +5192,11 @@ Responda EXCLUSIVAMENTE com um JSON válido no formato:
                                     logger.info(f"💾 Convênio identificado e salvo no flow_data: {insurance_plan}")
                             except Exception as e:
                                 logger.warning(f"⚠️ Erro ao tentar extrair convênio: {str(e)}")
+
+                    # Buscar is_new_patient do flow_data se não fornecido
+                    if is_new_patient is None and "is_new_patient" in context.flow_data:
+                        is_new_patient = context.flow_data.get("is_new_patient")
+                        logger.info(f"📋 Usando is_new_patient do flow_data (fallback): {is_new_patient}")
             
             # Validar tipo de consulta
             valid_types = ["clinica_geral", "geriatria", "domiciliar"]
@@ -5303,6 +5376,7 @@ Responda EXCLUSIVAMENTE com um JSON válido no formato:
                 duration_minutes=duracao,
                 consultation_type=consultation_type,
                 insurance_plan=insurance_plan,
+                is_new_patient=is_new_patient,  # Paciente novo ou retorno
                 status=AppointmentStatus.AGENDADA,
                 notes=notes
             )
@@ -5573,7 +5647,7 @@ Responda EXCLUSIVAMENTE com um JSON válido no formato:
             if not is_open:
                 # Clínica fechada - NÃO criar pausa, bot continua ativo
                 logger.info(f"🏥 Clínica fechada para {phone}: {message}")
-                return "No momento nossa secretária não está disponível (clínica fechada). Mas eu posso te ajudar com agendamentos, consultas e outras informações! Como posso te auxiliar?"
+                return "No momento nossa secretária não está disponível (clínica fechada). Mas eu posso te ajudar com agendamentos, consultas e outras informações!\n\n🚨 Em caso de emergência, ligue para a Dra. Rose: (51) 99954-6355\n\nComo posso te auxiliar?"
             
             # 2. Clínica aberta - prosseguir com transferência
             logger.info(f"🏥 Clínica aberta para {phone}: {message}")
@@ -5601,7 +5675,7 @@ Responda EXCLUSIVAMENTE com um JSON válido no formato:
             db.commit()
             
             logger.info(f"⏸️ Bot pausado para {phone} até {paused_until}")
-            return "Claro! Vou encaminhar você para um de nossos atendentes agora! Para acelerar o processo, já pode nos contar como podemos te ajudar! 😊"
+            return "Claro! Vou encaminhar você para um de nossos atendentes agora! Para acelerar o processo, já pode nos contar como podemos te ajudar! 😊\n\n🚨 Em caso de emergência, ligue para a Dra. Rose: (51) 99954-6355"
             
         except Exception as e:
             logger.error(f"Erro ao pausar bot para humano: {str(e)}")

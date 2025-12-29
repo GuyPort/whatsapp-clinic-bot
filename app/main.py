@@ -657,6 +657,7 @@ async def get_scheduled_appointments():
                     "appointment_time": apt.appointment_time,  # String HH:MM
                     "consultation_type": apt.consultation_type,
                     "insurance_plan": apt.insurance_plan,
+                    "is_new_patient": apt.is_new_patient,  # Paciente novo ou retorno
                     "status": apt.status.value,
                     "duration_minutes": apt.duration_minutes,
                     "notes": apt.notes,
@@ -1714,7 +1715,18 @@ async def dashboard(admin: str = Depends(verify_admin_credentials)):
                 background: rgba(16, 185, 129, 0.1);
                 color: var(--success);
             }
-            
+
+            .badge-new-patient {
+                background: rgba(245, 158, 11, 0.15);
+                color: #D97706;
+                font-weight: 600;
+            }
+
+            .badge-returning-patient {
+                background: rgba(99, 102, 241, 0.1);
+                color: #6366F1;
+            }
+
             /* No Appointments */
             .no-appointments {
                 text-align: center;
@@ -2030,6 +2042,7 @@ async def dashboard(admin: str = Depends(verify_admin_credentials)):
                         <div class="appointment-badges">
                             <span class="badge-custom badge-type">${getConsultationTypeText(appointment.consultation_type)}</span>
                             <span class="badge-custom badge-insurance">${getInsurancePlanText(appointment.insurance_plan)}</span>
+                            ${getNewPatientBadge(appointment.is_new_patient)}
                             <span class="badge-custom badge-status-${appointment.status}">${getStatusText(appointment.status)}</span>
                         </div>
                         <div class="appointment-actions">
@@ -2115,6 +2128,15 @@ async def dashboard(admin: str = Depends(verify_admin_credentials)):
                     'nao_compareceu': 'Não Compareceu'
                 };
                 return statusMap[status] || status;
+            }
+
+            function getNewPatientBadge(isNewPatient) {
+                if (isNewPatient === true) {
+                    return '<span class="badge-custom badge-new-patient">🆕 Primeira consulta</span>';
+                } else if (isNewPatient === false) {
+                    return '<span class="badge-custom badge-returning-patient">🔄 Retorno</span>';
+                }
+                return '';  // Não mostra nada se for null/undefined
             }
 
             // ========== FUNÇÕES DE AÇÃO ==========

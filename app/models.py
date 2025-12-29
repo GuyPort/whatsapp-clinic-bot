@@ -3,7 +3,7 @@ Modelos de banco de dados para o bot da clínica.
 Versão completa com todos os campos necessários para o agente Claude.
 """
 from datetime import datetime, date, time
-from sqlalchemy import Column, Integer, String, DateTime, Date, Time, Text, Index, Enum, JSON, CheckConstraint
+from sqlalchemy import Column, Integer, String, DateTime, Date, Time, Text, Index, Enum, JSON, CheckConstraint, Boolean
 from sqlalchemy.orm import declarative_base
 from sqlalchemy import event
 import enum
@@ -40,7 +40,8 @@ class Appointment(Base):
     duration_minutes = Column(Integer, default=60, nullable=False)  # Duração em minutos
     consultation_type = Column(String(50), nullable=True)  # Tipo de consulta (clinica_geral, geriatria, domiciliar)
     insurance_plan = Column(String(50), nullable=True)  # Convênio (CABERGS, IPE, particular)
-    
+    is_new_patient = Column(Boolean, nullable=True)  # True = primeira consulta com a Dra, False = paciente de retorno
+
     # Status e controle
     status = Column(
         Enum(AppointmentStatus, name='appointmentstatus', values_callable=lambda x: [e.value for e in x]),
@@ -56,6 +57,7 @@ class Appointment(Base):
     
     # Lembrete pré-consulta
     reminder_sent_at = Column(DateTime, nullable=True, index=True)  # Quando o lembrete 24h foi enviado
+    awaiting_confirmation = Column(Boolean, default=False)  # True após enviar lembrete, aguardando resposta
     
     # Timestamps
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)

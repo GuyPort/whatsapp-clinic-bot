@@ -271,11 +271,11 @@ def format_pre_appointment_reminder(
     
     message_lines = [
         f"Olá, {patient_name}! Passando para confirmar sua consulta referente ao dia {date_str} às {time_str}.",
-        "Compareça 15 minutos antes, traga seus últimos exames e, se possível, uma lista com as medicações que você usa.",
+        "Traga seus últimos exames e, se possível, uma lista com as medicações que você usa.",
         f"Endereço: {address}",
         "Caso precise de cadeira de rodas na chegada, é só nos avisar!",
         "",
-        "Esta é uma mensagem automática de confirmação — por favor, não responda."
+        "Você confirma presença? Responda SIM ou NÃO."
     ]
     
     return "\n".join(message_lines)
