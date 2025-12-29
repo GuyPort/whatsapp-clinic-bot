@@ -4,7 +4,7 @@
   
   "horario_funcionamento": {
     "segunda": "14:00-16:00",
-    "terca": "14:00-19:00",
+    "terca": "14:00-18:00",
     "quarta": "14:00-19:00",
     "quinta": "14:00-16:00",
     "sexta": "14:00-19:00",
@@ -14,7 +14,7 @@
 
   "horario_atendimento": {
     "segunda": "14:00-19:00",
-    "terca": "14:00-19:00",
+    "terca": "14:00-18:00",
     "quarta": "14:00-19:00",
     "quinta": "14:00-19:00",
     "sexta": "14:00-19:00",
