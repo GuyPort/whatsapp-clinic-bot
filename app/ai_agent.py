@@ -3798,8 +3798,8 @@ Responda EXCLUSIVAMENTE com um JSON válido no formato:
             except Exception as e:
                 logger.error(f"❌ Erro ao formatar horário: {str(e)}")
                 horario_str = "N/A"
-            
-            response += f"📋 *Resumo da consulta:*\n"
+
+            response = f"📋 *Resumo da consulta:*\n"
             response += f"👤 Nome: {patient_name}\n"
             response += f"🏥 Tipo: {tipo_nome} - R$ {tipo_valor}\n"
             response += f"💳 Convênio: {convenio_nome}\n"
