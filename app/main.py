@@ -13,6 +13,7 @@ from datetime import datetime, date
 from app.simple_config import settings
 
 from app.database import init_db, get_db
+from sqlalchemy.orm import Session
 from app.ai_agent import ai_agent
 from app.whatsapp_service import whatsapp_service
 from app.utils import normalize_phone
