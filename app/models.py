@@ -145,6 +145,24 @@ class PausedContact(Base):
         return f"<PausedContact(phone='{self.phone}', paused_until='{self.paused_until}')>"
 
 
+class HomeVisitRequest(Base):
+    """
+    Solicitações de atendimento domiciliar.
+    Registra quando um paciente solicita visita domiciliar.
+    """
+    __tablename__ = "home_visit_requests"
+
+    id = Column(Integer, primary_key=True, index=True)
+    patient_name = Column(String(200), nullable=False)
+    patient_phone = Column(String(20), nullable=False, index=True)
+    patient_birth_date = Column(String(20), nullable=True)
+    patient_address = Column(Text, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    def __repr__(self):
+        return f"<HomeVisitRequest(id={self.id}, patient='{self.patient_name}', phone='{self.patient_phone}')>"
+
+
 class ConversationContext(Base):
     """
     Contexto de conversa para manter histórico entre mensagens do WhatsApp.

@@ -1775,6 +1775,9 @@ async def dashboard(admin: str = Depends(verify_admin_credentials)):
                     <p class="text-muted mb-0">Consultório Dra. Rose • Apenas consultas ativas</p>
                 </div>
                 <div style="display: flex; gap: 12px;">
+                    <a href="/domiciliares" class="btn btn-outline-info" style="height: fit-content;">
+                        <i class="fas fa-house-medical"></i> Domiciliares
+                    </a>
                     <a href="/pausas" class="btn btn-outline-warning" style="height: fit-content;">
                         <i class="fas fa-pause-circle"></i> Pausas
                     </a>
@@ -3818,6 +3821,356 @@ async def pausas_dashboard(admin: str = Depends(verify_admin_credentials)):
     </html>
     """
 
+    return HTMLResponse(
+        content=html_content,
+        headers={
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Pragma": "no-cache",
+            "Expires": "0"
+        }
+    )
+
+
+# ============================================
+# API de Solicitações de Atendimento Domiciliar
+# ============================================
+
+@app.get("/api/home-visits")
+async def get_home_visits(db: Session = Depends(get_db)):
+    """Lista todas as solicitações de atendimento domiciliar"""
+    from app.models import HomeVisitRequest
+
+    requests = db.query(HomeVisitRequest).order_by(HomeVisitRequest.created_at.desc()).all()
+
+    return {
+        "count": len(requests),
+        "requests": [
+            {
+                "id": r.id,
+                "patient_name": r.patient_name,
+                "patient_phone": r.patient_phone,
+                "patient_birth_date": r.patient_birth_date,
+                "patient_address": r.patient_address,
+                "created_at": r.created_at.isoformat() if r.created_at else None
+            }
+            for r in requests
+        ]
+    }
+
+
+@app.get("/domiciliares")
+async def domiciliares_dashboard(admin: str = Depends(verify_admin_credentials)):
+    """Dashboard de solicitações de atendimento domiciliar (somente visualização)"""
+    html_content = """
+    <!DOCTYPE html>
+    <html lang="pt-BR">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Solicitações Domiciliares</title>
+        <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+        <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+        <style>
+            :root {
+                --primary: #4F46E5;
+                --success: #10B981;
+                --warning: #F59E0B;
+                --danger: #EF4444;
+                --info: #3B82F6;
+                --bg: #F9FAFB;
+                --card-bg: #FFFFFF;
+                --text: #1F2937;
+                --text-muted: #6B7280;
+                --border: #E5E7EB;
+            }
+
+            body {
+                background: var(--bg);
+                font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+                color: var(--text);
+                font-size: 0.9rem;
+            }
+
+            .dashboard-container {
+                max-width: 1200px;
+                margin: 0 auto;
+                padding: 1rem;
+            }
+
+            .header {
+                background: var(--card-bg);
+                border-radius: 12px;
+                padding: 0.75rem 1.25rem;
+                margin-bottom: 1rem;
+                box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+            }
+
+            .header h1 {
+                font-size: 1.25rem;
+                font-weight: 700;
+                color: var(--primary);
+                margin: 0;
+            }
+
+            .header h1 i {
+                margin-right: 0.5rem;
+            }
+
+            .header-actions {
+                display: flex;
+                gap: 0.5rem;
+                align-items: center;
+            }
+
+            .btn-nav {
+                background: var(--bg);
+                border: 1px solid var(--border);
+                color: var(--text);
+                padding: 0.4rem 0.75rem;
+                border-radius: 8px;
+                font-size: 0.8rem;
+                font-weight: 500;
+                cursor: pointer;
+                text-decoration: none;
+                display: flex;
+                align-items: center;
+                gap: 0.3rem;
+            }
+
+            .btn-nav:hover {
+                background: var(--primary);
+                color: white;
+                border-color: var(--primary);
+            }
+
+            .section {
+                background: var(--card-bg);
+                border-radius: 12px;
+                padding: 1rem;
+                margin-bottom: 1rem;
+                box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+            }
+
+            .section-header {
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                margin-bottom: 0.75rem;
+                padding-bottom: 0.5rem;
+                border-bottom: 1px solid var(--border);
+            }
+
+            .section-title {
+                font-size: 1rem;
+                font-weight: 600;
+                margin: 0;
+                display: flex;
+                align-items: center;
+                gap: 0.5rem;
+            }
+
+            .badge-count {
+                background: var(--primary);
+                color: white;
+                padding: 0.15rem 0.5rem;
+                border-radius: 20px;
+                font-size: 0.75rem;
+                font-weight: 600;
+            }
+
+            .request-card {
+                background: var(--bg);
+                border-radius: 10px;
+                padding: 1rem;
+                margin-bottom: 0.75rem;
+                border-left: 4px solid var(--primary);
+            }
+
+            .request-header {
+                display: flex;
+                justify-content: space-between;
+                align-items: flex-start;
+                margin-bottom: 0.5rem;
+            }
+
+            .patient-name {
+                font-weight: 600;
+                font-size: 1rem;
+                color: var(--text);
+            }
+
+            .request-date {
+                font-size: 0.75rem;
+                color: var(--text-muted);
+            }
+
+            .request-details {
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+                gap: 0.5rem;
+            }
+
+            .detail-item {
+                display: flex;
+                align-items: center;
+                gap: 0.5rem;
+                font-size: 0.85rem;
+            }
+
+            .detail-item i {
+                color: var(--primary);
+                width: 16px;
+            }
+
+            .address-item {
+                grid-column: 1 / -1;
+                background: white;
+                padding: 0.5rem;
+                border-radius: 6px;
+                margin-top: 0.25rem;
+            }
+
+            .empty-state {
+                text-align: center;
+                padding: 3rem;
+                color: var(--text-muted);
+            }
+
+            .empty-state i {
+                font-size: 3rem;
+                margin-bottom: 1rem;
+                opacity: 0.5;
+            }
+
+            .refresh-info {
+                color: var(--text-muted);
+                font-size: 0.75rem;
+            }
+
+            @media (max-width: 768px) {
+                .header {
+                    flex-direction: column;
+                    gap: 0.75rem;
+                    text-align: center;
+                }
+                .request-details {
+                    grid-template-columns: 1fr;
+                }
+            }
+        </style>
+    </head>
+    <body>
+        <div class="dashboard-container">
+            <div class="header">
+                <h1><i class="fas fa-house-medical"></i> Solicitações Domiciliares</h1>
+                <div class="header-actions">
+                    <span class="refresh-info" id="lastUpdate"></span>
+                    <button class="btn-nav" onclick="loadRequests()">
+                        <i class="fas fa-sync-alt"></i> Atualizar
+                    </button>
+                    <a href="/dashboard" class="btn-nav">
+                        <i class="fas fa-calendar"></i> Dashboard
+                    </a>
+                </div>
+            </div>
+
+            <div class="section">
+                <div class="section-header">
+                    <h2 class="section-title">
+                        <i class="fas fa-list"></i> Solicitações
+                        <span class="badge-count" id="requestCount">0</span>
+                    </h2>
+                </div>
+                <div id="requestsList"></div>
+            </div>
+        </div>
+
+        <script>
+            let allRequests = [];
+
+            async function loadRequests() {
+                try {
+                    const response = await fetch('/api/home-visits');
+                    const data = await response.json();
+                    allRequests = data.requests;
+                    document.getElementById('requestCount').textContent = data.count;
+                    displayRequests();
+                    document.getElementById('lastUpdate').textContent =
+                        'Atualizado: ' + new Date().toLocaleTimeString('pt-BR');
+                } catch (error) {
+                    console.error('Erro ao carregar solicitações:', error);
+                }
+            }
+
+            function formatDate(isoDate) {
+                if (!isoDate) return '-';
+                const date = new Date(isoDate);
+                return date.toLocaleDateString('pt-BR') + ' ' + date.toLocaleTimeString('pt-BR', {hour: '2-digit', minute: '2-digit'});
+            }
+
+            function formatPhone(phone) {
+                if (!phone) return '-';
+                // Remove 55 do início se tiver
+                let p = phone.replace(/^55/, '');
+                if (p.length === 11) {
+                    return `(${p.slice(0,2)}) ${p.slice(2,7)}-${p.slice(7)}`;
+                }
+                return phone;
+            }
+
+            function displayRequests() {
+                const container = document.getElementById('requestsList');
+
+                if (allRequests.length === 0) {
+                    container.innerHTML = `
+                        <div class="empty-state">
+                            <i class="fas fa-inbox"></i>
+                            <p>Nenhuma solicitação de atendimento domiciliar</p>
+                        </div>
+                    `;
+                    return;
+                }
+
+                let html = '';
+                for (const req of allRequests) {
+                    html += `
+                        <div class="request-card">
+                            <div class="request-header">
+                                <span class="patient-name">${req.patient_name || '-'}</span>
+                                <span class="request-date">${formatDate(req.created_at)}</span>
+                            </div>
+                            <div class="request-details">
+                                <div class="detail-item">
+                                    <i class="fas fa-phone"></i>
+                                    <span>${formatPhone(req.patient_phone)}</span>
+                                </div>
+                                <div class="detail-item">
+                                    <i class="fas fa-birthday-cake"></i>
+                                    <span>${req.patient_birth_date || '-'}</span>
+                                </div>
+                                <div class="detail-item address-item">
+                                    <i class="fas fa-map-marker-alt"></i>
+                                    <span>${req.patient_address || '-'}</span>
+                                </div>
+                            </div>
+                        </div>
+                    `;
+                }
+                container.innerHTML = html;
+            }
+
+            // Carregar ao iniciar
+            document.addEventListener('DOMContentLoaded', loadRequests);
+
+            // Auto-refresh a cada 60 segundos
+            setInterval(loadRequests, 60000);
+        </script>
+    </body>
+    </html>
+    """
     return HTMLResponse(
         content=html_content,
         headers={

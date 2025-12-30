@@ -5976,13 +5976,23 @@ IMPORTANTE: Se identificar que "patient_name" é uma frase de pedido (ex: "Eu Pr
             )
             
             if success:
+                # Salvar solicitação no banco para aparecer no dashboard
+                from app.models import HomeVisitRequest
+                home_visit = HomeVisitRequest(
+                    patient_name=patient_name,
+                    patient_phone=patient_phone,
+                    patient_birth_date=patient_birth_date,
+                    patient_address=patient_address
+                )
+                db.add(home_visit)
+
                 # Marcar que notificação foi enviada
                 flow_data["doctor_notified"] = True
                 context.flow_data = flow_data
                 flag_modified(context, "flow_data")
                 db.commit()
-                
-                logger.info("✅ Notificação enviada com sucesso para a doutora")
+
+                logger.info("✅ Notificação enviada e solicitação salva no banco")
                 return "Notificação enviada com sucesso para a doutora!"
             else:
                 return "Erro ao enviar notificação. Por favor, tente novamente."
