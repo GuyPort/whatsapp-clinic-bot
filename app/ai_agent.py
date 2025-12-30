@@ -872,7 +872,7 @@ Return ONLY a JSON object with this structure:
 
         try:
             response = self.client.messages.create(
-                model="claude-haiku-4-5-20241022",
+                model="claude-haiku-4-5-20251001",
                 max_tokens=400,
                 temperature=0,
                 messages=[{"role": "user", "content": prompt}]
@@ -1007,7 +1007,7 @@ Responda APENAS com uma palavra:
 
         try:
             response = self.client.messages.create(
-                model="claude-haiku-4-5-20241022",
+                model="claude-haiku-4-5-20251001",
                 max_tokens=10,
                 temperature=0,
                 messages=[{"role": "user", "content": prompt}]
@@ -1925,7 +1925,7 @@ Responda EXCLUSIVAMENTE com um JSON válido no formato:
 }}
 """
             response = self.client.messages.create(
-                model="claude-haiku-4-5-20241022",
+                model="claude-haiku-4-5-20251001",
                 max_tokens=200,
                 temperature=0.1,
                 messages=[{"role": "user", "content": instructions}]
@@ -3020,7 +3020,7 @@ Responda EXCLUSIVAMENTE com um JSON válido no formato:
             # 6. Fazer chamada para o Claude com histórico completo
             logger.info(f"🤖 Enviando {len(claude_messages)} mensagens para Claude")
             response = self.client.messages.create(
-                model="claude-haiku-4-5-20241022",
+                model="claude-haiku-4-5-20251001",
                 max_tokens=2000,
                 temperature=0.3,
                 system=self.system_prompt,
@@ -3101,7 +3101,7 @@ Responda EXCLUSIVAMENTE com um JSON válido no formato:
                                             # Construir contexto completo para Claude processar a confirmação
                                             # Incluir: histórico + request_home_address tool_use + tool_result + notify_doctor_home_visit tool_use + tool_result + mensagem de confirmação
                                             current_response = self.client.messages.create(
-                                                model="claude-haiku-4-5-20241022",
+                                                model="claude-haiku-4-5-20251001",
                                                 max_tokens=2000,
                                                 temperature=0.3,
                                                 system=self.system_prompt,
@@ -3166,7 +3166,7 @@ Responda EXCLUSIVAMENTE com um JSON válido no formato:
                             
                             # Fazer follow-up com o resultado
                             current_response = self.client.messages.create(
-                                model="claude-haiku-4-5-20241022",
+                                model="claude-haiku-4-5-20251001",
                                 max_tokens=2000,
                                 temperature=0.3,
                                 system=self.system_prompt,
@@ -5758,7 +5758,7 @@ IMPORTANTE: Se identificar que "patient_name" é uma frase de pedido (ex: "Eu Pr
 
             # Chamar Claude para extrair
             response = self.client.messages.create(
-                model="claude-haiku-4-5-20241022",
+                model="claude-haiku-4-5-20251001",
                 max_tokens=500,
                 temperature=0.3,
                 messages=[
