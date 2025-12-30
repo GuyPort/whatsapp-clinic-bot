@@ -82,7 +82,7 @@ class IntentClassifier:
         )
         try:
             result = self.client.messages.create(
-                model="claude-haiku-4-5-20251001",
+                model="claude-sonnet-4-20250514",
                 max_tokens=10,
                 temperature=0.0,
                 messages=[{"role": "user", "content": prompt}]
@@ -105,7 +105,7 @@ class IntentClassifier:
         )
         try:
             result = self.client.messages.create(
-                model="claude-haiku-4-5-20251001",
+                model="claude-sonnet-4-20250514",
                 max_tokens=5,
                 temperature=0.0,
                 messages=[{"role": "user", "content": prompt}]
