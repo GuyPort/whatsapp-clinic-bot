@@ -161,18 +161,17 @@ ABORDAGEM DE COMUNICAÇÃO
 
 MENU INICIAL:
 - Quando não houver contexto claro de agendamento ou o usuário iniciar nova conversa, apresente o menu:
-
-"Olá! Eu sou a Beatriz, secretária do {clinic_name}! 
+"Olá! Eu sou a Beatriz, secretária do {clinic_name}!
 Como posso te ajudar hoje?
 
-Para deixar o atendimento mais rápido, envie uma mensagem por vez e aguarde minha resposta antes de mandar a próxima, combinado?
+Para deixar o atendimento mais rápido, envie uma mensagem por vez e aguarde minha resposta antes de mandar a próxima.
 
-1️⃣ Marcar consulta (presencial na clínica)
+1️⃣ Marcar consulta
 2️⃣ Atendimento domiciliar (R$ 500)
 3️⃣ Remarcar/Cancelar consulta
 4️⃣ Receitas
 
-🚨 Em caso de emergência, ligue para a Dra. Rose: (51) 99954-6355
+Em caso de emergência, ligue para a Dra. Rose: (51) 99954-6355
 
 Digite o número da opção desejada."
 - Se o usuário já estiver no meio de um fluxo, mantenha o contexto e continue naturalmente
@@ -218,14 +217,12 @@ Após o usuário escolher qualquer opção do menu inicial, siga esta sequência
    Quando o usuário escolher "Atendimento domiciliar" no menu inicial:
    1. NÃO chame find_next_available_slot (não precisa agendar horário específico)
    2. PRIMEIRO: Pergunte ao usuário com esta mensagem formatada (NÃO chame nenhuma tool ainda):
-      "Perfeito! Para o atendimento domiciliar, preciso do seu endereço completo. Por favor, me informe:
-      
-      📍 Cidade
-      🏘️ Bairro
-      🛣️ Rua
-      🏠 Número da casa
-      
-      Você pode enviar tudo junto ou separado, como preferir!"
+      "Por favor, forneça seu endereço completo:
+
+      Cidade
+      Bairro
+      Rua
+      Número da casa"
    3. AGUARDE o usuário fornecer o endereço completo
    4. DEPOIS: Chame request_home_address para extrair e salvar o endereço fornecido
    5. Após request_home_address retornar sucesso, o sistema chamará notify_doctor_home_visit automaticamente
@@ -875,7 +872,7 @@ Return ONLY a JSON object with this structure:
 
         try:
             response = self.client.messages.create(
-                model="claude-sonnet-4-20250514",
+                model="claude-haiku-4-5-20241022",
                 max_tokens=400,
                 temperature=0,
                 messages=[{"role": "user", "content": prompt}]
@@ -1010,7 +1007,7 @@ Responda APENAS com uma palavra:
 
         try:
             response = self.client.messages.create(
-                model="claude-sonnet-4-20250514",
+                model="claude-haiku-4-5-20241022",
                 max_tokens=10,
                 temperature=0,
                 messages=[{"role": "user", "content": prompt}]
@@ -1928,7 +1925,7 @@ Responda EXCLUSIVAMENTE com um JSON válido no formato:
 }}
 """
             response = self.client.messages.create(
-                model="claude-sonnet-4-20250514",
+                model="claude-haiku-4-5-20241022",
                 max_tokens=200,
                 temperature=0.1,
                 messages=[{"role": "user", "content": instructions}]
@@ -2209,8 +2206,7 @@ Responda EXCLUSIVAMENTE com um JSON válido no formato:
                 "• Nome dos remédios que você usa\n"
                 "• Receita atual ou indicação médica\n"
                 "• Modo de uso (frequência e horários)\n"
-                "• Dosagem ou miligramagem\n\n"
-                "Por favor, envie tudo de uma vez para que eu possa prosseguir."
+                "• Dosagem ou miligramagem"
             )
         return "Obrigada! Como posso te ajudar a seguir?"
 
@@ -3024,7 +3020,7 @@ Responda EXCLUSIVAMENTE com um JSON válido no formato:
             # 6. Fazer chamada para o Claude com histórico completo
             logger.info(f"🤖 Enviando {len(claude_messages)} mensagens para Claude")
             response = self.client.messages.create(
-                model="claude-sonnet-4-20250514",
+                model="claude-haiku-4-5-20241022",
                 max_tokens=2000,
                 temperature=0.3,
                 system=self.system_prompt,
@@ -3105,7 +3101,7 @@ Responda EXCLUSIVAMENTE com um JSON válido no formato:
                                             # Construir contexto completo para Claude processar a confirmação
                                             # Incluir: histórico + request_home_address tool_use + tool_result + notify_doctor_home_visit tool_use + tool_result + mensagem de confirmação
                                             current_response = self.client.messages.create(
-                                                model="claude-sonnet-4-20250514",
+                                                model="claude-haiku-4-5-20241022",
                                                 max_tokens=2000,
                                                 temperature=0.3,
                                                 system=self.system_prompt,
@@ -3170,7 +3166,7 @@ Responda EXCLUSIVAMENTE com um JSON válido no formato:
                             
                             # Fazer follow-up com o resultado
                             current_response = self.client.messages.create(
-                                model="claude-sonnet-4-20250514",
+                                model="claude-haiku-4-5-20241022",
                                 max_tokens=2000,
                                 temperature=0.3,
                                 system=self.system_prompt,
@@ -5304,9 +5300,9 @@ Responda EXCLUSIVAMENTE com um JSON válido no formato:
 
                 # Retornar mensagem de bloqueio (Claude incorpora na conversa)
                 return (
-                    f"Identificamos que você já marcou e não compareceu a {no_show_count} consultas anteriormente. "
-                    "Por isso, vamos encaminhar você para nossa secretária para regularizar sua situação. "
-                    "Ela entrará em contato em breve. 😊"
+                    f"Você já marcou e não compareceu a {no_show_count} consultas anteriormente. "
+                    "Vamos encaminhar você para nossa secretária para regularizar sua situação. "
+                    "Ela entrará em contato em breve."
                 )
 
             # Converter datas COM VALIDAÇÃO
@@ -5426,19 +5422,16 @@ Responda EXCLUSIVAMENTE com um JSON válido no formato:
             cadeira_rodas = info_adicionais.get('cadeira_rodas_disponivel', False)
             
             message_lines = [
-                "✅ Agendamento confirmado com sucesso!",
+                "Agendamento confirmado com sucesso!",
                 "",
                 f"A consulta está marcada para *{data_formatada} às {appointment_time}*.",
                 "",
-                "📋 Informações importantes:",
-                "",
-                "• Por favor, traga os últimos exames realizados",
-                "• Lista de medicações que está tomando atualmente",
+                "• Traga os últimos exames realizados e lista de medicações que está tomando",
                 f"• Nossa clínica fica na {endereco}",
             ]
             if cadeira_rodas:
                 message_lines.append("• Temos cadeira de rodas disponível se necessário")
-            message_lines.append("• Você receberá uma mensagem de lembrete 48 horas antes da sua consulta")
+            message_lines.append("• Você receberá uma mensagem de lembrete 24 horas antes da sua consulta")
             message_lines.append("")
             message_lines.append("Posso te ajudar com mais alguma coisa?")
 
@@ -5675,7 +5668,7 @@ Responda EXCLUSIVAMENTE com um JSON válido no formato:
             db.commit()
             
             logger.info(f"⏸️ Bot pausado para {phone} até {paused_until}")
-            return "Claro! Vou encaminhar você para um de nossos atendentes agora! Para acelerar o processo, já pode nos contar como podemos te ajudar! 😊\n\n🚨 Em caso de emergência, ligue para a Dra. Rose: (51) 99954-6355"
+            return "Claro! Vou encaminhar você para um de nossos atendentes agora! Para acelerar o processo, já pode nos contar como podemos te ajudar!\n\nEm caso de emergência, ligue para a Dra. Rose: (51) 99954-6355"
             
         except Exception as e:
             logger.error(f"Erro ao pausar bot para humano: {str(e)}")
@@ -5765,7 +5758,7 @@ IMPORTANTE: Se identificar que "patient_name" é uma frase de pedido (ex: "Eu Pr
 
             # Chamar Claude para extrair
             response = self.client.messages.create(
-                model="claude-sonnet-4-20250514",
+                model="claude-haiku-4-5-20241022",
                 max_tokens=500,
                 temperature=0.3,
                 messages=[
@@ -5909,7 +5902,7 @@ IMPORTANTE: Se identificar que "patient_name" é uma frase de pedido (ex: "Eu Pr
                     break
             
             if not last_user_message or len(last_user_message.strip()) < 10:
-                return "Por favor, forneça seu endereço completo:\n\n📍 Cidade\n🏘️ Bairro\n🛣️ Rua\n🏠 Número da casa"
+                return "Por favor, forneça seu endereço completo:\n\nCidade\nBairro\nRua\nNúmero da casa"
             
             # Validar se a mensagem parece ser um endereço (não é tipo de consulta)
             last_message_lower = last_user_message.lower()
@@ -5921,11 +5914,11 @@ IMPORTANTE: Se identificar que "patient_name" é uma frase de pedido (ex: "Eu Pr
             ]
             
             if any(keyword in last_message_lower for keyword in invalid_keywords):
-                return "Por favor, forneça seu endereço completo:\n\n📍 Cidade\n🏘️ Bairro\n🛣️ Rua\n🏠 Número da casa\n\nApenas o endereço, não o tipo de consulta."
+                return "Por favor, forneça seu endereço completo:\n\nCidade\nBairro\nRua\nNúmero da casa\n\nApenas o endereço, não o tipo de consulta."
             
             # Se tem menos de 15 caracteres, provavelmente não é um endereço completo
             if len(last_user_message.strip()) < 15:
-                return "Por favor, forneça seu endereço completo:\n\n📍 Cidade\n🏘️ Bairro\n🛣️ Rua\n🏠 Número da casa"
+                return "Por favor, forneça seu endereço completo:\n\nCidade\nBairro\nRua\nNúmero da casa"
             
             # Salvar endereço no flow_data
             if not context.flow_data:
@@ -6011,7 +6004,7 @@ IMPORTANTE: Se identificar que "patient_name" é uma frase de pedido (ex: "Eu Pr
                 db.commit()
                 logger.info(f"🗑️ Contexto deletado para {phone}")
             
-            return "Foi um prazer atendê-lo(a)! Até logo! 😊"
+            return "Foi um prazer atendê-lo(a)! Até logo!"
             
         except Exception as e:
             logger.error(f"Erro ao encerrar conversa: {str(e)}")
