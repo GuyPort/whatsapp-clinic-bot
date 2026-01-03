@@ -4053,11 +4053,11 @@ Responda EXCLUSIVAMENTE com um JSON válido no formato:
             dias_semana = ['segunda-feira', 'terça-feira', 'quarta-feira', 
                           'quinta-feira', 'sexta-feira', 'sábado', 'domingo']
             
-            response = f"✅ Encontrei {len(alternatives)} opção(ões) alternativa(s) para você:\n\n"
+            response = f"✅ Encontrei {len(alternatives)} opções para você:\n\n"
             
             for i, (slot, alt_date) in enumerate(alternatives, 1):
                 dia_nome_completo = dias_semana[alt_date.weekday()]
-                response += f"**Opção {i}:**\n"
+                response += f"*Opção {i}:*\n"
                 response += f"📅 {format_date_br(alt_date)} ({dia_nome_completo})\n"
                 response += f"⏰ Horário: {slot.strftime('%H:%M')}\n\n"
             
@@ -4065,8 +4065,8 @@ Responda EXCLUSIVAMENTE com um JSON válido no formato:
             response += f"👤 Nome: {patient_name}\n"
             response += f"🏥 Tipo: {tipo_nome} - R$ {tipo_valor}\n"
             response += f"💳 Convênio: {convenio_nome}\n\n"
-            response += "Se nenhum desses horários funcionar, me indique uma data no formato DD/MM/AAAA ou descreva o período que prefere 😉\n\n"
-            response += f"Qual opção você prefere? Digite o número (1, 2 ou 3)."
+            response += "Se nenhum desses horários funcionar, me indique uma data no formato DD/MM/AAAA.\n\n"
+            response += f"Qual opção você prefere?"
             
             return response
             
@@ -5358,7 +5358,41 @@ Responda EXCLUSIVAMENTE com um JSON válido no formato:
             is_available = appointment_rules.check_slot_availability(appointment_datetime_naive, duracao, db)
             
             if not is_available:
-                return f"❌ Horário {appointment_time} não está disponível. Use a tool check_availability para ver horários disponíveis."
+                # Buscar próximo horário disponível automaticamente
+                logger.info(f"⚠️ Horário {appointment_time} não disponível (race condition?). Buscando alternativa...")
+
+                # Tentar encontrar próximo slot no mesmo dia
+                available_slots = appointment_rules.get_available_slots(
+                    appointment_datetime_naive, duracao, db, limit=1, insurance_plan=insurance_plan
+                )
+
+                # Se não encontrou no mesmo dia, buscar nos próximos dias
+                if not available_slots:
+                    from datetime import timedelta
+                    for days_ahead in range(1, 30):  # Buscar até 30 dias à frente
+                        next_date = appointment_datetime_naive + timedelta(days=days_ahead)
+                        available_slots = appointment_rules.get_available_slots(
+                            next_date, duracao, db, limit=1, insurance_plan=insurance_plan
+                        )
+                        if available_slots:
+                            break
+
+                if available_slots:
+                    next_slot = available_slots[0]
+                    next_date_str = next_slot.strftime('%d/%m/%Y')
+                    next_time_str = next_slot.strftime('%H:%M')
+                    return (
+                        f"⚠️ O horário {appointment_time} acabou de ser ocupado por outro paciente.\n\n"
+                        f"O próximo horário disponível é:\n"
+                        f"📅 {next_date_str} às {next_time_str}\n\n"
+                        f"Deseja agendar neste horário?"
+                    )
+                else:
+                    return (
+                        f"⚠️ O horário {appointment_time} acabou de ser ocupado por outro paciente.\n\n"
+                        f"Não encontrei outros horários disponíveis nos próximos dias. "
+                        f"Por favor, entre em contato com a clínica por telefone."
+                    )
             
             # Criar agendamento - SALVAR COMO STRING YYYYMMDD para evitar problemas de timezone
             appointment_datetime_formatted = str(appointment_datetime.strftime('%Y%m%d'))  # "20251022" - GARANTIR STRING
