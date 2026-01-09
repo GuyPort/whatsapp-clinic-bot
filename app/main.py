@@ -997,6 +997,11 @@ async def reschedule_appointment_admin(
             # Verificar se o horário é válido (COM ADMIN OVERRIDE)
             new_datetime = parse_appointment_datetime(new_date, new_time)
 
+            # Remover timezone para compatibilidade com check_slot_availability
+            # (mesmo tratamento que o chat faz em ai_agent.py:5356)
+            if new_datetime and new_datetime.tzinfo:
+                new_datetime = new_datetime.replace(tzinfo=None)
+
             is_valid, error_msg = rules.is_valid_appointment_date(new_datetime, admin_override=True)
             if not is_valid:
                 raise HTTPException(status_code=400, detail=error_msg)
@@ -1134,6 +1139,11 @@ async def create_appointment_admin(
             rules = AppointmentRules()
 
             appointment_datetime = parse_appointment_datetime(appointment_date, appointment_time)
+
+            # Remover timezone para compatibilidade com check_slot_availability
+            # (mesmo tratamento que o chat faz em ai_agent.py:5356)
+            if appointment_datetime and appointment_datetime.tzinfo:
+                appointment_datetime = appointment_datetime.replace(tzinfo=None)
 
             is_valid, error_msg = rules.is_valid_appointment_date(appointment_datetime, admin_override=True)
             if not is_valid:
