@@ -98,15 +98,20 @@ class ClaudeToolAgent:
         convenios = self.clinic_info.get('convenios_aceitos', {})
         info_adicionais = self.clinic_info.get('informacoes_adicionais', {})
 
-        # Formatar valores das consultas
+        # Formatar valores das consultas (valores são para PARTICULAR)
         valores_str = ""
         for tipo, dados in tipos_consulta.items():
             nome = dados.get('nome', tipo)
-            valor = dados.get('valor', 0)
-            valores_str += f"  • {nome}: R$ {valor}\n"
+            valor = dados.get('valor_particular', dados.get('valor', 0))
+            valores_str += f"  • {nome}: R$ {valor} (valor particular)\n"
+        valores_str += "  • Convênios (CABERGS/IPE): valor conforme categoria do plano\n"
 
-        # Formatar convênios
-        convenios_str = ", ".join([dados.get('nome', cod) for cod, dados in convenios.items()])
+        # Formatar convênios (sem incluir "particular" na lista)
+        convenios_list = []
+        for cod, dados in convenios.items():
+            if cod.lower() != 'particular':
+                convenios_list.append(dados.get('nome', cod))
+        convenios_str = ", ".join(convenios_list) if convenios_list else "Nenhum"
 
         # Formas de pagamento
         formas_pagamento = info_adicionais.get('formas_pagamento', [])
@@ -145,9 +150,11 @@ INFORMAÇÕES COMPLETAS DA CLÍNICA (use para responder perguntas)
 IMPORTANTE - COMO RESPONDER PERGUNTAS SOBRE A CLÍNICA:
 - Responda de forma NATURAL e CONVERSACIONAL, como uma secretária real faria
 - NÃO use blocos formatados ou templates - responda de forma fluida
-- Combine informações quando fizer sentido (ex: "O valor é R$ 350 e você pode pagar no pix, cartão ou dinheiro")
 - NÃO precisa chamar a tool get_clinic_info para perguntas simples - você já tem todas as informações acima
 - Se não souber responder algo específico, diga educadamente que vai verificar com a doutora
+- VALORES: Só informe valores quando o usuário PERGUNTAR especificamente. Ao informar:
+  • Particular: R$ 350 (Clínica Geral/Geriatria) ou R$ 500 (Domiciliar)
+  • Convênios (CABERGS/IPE): informe que o valor é conforme a categoria do plano do paciente
 
 ═══════════════════════════════════════════════════════════
 SEU OBJETIVO PRINCIPAL
@@ -187,7 +194,6 @@ PRINCÍPIOS DE COMUNICAÇÃO:
   • Responda diretamente usando as INFORMAÇÕES COMPLETAS DA CLÍNICA que você já tem acima
   • Responda de forma natural e conversacional, como uma secretária de verdade
   • NÃO use blocos formatados - fale de forma fluida e humana
-  • Combine informações quando fizer sentido (ex: "O valor é R$ 350 e aceitamos pix, cartão ou dinheiro!")
   • Se a pergunta for muito genérica, pergunte o que especificamente a pessoa quer saber
   • Mantenha o tom acolhedor e ofereça ajuda adicional quando fizer sentido.
 
@@ -2182,8 +2188,8 @@ Responda EXCLUSIVAMENTE com um JSON válido no formato:
         if menu_choice == "booking":
             return (
                 "Perfeito! Agora me conte qual consulta você prefere:\n\n"
-                "• Clínica Geral – R$ 350\n"
-                "• Geriatria Clínica e Preventiva – R$ 350\n\n"
+                "• Clínica Geral\n"
+                "• Geriatria Clínica e Preventiva\n\n"
                 "Escreva o nome da opção desejada."
             )
         if menu_choice == "home_visit":
@@ -2780,25 +2786,21 @@ Responda EXCLUSIVAMENTE com um JSON válido no formato:
                                 "domiciliar": "Atendimento Domiciliar ao Paciente Idoso"
                             }
                             tipo_nome = tipo_map.get(consultation_type, "Clínica Geral")
-                            
-                            tipos_consulta = self.clinic_info.get('tipos_consulta', {})
-                            tipo_data = tipos_consulta.get(consultation_type, {})
-                            tipo_valor = tipo_data.get('valor', 0)
-                            
+
                             convenio_nome = insurance_plan if insurance_plan != "particular" else "Particular"
-                            
-                            dias_semana = ['segunda-feira', 'terça-feira', 'quarta-feira', 
+
+                            dias_semana = ['segunda-feira', 'terça-feira', 'quarta-feira',
                                           'quinta-feira', 'sexta-feira', 'sábado', 'domingo']
                             alt_date = parse_date_br(selected_alt["date"])
                             if alt_date:
                                 dia_nome_completo = dias_semana[alt_date.weekday()]
                             else:
                                 dia_nome_completo = ""
-                            
+
                             response = f"Perfeito! Você escolheu a opção {message_stripped}.\n\n"
                             response += f"📋 *Resumo da consulta:*\n"
                             response += f"👤 Nome: {patient_name}\n"
-                            response += f"🏥 Tipo: {tipo_nome} - R$ {tipo_valor}\n"
+                            response += f"🏥 Tipo: {tipo_nome}\n"
                             response += f"💳 Convênio: {convenio_nome}\n"
                             response += f"📅 Data: {selected_alt['date']} ({dia_nome_completo})\n"
                             response += f"⏰ Horário: {selected_alt['time']}\n\n"
@@ -3828,30 +3830,26 @@ Responda EXCLUSIVAMENTE com um JSON válido no formato:
                 "domiciliar": "Atendimento Domiciliar ao Paciente Idoso"
             }
             tipo_nome = tipo_map.get(consultation_type, "Clínica Geral")
-            
-            tipos_consulta = self.clinic_info.get('tipos_consulta', {})
-            tipo_data = tipos_consulta.get(consultation_type, {})
-            tipo_valor = tipo_data.get('valor', 0)
-            
+
             if not insurance_plan or insurance_plan.lower() in {"particular", "particula"}:
                 convenio_nome = "Particular"
             else:
                 convenio_nome = insurance_plan.upper()
-            
-            dias_semana = ['segunda-feira', 'terça-feira', 'quarta-feira', 
+
+            dias_semana = ['segunda-feira', 'terça-feira', 'quarta-feira',
                           'quinta-feira', 'sexta-feira', 'sábado', 'domingo']
             dia_nome_completo = dias_semana[found_date.weekday()]
-            
+
             # Validar first_slot antes de formatar
             if not first_slot:
                 logger.error(f"❌ first_slot é None ou inválido")
                 return "❌ Erro ao buscar horário disponível. Por favor, tente novamente."
-            
+
             # Verificar se first_slot é datetime válido
             if not isinstance(first_slot, datetime):
                 logger.error(f"❌ first_slot não é datetime: {type(first_slot)}")
                 return "❌ Erro ao buscar horário disponível. Por favor, tente novamente."
-            
+
             # Formatar horário com validação
             try:
                 horario_str = first_slot.strftime('%H:%M')
@@ -3862,7 +3860,7 @@ Responda EXCLUSIVAMENTE com um JSON válido no formato:
 
             response = f"📋 *Resumo da consulta:*\n"
             response += f"👤 Nome: {patient_name}\n"
-            response += f"🏥 Tipo: {tipo_nome} - R$ {tipo_valor}\n"
+            response += f"🏥 Tipo: {tipo_nome}\n"
             response += f"💳 Convênio: {convenio_nome}\n"
             response += f"📅 Data: {format_date_br(found_date)} ({dia_nome_completo})\n"
             response += f"⏰ Horário: {horario_str}\n"
@@ -4043,27 +4041,23 @@ Responda EXCLUSIVAMENTE com um JSON válido no formato:
                 "domiciliar": "Atendimento Domiciliar ao Paciente Idoso"
             }
             tipo_nome = tipo_map.get(consultation_type, "Clínica Geral")
-            
-            tipos_consulta = self.clinic_info.get('tipos_consulta', {})
-            tipo_data = tipos_consulta.get(consultation_type, {})
-            tipo_valor = tipo_data.get('valor', 0)
-            
+
             convenio_nome = insurance_plan if insurance_plan != "particular" else "Particular"
-            
-            dias_semana = ['segunda-feira', 'terça-feira', 'quarta-feira', 
+
+            dias_semana = ['segunda-feira', 'terça-feira', 'quarta-feira',
                           'quinta-feira', 'sexta-feira', 'sábado', 'domingo']
-            
+
             response = f"✅ Encontrei {len(alternatives)} opções para você:\n\n"
-            
+
             for i, (slot, alt_date) in enumerate(alternatives, 1):
                 dia_nome_completo = dias_semana[alt_date.weekday()]
                 response += f"*Opção {i}:*\n"
                 response += f"📅 {format_date_br(alt_date)} ({dia_nome_completo})\n"
                 response += f"⏰ Horário: {slot.strftime('%H:%M')}\n\n"
-            
+
             response += f"📋 *Resumo:*\n"
             response += f"👤 Nome: {patient_name}\n"
-            response += f"🏥 Tipo: {tipo_nome} - R$ {tipo_valor}\n"
+            response += f"🏥 Tipo: {tipo_nome}\n"
             response += f"💳 Convênio: {convenio_nome}\n\n"
             response += "Se nenhum desses horários funcionar, me indique uma data no formato DD/MM/AAAA.\n\n"
             response += f"Qual opção você prefere?"
@@ -4103,8 +4097,12 @@ Responda EXCLUSIVAMENTE com um JSON válido no formato:
         lines = []
         for key, data in tipos_consulta.items():
             nome = data.get("nome", key.replace("_", " ").title())
-            valor = data.get("valor", "Sob consulta")
-            lines.append(f"• {nome}: R$ {valor:.2f}" if isinstance(valor, (int, float)) else f"• {nome}: {valor}")
+            valor = data.get("valor_particular", data.get("valor", "Sob consulta"))
+            if isinstance(valor, (int, float)):
+                lines.append(f"• {nome}: R$ {valor:.2f} (particular)")
+            else:
+                lines.append(f"• {nome}: {valor}")
+        lines.append("• Convênios (CABERGS/IPE): valor conforme categoria do plano")
         return "\n".join(lines)
 
     def _format_insurance_list(self) -> str:
@@ -4618,9 +4616,8 @@ Responda EXCLUSIVAMENTE com um JSON válido no formato:
                         tipos_consulta = self.clinic_info.get('tipos_consulta', {})
                         tipo_data = tipos_consulta.get(tipo, {})
                         tipo_nome = tipo_data.get('nome', '')
-                        tipo_valor = tipo_data.get('valor', 0)
-                        tipo_info = f"💼 Tipo: {tipo_nome}\n💰 Valor: R$ {tipo_valor}\n"
-                    
+                        tipo_info = f"💼 Tipo: {tipo_nome}\n"
+
                     if convenio:
                         convenios_aceitos = self.clinic_info.get('convenios_aceitos', {})
                         convenio_data = convenios_aceitos.get(convenio, {})

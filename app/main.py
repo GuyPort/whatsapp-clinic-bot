@@ -2262,7 +2262,16 @@ async def dashboard(admin: str = Depends(verify_admin_credentials)):
                             <label style="display: block; margin-bottom: 5px; font-weight: 500;">Nova Data</label>
                             <input type="date" id="new-date" class="swal2-input" style="margin-top: 0;">
                             <label style="display: block; margin-top: 15px; margin-bottom: 5px; font-weight: 500;">Novo Horário</label>
-                            <input type="time" id="new-time" class="swal2-input" style="margin-top: 0;" step="3600">
+                            <select id="new-time" class="swal2-input" style="margin-top: 0;">
+                                <option value="">Selecione...</option>
+                                <option value="13:00">13:00</option>
+                                <option value="14:00">14:00</option>
+                                <option value="15:00">15:00</option>
+                                <option value="16:00">16:00</option>
+                                <option value="17:00">17:00</option>
+                                <option value="18:00">18:00</option>
+                                <option value="19:00">19:00</option>
+                            </select>
                         </div>
                     `,
                     focusConfirm: false,
@@ -2350,7 +2359,16 @@ async def dashboard(admin: str = Depends(verify_admin_credentials)):
                             <input type="date" id="appointment-date" class="swal2-input" style="margin-top: 0;">
 
                             <label style="display: block; margin-top: 15px; margin-bottom: 5px; font-weight: 500;">Horário</label>
-                            <input type="time" id="appointment-time" class="swal2-input" style="margin-top: 0;" step="3600">
+                            <select id="appointment-time" class="swal2-input" style="margin-top: 0;">
+                                <option value="">Selecione...</option>
+                                <option value="13:00">13:00</option>
+                                <option value="14:00">14:00</option>
+                                <option value="15:00">15:00</option>
+                                <option value="16:00">16:00</option>
+                                <option value="17:00">17:00</option>
+                                <option value="18:00">18:00</option>
+                                <option value="19:00">19:00</option>
+                            </select>
                         </div>
                     `,
                     focusConfirm: false,
