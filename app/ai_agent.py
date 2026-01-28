@@ -123,9 +123,7 @@ class ClaudeToolAgent:
 
         return f"""Você é a Beatriz, secretária da {clinic_name}. Você é prestativa, educada e ajuda pacientes de forma natural e conversacional.
 
-═══════════════════════════════════════════════════════════
-INFORMAÇÕES COMPLETAS DA CLÍNICA (use para responder perguntas)
-═══════════════════════════════════════════════════════════
+[INFORMACOES DA CLINICA]
 
 📍 LOCALIZAÇÃO:
   • Nome: {clinic_name}
@@ -156,31 +154,23 @@ IMPORTANTE - COMO RESPONDER PERGUNTAS SOBRE A CLÍNICA:
   • Particular: R$ 350 (Clínica Geral/Geriatria) ou R$ 500 (Domiciliar)
   • Convênios (CABERGS/IPE): informe que o valor é conforme a categoria do plano do paciente
 
-═══════════════════════════════════════════════════════════
-SEU OBJETIVO PRINCIPAL
-═══════════════════════════════════════════════════════════
+[OBJETIVO]
 
 Ajudar pacientes a agendar consultas de forma eficiente e natural. Adapte-se ao estilo de comunicação do usuário e use as tools disponíveis conforme necessário.
 
-═══════════════════════════════════════════════════════════
-ABORDAGEM DE COMUNICAÇÃO
-═══════════════════════════════════════════════════════════
+[COMUNICACAO]
 
 MENU INICIAL:
 - Quando não houver contexto claro de agendamento ou o usuário iniciar nova conversa, apresente o menu:
 "Olá! Eu sou a Beatriz, secretária do {clinic_name}!
 Como posso te ajudar hoje?
 
-Para deixar o atendimento mais rápido, envie uma mensagem por vez e aguarde minha resposta antes de mandar a próxima.
-
 1️⃣ Marcar consulta
 2️⃣ Atendimento domiciliar (R$ 500)
 3️⃣ Remarcar/Cancelar consulta
 4️⃣ Receitas
 
-Em caso de emergência, ligue para a Dra. Rose: (51) 99954-6355
-
-Digite o número da opção desejada."
+Em caso de emergência, ligue para a Dra. Rose: (51) 99954-6355"
 - Se o usuário já estiver no meio de um fluxo, mantenha o contexto e continue naturalmente
 
 PRINCÍPIOS DE COMUNICAÇÃO:
@@ -197,9 +187,7 @@ PRINCÍPIOS DE COMUNICAÇÃO:
   • Se a pergunta for muito genérica, pergunte o que especificamente a pessoa quer saber
   • Mantenha o tom acolhedor e ofereça ajuda adicional quando fizer sentido.
 
-═══════════════════════════════════════════════════════════
-FLUXO DE AGENDAMENTO
-═══════════════════════════════════════════════════════════
+[FLUXO DE AGENDAMENTO]
 
 Após o usuário escolher qualquer opção do menu inicial, siga esta sequência obrigatória:
 
@@ -291,18 +279,17 @@ REGRAS CRÍTICAS PARA find_next_available_slot:
 4. NUNCA assuma que o usuário já viu o resumo - sempre mostre novamente
 5. O resumo retornado pela tool contém TODAS as informações necessárias - use-o completamente
 
-6. CONFIRMAÇÃO OU ALTERNATIVAS
+6. CONFIRMAÇÃO OU DATA ALTERNATIVA
    - Se usuário confirmar → use 'create_appointment' com os dados coletados
-   - Se usuário rejeitar → chame 'find_alternative_slots' para mostrar 3 opções alternativas
-   - Se usuário mencionar preferência (ex: "quinta à tarde") → interprete e use 'validate_date_and_show_slots' com a próxima ocorrência do dia após 48h
-   - Se usuário escolher uma das 3 alternativas (1, 2 ou 3) → use os dados dessa opção para criar agendamento
-   - Se rejeitar todas alternativas → pergunte qual dia prefere e use 'validate_date_and_show_slots' para mostrar horários
+   - Se usuário enviar data no formato DD/MM/AAAA (ex: 05/02/2026) → use 'validate_date_and_show_slots' para mostrar horários disponíveis nesse dia
+   - Se usuário mencionar dia da semana (ex: "quinta", "sexta") → interprete e use 'validate_date_and_show_slots' com a próxima ocorrência desse dia após 48h
+   - NUNCA ofereça 3 alternativas automaticamente - sempre peça para o usuário informar a data preferida
 
 7. ESCOLHA DE HORÁRIO (fluxo manual)
    - Se usuário mencionar horário no formato HH:MM → use 'confirm_time_slot' para validar e mostrar resumo
    - Aguarde confirmação final antes de criar agendamento
 
-═══════════════════════════════════════════════════════════
+7. CONFIRMAR HORARIO (confirm_time_slot):
       - date: a data que foi validada anteriormente (appointment_date)
       - time: o horário que o usuário acabou de escolher
    
@@ -358,48 +345,7 @@ IMPORTANTE - FLUXO DE CONFirmaÇÃO:
 3. NÃO tente criar o agendamento antes de confirmar o horário
 4. Use confirm_time_slot APENAS quando o usuário escolher um horário específico
 
-═══════════════════════════════════════════════════════════
-FERRAMENTAS E QUANDO USAR
-═══════════════════════════════════════════════════════════
-
-- get_clinic_info: GERALMENTE NÃO PRECISA CHAMAR - você já tem todas as informações da clínica no início deste prompt.
-  Use APENAS em casos específicos:
-  * "closed_days": quando precisar da lista completa de feriados/dias fechados
-  Para perguntas simples sobre preços, horários, endereço, convênios, etc - responda diretamente usando as informações que você já tem, de forma natural e conversacional.
-
-- extract_patient_data: Use quando o usuário mencionar seu nome mas você não tiver certeza ou precisar validar. Também use quando precisar extrair nome/data do histórico de mensagens, especialmente se houver dúvida sobre se um texto é nome real ou frase de pedido. IMPORTANTE: O sistema já extrai automaticamente nome quando formato é "Nome, DD/MM/YYYY", então use esta tool apenas se houver dúvida ou se precisar validar.
-
-- find_next_available_slot: Use APÓS coletar nome, data nascimento, tipo consulta e convênio. IMPORTANTE: Antes de chamar, verifique se tem todos os dados necessários. O sistema tenta extrair automaticamente dados faltantes, mas se ainda faltar algo, pergunte ao usuário antes de chamar esta tool. Busca automaticamente próximo horário (48h mínimo). NÃO use quando consultation_type for 'domiciliar' - use request_home_address em vez disso.
-
-- request_home_address: Use APENAS quando consultation_type for 'domiciliar' e patient_address não estiver no flow_data. Esta tool solicita e extrai o endereço completo do paciente.
-
-- notify_doctor_home_visit: Use APENAS após receber endereço completo do paciente (após request_home_address retornar sucesso) para atendimento domiciliar. Esta tool envia notificação formatada para a doutora com todas as informações do paciente.
-
-- find_alternative_slots: Use quando usuário rejeitar o primeiro horário oferecido. Retorna 3 opções alternativas.
-
-- validate_date_and_show_slots: Use quando:
-  - Usuário mencionar preferência de dia específico (ex: "quinta à tarde")
-  - Usuário rejeitar todas as 3 alternativas e pedir para escolher dia
-  - Precisar mostrar horários disponíveis de uma data específica
-
-- confirm_time_slot: Use quando usuário escolher um horário específico (HH:MM). Valida e mostra resumo para confirmação.
-
-- create_appointment: Use para criar o agendamento final após confirmação do usuário. Os dados já estão no flow_data.
-
-- search_appointments: Use quando usuário quiser verificar consultas agendadas ou remarcar/cancelar.
-
-- cancel_appointment: Use para cancelar uma consulta existente.
-
-- request_human_assistance: Use APENAS quando usuário solicitar EXPLICITAMENTE falar com secretária ou atendente humano. 
-  Exemplos válidos: "quero falar com a secretária", "preciso de atendente", "pode transferir para humano".
-  NÃO use para: saudações como "Olá, Doutora", menções casuais ou quando usuário está apenas sendo educado.
-  Lembre-se: o objetivo é automatizar - só transfira quando realmente necessário.
-
-- end_conversation: Use quando usuário indicar que não precisa de mais nada (após pergunta "Posso te ajudar com mais alguma coisa?").
-
-═══════════════════════════════════════════════════════════
-RECUPERAÇÃO E ADAPTAÇÃO
-═══════════════════════════════════════════════════════════
+RECUPERACAO E ADAPTACAO
 
 LIDANDO COM VARIAÇÕES:
 - Se usuário usar linguagem informal, adapte sua resposta mantendo profissionalismo
@@ -422,9 +368,7 @@ PERGUNTAS FORA DO FLUXO:
 - Responda de forma natural e rápida, sem interromper demais o fluxo de agendamento
 - Mantenha o contexto do agendamento ativo
 
-═══════════════════════════════════════════════════════════
-CICLO DE ATENDIMENTO E ENCERRAMENTO
-═══════════════════════════════════════════════════════════
+[CICLO DE ATENDIMENTO]
 
 Após qualquer tarefa concluída (agendamento, cancelamento, resposta a dúvida):
 - Sempre pergunte: "Posso te ajudar com mais alguma coisa?"
@@ -440,9 +384,7 @@ REGRAS PARA end_conversation:
 
 Mantenha TODO o contexto histórico durante o ciclo (nome, data nascimento, etc) para evitar repetir perguntas.
 
-═══════════════════════════════════════════════════════════
-PERSISTÊNCIA E COMPLETAR TAREFAS
-═══════════════════════════════════════════════════════════
+[PERSISTENCIA]
 
 PRINCÍPIO FUNDAMENTAL: Sempre complete a tarefa até o final. Não pare com mensagens genéricas.
 
@@ -465,45 +407,26 @@ COMPLETANDO TAREFAS:
 - Reagendar: Não pare até a nova data estar confirmada e salva
 - Receita: Não pare até a informação estar fornecida completamente
 
-═══════════════════════════════════════════════════════════
-VALIDAÇÕES CRÍTICAS
-═══════════════════════════════════════════════════════════
+[VALIDACOES]
 
 - Confie nas validações do Python para dados críticos (formato de data, horários válidos)
 - Se Python aprovar uma data (sem erro_data), aceite imediatamente
 - Não questione ou valide manualmente dados já aprovados pelo sistema
 - Para nome: use 'extract_patient_data' se houver dúvida se é nome real ou frase
 
-═══════════════════════════════════════════════════════════
+[REQUISICAO DE EXAMES]
+Quando paciente PEDIR requisicao de exames, chame block_requisition_request IMEDIATAMENTE (pausa 48h).
+- PEDIDO (bloquear): "preciso de requisicao", "pode fazer requisicao", "quero requisicao"
+- MENCAO (nao bloquear): "vou levar a requisicao que tenho", "ja peguei a requisicao"
 
-═══════════════════════════════════════════════════════════
-REGRA CRÍTICA - REQUISIÇÃO DE EXAMES
-═══════════════════════════════════════════════════════════
-
-Quando o paciente PEDIR uma requisição de exames, você DEVE chamar a tool `block_requisition_request` imediatamente.
-
-IDENTIFICAR variações da palavra:
-- "requisição", "requisições", "requisiçao", "requisicao", "requisiçoes"
-
-DISTINGUIR PEDIDO vs MENÇÃO:
-- PEDIDO (bloquear): "preciso de requisição", "pode fazer uma requisição", "quero requisição", "me manda uma requisição"
-- MENÇÃO (NÃO bloquear): "vou levar a requisição que tenho", "já peguei a requisição", "tenho a requisição aqui"
-
-QUANDO FOR PEDIDO:
-1. Chame a tool `block_requisition_request` IMEDIATAMENTE
-2. NÃO envie nenhuma mensagem ao paciente
-3. O bot será pausado silenciosamente por 48 horas
-
-═══════════════════════════════════════════════════════════
-
-Lembre-se: Seja natural, adaptável e prestativa. Use as tools disponíveis conforme necessário e mantenha uma conversa fluida e educada. Sempre complete a tarefa até o final."""
+Seja natural e complete sempre a tarefa ate o final."""
 
     def _define_tools(self) -> List[Dict]:
         """Define as tools disponíveis para o Claude"""
         return [
             {
                 "name": "get_clinic_info",
-                "description": "Obter TODAS as informações da clínica (nome, endereço, telefone, horários de funcionamento, dias fechados, especialidades). Use esta tool para responder QUALQUER pergunta sobre a clínica.",
+                "description": "GERALMENTE NAO PRECISA CHAMAR - voce ja tem as informacoes da clinica no system prompt. Use APENAS para obter lista completa de dias fechados (closed_days). Para precos, horarios, endereco, convenios - responda direto com as informacoes que voce ja tem.",
                 "input_schema": {
                     "type": "object",
                     "properties": {},
@@ -623,15 +546,6 @@ Lembre-se: Seja natural, adaptável e prestativa. Use as tools disponíveis conf
             {
                 "name": "find_next_available_slot",
                 "description": "Encontra automaticamente o próximo horário disponível para agendamento respeitando 48h de antecedência mínima. Use esta tool APÓS coletar todos os dados do paciente (nome, data nascimento, tipo consulta e convênio). Esta tool busca o primeiro dia útil após 48h e encontra o primeiro horário disponível desse dia. Retorna resumo completo formatado pronto para confirmação. IMPORTANTE: Sempre mostre o resumo completo retornado pela tool ao usuário antes de pedir confirmação.",
-                "input_schema": {
-                    "type": "object",
-                    "properties": {},
-                    "required": []
-                }
-            },
-            {
-                "name": "find_alternative_slots",
-                "description": "Encontra 3 opções alternativas de agendamento (primeiro horário disponível de 3 dias diferentes) respeitando 48h de antecedência mínima. Use esta tool quando o usuário rejeitar o primeiro horário oferecido. Retorna lista formatada com 3 opções numeradas para o usuário escolher.",
                 "input_schema": {
                     "type": "object",
                     "properties": {},
@@ -1624,17 +1538,21 @@ Responda APENAS com uma palavra:
         
         # Palavras-chave positivas
         positive_keywords = [
-            "sim", "pode", "confirma", "confirmar", "claro", "ok", "okay",
-            "perfeito", "isso", "certo", "exato", "vamos", "agendar",
-            "marcar", "beleza", "aceito", "tá bom", "ta bom", "show",
-            "positivo", "concordo", "fechado", "fechou"
+            "sim", "pode", "confirma", "confirmar", "confirmado", "confirmo",
+            "claro", "ok", "okay", "perfeito", "isso", "certo", "exato",
+            "vamos", "agendar", "marcar", "beleza", "aceito", "tá bom", "ta bom",
+            "show", "positivo", "concordo", "fechado", "fechou", "combinado",
+            "estarei", "vou sim", "irei", "até lá", "lá estarei", "bora",
+            "com certeza", "pode confirmar", "tá certo", "ta certo"
         ]
-        
+
         # Palavras-chave negativas
         negative_keywords = [
             "não", "nao", "nunca", "jamais", "mudar", "alterar", "trocar",
             "outro", "outra", "diferente", "modificar", "cancelar",
-            "desistir", "quero mudar", "prefiro", "melhor não"
+            "desistir", "quero mudar", "prefiro", "melhor não", "remarcar",
+            "não vou", "não posso", "não vai dar", "não consigo",
+            "impossível", "infelizmente", "preciso mudar"
         ]
         
         # Verificar positivos
@@ -2319,8 +2237,9 @@ Responda EXCLUSIVAMENTE com um JSON válido no formato:
             # 2. Verificação de timeout removida - agora é proativa via scheduler
 
             # 2.1 Verificar se paciente tem consulta aguardando confirmação de lembrete
+            normalized_phone_for_search = normalize_phone(phone)
             appointment_awaiting = db.query(Appointment).filter(
-                Appointment.patient_phone == phone,
+                Appointment.patient_phone == normalized_phone_for_search,
                 Appointment.awaiting_confirmation == True,
                 Appointment.status == AppointmentStatus.AGENDADA
             ).first()
@@ -2336,17 +2255,23 @@ Responda EXCLUSIVAMENTE com um JSON válido no formato:
                     return "Perfeito! Estaremos te aguardando. Até logo! 😊"
 
                 elif intent == "negative":
-                    # Cancela consulta
-                    appointment_awaiting.status = AppointmentStatus.CANCELADA
-                    appointment_awaiting.cancelled_at = datetime.utcnow()
-                    appointment_awaiting.cancelled_reason = "Cancelada via confirmação de lembrete"
+                    # Não cancela automaticamente - encaminha para secretária
                     appointment_awaiting.awaiting_confirmation = False
                     db.commit()
-                    logger.info(f"❌ Consulta {appointment_awaiting.id} cancelada via confirmação de lembrete")
-                    return "Entendido! Sua consulta foi cancelada. Quando precisar, é só chamar! 😊"
+                    logger.info(f"⚠️ Resposta negativa para consulta {appointment_awaiting.id} - encaminhando para secretária")
+                    return "Entendido! Nossa secretária vai entrar em contato para verificar sua consulta. Se for urgente, ligue: (51) 99954-6355"
 
                 # Se intent == "unclear", continua processamento normal
                 logger.info(f"❓ Resposta não clara para confirmação de lembrete: {message}")
+
+            # 2.2 Interceptar qualquer menção a remarcar/cancelar - encaminha para secretária
+            normalized_msg = message.strip().lower()
+            reschedule_keywords = ["remarcar", "cancelar", "cancelamento", "remarcação", "remarcacao", "desmarcar", "quero cancelar", "quero remarcar"]
+            if any(keyword in normalized_msg for keyword in reschedule_keywords):
+                logger.info(f"📞 Keyword remarcar/cancelar detectada para {phone} - encaminhando para secretária")
+                response = "Para remarcar ou cancelar sua consulta, nossa secretária vai entrar em contato com você. Se for urgente, ligue: (51) 99954-6355"
+                self._record_interaction(context, message, response, db)
+                return response
 
             # 3. Decidir se deve encerrar contexto por resposta negativa
             if self._should_end_context(context, message):
@@ -2360,6 +2285,15 @@ Responda EXCLUSIVAMENTE com um JSON válido no formato:
                 context.flow_data = {}
                 flag_modified(context, "flow_data")
             flow_data = context.flow_data
+
+            # 4.1 Detectar pergunta sobre status de receita (apenas sem fluxo ativo)
+            if not flow_data.get("menu_choice") and not flow_data.get("awaiting_prescription_details"):
+                prescription_status_keywords = ["pronta", "ficou pronta", "está pronta", "ja saiu", "já saiu", "saiu a receita", "novidade", "previsão", "quando fica"]
+                if "receita" in normalized_msg and any(keyword in normalized_msg for keyword in prescription_status_keywords):
+                    logger.info(f"💊 Pergunta sobre status de receita detectada para {phone}")
+                    response = "Vou verificar com a Dra. Rose sobre sua receita e te retorno assim que tiver novidades!"
+                    self._record_interaction(context, message, response, db)
+                    return response
 
             # Verificar resposta à mensagem de erro quando não encontra consultas
             if flow_data.get("awaiting_no_appointments_response"):
@@ -2427,22 +2361,17 @@ Responda EXCLUSIVAMENTE com um JSON válido no formato:
 
             if menu_choice:
                 logger.info(f"🧭 Menu option '{menu_choice}' selecionada para {phone}")
+
+                # Remarcar/Cancelar: simplificado - encaminha para secretária
+                if menu_choice == "reschedule":
+                    logger.info(f"📞 Remarcar/Cancelar para {phone} - encaminhando para secretária")
+                    response = "Para remarcar ou cancelar sua consulta, nossa secretária vai entrar em contato com você. Se for urgente, ligue: (51) 99954-6355"
+                    self._record_interaction(context, message, response, db)
+                    return response
+
                 if not context.flow_data:
                     context.flow_data = {}
                 flow_ref = context.flow_data
-                if menu_choice == "reschedule":
-                    lower_msg = message.lower()
-                    if "cancel" in lower_msg and "remarc" not in lower_msg:
-                        flow_ref["cancel_intent"] = "cancel"
-                    elif "remarc" in lower_msg:
-                        flow_ref["cancel_intent"] = "reschedule"
-                    else:
-                        flow_ref["cancel_intent"] = "cancel"
-                    flow_ref.pop("pending_appointments_map", None)
-                    flow_ref.pop("awaiting_cancel_choice", None)
-                    flow_ref.pop("awaiting_cancel_reason", None)
-                    flow_ref.pop("selected_appointment", None)
-                    flag_modified(context, "flow_data")
                 self._start_identity_collection(context, menu_choice)
                 prompt = self._build_name_prompt(menu_choice)
                 self._record_interaction(context, message, prompt, db, flow_modified=True)
@@ -2946,43 +2875,15 @@ Responda EXCLUSIVAMENTE com um JSON válido no formato:
                     logger.info(f"❌ Usuário {phone} recusou o horário sugerido")
                     if not context.flow_data:
                         context.flow_data = {}
-                    alternatives_already_offered = context.flow_data.get("alternatives_offered", False)
-
-                    if not alternatives_already_offered:
-                        logger.info("🔁 Oferecendo alternativas automaticamente")
-                        # Encerrar confirmação atual e apresentar alternativas
-                        context.flow_data["pending_confirmation"] = False
-                        context.flow_data["alternatives_offered"] = True
-                        db.commit()
-
-                        alternatives_message = self._handle_find_alternative_slots({}, db, phone)
-
-                        context.messages.append({
-                            "role": "user",
-                            "content": message,
-                            "timestamp": datetime.utcnow().isoformat()
-                        })
-                        context.messages.append({
-                            "role": "assistant",
-                            "content": alternatives_message,
-                            "timestamp": datetime.utcnow().isoformat()
-                        })
-                        context.last_activity = datetime.utcnow()
-                        db.commit()
-
-                        return alternatives_message
-
-                    logger.info("🗓️ Alternativas já oferecidas - solicitando nova disponibilidade")
+                    # Usuário rejeitou - pedir data preferida diretamente
+                    logger.info("🗓️ Usuário rejeitou horário - solicitando data preferida")
                     context.flow_data["pending_confirmation"] = False
                     context.flow_data["awaiting_custom_date"] = True
-                    # Limpar alternativas anteriores para evitar reapresentação
-                    context.flow_data.pop("alternative_slots", None)
                     db.commit()
 
                     response = (
-                        "Tudo bem! Qual dia fica melhor para você? "
-                        "Você pode me informar o dia no formato DD/MM/AAAA ou dizer, por exemplo, "
-                        "\"quinta-feira à tarde\"."
+                        "Tudo bem! Qual dia fica melhor para você?\n\n"
+                        "Me envie a data no formato DD/MM/AAAA (ex: 05/02/2026)"
                     )
 
                     context.messages.append({
@@ -3025,7 +2926,11 @@ Responda EXCLUSIVAMENTE com um JSON válido no formato:
                 model="claude-sonnet-4-20250514",
                 max_tokens=2000,
                 temperature=0.3,
-                system=self.system_prompt,
+                system=[{
+                    "type": "text",
+                    "text": self.system_prompt,
+                    "cache_control": {"type": "ephemeral"}
+                }],
                 messages=claude_messages,  # ✅ HISTÓRICO COMPLETO!
                 tools=self.tools
             )
@@ -3106,7 +3011,11 @@ Responda EXCLUSIVAMENTE com um JSON válido no formato:
                                                 model="claude-sonnet-4-20250514",
                                                 max_tokens=2000,
                                                 temperature=0.3,
-                                                system=self.system_prompt,
+                                                system=[{
+                                                    "type": "text",
+                                                    "text": self.system_prompt,
+                                                    "cache_control": {"type": "ephemeral"}
+                                                }],
                                                 messages=claude_messages + [
                                                     {"role": "assistant", "content": current_response.content},
                                                     {
@@ -3165,13 +3074,17 @@ Responda EXCLUSIVAMENTE com um JSON válido no formato:
                                         tool_result += f"\n\n[ERRO: Faltam informações para enviar notificação: {', '.join(missing)}]"
                             
                             logger.info(f"🔧 Iteration {iteration}: Tool {content.name} result: {tool_result[:200] if len(tool_result) > 200 else tool_result}")
-                            
+
                             # Fazer follow-up com o resultado
                             current_response = self.client.messages.create(
                                 model="claude-sonnet-4-20250514",
                                 max_tokens=2000,
                                 temperature=0.3,
-                                system=self.system_prompt,
+                                system=[{
+                                    "type": "text",
+                                    "text": self.system_prompt,
+                                    "cache_control": {"type": "ephemeral"}
+                                }],
                                 messages=claude_messages + [
                                     {"role": "assistant", "content": current_response.content},
                                     {
@@ -3208,12 +3121,12 @@ Responda EXCLUSIVAMENTE com um JSON válido no formato:
                                     tem_palavras_chave = any(palavra in content_text for palavra in palavras_chave)
                                     
                                     if not tem_palavras_chave:
-                                        # Adicionar resumo completo + pergunta de confirmação
-                                        resposta_completa = tool_result + "\n\nPosso confirmar o agendamento?"
+                                        # Adicionar resumo completo + pergunta de confirmação + opção de outro dia
+                                        resposta_completa = tool_result + "\n\nPosso confirmar o agendamento?\n\n_Se esse horário não funciona, me envie o dia que prefere (ex: 05/02/2026)_"
                                     else:
                                         # Já tem palavras-chave, apenas adicionar pergunta se não tiver
                                         if "confirmar" not in content_text.lower():
-                                            resposta_completa = tool_result + "\n\nPosso confirmar o agendamento?"
+                                            resposta_completa = tool_result + "\n\nPosso confirmar o agendamento?\n\n_Se esse horário não funciona, me envie o dia que prefere (ex: 05/02/2026)_"
                                         else:
                                             resposta_completa = tool_result
                                 else:
@@ -3543,8 +3456,6 @@ Responda EXCLUSIVAMENTE com um JSON válido no formato:
                 return self._handle_cancel_appointment(tool_input, db)
             elif tool_name == "find_next_available_slot":
                 return self._handle_find_next_available_slot(tool_input, db, phone)
-            elif tool_name == "find_alternative_slots":
-                return self._handle_find_alternative_slots(tool_input, db, phone)
             elif tool_name == "request_human_assistance":
                 return self._handle_request_human_assistance(tool_input, db, phone)
             elif tool_name == "block_requisition_request":
@@ -3864,7 +3775,8 @@ Responda EXCLUSIVAMENTE com um JSON válido no formato:
             response += f"💳 Convênio: {convenio_nome}\n"
             response += f"📅 Data: {format_date_br(found_date)} ({dia_nome_completo})\n"
             response += f"⏰ Horário: {horario_str}\n"
-            response += "\nPosso confirmar o agendamento?"
+            response += "\nPosso confirmar o agendamento?\n\n"
+            response += "_Se esse horário não funciona, me envie o dia que prefere (ex: 05/02/2026)_"
             
             return response
             
@@ -5134,7 +5046,8 @@ Responda EXCLUSIVAMENTE com um JSON válido no formato:
                 convenio_nome = convenio_data.get('nome', convenio)
                 msg += f"💳 Convênio: {convenio_nome}\n"
 
-            msg += "\nPosso confirmar o agendamento?"
+            msg += "\nPosso confirmar o agendamento?\n\n"
+            msg += "_Se esse horário não funciona, me envie o dia que prefere (ex: 05/02/2026)_"
             return msg
             
         except Exception as e:

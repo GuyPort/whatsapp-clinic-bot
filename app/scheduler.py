@@ -34,21 +34,8 @@ async def check_inactive_contexts():
             
             for context in inactive_contexts:
                 logger.info(f"🕒 Encerrando contexto inativo para {context.phone}")
-                
-                # Enviar mensagem de encerramento
-                message = (
-                    "Olá! Como você ficou um tempo sem responder, "
-                    "vou encerrar essa sessão. 😊\n\n"
-                    "Quando quiser conversar novamente, é só me chamar!"
-                )
-                
-                try:
-                    await whatsapp_service.send_message(context.phone, message)
-                    logger.info(f"📤 Mensagem de encerramento enviada para {context.phone}")
-                except Exception as e:
-                    logger.error(f"❌ Erro ao enviar mensagem para {context.phone}: {str(e)}")
-                
-                # Deletar contexto
+
+                # Deletar contexto silenciosamente (sem enviar mensagem)
                 db.delete(context)
                 db.commit()
                 logger.info(f"✅ Contexto encerrado e deletado para {context.phone}")
