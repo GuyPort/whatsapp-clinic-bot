@@ -217,7 +217,7 @@ class WhatsAppService:
 
     MESSAGE_BUFFER_KEY = "whatsapp:message_buffer:{phone}"
     LAST_MESSAGE_TIME_KEY = "whatsapp:last_message_time:{phone}"
-    MESSAGE_DEBOUNCE_SECONDS = 7  # Tempo de espera para agrupar mensagens
+    MESSAGE_DEBOUNCE_SECONDS = 10  # Tempo de espera para agrupar mensagens
 
     def add_message_to_buffer(self, phone: str, message: str, message_id: str = None) -> bool:
         """

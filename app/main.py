@@ -4456,7 +4456,7 @@ async def test_chat_page():
             const sendBtn = document.getElementById('sendBtn');
 
             // Debounce configuration (simula produção)
-            const DEBOUNCE_SECONDS = 7;
+            const DEBOUNCE_SECONDS = 10;
             let messageBuffer = [];
             let debounceTimer = null;
             let countdownInterval = null;
