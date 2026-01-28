@@ -2,6 +2,10 @@
 Configurações simples sem Pydantic para evitar problemas de cache.
 """
 import os
+from dotenv import load_dotenv
+
+# Carregar variaveis do arquivo .env
+load_dotenv()
 
 # Configurações carregadas diretamente das variáveis de ambiente
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")

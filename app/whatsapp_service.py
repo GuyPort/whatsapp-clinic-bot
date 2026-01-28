@@ -198,11 +198,11 @@ class WhatsAppService:
         """
         Marca uma mensagem como lida.
         Nota: Wasender pode não suportar esta funcionalidade.
-        
+
         Args:
             phone: Número do telefone
             message_id: ID da mensagem
-            
+
         Returns:
             True se marcado com sucesso
         """
@@ -210,6 +210,187 @@ class WhatsAppService:
         # marcar mensagens como lidas
         logger.info(f"Marcando mensagem {message_id} como lida para {phone}")
         return True
+
+    # =========================================================================
+    # MESSAGE BUFFER - Sistema de debounce para agrupar mensagens
+    # =========================================================================
+
+    MESSAGE_BUFFER_KEY = "whatsapp:message_buffer:{phone}"
+    LAST_MESSAGE_TIME_KEY = "whatsapp:last_message_time:{phone}"
+    MESSAGE_DEBOUNCE_SECONDS = 7  # Tempo de espera para agrupar mensagens
+
+    def add_message_to_buffer(self, phone: str, message: str, message_id: str = None) -> bool:
+        """
+        Adiciona uma mensagem ao buffer temporário.
+        Atualiza o timestamp da última mensagem recebida.
+
+        Args:
+            phone: Número do telefone
+            message: Texto da mensagem
+            message_id: ID da mensagem (opcional)
+
+        Returns:
+            True se adicionado com sucesso
+        """
+        if not self.redis_client:
+            logger.warning("Redis indisponivel - buffer de mensagens desativado")
+            return False
+
+        try:
+            import time
+            import json
+
+            buffer_key = self.MESSAGE_BUFFER_KEY.format(phone=phone)
+            time_key = self.LAST_MESSAGE_TIME_KEY.format(phone=phone)
+
+            # Criar objeto da mensagem com timestamp
+            msg_data = json.dumps({
+                "text": message,
+                "message_id": message_id,
+                "timestamp": time.time()
+            })
+
+            # Adicionar mensagem ao buffer (lista Redis)
+            self.redis_client.rpush(buffer_key, msg_data)
+
+            # Definir TTL no buffer (expira após 5 minutos se não processado)
+            self.redis_client.expire(buffer_key, 300)
+
+            # Atualizar timestamp da última mensagem
+            self.redis_client.set(time_key, str(time.time()), ex=300)
+
+            # Contar mensagens no buffer
+            count = self.redis_client.llen(buffer_key)
+            logger.info(f"[BUFFER] Mensagem adicionada para {phone} (total: {count})")
+
+            return True
+
+        except Exception as e:
+            logger.error(f"[BUFFER] Erro ao adicionar mensagem: {str(e)}")
+            return False
+
+    def get_buffered_messages(self, phone: str) -> list:
+        """
+        Retorna todas as mensagens do buffer e limpa o buffer.
+
+        Args:
+            phone: Número do telefone
+
+        Returns:
+            Lista de mensagens concatenadas ou lista vazia
+        """
+        if not self.redis_client:
+            return []
+
+        try:
+            import json
+
+            buffer_key = self.MESSAGE_BUFFER_KEY.format(phone=phone)
+
+            # Obter todas as mensagens
+            raw_messages = self.redis_client.lrange(buffer_key, 0, -1)
+
+            if not raw_messages:
+                return []
+
+            # Limpar o buffer
+            self.redis_client.delete(buffer_key)
+
+            # Decodificar mensagens
+            messages = []
+            for raw in raw_messages:
+                try:
+                    data = json.loads(raw.decode('utf-8') if isinstance(raw, bytes) else raw)
+                    messages.append(data)
+                except Exception:
+                    # Se falhar ao decodificar, usar como string
+                    messages.append({"text": raw.decode('utf-8') if isinstance(raw, bytes) else str(raw)})
+
+            logger.info(f"[BUFFER] {len(messages)} mensagens recuperadas para {phone}")
+            return messages
+
+        except Exception as e:
+            logger.error(f"[BUFFER] Erro ao obter mensagens: {str(e)}")
+            return []
+
+    def get_concatenated_message(self, phone: str) -> str:
+        """
+        Retorna todas as mensagens do buffer concatenadas em uma única string.
+
+        Args:
+            phone: Número do telefone
+
+        Returns:
+            Mensagens concatenadas ou string vazia
+        """
+        messages = self.get_buffered_messages(phone)
+        if not messages:
+            return ""
+
+        # Extrair apenas o texto de cada mensagem
+        texts = [msg.get("text", "") for msg in messages if msg.get("text")]
+
+        # Concatenar com quebra de linha
+        concatenated = "\n".join(texts)
+
+        logger.info(f"[BUFFER] Mensagens concatenadas para {phone}: {concatenated[:100]}...")
+        return concatenated
+
+    def should_process_now(self, phone: str) -> bool:
+        """
+        Verifica se já passou tempo suficiente desde a última mensagem
+        para processar o buffer.
+
+        Args:
+            phone: Número do telefone
+
+        Returns:
+            True se deve processar agora, False se deve esperar
+        """
+        if not self.redis_client:
+            return True  # Sem Redis, processa imediatamente
+
+        try:
+            import time
+
+            time_key = self.LAST_MESSAGE_TIME_KEY.format(phone=phone)
+            last_time_str = self.redis_client.get(time_key)
+
+            if not last_time_str:
+                return True  # Sem registro, pode processar
+
+            last_time = float(last_time_str.decode('utf-8') if isinstance(last_time_str, bytes) else last_time_str)
+            elapsed = time.time() - last_time
+
+            should_process = elapsed >= self.MESSAGE_DEBOUNCE_SECONDS
+
+            logger.info(f"[BUFFER] {phone} - elapsed: {elapsed:.1f}s, debounce: {self.MESSAGE_DEBOUNCE_SECONDS}s, should_process: {should_process}")
+
+            return should_process
+
+        except Exception as e:
+            logger.error(f"[BUFFER] Erro ao verificar tempo: {str(e)}")
+            return True  # Em caso de erro, processa
+
+    def has_pending_messages(self, phone: str) -> bool:
+        """
+        Verifica se há mensagens pendentes no buffer.
+
+        Args:
+            phone: Número do telefone
+
+        Returns:
+            True se há mensagens pendentes
+        """
+        if not self.redis_client:
+            return False
+
+        try:
+            buffer_key = self.MESSAGE_BUFFER_KEY.format(phone=phone)
+            count = self.redis_client.llen(buffer_key)
+            return count > 0
+        except Exception:
+            return False
 
 
 # Instância global do serviço

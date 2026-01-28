@@ -44,7 +44,7 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 def init_db():
     """Inicializa o banco de dados criando todas as tabelas"""
     Base.metadata.create_all(bind=engine)
-    print("✅ Banco de dados inicializado com sucesso!")
+    print("[OK] Banco de dados inicializado com sucesso!")
 
 
 @contextmanager

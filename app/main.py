@@ -296,14 +296,31 @@ async def whatsapp_webhook(request: Request):
         if not message_text or not phone:
             logger.warning("Mensagem sem texto ou telefone")
             return {"status": "ignored", "reason": "no text or phone"}
-        
+
         logger.info(f"Mensagem de {phone}: {message_text[:50]}...")
-        
-        # Enfileirar task no Celery
-        task = process_message_task.delay(phone, message_text, key.get('id'))
-        logger.info(f"📨 Task enfileirada: {task.id} para {phone}")
-        
-        return {"status": "processing", "task_id": task.id}
+
+        # Sistema de debounce: adicionar ao buffer e agendar task com delay
+        # Isso permite agrupar múltiplas mensagens enviadas em sequência
+        message_id = key.get('id')
+
+        # Adicionar mensagem ao buffer Redis
+        buffer_added = whatsapp_service.add_message_to_buffer(phone, message_text, message_id)
+
+        if buffer_added:
+            # Agendar task com delay de 7 segundos
+            # Se outra mensagem chegar, essa task vai verificar e ignorar se não passou o tempo
+            debounce_seconds = whatsapp_service.MESSAGE_DEBOUNCE_SECONDS
+            task = process_message_task.apply_async(
+                args=[phone, None, message_id],  # message_text=None pois vamos pegar do buffer
+                countdown=debounce_seconds
+            )
+            logger.info(f"[DEBOUNCE] Task agendada para {phone} em {debounce_seconds}s (task: {task.id})")
+            return {"status": "buffered", "task_id": task.id, "debounce_seconds": debounce_seconds}
+        else:
+            # Fallback: se Redis não disponível, processar imediatamente (comportamento antigo)
+            task = process_message_task.delay(phone, message_text, message_id)
+            logger.info(f"Task enfileirada (sem buffer): {task.id} para {phone}")
+            return {"status": "processing", "task_id": task.id}
         
     except Exception as e:
         logger.error(f"Erro no webhook: {str(e)}", exc_info=True)
@@ -368,50 +385,73 @@ def send_message_task(self, phone: str, message: str):
 
 
 @celery_app.task(bind=True, max_retries=3, default_retry_delay=60)
-def process_message_task(self, phone: str, message_text: str, message_id: str = None):
+def process_message_task(self, phone: str, message_text: str = None, message_id: str = None):
     """
     Processa mensagem em background usando Celery.
-    
+    Suporta sistema de debounce: se message_text for None, busca do buffer Redis.
+
     Args:
         phone: Número do telefone
-        message_text: Texto da mensagem
+        message_text: Texto da mensagem (None se usando buffer)
         message_id: ID da mensagem (para marcar como lida)
     """
     task_id = self.request.id
-    logger.info(f"🔄 Task {task_id} iniciada para {phone}: {message_text[:50]}...")
-    
+
+    # Normalizar telefone primeiro
+    phone = normalize_phone(phone)
+
+    # ==========================================================================
+    # SISTEMA DE DEBOUNCE: Verificar se deve processar agora
+    # ==========================================================================
+    if message_text is None:
+        # Task foi agendada com delay - verificar se deve processar
+        if not whatsapp_service.should_process_now(phone):
+            # Ainda não passou tempo suficiente - outra mensagem chegou
+            # Ignorar esta task, a próxima vai processar
+            logger.info(f"[DEBOUNCE] Task {task_id} ignorada para {phone} - aguardando mais mensagens")
+            return
+
+        # Passou o tempo de debounce - pegar mensagens concatenadas do buffer
+        message_text = whatsapp_service.get_concatenated_message(phone)
+
+        if not message_text:
+            logger.warning(f"[DEBOUNCE] Task {task_id} - Buffer vazio para {phone}")
+            return
+
+        logger.info(f"[DEBOUNCE] Task {task_id} processando {phone}: {message_text[:80]}...")
+    else:
+        # Modo antigo (fallback sem Redis) - processar diretamente
+        logger.info(f"Task {task_id} iniciada para {phone}: {message_text[:50]}...")
+
     lock = None
     lock_acquired = False
-    
+
     try:
-        # Normalizar telefone
-        phone = normalize_phone(phone)
-        
         # Garantir processamento serializado por contato
         lock = whatsapp_service.acquire_chat_lock(phone)
         if lock:
             try:
                 lock_acquired = lock.acquire(blocking=True)
             except Exception as lock_error:
-                logger.warning(f"⚠️ Não foi possível adquirir lock para {phone}: {lock_error}")
+                logger.warning(f"Nao foi possivel adquirir lock para {phone}: {lock_error}")
                 raise self.retry(exc=lock_error, countdown=2)
-            
+
             if not lock_acquired:
-                logger.warning(f"⚠️ Lock ocupado para {phone}, reagendando task")
+                logger.warning(f"Lock ocupado para {phone}, reagendando task")
                 raise self.retry(exc=Exception("chat_lock_busy"), countdown=2)
         else:
-            logger.warning(f"⚠️ Processando {phone} sem lock - Redis indisponível")
-        
+            logger.warning(f"Processando {phone} sem lock - Redis indisponivel")
+
         # Marcar como lida
         if message_id:
             _mark_message_as_read_sync(phone, message_id)
-        
+
         # Verificar comandos administrativos (/pausar)
         lowered = message_text.strip().lower()
 
         if lowered in {"/pausar", "/pause"}:
             with get_db() as db:
-                logger.info(f"⏸️ Comando /pausar recebido para {phone}")
+                logger.info(f"Comando /pausar recebido para {phone}")
                 response = ai_agent._handle_request_human_assistance({}, db, phone)
                 if response:
                     send_message_task.delay(phone, response)
@@ -420,18 +460,18 @@ def process_message_task(self, phone: str, message_text: str, message_id: str = 
         # Verificar se bot está pausado para este telefone
         with get_db() as db:
             paused_contact = db.query(PausedContact).filter_by(phone=phone).first()
-            
+
             if paused_contact:
                 if datetime.utcnow() < paused_contact.paused_until:
                     # Ainda pausado - bot ignora mensagem
-                    logger.info(f"Bot pausado para {phone} até {paused_contact.paused_until}")
+                    logger.info(f"Bot pausado para {phone} ate {paused_contact.paused_until}")
                     return
                 else:
                     # Passou 2 horas - reativar silenciosamente
                     logger.info(f"Bot reativado automaticamente para {phone}")
                     db.delete(paused_contact)
                     db.commit()
-            
+
         # Processar com IA
         response = ai_agent.process_message(message_text, phone, db)
         
@@ -4208,6 +4248,413 @@ async def domiciliares_dashboard(admin: str = Depends(verify_admin_credentials))
             "Expires": "0"
         }
     )
+
+
+# =============================================================================
+# AMBIENTE DE TESTE - Simulador de Chat WhatsApp
+# =============================================================================
+
+TEST_PHONE = "5500000000000"  # Número simulado para testes
+
+@app.get("/test/chat", response_class=HTMLResponse)
+async def test_chat_page():
+    """Página de teste com interface de chat estilo WhatsApp"""
+    return """
+    <!DOCTYPE html>
+    <html lang="pt-BR">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Teste do Bot - Simulador WhatsApp</title>
+        <style>
+            * { margin: 0; padding: 0; box-sizing: border-box; }
+            body {
+                font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+                background: #0b141a;
+                height: 100vh;
+                display: flex;
+                justify-content: center;
+                align-items: center;
+            }
+            .chat-container {
+                width: 100%;
+                max-width: 500px;
+                height: 95vh;
+                background: #0b141a;
+                display: flex;
+                flex-direction: column;
+                border-radius: 10px;
+                overflow: hidden;
+                box-shadow: 0 0 20px rgba(0,0,0,0.5);
+            }
+            .chat-header {
+                background: #202c33;
+                padding: 10px 16px;
+                display: flex;
+                align-items: center;
+                gap: 12px;
+                border-bottom: 1px solid #2a3942;
+            }
+            .avatar {
+                width: 40px;
+                height: 40px;
+                background: #00a884;
+                border-radius: 50%;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                font-size: 20px;
+            }
+            .header-info h3 {
+                color: #e9edef;
+                font-size: 16px;
+                font-weight: 500;
+            }
+            .header-info span {
+                color: #8696a0;
+                font-size: 12px;
+            }
+            .header-actions {
+                margin-left: auto;
+                display: flex;
+                gap: 8px;
+            }
+            .header-actions button {
+                background: #ea4335;
+                border: none;
+                color: white;
+                padding: 6px 12px;
+                border-radius: 4px;
+                cursor: pointer;
+                font-size: 12px;
+            }
+            .header-actions button:hover { background: #d33426; }
+            .chat-messages {
+                flex: 1;
+                overflow-y: auto;
+                padding: 20px;
+                background: #0b141a url("data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADIAAAAyCAYAAAAeP4ixAAAACXBIWXMAAAsTAAALEwEAmpwYAAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAABnSURBVHgB7dCxDQAgDAOwkv9/GRZgYKJ7Qcq8SQIAAAAAAAAAAAAAAAAAAACAt9Xd5z1JkvX+3Jckd/eZuz8fAAAAAAAAAAAAAAAAAAAAAAAAAADgny4L/RLLnhL7pgAAAABJRU5ErkJggg==");
+            }
+            .message {
+                max-width: 80%;
+                margin-bottom: 8px;
+                padding: 8px 12px;
+                border-radius: 8px;
+                font-size: 14px;
+                line-height: 1.4;
+                position: relative;
+                word-wrap: break-word;
+                white-space: pre-wrap;
+            }
+            .message.user {
+                background: #005c4b;
+                color: #e9edef;
+                margin-left: auto;
+                border-bottom-right-radius: 0;
+            }
+            .message.bot {
+                background: #202c33;
+                color: #e9edef;
+                margin-right: auto;
+                border-bottom-left-radius: 0;
+            }
+            .message .time {
+                font-size: 11px;
+                color: #8696a0;
+                text-align: right;
+                margin-top: 4px;
+            }
+            .message.bot .time { color: #8696a0; }
+            .chat-input {
+                background: #202c33;
+                padding: 10px 16px;
+                display: flex;
+                gap: 10px;
+                align-items: center;
+            }
+            .chat-input input {
+                flex: 1;
+                background: #2a3942;
+                border: none;
+                padding: 12px 16px;
+                border-radius: 8px;
+                color: #e9edef;
+                font-size: 14px;
+                outline: none;
+            }
+            .chat-input input::placeholder { color: #8696a0; }
+            .chat-input button {
+                background: #00a884;
+                border: none;
+                width: 42px;
+                height: 42px;
+                border-radius: 50%;
+                cursor: pointer;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+            }
+            .chat-input button:hover { background: #06cf9c; }
+            .chat-input button:disabled { background: #2a3942; cursor: not-allowed; }
+            .chat-input button svg { fill: #e9edef; width: 20px; height: 20px; }
+            .typing {
+                display: none;
+                color: #8696a0;
+                font-size: 12px;
+                padding: 8px 12px;
+            }
+            .typing.visible { display: block; }
+            .system-message {
+                text-align: center;
+                color: #8696a0;
+                font-size: 12px;
+                margin: 16px 0;
+                padding: 6px 12px;
+                background: #202c33;
+                border-radius: 8px;
+                display: inline-block;
+                margin-left: 50%;
+                transform: translateX(-50%);
+            }
+            .phone-display {
+                color: #8696a0;
+                font-size: 11px;
+                text-align: center;
+                padding: 4px;
+                background: #202c33;
+            }
+        </style>
+    </head>
+    <body>
+        <div class="chat-container">
+            <div class="chat-header">
+                <div class="avatar">🏥</div>
+                <div class="header-info">
+                    <h3>Bot da Clínica</h3>
+                    <span>Ambiente de Teste</span>
+                </div>
+                <div class="header-actions">
+                    <button onclick="resetChat()">Resetar Conversa</button>
+                </div>
+            </div>
+            <div class="phone-display">Telefone simulado: <strong id="phone-number">5500000000000</strong></div>
+            <div class="chat-messages" id="messages">
+                <div class="system-message">Envie mensagens para testar o bot (debounce: 7s)</div>
+            </div>
+            <div class="typing" id="typing">Bot está digitando...</div>
+            <div class="chat-input">
+                <input type="text" id="messageInput" placeholder="Digite uma mensagem..." onkeypress="if(event.key==='Enter') sendMessage()">
+                <button onclick="sendMessage()" id="sendBtn">
+                    <svg viewBox="0 0 24 24"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
+                </button>
+            </div>
+        </div>
+        <script>
+            const messagesDiv = document.getElementById('messages');
+            const input = document.getElementById('messageInput');
+            const typing = document.getElementById('typing');
+            const sendBtn = document.getElementById('sendBtn');
+
+            // Debounce configuration (simula produção)
+            const DEBOUNCE_SECONDS = 7;
+            let messageBuffer = [];
+            let debounceTimer = null;
+            let countdownInterval = null;
+            let countdownValue = 0;
+
+            function getTime() {
+                return new Date().toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
+            }
+
+            function addMessage(text, isUser) {
+                const msg = document.createElement('div');
+                msg.className = 'message ' + (isUser ? 'user' : 'bot');
+                msg.innerHTML = text + '<div class="time">' + getTime() + '</div>';
+                messagesDiv.appendChild(msg);
+                messagesDiv.scrollTop = messagesDiv.scrollHeight;
+            }
+
+            function startCountdown() {
+                countdownValue = DEBOUNCE_SECONDS;
+                updateTypingText();
+                typing.classList.add('visible');
+
+                if (countdownInterval) clearInterval(countdownInterval);
+                countdownInterval = setInterval(() => {
+                    countdownValue--;
+                    if (countdownValue > 0) {
+                        updateTypingText();
+                    }
+                }, 1000);
+            }
+
+            function updateTypingText() {
+                const bufferInfo = messageBuffer.length > 1 ? ' [' + messageBuffer.length + ' msgs]' : '';
+                typing.textContent = 'Aguardando mais mensagens... (' + countdownValue + 's)' + bufferInfo;
+            }
+
+            function stopCountdown() {
+                if (countdownInterval) {
+                    clearInterval(countdownInterval);
+                    countdownInterval = null;
+                }
+            }
+
+            function sendMessage() {
+                const text = input.value.trim();
+                if (!text) return;
+
+                // Adiciona mensagem na UI imediatamente
+                addMessage(text, true);
+                input.value = '';
+
+                // Adiciona ao buffer
+                messageBuffer.push(text);
+
+                // Reseta o timer de debounce
+                if (debounceTimer) clearTimeout(debounceTimer);
+                startCountdown();
+
+                debounceTimer = setTimeout(processBuffer, DEBOUNCE_SECONDS * 1000);
+            }
+
+            async function processBuffer() {
+                if (messageBuffer.length === 0) return;
+
+                stopCountdown();
+                input.disabled = true;
+                sendBtn.disabled = true;
+                typing.textContent = 'Bot esta digitando...';
+                typing.classList.add('visible');
+
+                // Concatena todas as mensagens do buffer
+                const concatenated = messageBuffer.join('\\n');
+                const msgCount = messageBuffer.length;
+                messageBuffer = [];
+
+                console.log('[Debounce] Processando ' + msgCount + ' mensagem(ns): ' + concatenated);
+
+                try {
+                    const response = await fetch('/test/chat', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ message: concatenated })
+                    });
+                    const data = await response.json();
+
+                    if (data.response) {
+                        addMessage(data.response, false);
+                    } else if (data.error) {
+                        addMessage('Erro: ' + data.error, false);
+                    }
+                } catch (err) {
+                    addMessage('Erro de conexao: ' + err.message, false);
+                }
+
+                typing.classList.remove('visible');
+                input.disabled = false;
+                sendBtn.disabled = false;
+                input.focus();
+            }
+
+            async function resetChat() {
+                if (!confirm('Tem certeza que deseja resetar a conversa? Todo o histórico será apagado.')) return;
+
+                try {
+                    const response = await fetch('/test/reset', { method: 'POST' });
+                    const data = await response.json();
+
+                    messagesDiv.innerHTML = '<div class="system-message">Conversa resetada - ' + getTime() + '</div>';
+                    alert(data.message || 'Conversa resetada!');
+                } catch (err) {
+                    alert('Erro ao resetar: ' + err.message);
+                }
+            }
+
+            input.focus();
+        </script>
+    </body>
+    </html>
+    """
+
+
+@app.post("/test/chat")
+async def test_chat_send(request: Request):
+    """
+    Endpoint de teste que processa mensagem e retorna resposta diretamente.
+    Simula exatamente o comportamento do bot no WhatsApp, mas sem:
+    - Celery (processamento síncrono)
+    - Evolution API (não envia para WhatsApp)
+    - Redis locks (não precisa)
+    """
+    try:
+        data = await request.json()
+        message_text = data.get("message", "").strip()
+
+        if not message_text:
+            return JSONResponse({"error": "Mensagem vazia"}, status_code=400)
+
+        phone = TEST_PHONE
+        logger.info(f"[TEST] Mensagem recebida: {message_text}")
+
+        # Verificar comandos administrativos
+        lowered = message_text.lower()
+        if lowered in {"/pausar", "/pause"}:
+            with get_db() as db:
+                response = ai_agent._handle_request_human_assistance({}, db, phone)
+                return {"response": response, "phone": phone}
+
+        # Verificar se bot está pausado
+        with get_db() as db:
+            paused = db.query(PausedContact).filter_by(phone=phone).first()
+            if paused:
+                from datetime import datetime
+                if datetime.utcnow() < paused.paused_until:
+                    return {"response": "[Bot pausado para este número - aguardando atendimento humano]", "phone": phone}
+                else:
+                    db.delete(paused)
+                    db.commit()
+
+            # Processar com IA (mesmo código do webhook real)
+            response = ai_agent.process_message(message_text, phone, db)
+
+            logger.info(f"[TEST] Resposta gerada: {response[:100] if response else 'None'}...")
+
+            return {"response": response or "[Sem resposta]", "phone": phone}
+
+    except Exception as e:
+        logger.error(f"[TEST] Erro: {str(e)}", exc_info=True)
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.post("/test/reset")
+async def test_chat_reset():
+    """Reseta o contexto de conversa do número de teste"""
+    try:
+        with get_db() as db:
+            # Deletar contexto de conversa
+            context = db.query(ConversationContext).filter_by(phone=TEST_PHONE).first()
+            if context:
+                db.delete(context)
+
+            # Deletar pausa se existir
+            paused = db.query(PausedContact).filter_by(phone=TEST_PHONE).first()
+            if paused:
+                db.delete(paused)
+
+            # Deletar agendamentos de teste
+            appointments = db.query(Appointment).filter_by(patient_phone=TEST_PHONE).all()
+            for apt in appointments:
+                db.delete(apt)
+
+            db.commit()
+
+        logger.info(f"[TEST] Contexto resetado para {TEST_PHONE}")
+        return {"message": "Conversa resetada com sucesso!", "phone": TEST_PHONE}
+
+    except Exception as e:
+        logger.error(f"[TEST] Erro ao resetar: {str(e)}", exc_info=True)
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 
 if __name__ == "__main__":
