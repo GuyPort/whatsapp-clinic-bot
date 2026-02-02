@@ -3122,11 +3122,11 @@ Responda EXCLUSIVAMENTE com um JSON válido no formato:
                                     
                                     if not tem_palavras_chave:
                                         # Adicionar resumo completo + pergunta de confirmação + opção de outro dia
-                                        resposta_completa = tool_result + "\n\nPosso confirmar o agendamento?\n\n_Se esse horário não funciona, me envie o dia que prefere (ex: 05/02/2026)_"
+                                        resposta_completa = tool_result + "\n\nPosso confirmar o agendamento?\n\n_Se esse horário não funciona, me envie o dia que prefere (ex: 05/08/2026)_"
                                     else:
                                         # Já tem palavras-chave, apenas adicionar pergunta se não tiver
                                         if "confirmar" not in content_text.lower():
-                                            resposta_completa = tool_result + "\n\nPosso confirmar o agendamento?\n\n_Se esse horário não funciona, me envie o dia que prefere (ex: 05/02/2026)_"
+                                            resposta_completa = tool_result + "\n\nPosso confirmar o agendamento?\n\n_Se esse horário não funciona, me envie o dia que prefere (ex: 05/08/2026)_"
                                         else:
                                             resposta_completa = tool_result
                                 else:
@@ -3776,7 +3776,7 @@ Responda EXCLUSIVAMENTE com um JSON válido no formato:
             response += f"📅 Data: {format_date_br(found_date)} ({dia_nome_completo})\n"
             response += f"⏰ Horário: {horario_str}\n"
             response += "\nPosso confirmar o agendamento?\n\n"
-            response += "_Se esse horário não funciona, me envie o dia que prefere (ex: 05/02/2026)_"
+            response += "_Se esse horário não funciona, me envie o dia que prefere (ex: 05/08/2026)_"
             
             return response
             
@@ -5047,7 +5047,7 @@ Responda EXCLUSIVAMENTE com um JSON válido no formato:
                 msg += f"💳 Convênio: {convenio_nome}\n"
 
             msg += "\nPosso confirmar o agendamento?\n\n"
-            msg += "_Se esse horário não funciona, me envie o dia que prefere (ex: 05/02/2026)_"
+            msg += "_Se esse horário não funciona, me envie o dia que prefere (ex: 05/08/2026)_"
             return msg
             
         except Exception as e:
