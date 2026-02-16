@@ -2428,7 +2428,7 @@ Responda EXCLUSIVAMENTE com um JSON válido no formato:
                     flag_modified(context, "flow_data")
                     first_name = captured_name.split()[0]
                     response = (
-                        f"Muito obrigada, {first_name}! Agora, me informe sua data de nascimento no formato DD/MM/AAAA."                   
+                        f"Muito obrigada, {first_name}! Agora, me informe sua data de nascimento (Ex: 07/08/2003)."
                     )
                     logger.info(f"👤 Nome registrado para {phone}: {captured_name}")
                     self._record_interaction(context, message, response, db, flow_modified=True)
@@ -2506,7 +2506,7 @@ Responda EXCLUSIVAMENTE com um JSON válido no formato:
                     return next_prompt
                 else:
                     error_msg = birth_extraction.get("erro_data") or "Não consegui identificar sua data de nascimento."
-                    response = f"{error_msg.strip().rstrip('.')}. Pode enviar no formato DD/MM/AAAA?"
+                    response = f"{error_msg.strip().rstrip('.')}. Pode enviar no formato DD/MM/AAAA? (Ex: 07/08/2003)"
                     logger.warning(f"⚠️ Data de nascimento inválida informada por {phone}: {message}")
                     self._record_interaction(context, message, response, db)
                     return response
