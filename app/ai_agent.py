@@ -278,8 +278,9 @@ REGRAS CRÍTICAS PARA find_next_available_slot:
 3. NUNCA peça confirmação sem mostrar o resumo primeiro
 4. NUNCA assuma que o usuário já viu o resumo - sempre mostre novamente
 5. O resumo retornado pela tool contém TODAS as informações necessárias - use-o completamente
+6. O horário retornado por find_next_available_slot é SEMPRE o mais próximo disponível. Se o paciente pedir um horário "mais cedo", "antes" ou "anterior", NÃO busque novamente. Explique que esse já é o primeiro horário disponível e que, se for urgente, pode ligar para a clínica.
 
-6. CONFIRMAÇÃO OU DATA ALTERNATIVA
+7. CONFIRMAÇÃO OU DATA ALTERNATIVA
    - Se usuário confirmar → use 'create_appointment' com os dados coletados
    - Se usuário enviar data no formato DD/MM/AAAA (ex: 05/02/2026) → use 'validate_date_and_show_slots' para mostrar horários disponíveis nesse dia
    - Se usuário mencionar dia da semana (ex: "quinta", "sexta") → interprete e use 'validate_date_and_show_slots' com a próxima ocorrência desse dia após 48h
@@ -3769,12 +3770,20 @@ Responda EXCLUSIVAMENTE com um JSON válido no formato:
                 logger.error(f"❌ Erro ao formatar horário: {str(e)}")
                 horario_str = "N/A"
 
+            # Buscar telefone da doutora para casos urgentes
+            info_adicionais = self.clinic_info.get('informacoes_adicionais', {})
+            telefone_doutora = info_adicionais.get('telefone_doutora', '')
+
             response = f"📋 *Resumo da consulta:*\n"
             response += f"👤 Nome: {patient_name}\n"
             response += f"🏥 Tipo: {tipo_nome}\n"
             response += f"💳 Convênio: {convenio_nome}\n"
             response += f"📅 Data: {format_date_br(found_date)} ({dia_nome_completo})\n"
             response += f"⏰ Horário: {horario_str}\n"
+            response += "\n⚠️ *Este é o primeiro horário disponível.*\n"
+            if telefone_doutora:
+                telefone_formatado = f"+{telefone_doutora[:2]} ({telefone_doutora[2:4]}) {telefone_doutora[4:9]}-{telefone_doutora[9:]}"
+                response += f"Se for urgente, ligue para: {telefone_formatado}\n"
             response += "\nPosso confirmar o agendamento?\n\n"
             response += "_Se esse horário não funciona, me envie o dia que prefere (ex: 05/08/2026)_"
             
