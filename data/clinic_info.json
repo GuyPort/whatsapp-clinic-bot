@@ -72,6 +72,13 @@
     }
   },
   
+  "links": {
+    "agendar": "https://clinica.example.com/agendar",
+    "consultas": "https://clinica.example.com/consultas",
+    "receita": "https://clinica.example.com/receita",
+    "visita": "https://clinica.example.com/visita"
+  },
+
   "informacoes_adicionais": {
     "formas_pagamento": ["Dinheiro", "Pix"],
     "politica_cancelamento": "Cancelamentos devem ser feitos com no mínimo 24 horas de antecedência",
