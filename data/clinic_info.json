@@ -3,20 +3,20 @@
   "endereco": "Rua Dr. Edmundo Lauffer, 299 - Bom Pastor - Igrejinha/RS - CEP 95650-000 - Sala 405",
   
   "horario_funcionamento": {
-    "segunda": "14:00-16:00",
-    "terca": "14:00-18:00",
+    "segunda": "FECHADO",
+    "terca": "14:00-19:00",
     "quarta": "14:00-17:00",
-    "quinta": "14:00-16:00",
+    "quinta": "FECHADO",
     "sexta": "14:00-19:00",
     "sabado": "FECHADO",
     "domingo": "FECHADO"
   },
 
   "horario_atendimento": {
-    "segunda": "14:00-19:00",
-    "terca": "14:00-18:00",
-    "quarta": "14:00-19:00",
-    "quinta": "14:00-19:00",
+    "segunda": "FECHADO",
+    "terca": "14:00-19:00",
+    "quarta": "14:00-17:00",
+    "quinta": "FECHADO",
     "sexta": "14:00-19:00",
     "sabado": "FECHADO",
     "domingo": "FECHADO"
