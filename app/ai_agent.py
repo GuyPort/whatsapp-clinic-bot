@@ -535,17 +535,7 @@ Após responder qualquer dúvida ou enviar um link:
         try:
             logger.info(f"🛑 Tool request_human_assistance chamada para {phone}")
 
-            # Verificar se a clínica está aberta
-            is_open, message = self._is_clinic_open_now()
-
-            if not is_open:
-                logger.info(f"🏥 Clínica fechada para {phone}: {message}")
-                return ("No momento nossa secretária não está disponível (clínica fechada). "
-                        "Mas eu posso te ajudar com informações sobre a clínica!\n\n"
-                        "🚨 Em caso de emergência, ligue para a Dra. Rose: (51) 99954-6355\n\n"
-                        "Como posso te auxiliar?")
-
-            # Clínica aberta - transferir
+            # Pausar sempre, independente do horário
             existing_context = db.query(ConversationContext).filter_by(phone=phone).first()
             if existing_context:
                 db.delete(existing_context)
@@ -564,9 +554,19 @@ Após responder qualquer dúvida ou enviar um link:
             db.commit()
 
             logger.info(f"⏸️ Bot pausado para {phone} até {paused_until}")
-            return ("Claro! Vou encaminhar você para um de nossos atendentes agora! "
-                    "Para acelerar o processo, já pode nos contar como podemos te ajudar!\n\n"
-                    "Em caso de emergência, ligue para a Dra. Rose: (51) 99954-6355")
+
+            # Mensagem diferente conforme horário
+            is_open, message = self._is_clinic_open_now()
+
+            if is_open:
+                return ("Vou transferir você para nossa secretária Beatriz agora! "
+                        "Para agilizar, já pode nos contar como podemos te ajudar.\n\n"
+                        "Em caso de emergência, ligue para a Dra. Rose: (51) 99954-6355")
+            else:
+                return ("Vou transferir você para nossa secretária Beatriz. "
+                        "Neste momento estamos fora do horário de atendimento, "
+                        "mas ela vai te responder assim que possível.\n\n"
+                        "Em caso de emergência, ligue para a Dra. Rose: (51) 99954-6355")
 
         except Exception as e:
             logger.error(f"Erro ao pausar bot para humano: {str(e)}")
