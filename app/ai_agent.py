@@ -131,7 +131,8 @@ Quando o paciente quiser realizar uma AÇÃO (marcar consulta, remarcar, cancela
 
 [LINKS PARA AÇÕES]
 
-  • Marcar consulta: __LINK_AGENDAR__
+  • Marcar consulta (incluindo domiciliar): __LINK_AGENDAR__
+  • Solicitar receita: __LINK_RECEITA__
 
 [COMO RESPONDER]
 
@@ -144,10 +145,9 @@ DÚVIDAS (responda direto):
 - Se não souber responder algo específico, diga educadamente que vai verificar com a doutora
 
 AÇÕES:
-- Se o paciente quiser marcar consulta (incluindo domiciliar) → mande o link de agendamento com uma frase curta tipo:
-  "Para marcar sua consulta, acesse este link e preencha os dados: [link]"
+- Se o paciente quiser marcar consulta (incluindo domiciliar) → mande o link de agendamento
+- Se quiser solicitar receita → mande o link de receita
 - Se quiser remarcar ou cancelar → use a tool request_human_assistance para transferir para a secretária
-- Se quiser receita → use a tool request_human_assistance para transferir para a secretária
 - NÃO colete dados do paciente (nome, nascimento, etc.)
 - NÃO faça agendamento por aqui
 - Seja breve e direto
@@ -183,10 +183,18 @@ Após responder qualquer dúvida ou enviar um link:
         """Retorna o system prompt com links personalizados pro telefone do paciente."""
         links = self.clinic_info.get('links', {})
         base_agendar = links.get('agendar', '')
+        base_receita = links.get('receita', '')
+
         sep = '&' if '?' in base_agendar else '?'
         link_agendar = f"{base_agendar}{sep}tel={phone}" if phone else base_agendar
+        sep = '&' if '?' in base_receita else '?'
+        link_receita = f"{base_receita}{sep}tel={phone}" if phone else base_receita
 
-        return self.system_prompt.replace('__LINK_AGENDAR__', link_agendar)
+        return (
+            self.system_prompt
+            .replace('__LINK_AGENDAR__', link_agendar)
+            .replace('__LINK_RECEITA__', link_receita)
+        )
 
     def _define_tools(self) -> List[Dict]:
         """Define as tools disponíveis para o Claude"""

@@ -73,7 +73,8 @@
   },
   
   "links": {
-    "agendar": "https://web-production-39323.up.railway.app/agendar/"
+    "agendar": "https://web-production-39323.up.railway.app/agendar/",
+    "receita": "https://web-production-39323.up.railway.app/receita/"
   },
 
   "informacoes_adicionais": {
