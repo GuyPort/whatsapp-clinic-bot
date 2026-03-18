@@ -101,12 +101,6 @@ class ClaudeToolAgent:
         cadeira_rodas = "Sim" if info_adicionais.get('cadeira_rodas_disponivel', False) else "Não"
         politica_cancelamento = info_adicionais.get('politica_cancelamento', 'Não informado')
 
-        # Links para as páginas web (serão configurados depois)
-        link_agendar = self.clinic_info.get('links', {}).get('agendar', 'https://clinica.example.com/agendar')
-        link_consultas = self.clinic_info.get('links', {}).get('consultas', 'https://clinica.example.com/consultas')
-        link_receita = self.clinic_info.get('links', {}).get('receita', 'https://clinica.example.com/receita')
-        link_visita = self.clinic_info.get('links', {}).get('visita', 'https://clinica.example.com/visita')
-
         return f"""Você é a assistente virtual do {clinic_name}. Você tira dúvidas sobre a clínica de forma natural e conversacional.
 
 [INFORMAÇÕES DA CLÍNICA]
@@ -137,10 +131,10 @@ Quando o paciente quiser realizar uma AÇÃO (marcar consulta, remarcar, cancela
 
 [LINKS PARA AÇÕES]
 
-  • Marcar consulta: {link_agendar}
-  • Remarcar ou cancelar consulta: {link_consultas}
-  • Solicitar receita: {link_receita}
-  • Solicitar visita domiciliar: {link_visita}
+  • Marcar consulta: __LINK_AGENDAR__
+  • Remarcar ou cancelar consulta: __LINK_CONSULTAS__
+  • Solicitar receita: __LINK_RECEITA__
+  • Solicitar visita domiciliar: __LINK_VISITA__
 
 [COMO RESPONDER]
 
@@ -188,6 +182,31 @@ Após responder qualquer dúvida ou enviar um link:
 - Seja natural, acolhedora e conversacional
 - Adapte-se ao estilo do usuário (formal ou informal)
 - Mantenha respostas concisas e úteis"""
+
+    def _get_system_prompt_for(self, phone: str) -> str:
+        """Retorna o system prompt com links personalizados pro telefone do paciente."""
+        links = self.clinic_info.get('links', {})
+        base_agendar = links.get('agendar', '')
+        base_consultas = links.get('consultas', '')
+        base_receita = links.get('receita', '')
+        base_visita = links.get('visita', '')
+
+        sep = '&' if '?' in base_agendar else '?'
+        link_agendar = f"{base_agendar}{sep}tel={phone}" if phone else base_agendar
+        sep = '&' if '?' in base_consultas else '?'
+        link_consultas = f"{base_consultas}{sep}tel={phone}" if phone else base_consultas
+        sep = '&' if '?' in base_receita else '?'
+        link_receita = f"{base_receita}{sep}tel={phone}" if phone else base_receita
+        sep = '&' if '?' in base_visita else '?'
+        link_visita = f"{base_visita}{sep}tel={phone}" if phone else base_visita
+
+        return (
+            self.system_prompt
+            .replace('__LINK_AGENDAR__', link_agendar)
+            .replace('__LINK_CONSULTAS__', link_consultas)
+            .replace('__LINK_RECEITA__', link_receita)
+            .replace('__LINK_VISITA__', link_visita)
+        )
 
     def _define_tools(self) -> List[Dict]:
         """Define as tools disponíveis para o Claude"""
@@ -384,13 +403,14 @@ Após responder qualquer dúvida ou enviar um link:
 
             # 6. Chamar Claude
             logger.info(f"🤖 Enviando {len(claude_messages)} mensagens para Claude")
+            system_prompt = self._get_system_prompt_for(normalized_phone)
             response = self.client.messages.create(
                 model="claude-sonnet-4-20250514",
                 max_tokens=1500,
                 temperature=0.3,
                 system=[{
                     "type": "text",
-                    "text": self.system_prompt,
+                    "text": system_prompt,
                     "cache_control": {"type": "ephemeral"}
                 }],
                 messages=claude_messages,
