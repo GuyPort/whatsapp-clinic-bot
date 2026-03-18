@@ -73,10 +73,10 @@
   },
   
   "links": {
-    "agendar": "https://clinica.example.com/agendar",
-    "consultas": "https://clinica.example.com/consultas",
-    "receita": "https://clinica.example.com/receita",
-    "visita": "https://clinica.example.com/visita"
+    "agendar": "https://web-production-39323.up.railway.app/agendar/",
+    "consultas": "https://web-production-39323.up.railway.app/consultas/",
+    "receita": "https://web-production-39323.up.railway.app/receita/",
+    "visita": "https://web-production-39323.up.railway.app/visita/"
   },
 
   "informacoes_adicionais": {
