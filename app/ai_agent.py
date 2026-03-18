@@ -132,9 +132,6 @@ Quando o paciente quiser realizar uma AÇÃO (marcar consulta, remarcar, cancela
 [LINKS PARA AÇÕES]
 
   • Marcar consulta: __LINK_AGENDAR__
-  • Remarcar ou cancelar consulta: __LINK_CONSULTAS__
-  • Solicitar receita: __LINK_RECEITA__
-  • Solicitar visita domiciliar: __LINK_VISITA__
 
 [COMO RESPONDER]
 
@@ -146,15 +143,14 @@ DÚVIDAS (responda direto):
 - VALORES: Só informe valores quando o usuário PERGUNTAR especificamente
 - Se não souber responder algo específico, diga educadamente que vai verificar com a doutora
 
-AÇÕES (mande o link):
-- Se o paciente quiser marcar consulta → mande o link de agendamento com uma frase curta tipo:
+AÇÕES:
+- Se o paciente quiser marcar consulta (incluindo domiciliar) → mande o link de agendamento com uma frase curta tipo:
   "Para marcar sua consulta, acesse este link e preencha os dados: [link]"
-- Se quiser remarcar ou cancelar → mande o link de consultas
-- Se quiser receita → mande o link de receita
-- Se quiser visita domiciliar → mande o link de visita domiciliar
+- Se quiser remarcar ou cancelar → use a tool request_human_assistance para transferir para a secretária
+- Se quiser receita → use a tool request_human_assistance para transferir para a secretária
 - NÃO colete dados do paciente (nome, nascimento, etc.)
 - NÃO faça agendamento por aqui
-- Seja breve e direto ao enviar links
+- Seja breve e direto
 
 FALAR COM HUMANO:
 - Se o paciente pedir para falar com a secretária ou atendente → use a tool request_human_assistance
@@ -187,26 +183,10 @@ Após responder qualquer dúvida ou enviar um link:
         """Retorna o system prompt com links personalizados pro telefone do paciente."""
         links = self.clinic_info.get('links', {})
         base_agendar = links.get('agendar', '')
-        base_consultas = links.get('consultas', '')
-        base_receita = links.get('receita', '')
-        base_visita = links.get('visita', '')
-
         sep = '&' if '?' in base_agendar else '?'
         link_agendar = f"{base_agendar}{sep}tel={phone}" if phone else base_agendar
-        sep = '&' if '?' in base_consultas else '?'
-        link_consultas = f"{base_consultas}{sep}tel={phone}" if phone else base_consultas
-        sep = '&' if '?' in base_receita else '?'
-        link_receita = f"{base_receita}{sep}tel={phone}" if phone else base_receita
-        sep = '&' if '?' in base_visita else '?'
-        link_visita = f"{base_visita}{sep}tel={phone}" if phone else base_visita
 
-        return (
-            self.system_prompt
-            .replace('__LINK_AGENDAR__', link_agendar)
-            .replace('__LINK_CONSULTAS__', link_consultas)
-            .replace('__LINK_RECEITA__', link_receita)
-            .replace('__LINK_VISITA__', link_visita)
-        )
+        return self.system_prompt.replace('__LINK_AGENDAR__', link_agendar)
 
     def _define_tools(self) -> List[Dict]:
         """Define as tools disponíveis para o Claude"""
