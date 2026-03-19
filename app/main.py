@@ -245,12 +245,23 @@ async def whatsapp_webhook(request: Request):
         
         # Extrair texto da mensagem (antes de tratar fromMe)
         message_text = None
+        media_type = None  # Tipo de mídia não suportada
         if 'conversation' in message_data:
             message_text = message_data['conversation']
         elif 'extendedTextMessage' in message_data:
             message_text = message_data['extendedTextMessage'].get('text', '')
         elif 'imageMessage' in message_data:
             message_text = message_data['imageMessage'].get('caption', '')
+            if not message_text:
+                media_type = 'imagem'
+        elif 'audioMessage' in message_data:
+            media_type = 'áudio'
+        elif 'videoMessage' in message_data:
+            media_type = 'vídeo'
+        elif 'documentMessage' in message_data:
+            media_type = 'documento'
+        elif 'stickerMessage' in message_data:
+            media_type = 'figurinha'
         
         is_from_me = key.get('fromMe', False)
         
@@ -293,9 +304,23 @@ async def whatsapp_webhook(request: Request):
         else:
             phone = phone.replace('@s.whatsapp.net', '').replace('@c.us', '')
         
-        if not message_text or not phone:
-            logger.warning("Mensagem sem texto ou telefone")
-            return {"status": "ignored", "reason": "no text or phone"}
+        if not phone:
+            logger.warning("Mensagem sem telefone")
+            return {"status": "ignored", "reason": "no phone"}
+
+        if not message_text:
+            if media_type:
+                # Responde que não processa mídia
+                logger.info(f"Mídia recebida de {phone}: {media_type}")
+                resposta = (
+                    f"Desculpe, não consigo receber {media_type}. "
+                    f"Se puder me explicar por texto, consigo te ajudar!\n\n"
+                    f"Caso prefira, posso te transferir para nossa secretária Beatriz."
+                )
+                send_message_task.delay(phone, resposta)
+                return {"status": "processed", "action": "media_response", "media_type": media_type}
+            logger.warning("Mensagem sem texto")
+            return {"status": "ignored", "reason": "no text"}
 
         logger.info(f"Mensagem de {phone}: {message_text[:50]}...")
 
