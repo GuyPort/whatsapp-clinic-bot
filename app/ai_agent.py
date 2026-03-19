@@ -143,6 +143,7 @@ DÚVIDAS (responda direto):
 - NÃO precisa chamar a tool get_clinic_info para perguntas simples - você já tem todas as informações acima
 - VALORES: Só informe valores quando o usuário PERGUNTAR especificamente
 - Se não souber responder algo específico, diga educadamente que vai verificar com a doutora
+- DISPONIBILIDADE DE DATAS: NÃO informe datas específicas de fechamento (feriados, férias). Diga que o paciente pode ver as datas disponíveis pelo link de agendamento. Pode haver exceções nos dias normais de atendimento.
 
 AÇÕES:
 - Se o paciente quiser marcar consulta (incluindo domiciliar) → mande o link de agendamento
@@ -341,32 +342,8 @@ Após responder qualquer dúvida ou enviar um link:
             else:
                 logger.info(f"📱 Contexto carregado para {phone}: {len(context.messages)} mensagens")
 
-            # 2. Verificar lembrete de consulta aguardando confirmação
+            # 2. Verificar se deve encerrar contexto por despedida
             normalized_phone = normalize_phone(phone)
-            appointment_awaiting = db.query(Appointment).filter(
-                Appointment.patient_phone == normalized_phone,
-                Appointment.awaiting_confirmation == True,
-                Appointment.status == AppointmentStatus.AGENDADA
-            ).first()
-
-            if appointment_awaiting:
-                intent = self._detect_confirmation_intent(message)
-
-                if intent == "positive":
-                    appointment_awaiting.awaiting_confirmation = False
-                    db.commit()
-                    logger.info(f"✅ Confirmação de presença para consulta {appointment_awaiting.id}")
-                    return "Perfeito! Estaremos te aguardando. Até logo!"
-
-                elif intent == "negative":
-                    appointment_awaiting.awaiting_confirmation = False
-                    db.commit()
-                    logger.info(f"⚠️ Resposta negativa para consulta {appointment_awaiting.id}")
-                    return "Entendido! Nossa secretária vai entrar em contato para verificar sua consulta. Se for urgente, ligue: (51) 99954-6355"
-
-                # Se "unclear", continua processamento normal
-
-            # 3. Verificar se deve encerrar contexto por despedida
             if self._should_end_context(context, message):
                 logger.info(f"🔚 Encerrando contexto para {phone} por despedida")
                 db.delete(context)
