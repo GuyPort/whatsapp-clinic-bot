@@ -43,7 +43,9 @@
     },
     "domiciliar": {
       "nome": "Atendimento Domiciliar ao Paciente Idoso",
-      "valor_particular": 500
+      "valor_particular": 500,
+      "aceita_convenio": false,
+      "observacao": "Apenas particular, não aceita convênio"
     }
   },
 
@@ -74,6 +76,7 @@
     "politica_cancelamento": "Cancelamentos devem ser feitos com no mínimo 24 horas de antecedência",
     "secretaria": "Beatriz",
     "cadeira_rodas_disponivel": true,
-    "telefone_doutora": "555199546355"
+    "telefone_doutora": "555199546355",
+    "valor_receita": "R$ 25,00"
   }
 }

@@ -86,8 +86,12 @@ class ClaudeToolAgent:
         for tipo, dados in tipos_consulta.items():
             nome = dados.get('nome', tipo)
             valor = dados.get('valor_particular', dados.get('valor', 0))
-            valores_str += f"  • {nome}: R$ {valor} (valor particular)\n"
-        valores_str += "  • Convênios (CABERGS/IPE): valor conforme categoria do plano\n"
+            obs = dados.get('observacao', '')
+            if obs:
+                valores_str += f"  • {nome}: R$ {valor} ({obs})\n"
+            else:
+                valores_str += f"  • {nome}: R$ {valor} (valor particular)\n"
+        valores_str += "  • Convênios (CABERGS/IPE): valor conforme categoria do plano (exceto domiciliar)\n"
 
         convenios_list = []
         for cod, dados in convenios.items():
@@ -100,6 +104,7 @@ class ClaudeToolAgent:
 
         cadeira_rodas = "Sim" if info_adicionais.get('cadeira_rodas_disponivel', False) else "Não"
         politica_cancelamento = info_adicionais.get('politica_cancelamento', 'Não informado')
+        valor_receita = info_adicionais.get('valor_receita', 'Não informado')
 
         return f"""Você é a assistente virtual do {clinic_name}. Você tira dúvidas sobre a clínica de forma natural e conversacional.
 
@@ -123,6 +128,7 @@ class ClaudeToolAgent:
   • Cadeira de rodas disponível: {cadeira_rodas}
   • Política de cancelamento: {politica_cancelamento}
   • Secretária: {secretaria}
+  • Valor da receita (solicitação avulsa): {valor_receita}
 
 [OBJETIVO]
 
