@@ -82,9 +82,10 @@ class IntentClassifier:
         )
         try:
             result = self.client.messages.create(
-                model="claude-sonnet-4-20250514",
+                model="claude-sonnet-4-6",
                 max_tokens=10,
                 temperature=0.0,
+                thinking={"type": "disabled"},
                 messages=[{"role": "user", "content": prompt}]
             )
             if result.content:
@@ -105,9 +106,10 @@ class IntentClassifier:
         )
         try:
             result = self.client.messages.create(
-                model="claude-sonnet-4-20250514",
+                model="claude-sonnet-4-6",
                 max_tokens=5,
                 temperature=0.0,
+                thinking={"type": "disabled"},
                 messages=[{"role": "user", "content": prompt}]
             )
             if result.content:

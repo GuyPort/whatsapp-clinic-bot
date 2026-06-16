@@ -378,9 +378,11 @@ Após responder qualquer dúvida ou enviar um link:
             logger.info(f"🤖 Enviando {len(claude_messages)} mensagens para Claude")
             system_prompt = self._get_system_prompt_for(normalized_phone)
             response = self.client.messages.create(
-                model="claude-sonnet-4-20250514",
+                model="claude-sonnet-4-6",
                 max_tokens=1500,
                 temperature=0.3,
+                thinking={"type": "disabled"},
+                extra_body={"output_config": {"effort": "low"}},
                 system=[{
                     "type": "text",
                     "text": system_prompt,
@@ -442,9 +444,11 @@ Após responder qualquer dúvida ou enviar um link:
 
                     # Continuar conversa com resultado da tool
                     current_response = self.client.messages.create(
-                        model="claude-sonnet-4-20250514",
+                        model="claude-sonnet-4-6",
                         max_tokens=1500,
                         temperature=0.3,
+                        thinking={"type": "disabled"},
+                        extra_body={"output_config": {"effort": "low"}},
                         system=[{
                             "type": "text",
                             "text": self.system_prompt,
