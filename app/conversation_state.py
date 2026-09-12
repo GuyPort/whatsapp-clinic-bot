@@ -538,6 +538,43 @@ class ProcessingAttempt:
 
 
 @dataclass(frozen=True, repr=False)
+class OutboundReservation:
+    """Authority for one local enqueue attempt identity, not evidence of enqueue."""
+
+    reservation_id: str
+    batch_id: str
+    processing_id: str
+    operation_id: str
+    coordination_epoch: str
+    generation: str
+    claim_token: str
+    result_fingerprint: str
+
+    def __post_init__(self):
+        try:
+            for name in self.__dataclass_fields__:
+                value = getattr(self, name)
+                if not isinstance(value, str):
+                    raise ValueError
+                if name == "result_fingerprint":
+                    if len(value) != 64 or any(c not in "0123456789abcdef" for c in value):
+                        raise ValueError
+                elif str(UUID(value)) != value:
+                    raise ValueError
+        except (ValueError, TypeError, AttributeError):
+            raise ConversationMutationPending(FailureReason.MUTATION_PENDING) from None
+
+    def to_payload(self) -> dict[str, str]:
+        return {name: getattr(self, name) for name in self.__dataclass_fields__}
+
+    @classmethod
+    def from_payload(cls, payload):
+        if not isinstance(payload, dict) or set(payload) != set(cls.__dataclass_fields__):
+            raise ConversationMutationPending(FailureReason.MUTATION_PENDING)
+        return cls(**payload)
+
+
+@dataclass(frozen=True, repr=False)
 class BatchClaim:
     outcome: ClaimOutcome
     attempt: ProcessingAttempt | None = None
@@ -659,13 +696,16 @@ class ConversationStore(Protocol):
                            result: AgentResult, now: datetime, lease: ContactLease) -> None: ...
 
     def complete_batch(self, command: ProcessingCommand, attempt: ProcessingAttempt,
-                       now: datetime, lease: ContactLease) -> None: ...
+                       now: datetime, lease: ContactLease, *, reservation: OutboundReservation | None = None) -> None: ...
 
     def prepare_fixed_response(self, command: ProcessingCommand, attempt: ProcessingAttempt,
                                now: datetime, lease: ContactLease) -> None: ...
 
+    def reserve_outbound_enqueue(self, command: ProcessingCommand, attempt: ProcessingAttempt,
+                                 now: datetime, lease: ContactLease) -> OutboundReservation: ...
+
     def record_outbound_attempt(self, command: ProcessingCommand, attempt: ProcessingAttempt,
-                                now: datetime, lease: ContactLease) -> None: ...
+                                now: datetime, lease: ContactLease, *, reservation: OutboundReservation | None = None) -> None: ...
 
     def exhaust_batch(self, command: ProcessingCommand, now: datetime, lease: ContactLease) -> None: ...
 

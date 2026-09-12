@@ -212,14 +212,15 @@ def test_batch_complete_atomic_failure_retries_without_losing_sql_receipt(transi
         store.stage_agent_result(command, claim.attempt, result, clock.now(), lease)
         coordinator.apply_agent_result(db, PHONE, result, claim.attempt.processing_id,
                                        claim.attempt.operation_id, clock.now(), lease)
-        store.record_outbound_attempt(command, claim.attempt, clock.now(), lease)
+        reservation = store.reserve_outbound_enqueue(command, claim.attempt, clock.now(), lease)
+        store.record_outbound_attempt(command, claim.attempt, clock.now(), lease, reservation=reservation)
         snapshot = store.snapshot()
         store.fail_next_atomic("complete_batch")
         with pytest.raises(ConversationStateUnavailable):
-            store.complete_batch(command, claim.attempt, clock.now(), lease)
+            store.complete_batch(command, claim.attempt, clock.now(), lease, reservation=reservation)
         assert store.snapshot() == snapshot
         assert store.inspect_mutation(PHONE, claim.attempt.operation_id, lease).phase is domain.MutationPhase.COMMITTED
-        store.complete_batch(command, claim.attempt, clock.now(), lease)
+        store.complete_batch(command, claim.attempt, clock.now(), lease, reservation=reservation)
         assert batch_details(store, lease, "dedupe")[0].body["disposition"] == "PROCESSED"
 
 
@@ -584,8 +585,9 @@ def test_terminal_processing_batch_cannot_authorize_another_operation_or_result(
         first_result = domain.AgentResult("first result", [], None, {"version": 1}, domain.AgentIntent.SAVE_CONTEXT)
         store.stage_agent_result(first_command, first, first_result, clock.now(), lease)
         coordinator.apply_agent_result(db, PHONE, first_result, first.processing_id, first.operation_id, clock.now(), lease)
-        store.record_outbound_attempt(first_command, first, clock.now(), lease)
-        store.complete_batch(first_command, first, clock.now(), lease)
+        reservation = store.reserve_outbound_enqueue(first_command, first, clock.now(), lease)
+        store.record_outbound_attempt(first_command, first, clock.now(), lease, reservation=reservation)
+        store.complete_batch(first_command, first, clock.now(), lease, reservation=reservation)
         second_command = batch_command(store, lease, append_batch(store, lease, message_id="second-id"))
         second = store.claim_or_resume_batch(second_command, clock.now(), lease).attempt
         second_result = replace(first_result, text="second result", flow_data={"version": 2})
@@ -613,8 +615,9 @@ def test_terminal_processing_batch_validates_result_fingerprint_before_short_cir
         result = domain.AgentResult("winner", [], None, {}, domain.AgentIntent.SAVE_CONTEXT)
         store.stage_agent_result(command, attempt, result, clock.now(), lease)
         coordinator.apply_agent_result(db, PHONE, result, attempt.processing_id, attempt.operation_id, clock.now(), lease)
-        store.record_outbound_attempt(command, attempt, clock.now(), lease)
-        store.complete_batch(command, attempt, clock.now(), lease)
+        reservation = store.reserve_outbound_enqueue(command, attempt, clock.now(), lease)
+        store.record_outbound_attempt(command, attempt, clock.now(), lease, reservation=reservation)
+        store.complete_batch(command, attempt, clock.now(), lease, reservation=reservation)
         db.events.clear()
         with pytest.raises(domain.ConversationMutationPending):
             store.validate_agent_application(PHONE, attempt.processing_id, attempt.operation_id,
@@ -692,8 +695,9 @@ def test_batch_cleanup_retains_committed_proof_until_its_staged_batch_completes(
         assert store.dispatch(command, lease).phase is domain.DispatchPhase.STAGED
         assert any(item.entry.id == command.batch_id for item in batch_details(store, lease, "staging"))
         # Task 7 owns its actual local enqueue attempt before calling completion.
-        store.record_outbound_attempt(command, resumed.attempt, clock.now(), lease)
-        store.complete_batch(command, resumed.attempt, clock.now(), lease)
+        reservation = store.reserve_outbound_enqueue(command, resumed.attempt, clock.now(), lease)
+        store.record_outbound_attempt(command, resumed.attempt, clock.now(), lease, reservation=reservation)
+        store.complete_batch(command, resumed.attempt, clock.now(), lease, reservation=reservation)
         store.cleanup(lease, store.read_anchor(lease))
         assert store.inspect_mutation(PHONE, attempt.operation_id, lease) is None
 

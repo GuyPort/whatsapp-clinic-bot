@@ -164,9 +164,10 @@ def process_batch(command: ProcessingCommand, runtime: ConversationRuntime) -> P
                     runtime.store.prepare_fixed_response(command, attempt, runtime.clock.now(), lease)
                     outbound = OutboundEnvelope(command.phone, result.text, OutboundKind.NORMAL,
                         command.generation, attempt.processing_id, attempt.operation_id)
+                reservation = runtime.store.reserve_outbound_enqueue(command, attempt, runtime.clock.now(), lease)
                 _enqueue(outbound, runtime, lease)
-                runtime.store.record_outbound_attempt(command, attempt, runtime.clock.now(), lease)
-                runtime.store.complete_batch(command, attempt, runtime.clock.now(), lease)
+                runtime.store.record_outbound_attempt(command, attempt, runtime.clock.now(), lease, reservation=reservation)
+                runtime.store.complete_batch(command, attempt, runtime.clock.now(), lease, reservation=reservation)
             return ProcessingOutcome.PROCESSED
     except ConversationMutationAborted:
         return ProcessingOutcome.TERMINAL

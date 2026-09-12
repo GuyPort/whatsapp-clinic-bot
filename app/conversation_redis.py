@@ -31,7 +31,7 @@ from app.conversation_state import (
     BufferDispatch, DispatchPhase, ProcessingAttempt, ProcessingPhase, ConversationDomainError,
     BatchClaim, ClaimOutcome, AgentResult, AgentIntent, EnqueueResult, RecoveryPage,
     EnsureConsumerResult, BrokerUnavailable,
-    ResultApplication, fixed_reply_result,
+    ResultApplication, OutboundReservation, fixed_reply_result,
 )
 from app.utils import normalize_phone
 
@@ -835,6 +835,39 @@ class RedisConversationStore:
         return (attempt.generation == anchor.last_generation
                 and attempt.phase in (MutationPhase.PREPARED, MutationPhase.COMMITTING, MutationPhase.COMMITTED))
 
+    def _outbound_reservation(self, anchor, details, batch):
+        """Validate persisted authority before exempting a result from its deadline."""
+        processing = self._find(details, "processing", batch.body["processing_id"])
+        if processing is None or processing.body.get("outbound_reservation") is None:
+            return None
+        if not self._compatible_generation(anchor, details, batch):
+            return None  # An invalidated reservation must not fence the next cycle.
+        reservation = OutboundReservation.from_payload(processing.body["outbound_reservation"])
+        staging = self._find(details, "staging", batch.entry.id)
+        mutation = self._find(details, "mutation", self._attempt_id(batch.body["operation_id"]))
+        committed = mutation is not None and self._attempt_load(mutation).phase is MutationPhase.COMMITTED
+        no_sql = (processing.body.get("application") == ResultApplication.NO_SQL.value
+                  and mutation is None and anchor.cycle is ConversationCycle.OPEN)
+        if (batch.body["phase"] != "STAGED" or processing.body["phase"] != "APPLYING"
+                or staging is None or staging.body.get("result") is None
+                or reservation.batch_id != batch.entry.id
+                or reservation.processing_id != processing.entry.id
+                or reservation.operation_id != batch.body["operation_id"]
+                or reservation.operation_id != processing.body["operation_id"]
+                or reservation.coordination_epoch != batch.body["epoch"]
+                or reservation.coordination_epoch != processing.body["epoch"]
+                or reservation.coordination_epoch != str(self.config.coordination_epoch)
+                or reservation.generation != str(anchor.last_generation)
+                or processing.body["generation"] != batch.body["generation"]
+                or reservation.claim_token != processing.body["claim_token"]
+                or reservation.result_fingerprint != processing.body.get("result_fingerprint")
+                or reservation.result_fingerprint != hashlib.sha256(_json(staging.body["result"]).encode()).hexdigest()
+                or not (committed or no_sql)):
+            raise ConversationMutationPending(FailureReason.MUTATION_PENDING)
+        if no_sql and self._result_load(staging.body["result"]) != self._fixed_staging_result(staging):
+            raise ConversationMutationPending(FailureReason.MUTATION_PENDING)
+        return reservation
+
     def finalize_ingress_once(self, phone, envelope, message_id, generation, lease, *,
                               disposition=IngressDisposition.BUFFERED, paused_until=None):
         """One logical append and its receipt, batch, index and manifest share a CAS.
@@ -929,7 +962,8 @@ class RedisConversationStore:
             deadline = dispatch.processing_deadline if dispatch.phase is DispatchPhase.STAGED else dispatch.dispatch_deadline
             mutation = self._find(details, "mutation", self._attempt_id(dispatch.operation_id)) if dispatch.operation_id else None
             committed = mutation is not None and self._attempt_load(mutation).phase is MutationPhase.COMMITTED
-            if not self._compatible_generation(anchor, details, batch) or (self._now() >= deadline and not committed):
+            durable = committed or self._outbound_reservation(anchor, details, batch) is not None
+            if not self._compatible_generation(anchor, details, batch) or (self._now() >= deadline and not durable):
                 self.exhaust_batch(command, self._now(), lease)
                 return EnsureConsumerResult.NOT_DUE
             if dispatch.phase is DispatchPhase.STAGED:
@@ -942,8 +976,8 @@ class RedisConversationStore:
             reserved = self._changed(batch, body={**batch.body, "enqueue_attempt_id": str(uuid4()),
                 "next_enqueue_at": (started + timedelta(seconds=self.config.enqueue_visibility_seconds)).timestamp()})
             self._transition(lease, anchor, self._replace_details(details, reserved), operation="reserve_enqueue",
-                             deadline=None if committed else deadline,
-                             deadline_transition=None if committed else self._terminal_plan(anchor, details, batch))
+                             deadline=None if durable else deadline,
+                             deadline_transition=None if durable else self._terminal_plan(anchor, details, batch))
         lease.assert_owned()
         try:
             outcome = broker.enqueue_processing(command)
@@ -964,8 +998,8 @@ class RedisConversationStore:
                 body["scheduled_at"] = None
                 body["next_enqueue_at"] = (self._now() + timedelta(seconds=self.config.enqueue_backoff_seconds)).timestamp()
             self._transition(lease, anchor, self._replace_details(details, self._changed(current, body=body)),
-                             operation="finish_enqueue", deadline=None if committed else deadline,
-                             deadline_transition=None if committed else self._terminal_plan(anchor, details, current))
+                             operation="finish_enqueue", deadline=None if durable else deadline,
+                             deadline_transition=None if durable else self._terminal_plan(anchor, details, current))
         if outcome is EnqueueResult.DEFINITIVE_FAILURE:
             raise BrokerUnavailable(FailureReason.BROKER_UNAVAILABLE)
         return EnsureConsumerResult.SCHEDULED
@@ -1004,9 +1038,10 @@ class RedisConversationStore:
             if mutation and self._attempt_load(mutation).phase is MutationPhase.COMMITTING:
                 self.quarantine_ambiguous_commit(command.phone, operation, lease, now)
                 raise ConversationMutationPending(FailureReason.MUTATION_PENDING)
-            if mutation and self._attempt_load(mutation).phase is MutationPhase.COMMITTED:
-                # The processing deadline only exhausts pre-commit work. Preserve
-                # result/index until the caller crosses its local enqueue boundary.
+            if ((mutation and self._attempt_load(mutation).phase is MutationPhase.COMMITTED
+                    or self._outbound_reservation(anchor, details, batch) is not None)
+                    and self._compatible_generation(anchor, details, batch)):
+                # Commit or enqueue reservation keeps a compatible result recoverable.
                 return
             deadline = dispatch.processing_deadline if dispatch.phase is DispatchPhase.STAGED else dispatch.dispatch_deadline
             if self._now() < deadline and self._compatible_generation(anchor, details, batch):
@@ -1022,8 +1057,9 @@ class RedisConversationStore:
             self.assert_mutation_available(lease, now, operation_id=dispatch.operation_id)
             mutation = self._find(details, "mutation", self._attempt_id(dispatch.operation_id)) if dispatch.operation_id else None
             committed = mutation is not None and self._attempt_load(mutation).phase is MutationPhase.COMMITTED
+            durable = committed or self._outbound_reservation(anchor, details, batch) is not None
             deadline = dispatch.processing_deadline if dispatch.phase is DispatchPhase.STAGED else dispatch.dispatch_deadline
-            if not self._compatible_generation(anchor, details, batch) or (self._now() >= deadline and not committed):
+            if not self._compatible_generation(anchor, details, batch) or (self._now() >= deadline and not durable):
                 self.exhaust_batch(command, now, lease)
                 return BatchClaim(ClaimOutcome.TERMINAL)
             if dispatch.phase is not DispatchPhase.STAGED:
@@ -1064,8 +1100,8 @@ class RedisConversationStore:
                         "owner_token_hash": hashlib.sha256(lease.owner_token.encode()).hexdigest()})
                     outcome = ClaimOutcome.RESULT_READY if phase is ProcessingPhase.RESULT_READY else ClaimOutcome.APPLYING
                 self._transition(lease, anchor, self._replace_details(details, processing), operation="claim_or_resume_batch",
-                                 deadline=None if committed else deadline,
-                                 deadline_transition=None if committed else self._terminal_plan(anchor, details, batch))
+                                 deadline=None if durable else deadline,
+                                 deadline_transition=None if durable else self._terminal_plan(anchor, details, batch))
             envelopes = tuple(InboundEnvelope(e["kind"], e["content"], datetime.fromisoformat(e["received_at"]),
                                               e["generation"], e["message_id"]) for e in staging.body["envelopes"])
             result = staging.body.get("result")
@@ -1144,7 +1180,8 @@ class RedisConversationStore:
                 or staging.body.get("result") != self._result_data(result)):
             raise ConversationMutationPending(FailureReason.MUTATION_PENDING)
         committed = mutation and self._attempt_load(mutation).phase is MutationPhase.COMMITTED
-        if self._now() >= self._date(processing.body["processing_deadline"]) and not committed:
+        durable = committed or self._outbound_reservation(anchor, details, batch) is not None
+        if self._now() >= self._date(processing.body["processing_deadline"]) and not durable:
             self.exhaust_batch(self._command_for(phone, batch), self._now(), lease)
             raise ConversationMutationPending(FailureReason.MUTATION_PENDING)
 
@@ -1178,10 +1215,13 @@ class RedisConversationStore:
             if (anchor.cycle is not ConversationCycle.OPEN or result != self._fixed_staging_result(staging)
                     or self._find(details, "mutation", self._attempt_id(attempt.operation_id)) is not None):
                 raise ConversationMutationPending(FailureReason.MUTATION_PENDING)
+            if self._outbound_reservation(anchor, details, batch) is not None:
+                return
             updated = self._changed(processing, body={**processing.body, "phase": "APPLYING",
                 "application": ResultApplication.NO_SQL.value})
             self._transition(lease, anchor, self._replace_details(details, updated), operation="prepare_fixed_response",
-                deadline=attempt.processing_deadline, deadline_transition=self._terminal_plan(anchor, details, batch))
+                deadline=self._date(processing.body["processing_deadline"]),
+                deadline_transition=self._terminal_plan(anchor, details, batch))
 
     def _applied_result(self, command, attempt, lease):
         anchor, details, batch, processing, staging, result = self._owned_result(command, attempt, lease)
@@ -1194,26 +1234,64 @@ class RedisConversationStore:
             raise ConversationMutationPending(FailureReason.MUTATION_PENDING)
         return anchor, details, batch, processing, committed
 
-    def record_outbound_attempt(self, command, attempt, now, lease):
+    def reserve_outbound_enqueue(self, command, attempt, now, lease):
+        """Win deadline/generation authorization atomically before touching the broker."""
+        with self._lock:
+            anchor, details, batch, processing, committed = self._applied_result(command, attempt, lease)
+            existing = self._outbound_reservation(anchor, details, batch)
+            if existing is not None:
+                return existing
+            reservation = OutboundReservation(str(uuid4()), command.batch_id, attempt.processing_id,
+                attempt.operation_id, command.coordination_epoch, str(anchor.last_generation),
+                attempt.claim_token, processing.body["result_fingerprint"])
+            updated = self._changed(processing, body={**processing.body,
+                "outbound_reservation": reservation.to_payload()})
+            self._transition(lease, anchor, self._replace_details(details, updated), operation="reserve_outbound_enqueue",
+                deadline=None if committed else self._date(processing.body["processing_deadline"]),
+                deadline_transition=None if committed else self._terminal_plan(anchor, details, batch))
+            return reservation
+
+    def _require_outbound_reservation(self, anchor, details, batch, reservation):
+        if (not isinstance(reservation, OutboundReservation)
+                or self._outbound_reservation(anchor, details, batch) != reservation):
+            raise ConversationMutationPending(FailureReason.MUTATION_PENDING)
+
+    def record_outbound_attempt(self, command, attempt, now, lease, *, reservation=None):
         """Caller has crossed the local broker boundary; this is not delivery proof."""
         with self._lock:
             anchor, details, batch, processing, committed = self._applied_result(command, attempt, lease)
-            updated = self._changed(processing, body={**processing.body, "outbound_attempted": True})
-            self._transition(lease, anchor, self._replace_details(details, updated), operation="record_outbound_attempt",
-                deadline=None if committed else attempt.processing_deadline,
-                deadline_transition=None if committed else self._terminal_plan(anchor, details, batch))
+            self._require_outbound_reservation(anchor, details, batch, reservation)
+            updated = self._changed(processing, body={**processing.body, "outbound_attempted": True,
+                "outbound_attempt_id": reservation.reservation_id})
+            self._transition(lease, anchor, self._replace_details(details, updated), operation="record_outbound_attempt")
 
-    def complete_batch(self, command, attempt, now, lease):
+    def complete_batch(self, command, attempt, now, lease, *, reservation=None):
         with self._lock:
             anchor, details, batch, _ = self._batch_snapshot(command, lease)
             if batch.body["phase"] in ("EXHAUSTED", "PROCESSED"):
+                processing = self._find(details, "processing", batch.body["processing_id"])
+                if (batch.body["phase"] != "PROCESSED" or processing is None
+                        or not isinstance(reservation, OutboundReservation)
+                        or processing.body.get("outbound_reservation") != reservation.to_payload()
+                        or reservation.batch_id != command.batch_id or reservation.batch_id != attempt.batch_id
+                        or reservation.processing_id != attempt.processing_id
+                        or reservation.operation_id != attempt.operation_id
+                        or reservation.coordination_epoch != attempt.coordination_epoch
+                        or reservation.claim_token != attempt.claim_token
+                        or reservation.result_fingerprint != processing.body.get("result_fingerprint")
+                        or reservation.generation != str(anchor.last_generation)
+                        or attempt.generation != command.generation
+                        or processing.body["owner_token_hash"] != hashlib.sha256(lease.owner_token.encode()).hexdigest()
+                        or processing.body.get("outbound_attempted") is not True
+                        or processing.body.get("outbound_attempt_id") != reservation.reservation_id):
+                    raise ConversationMutationPending(FailureReason.MUTATION_PENDING)
                 return
             anchor, details, batch, processing, committed = self._applied_result(command, attempt, lease)
-            if processing.body.get("outbound_attempted") is not True:
+            self._require_outbound_reservation(anchor, details, batch, reservation)
+            if (processing.body.get("outbound_attempted") is not True
+                    or processing.body.get("outbound_attempt_id") != reservation.reservation_id):
                 raise ConversationMutationPending(FailureReason.MUTATION_PENDING)
-            self._transition(lease, anchor, operation="complete_batch", **self._terminal_plan(anchor, details, batch, processed=True),
-                deadline=None if committed else attempt.processing_deadline,
-                deadline_transition=None if committed else self._terminal_plan(anchor, details, batch))
+            self._transition(lease, anchor, operation="complete_batch", **self._terminal_plan(anchor, details, batch, processed=True))
 
     @staticmethod
     def _recovery_cursor(state):

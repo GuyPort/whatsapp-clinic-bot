@@ -58,7 +58,14 @@ def test_process_batch_commits_winning_result_before_enqueue_and_done(task_api, 
     def at_enqueue(outbound):
         assert outbound.kind is kind
         assert rt.sessions[-1].events.count("commit_returned") == 1
-        assert not any(item.body.get("disposition") == "PROCESSED" for item in rt.store.read_details(rt.active_lease))
+        details = rt.store.read_details(rt.active_lease)
+        assert not any(item.body.get("disposition") == "PROCESSED" for item in details)
+        processing = next(item for item in details if item.entry.kind == "processing")
+        reservation = domain.OutboundReservation.from_payload(processing.body["outbound_reservation"])
+        assert reservation.generation == outbound.generation
+        assert reservation.processing_id == outbound.processing_id
+        assert reservation.operation_id == outbound.operation_id
+        assert processing.body.get("outbound_attempted") is not True
     original = rt.coordinator.apply_agent_result
     def apply(*args, **kwargs):
         rt.active_lease = args[-1]
@@ -144,6 +151,43 @@ def test_process_batch_outbound_before_complete_failure_reuses_commit_without_sq
     assert len(rt.outbound_broker.calls) == 2
 
 
+def test_process_batch_invalidated_committed_work_is_failed_without_blocking_next_conversation(task_api, processing_runtime):
+    rt = processing_runtime
+    command = rt.buffer("old synthetic input")
+    rt.outbound_broker.next_result = domain.EnqueueResult.DEFINITIVE_FAILURE
+    with pytest.raises(task_api.RetryRequested) as caught:
+        task_api.process_batch(command, rt)
+    retry = caught.value.command
+    old_outbound = rt.outbound_broker.calls[-1]
+    old_commits = sum(s.events.count("commit_entered") for s in rt.sessions)
+    pause = rt.pause()
+    rt.outbound_broker.next_result = domain.EnqueueResult.CONFIRMED
+    assert task_api.process_batch(retry, rt) is task_api.ProcessingOutcome.TERMINAL
+    with rt.store.contact_lease(PHONE) as lease:
+        anchor = rt.store.read_anchor(lease)
+        details = rt.store.read_details(lease)
+        assert str(anchor.last_generation) == pause.generation
+        assert anchor.cycle is domain.ConversationCycle.PAUSED
+        old_batch = next(item for item in details if item.entry.kind == "batch" and item.entry.id == command.batch_id)
+        old_processing = next(item for item in details if item.entry.kind == "processing" and item.entry.id == retry.processing_id)
+        receipt = next(item for item in details if item.entry.kind == "dedupe" and item.body.get("batch_id") == command.batch_id)
+        assert old_batch.terminal and old_batch.body["phase"] == "EXHAUSTED"
+        assert old_processing.terminal
+        assert receipt.terminal and receipt.body["disposition"] == "FAILED"
+        assert not any(item.entry.kind == "staging" and item.entry.id == command.batch_id for item in details)
+        assert rt.store.inspect_mutation(PHONE, retry.operation_id, lease).phase is domain.MutationPhase.COMMITTED
+    assert all(c.batch_id != command.batch_id for c in rt.store.recoverable_batches().commands)
+    assert "old synthetic input" not in str(rt.store.contact_snapshot(PHONE))
+    assert len(rt.agent.calls) == len(rt.outbound_broker.calls) == 1
+    assert sum(s.events.count("commit_entered") for s in rt.sessions) == old_commits
+    assert task_api.send_outbound(old_outbound, rt) is task_api.SendOutcome.DISCARDED
+    assert rt.transport.calls == []
+    rt.clock.set(pause.paused_until)
+    newer = rt.buffer("new synthetic input")
+    assert task_api.process_batch(newer, rt) is task_api.ProcessingOutcome.PROCESSED
+    assert rt.agent.calls[-1][0] == "new synthetic input"
+
+
 @pytest.mark.parametrize("content,kind,expected", [
     ("/pause", "text", "Para falar com a Beatriz, envie ATENDIMENTO."),
     ("/pausar", "text", "Para falar com a Beatriz, envie ATENDIMENTO."),
@@ -183,6 +227,116 @@ def test_process_batch_fixed_retry_uses_staged_result_and_no_sql(task_api, proce
     assert not any("commit_entered" in s.events for s in rt.sessions)
 
 
+def staged_fixed_before_deadline(runtime):
+    from dataclasses import replace
+    command = runtime.buffer("/pause")
+    with runtime.store.contact_lease(PHONE) as lease:
+        claim = runtime.store.claim_or_resume_batch(command, runtime.clock.now(), lease)
+        result = domain.AgentResult("Para falar com a Beatriz, envie ATENDIMENTO.", [], None, {}, domain.AgentIntent.SAVE_CONTEXT)
+        runtime.store.stage_agent_result(command, claim.attempt, result, runtime.clock.now(), lease)
+    runtime.clock.set(claim.attempt.processing_deadline - timedelta(seconds=1))
+    return replace(command, processing_id=claim.attempt.processing_id,
+        operation_id=claim.attempt.operation_id, staging_id=command.batch_id), claim.attempt.processing_deadline
+
+
+@pytest.mark.parametrize("offset", [0, 1])
+@pytest.mark.parametrize("boundary", ["before_reservation", "atomic_reservation"])
+def test_no_sql_deadline_before_outbound_reservation_has_zero_enqueue(task_api, processing_runtime, offset, boundary):
+    rt = processing_runtime
+    command, deadline = staged_fixed_before_deadline(rt)
+    hook = lambda: rt.clock.set(deadline + timedelta(seconds=offset))
+    if boundary == "before_reservation":
+        rt.store.client.after_operation["prepare_fixed_response"] = hook
+    else:
+        rt.store.client.before_operation["reserve_outbound_enqueue"] = hook
+    with pytest.raises(task_api.RetryRequested):
+        task_api.process_batch(command, rt)
+    assert rt.outbound_broker.calls == []
+    assert rt.agent.calls == rt.transport.calls == []
+    assert not any("commit_entered" in session.events for session in rt.sessions)
+    with rt.store.contact_lease(PHONE) as lease:
+        assert rt.store.dispatch(command, lease).phase is domain.DispatchPhase.EXHAUSTED
+        assert any(item.body.get("disposition") == "FAILED" for item in rt.store.read_details(lease))
+
+
+def test_no_sql_reservation_before_deadline_survives_clock_passage_until_local_enqueue(task_api, processing_runtime):
+    rt = processing_runtime
+    command, deadline = staged_fixed_before_deadline(rt)
+    rt.store.client.after_operation["reserve_outbound_enqueue"] = lambda: rt.clock.set(deadline)
+    def not_acknowledged_yet(_):
+        assert '"outbound_reservation"' in str(rt.store.contact_snapshot(PHONE))
+        assert '"outbound_attempted":true' not in str(rt.store.contact_snapshot(PHONE))
+    rt.outbound_broker.on_enqueue = not_acknowledged_yet
+    assert task_api.process_batch(command, rt) is task_api.ProcessingOutcome.PROCESSED
+    assert rt.clock.now() == deadline
+    assert len(rt.outbound_broker.calls) == 1
+    assert rt.agent.calls == []
+    assert not any("commit_entered" in s.events for s in rt.sessions)
+    with rt.store.contact_lease(PHONE) as lease:
+        assert rt.store.dispatch(command, lease).phase is domain.DispatchPhase.PROCESSED
+        assert any(item.body.get("disposition") == "PROCESSED" for item in rt.store.read_details(lease))
+
+
+@pytest.mark.parametrize("outcome", [domain.EnqueueResult.DEFINITIVE_FAILURE, domain.EnqueueResult.AMBIGUOUS])
+def test_no_sql_reserved_broker_retry_keeps_same_reservation_after_deadline(task_api, processing_runtime, outcome):
+    rt = processing_runtime
+    command, deadline = staged_fixed_before_deadline(rt)
+    rt.outbound_broker.next_result = outcome
+    rt.outbound_broker.on_enqueue = lambda _: rt.clock.set(deadline)
+    with pytest.raises(task_api.RetryRequested) as caught:
+        task_api.process_batch(command, rt)
+    with rt.store.contact_lease(PHONE) as lease:
+        details = rt.store.read_details(lease)
+        processing = next(item for item in details if item.entry.kind == "processing")
+        reservation = processing.body.get("outbound_reservation")
+        assert reservation is not None
+        assert processing.body.get("outbound_attempted") is not True
+        assert rt.store.dispatch(command, lease).phase is domain.DispatchPhase.STAGED
+        assert not any(item.body.get("disposition") == "PROCESSED" for item in details)
+        rt.store.exhaust_batch(command, rt.clock.now(), lease)
+        assert rt.store.dispatch(command, lease).phase is domain.DispatchPhase.STAGED
+    # Recovery must still schedule the reserved batch past its old deadline.
+    rt.clock.advance(timedelta(seconds=601))
+    with rt.store.contact_lease(PHONE) as lease:
+        assert rt.store.ensure_consumer(rt.processing_broker, command, rt.clock.now(), lease) is domain.EnsureConsumerResult.SCHEDULED
+    rt.outbound_broker.on_enqueue = None
+    rt.outbound_broker.next_result = domain.EnqueueResult.CONFIRMED
+    assert task_api.process_batch(caught.value.command, rt) is task_api.ProcessingOutcome.PROCESSED
+    with rt.store.contact_lease(PHONE) as lease:
+        processing = next(item for item in rt.store.read_details(lease) if item.entry.kind == "processing")
+        assert processing.body["outbound_reservation"] == reservation
+        assert processing.body["outbound_attempted"] is True
+    assert rt.agent.calls == []
+    assert len(rt.outbound_broker.calls) == 2  # No exactly-once claim at this external boundary.
+    assert not any("commit_entered" in s.events for s in rt.sessions)
+
+
+@pytest.mark.parametrize("field", ["reservation_id", "batch_id", "processing_id", "operation_id",
+    "coordination_epoch", "generation", "claim_token", "result_fingerprint"])
+@pytest.mark.parametrize("boundary", ["record_outbound_attempt", "complete_batch", "terminal_complete"])
+def test_outbound_boundary_rejects_substituted_reservation(task_api, processing_runtime, field, boundary):
+    from dataclasses import replace
+    from uuid import uuid4
+    rt = processing_runtime
+    command, _ = staged_fixed_before_deadline(rt)
+    with rt.store.contact_lease(PHONE) as lease:
+        claim = rt.store.claim_or_resume_batch(command, rt.clock.now(), lease)
+        rt.store.prepare_fixed_response(command, claim.attempt, rt.clock.now(), lease)
+        reservation = rt.store.reserve_outbound_enqueue(command, claim.attempt, rt.clock.now(), lease)
+        if boundary in ("complete_batch", "terminal_complete"):
+            rt.store.record_outbound_attempt(command, claim.attempt, rt.clock.now(), lease, reservation=reservation)
+        if boundary == "terminal_complete":
+            rt.store.complete_batch(command, claim.attempt, rt.clock.now(), lease, reservation=reservation)
+        changed = replace(reservation, **{field: "0" * 64 if field == "result_fingerprint" else str(uuid4())})
+        before = rt.store.contact_snapshot(PHONE)
+        with pytest.raises(domain.ConversationMutationPending):
+            getattr(rt.store, "complete_batch" if boundary == "terminal_complete" else boundary)(
+                command, claim.attempt, rt.clock.now(), lease, reservation=changed)
+        assert rt.store.contact_snapshot(PHONE) == before
+        expected = domain.DispatchPhase.PROCESSED if boundary == "terminal_complete" else domain.DispatchPhase.STAGED
+        assert rt.store.dispatch(command, lease).phase is expected
+
+
 @pytest.mark.parametrize("kind", ["text", "pause_help"])
 def test_process_batch_cannot_complete_before_outbound_attempt_boundary(task_api, processing_runtime, kind):
     rt = processing_runtime
@@ -193,8 +347,133 @@ def test_process_batch_cannot_complete_before_outbound_attempt_boundary(task_api
         task_api.process_batch(command, rt)
     with rt.store.contact_lease(PHONE) as lease:
         claim = rt.store.claim_or_resume_batch(caught.value.command, rt.clock.now(), lease)
+        reservation = rt.store.reserve_outbound_enqueue(caught.value.command, claim.attempt, rt.clock.now(), lease)
         with pytest.raises(domain.ConversationMutationPending):
-            rt.store.complete_batch(caught.value.command, claim.attempt, rt.clock.now(), lease)
+            rt.store.complete_batch(caught.value.command, claim.attempt, rt.clock.now(), lease, reservation=reservation)
+
+
+@pytest.mark.parametrize("boundary", ["reserve_outbound_enqueue", "record_outbound_attempt", "complete_batch"])
+@pytest.mark.parametrize("fault", ["claim_token", "processing_id", "operation_id", "coordination_epoch", "generation", "owner"])
+def test_outbound_reservation_boundaries_reject_stale_processing_claim(task_api, processing_runtime, boundary, fault):
+    from dataclasses import replace
+    from uuid import uuid4
+    rt = processing_runtime
+    command, _ = staged_fixed_before_deadline(rt)
+    with rt.store.contact_lease(PHONE) as first_lease:
+        claim = rt.store.claim_or_resume_batch(command, rt.clock.now(), first_lease)
+        rt.store.prepare_fixed_response(command, claim.attempt, rt.clock.now(), first_lease)
+        reservation = rt.store.reserve_outbound_enqueue(command, claim.attempt, rt.clock.now(), first_lease)
+        rt.store.record_outbound_attempt(command, claim.attempt, rt.clock.now(), first_lease, reservation=reservation)
+    with rt.store.contact_lease(PHONE) as lease:
+        # A fresh lease alone cannot impersonate the previous processing owner.
+        if fault != "owner":
+            claim = rt.store.claim_or_resume_batch(command, rt.clock.now(), lease)
+        attempt = claim.attempt if fault == "owner" else replace(claim.attempt, **{fault: str(uuid4())})
+        before = rt.store.contact_snapshot(PHONE)
+        kwargs = {} if boundary == "reserve_outbound_enqueue" else {"reservation": reservation}
+        with pytest.raises(domain.ConversationMutationPending):
+            getattr(rt.store, boundary)(command, attempt, rt.clock.now(), lease, **kwargs)
+        assert rt.store.contact_snapshot(PHONE) == before
+
+
+@pytest.mark.parametrize("boundary", ["reserve_outbound_enqueue", "record_outbound_attempt", "complete_batch"])
+def test_reserved_no_sql_invalidated_generation_cannot_record_or_complete(task_api, processing_runtime, boundary):
+    from uuid import uuid4
+    rt = processing_runtime
+    command, _ = staged_fixed_before_deadline(rt)
+    with rt.store.contact_lease(PHONE) as lease:
+        claim = rt.store.claim_or_resume_batch(command, rt.clock.now(), lease)
+        rt.store.prepare_fixed_response(command, claim.attempt, rt.clock.now(), lease)
+        reservation = rt.store.reserve_outbound_enqueue(command, claim.attempt, rt.clock.now(), lease)
+        rt.store.record_outbound_attempt(command, claim.attempt, rt.clock.now(), lease, reservation=reservation)
+        with rt.session_factory() as db:
+            pause = rt.coordinator.pause_for_secretary(db, PHONE, "secretary_manual_pause", rt.clock.now(), lease, str(uuid4()))
+        kwargs = {} if boundary == "reserve_outbound_enqueue" else {"reservation": reservation}
+        with pytest.raises(domain.ConversationMutationPending):
+            getattr(rt.store, boundary)(command, claim.attempt, rt.clock.now(), lease, **kwargs)
+        rt.store.exhaust_batch(command, rt.clock.now(), lease)
+        assert rt.store.dispatch(command, lease).phase is domain.DispatchPhase.EXHAUSTED
+        assert str(rt.store.read_anchor(lease).last_generation) == pause.generation
+        assert any(item.body.get("disposition") == "FAILED" for item in rt.store.read_details(lease))
+        assert not any(item.entry.kind == "staging" for item in rt.store.read_details(lease))
+    assert rt.agent.calls == rt.outbound_broker.calls == rt.transport.calls == []
+
+
+@pytest.mark.parametrize("boundary", ["reserve_outbound_enqueue", "record_outbound_attempt", "complete_batch"])
+@pytest.mark.parametrize("replace_fingerprint", [False, True])
+def test_outbound_reservation_rejects_substituted_staged_result(task_api, processing_runtime, boundary, replace_fingerprint):
+    import hashlib
+    from app.conversation_redis import _json
+    rt = processing_runtime
+    command, _ = staged_fixed_before_deadline(rt)
+    with rt.store.contact_lease(PHONE) as lease:
+        claim = rt.store.claim_or_resume_batch(command, rt.clock.now(), lease)
+        rt.store.prepare_fixed_response(command, claim.attempt, rt.clock.now(), lease)
+        reservation = rt.store.reserve_outbound_enqueue(command, claim.attempt, rt.clock.now(), lease)
+        rt.store.record_outbound_attempt(command, claim.attempt, rt.clock.now(), lease, reservation=reservation)
+        details = rt.store.read_details(lease)
+        staging = next(item for item in details if item.entry.kind == "staging")
+        result = {**staging.body["result"], "text": "synthetic-replaced-output"}
+        updates = [rt.store._changed(staging, body={**staging.body, "result": result})]
+        if replace_fingerprint:
+            processing = next(item for item in details if item.entry.kind == "processing")
+            updates.append(rt.store._changed(processing, body={**processing.body,
+                "result_fingerprint": hashlib.sha256(_json(result).encode()).hexdigest()}))
+        rt.store.compare_and_set(lease, rt.store.read_anchor(lease), rt.store._replace_details(details, *updates))
+        before = rt.store.contact_snapshot(PHONE)
+        kwargs = {} if boundary == "reserve_outbound_enqueue" else {"reservation": reservation}
+        with pytest.raises(domain.ConversationMutationPending):
+            getattr(rt.store, boundary)(command, claim.attempt, rt.clock.now(), lease, **kwargs)
+        assert rt.store.contact_snapshot(PHONE) == before
+    assert rt.outbound_broker.calls == []
+
+
+def test_no_sql_reservation_uses_persisted_deadline_not_caller_deadline(task_api, processing_runtime):
+    from dataclasses import replace
+    rt = processing_runtime
+    command, deadline = staged_fixed_before_deadline(rt)
+    with rt.store.contact_lease(PHONE) as lease:
+        claim = rt.store.claim_or_resume_batch(command, rt.clock.now(), lease)
+        rt.store.prepare_fixed_response(command, claim.attempt, rt.clock.now(), lease)
+        rt.store.client.before_operation["reserve_outbound_enqueue"] = lambda: rt.clock.set(deadline)
+        forged = replace(claim.attempt, processing_deadline=deadline + timedelta(days=1))
+        with pytest.raises(domain.ConversationMutationPending):
+            rt.store.reserve_outbound_enqueue(command, forged, rt.clock.now(), lease)
+        assert rt.store.dispatch(command, lease).phase is domain.DispatchPhase.EXHAUSTED
+    assert rt.outbound_broker.calls == []
+
+
+@pytest.mark.parametrize("fault", ["before_atomic", "lost_ack", "lost_owner"])
+def test_outbound_reservation_fault_precedes_broker_and_preserves_recoverable_result(task_api, processing_runtime, fault):
+    from app.conversation_redis import contact_keys
+    rt = processing_runtime
+    command, deadline = staged_fixed_before_deadline(rt)
+    if fault == "before_atomic":
+        rt.store.fail_next_atomic("reserve_outbound_enqueue")
+    elif fault == "lost_ack":
+        def lose_ack():
+            rt.clock.set(deadline)
+            raise RuntimeError("synthetic-private-reservation-error")
+        rt.store.client.after_operation["reserve_outbound_enqueue"] = lose_ack
+    else:
+        rt.store.client.after_operation["reserve_outbound_enqueue"] = lambda: rt.store.client.values.pop(contact_keys(PHONE).lease)
+    with pytest.raises(task_api.RetryRequested) as caught:
+        task_api.process_batch(command, rt)
+    assert "synthetic-private" not in "".join(traceback.format_exception(caught.value))
+    assert rt.outbound_broker.calls == []
+    details = rt.details()
+    processing = next(item for item in details if item.entry.kind == "processing")
+    reservation = processing.body.get("outbound_reservation")
+    assert (reservation is None) is (fault == "before_atomic")
+    assert processing.body.get("outbound_attempted") is not True
+    assert not any(item.body.get("disposition") == "PROCESSED" for item in details)
+    assert task_api.process_batch(caught.value.command, rt) is task_api.ProcessingOutcome.PROCESSED
+    final = next(item for item in rt.details() if item.entry.kind == "processing")
+    if reservation is not None:
+        assert final.body["outbound_reservation"] == reservation
+    assert len(rt.outbound_broker.calls) == 1
+    assert rt.agent.calls == []
+    assert not any("commit_entered" in session.events for session in rt.sessions)
 
 
 @pytest.mark.parametrize("fault", ["missing", "extra", "phone", "generation", "kind", "ref_extra", "ref_date", "ref_type", "processing_id"])
@@ -952,8 +1231,9 @@ def test_webhook_terminal_replay_reads_no_sql_or_session_and_mutates_no_state(
                 ingress_runtime.store.stage_agent_result(command, claim.attempt, result, ingress_runtime.clock.now(), lease)
                 ingress_runtime.coordinator.apply_agent_result(db, PHONE, result, claim.attempt.processing_id,
                     claim.attempt.operation_id, ingress_runtime.clock.now(), lease)
-                ingress_runtime.store.record_outbound_attempt(command, claim.attempt, ingress_runtime.clock.now(), lease)
-                ingress_runtime.store.complete_batch(command, claim.attempt, ingress_runtime.clock.now(), lease)
+                reservation = ingress_runtime.store.reserve_outbound_enqueue(command, claim.attempt, ingress_runtime.clock.now(), lease)
+                ingress_runtime.store.record_outbound_attempt(command, claim.attempt, ingress_runtime.clock.now(), lease, reservation=reservation)
+                ingress_runtime.store.complete_batch(command, claim.attempt, ingress_runtime.clock.now(), lease, reservation=reservation)
     receipts = [item for item in ingress_runtime.details() if item.entry.kind == "dedupe"]
     assert len(receipts) == 1 and receipts[0].body["disposition"] == disposition and receipts[0].terminal
     before = ingress_runtime.store.snapshot()
