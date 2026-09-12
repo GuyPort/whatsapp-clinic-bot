@@ -80,17 +80,24 @@ def normalize_phone(phone: str) -> str:
     if not phone or not isinstance(phone, str):
         return ""
     
-    clean = re.sub(r'\D', '', phone)
+    candidate = phone.strip()
+    for suffix in ("@s.whatsapp.net", "@c.us"):
+        if candidate.endswith(suffix):
+            candidate = candidate[:-len(suffix)]
+            break
+
+    # Classificacao de outros tipos de JID pertence ao ingresso em main.py.
+    if "@" in candidate:
+        return ""
+
+    clean = re.sub(r'\D', '', candidate)
     
     # Validar tamanho (máximo 15 dígitos conforme padrão internacional)
-    if len(clean) > 15:
-        return ""
-    
-    # Garantir que tem código do país (55) para Brasil
-    if not clean.startswith('55') and len(clean) >= 10:
+    if len(clean) in (10, 11):
         clean = '55' + clean
     
-    return clean
+    # Garantir que tem código do país (55) para Brasil
+    return clean if re.fullmatch(r"[1-9][0-9]{9,14}", clean) else ""
 
 
 def load_clinic_info() -> Dict[str, Any]:
