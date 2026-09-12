@@ -19,6 +19,7 @@ from app import conversation_state as domain
 from app import utils
 from app.conversation_redis import RedisConversationStore
 from tests.fakes import ForbiddenAgentEffects, ManualClock, ScriptedClaude
+from tests.fakes import WebhookRequest, webhook_payload
 
 
 PHONE = "5551999990000"
@@ -34,6 +35,298 @@ CLINIC_INFO = {
         "receita": "https://clinic.synthetic.invalid/receita/",
     },
 }
+
+
+def webhook(main, **payload_args):
+    import asyncio
+    return asyncio.run(main.whatsapp_webhook(WebhookRequest(main.app, webhook_payload(**payload_args))))
+
+
+@pytest.mark.parametrize("jid,fields", [
+    ("(51) 99999-0000", {}), (PHONE, {}), (PHONE + "@s.whatsapp.net", {}),
+    (PHONE + "@c.us", {}), ("123456789012345@lid", {"cleanedSenderPn": PHONE}),
+    ("123456789012345@lid", {"senderPn": PHONE + "@s.whatsapp.net"}),
+    ("123456789012345@lid", {"senderPn": PHONE + "@c.us"}),
+])
+@pytest.mark.parametrize("nested", [True, False])
+def test_webhook_identity_normalizes_once_to_one_canonical_lease(main_module, ingress_runtime, monkeypatch, jid, fields, nested):
+    normalized = []
+    original = main_module.normalize_phone
+    def normalize(raw):
+        normalized.append(raw)
+        return original(raw)
+    monkeypatch.setattr(main_module, "normalize_phone", normalize)
+    response = webhook(main_module, jid=jid, key_fields=fields, nested=nested)
+    assert response.status_code == 200
+    assert ingress_runtime.lease_calls == 1
+    assert len(normalized) == 1
+    assert len(ingress_runtime.processing_broker.calls) == 1
+    assert ingress_runtime.processing_broker.calls[0].phone == PHONE
+    assert ingress_runtime.envelopes()[0]["message_id"] == "synthetic-message-id"
+
+
+@pytest.mark.parametrize("media", [None, "audioMessage", "imageMessage", "videoMessage", "documentMessage", "stickerMessage"])
+def test_webhook_paused_text_and_media_are_dropped_before_batch_and_remain_dropped(main_module, ingress_runtime, media):
+    ref = ingress_runtime.pause()
+    response = webhook(main_module, media=media, text="synthetic-discarded-content")
+    assert response.status_code == 200
+    assert json.loads(response.body) == {"status": "ignored"}
+    details = ingress_runtime.details()
+    receipt = next(item for item in details if item.entry.kind == "dedupe")
+    assert receipt.body["disposition"] == "DROPPED"
+    assert receipt.entry.expected_until >= ref.paused_until + timedelta(days=7, seconds=300)
+    assert not any(item.entry.kind in ("batch", "buffer", "staging") for item in details)
+    serialized = json.dumps(ingress_runtime.store.snapshot(), default=str)
+    assert "synthetic-discarded-content" not in serialized
+    assert "synthetic-media-url" not in serialized
+    assert "synthetic-message-id" not in serialized
+    ingress_runtime.clock.set(ref.paused_until + timedelta(seconds=1))
+    before = ingress_runtime.store.contact_snapshot(PHONE)
+    assert ingress_runtime.processing_broker.calls == []
+    response = webhook(main_module, media=media, text="synthetic-discarded-content")
+    assert response.status_code == 200
+    assert json.loads(response.body) == {"status": "ignored"}
+    assert ingress_runtime.store.contact_snapshot(PHONE) == before
+    assert ingress_runtime.processing_broker.calls == []
+
+
+@pytest.mark.parametrize("alias", ["/pausar", "/pause"])
+def test_webhook_patient_pause_alias_buffers_fixed_help_only_while_active(main_module, ingress_runtime, session_factory, alias):
+    from app.models import PausedContact
+    response = webhook(main_module, text=alias)
+    assert response.status_code == 200
+    envelope = ingress_runtime.envelopes()[0]
+    assert envelope["kind"] == "pause_help"
+    assert envelope["content"] == "Para falar com a Beatriz, envie ATENDIMENTO."
+    with session_factory() as db:
+        assert db.get(PausedContact, PHONE) is None
+    ingress_runtime.pause()
+    calls = len(ingress_runtime.processing_broker.calls)
+    response = webhook(main_module, text=alias, message_id="paused-alias")
+    assert response.status_code == 200
+    assert json.loads(response.body) == {"status": "ignored"}
+    assert len(ingress_runtime.processing_broker.calls) == calls
+    assert any(item.body.get("disposition") == "DROPPED" for item in ingress_runtime.details())
+
+
+@pytest.mark.parametrize("alias", ["/pausar", "/pause"])
+def test_webhook_secretary_pause_renews_24h_but_duplicate_id_never_renews(main_module, ingress_runtime, session_factory, alias):
+    from app.models import PausedContact
+    start = ingress_runtime.clock.now()
+    response = webhook(main_module, text=alias, from_me=True)
+    assert response.status_code == 200
+    assert ingress_runtime.lease_calls == 1
+    details = ingress_runtime.details()
+    receipt = next(item for item in details if item.entry.kind == "dedupe")
+    assert receipt.body["disposition"] == "APPLIED"
+    operation_id = receipt.body["operation_id"]
+    assert sum(item.entry.kind == "mutation" for item in details) == 1
+    ingress_runtime.clock.advance(timedelta(hours=1))
+    response = webhook(main_module, text=alias, from_me=True)
+    assert response.status_code == 200
+    assert next(item for item in ingress_runtime.details() if item.entry.kind == "dedupe").body["operation_id"] == operation_id
+    with session_factory() as db:
+        assert db.get(PausedContact, PHONE).paused_until == (start + timedelta(hours=24)).replace(tzinfo=None)
+    response = webhook(main_module, text=alias, from_me=True, message_id="renewed-command")
+    assert response.status_code == 200
+    with session_factory() as db:
+        assert db.get(PausedContact, PHONE).paused_until == (start + timedelta(hours=25)).replace(tzinfo=None)
+    assert ingress_runtime.processing_broker.calls == []
+
+
+def test_webhook_secretary_pause_retries_same_prepared_operation(main_module, ingress_runtime, monkeypatch, session_factory):
+    from sqlalchemy.orm import Session
+    from app.models import PausedContact
+    original = Session.flush
+    calls = []
+    def fail_once(db, *args, **kwargs):
+        if not calls and (db.new or db.dirty):
+            calls.append(True)
+            raise RuntimeError("synthetic-sensitive-sql-error")
+        return original(db, *args, **kwargs)
+    monkeypatch.setattr(Session, "flush", fail_once)
+    response = webhook(main_module, text="/pause", from_me=True)
+    assert response.status_code == 503
+    details = ingress_runtime.details()
+    receipt = next(item for item in details if item.entry.kind == "dedupe")
+    operation = receipt.body["operation_id"]
+    assert receipt.body["disposition"] is None
+    with session_factory() as db:
+        assert db.get(PausedContact, PHONE) is None
+    ingress_runtime.clock.advance(timedelta(seconds=10))
+    response = webhook(main_module, text="/pause", from_me=True)
+    assert response.status_code == 200
+    details = ingress_runtime.details()
+    receipt = next(item for item in details if item.entry.kind == "dedupe")
+    assert receipt.body["operation_id"] == operation
+    assert receipt.body["disposition"] == "APPLIED"
+    assert sum(item.entry.kind == "mutation" for item in details) == 1
+
+
+def test_webhook_ordinary_origin_from_me_is_ignored_with_terminal_receipt(main_module, ingress_runtime):
+    response = webhook(main_module, text="Resposta da clínica", from_me=True)
+    assert response.status_code == 200
+    assert ingress_runtime.lease_calls == 1
+    details = ingress_runtime.details()
+    assert [item.body["disposition"] for item in details if item.entry.kind == "dedupe"] == ["IGNORED"]
+    before = ingress_runtime.store.contact_snapshot(PHONE)
+    response = webhook(main_module, text="Resposta da clínica", from_me=True)
+    assert response.status_code == 200
+    assert ingress_runtime.store.contact_snapshot(PHONE) == before
+    assert ingress_runtime.processing_broker.calls == []
+
+
+@pytest.mark.parametrize("media,label", [("audioMessage", "áudio"), ("imageMessage", "imagem"),
+    ("videoMessage", "vídeo"), ("documentMessage", "documento"), ("stickerMessage", "figurinha")])
+def test_webhook_active_media_buffers_only_required_content(main_module, ingress_runtime, media, label):
+    response = webhook(main_module, media=media)
+    assert response.status_code == 200
+    envelope = ingress_runtime.envelopes()[0]
+    assert envelope["kind"] == "media"
+    assert envelope["content"] == label
+    assert "synthetic-media-url" not in json.dumps(envelope)
+
+
+def test_webhook_pause_expiry_at_exact_deadline_opens_new_generation(main_module, ingress_runtime, session_factory):
+    from app.models import PausedContact
+    ref = ingress_runtime.pause()
+    ingress_runtime.clock.set(ref.paused_until)
+    response = webhook(main_module)
+    assert response.status_code == 200
+    envelope = ingress_runtime.envelopes()[0]
+    assert envelope["generation"] != ref.generation
+    with session_factory() as db:
+        assert db.get(PausedContact, PHONE) is None
+
+
+@pytest.mark.parametrize("failure", [domain.EnqueueResult.DEFINITIVE_FAILURE, domain.EnqueueResult.AMBIGUOUS])
+def test_webhook_broker_failure_keeps_one_batch_and_replay_respects_due_time(main_module, ingress_runtime, failure):
+    ingress_runtime.processing_broker.next_result = failure
+    response = webhook(main_module)
+    assert response.status_code == 503
+    first = ingress_runtime.processing_broker.calls[0]
+    assert len(ingress_runtime.envelopes()) == 1
+    response = webhook(main_module)
+    assert response.status_code == 503
+    assert len(ingress_runtime.processing_broker.calls) == 1
+    ingress_runtime.clock.advance(timedelta(seconds=60))
+    ingress_runtime.processing_broker.next_result = domain.EnqueueResult.CONFIRMED
+    response = webhook(main_module)
+    assert response.status_code == 200
+    assert ingress_runtime.processing_broker.calls == [first, first]
+    assert len(ingress_runtime.envelopes()) == 1
+
+
+def test_webhook_replay_after_dispatch_deadline_is_terminal_without_rebuffer(main_module, ingress_runtime):
+    assert webhook(main_module).status_code == 200
+    ingress_runtime.clock.advance(timedelta(seconds=900))
+    response = webhook(main_module)
+    assert response.status_code == 200
+    assert json.loads(response.body) == {"status": "ignored"}
+    assert ingress_runtime.envelopes() == []
+    assert len(ingress_runtime.processing_broker.calls) == 1
+    with ingress_runtime.store.contact_lease(PHONE) as lease:
+        claim = ingress_runtime.store.claim_or_resume_batch(ingress_runtime.processing_broker.calls[0], ingress_runtime.clock.now(), lease)
+    assert claim.outcome is domain.ClaimOutcome.TERMINAL
+    assert claim.envelopes == ()
+
+
+def test_webhook_without_message_id_accepts_without_replay_guarantee(main_module, ingress_runtime):
+    assert webhook(main_module, message_id=None).status_code == 200
+    assert webhook(main_module, message_id=None).status_code == 200
+    assert len(ingress_runtime.envelopes()) == 2
+
+
+@pytest.mark.parametrize("operation", ["acquire", "initialize", "finalize_ingress_once"])
+def test_webhook_coordination_failure_is_503_without_legacy_fallback(main_module, ingress_runtime, operation):
+    ingress_runtime.store.fail_next_atomic(operation)
+    response = webhook(main_module)
+    assert response.status_code == 503
+    assert json.loads(response.body) == {"status": "temporarily_unavailable"}
+    assert ingress_runtime.processing_broker.calls == []
+
+
+@pytest.mark.parametrize("message", [{"extendedTextMessage": {"text": "Texto estendido"}},
+    {"imageMessage": {"caption": "Legenda", "url": "synthetic-media-url"}}])
+def test_webhook_extended_text_and_image_caption_keep_existing_text_behavior(main_module, ingress_runtime, message):
+    import asyncio
+    payload = webhook_payload()
+    payload["data"]["messages"]["message"] = message
+    response = asyncio.run(main_module.whatsapp_webhook(WebhookRequest(main_module.app, payload)))
+    assert response.status_code == 200
+    envelope = ingress_runtime.envelopes()[0]
+    assert envelope["kind"] == "text"
+    assert envelope["content"] in ("Texto estendido", "Legenda")
+
+
+def test_webhook_lease_loss_after_atomic_buffer_never_enqueues(main_module, ingress_runtime):
+    from app.conversation_redis import contact_keys
+    def lose(*args):
+        ingress_runtime.store.client.values.pop(contact_keys(PHONE).lease, None)
+    ingress_runtime.store.client.after_operation["finalize_ingress_once"] = lose
+    response = webhook(main_module)
+    assert response.status_code == 503
+    assert ingress_runtime.processing_broker.calls == []
+
+
+def test_webhook_secretary_ignored_does_not_expire_pause_or_open_closed_cycle(main_module, ingress_runtime):
+    from uuid import uuid4
+    with ingress_runtime.store.contact_lease(PHONE) as lease, ingress_runtime.session_factory() as db:
+        ingress_runtime.coordinator.resolve_ingress(db, PHONE, ingress_runtime.clock.now(), lease)
+        ref = ingress_runtime.coordinator.close_context(db, PHONE, ingress_runtime.clock.now(), lease, str(uuid4()))
+    response = webhook(main_module, from_me=True)
+    assert response.status_code == 200
+    with ingress_runtime.store.contact_lease(PHONE) as lease:
+        anchor = ingress_runtime.store.read_anchor(lease)
+    assert str(anchor.last_generation) == ref.generation
+    assert anchor.cycle is domain.ConversationCycle.CLOSED
+    pause = ingress_runtime.pause()
+    ingress_runtime.clock.set(pause.paused_until)
+    response = webhook(main_module, from_me=True, message_id="ignored-after-pause")
+    assert response.status_code == 200
+    with ingress_runtime.store.contact_lease(PHONE) as lease:
+        anchor = ingress_runtime.store.read_anchor(lease)
+    assert str(anchor.last_generation) == pause.generation
+    assert anchor.cycle is domain.ConversationCycle.PAUSED
+
+
+def test_webhook_committing_command_retry_never_repeats_sql(main_module, ingress_runtime, session_factory):
+    from app.models import PausedContact
+    ingress_runtime.store.fail_next_atomic("finalize_committed")
+    first = webhook(main_module, from_me=True, text="/pause")
+    assert first.status_code == 503
+    with session_factory() as db:
+        deadline = db.get(PausedContact, PHONE).paused_until
+    ingress_runtime.clock.advance(timedelta(seconds=10))
+    second = webhook(main_module, from_me=True, text="/pause")
+    assert second.status_code == 503
+    with session_factory() as db:
+        assert db.get(PausedContact, PHONE).paused_until == deadline
+    details = ingress_runtime.details()
+    assert sum(item.entry.kind == "mutation" for item in details) == 1
+    assert next(item.body for item in details if item.entry.kind == "dedupe")["disposition"] is None
+
+
+def test_webhook_pause_does_not_block_other_canonical_contact(main_module, ingress_runtime):
+    ingress_runtime.pause()
+    assert webhook(main_module, jid=OTHER_PHONE).status_code == 200
+    assert ingress_runtime.processing_broker.calls[0].phone == OTHER_PHONE
+    assert ingress_runtime.envelopes(PHONE) == []
+
+
+def test_webhook_staged_replay_uses_processing_deadline_not_old_dispatch_deadline(main_module, ingress_runtime):
+    assert webhook(main_module).status_code == 200
+    command = ingress_runtime.processing_broker.calls[0]
+    ingress_runtime.clock.advance(timedelta(seconds=850))
+    with ingress_runtime.store.contact_lease(PHONE) as lease:
+        claim = ingress_runtime.store.claim_or_resume_batch(command, ingress_runtime.clock.now(), lease)
+    assert claim.outcome is domain.ClaimOutcome.CLAIMED
+    ingress_runtime.clock.advance(timedelta(seconds=50))
+    assert webhook(main_module).status_code == 200
+    with ingress_runtime.store.contact_lease(PHONE) as lease:
+        dispatch = ingress_runtime.store.dispatch(command, lease)
+    assert dispatch.phase is domain.DispatchPhase.STAGED
+    assert len(ingress_runtime.envelopes()) == 1
 
 
 @pytest.fixture

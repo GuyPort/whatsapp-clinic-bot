@@ -87,7 +87,7 @@ def normalize_phone(phone: str) -> str:
             break
 
     # Classificacao de outros tipos de JID pertence ao ingresso em main.py.
-    if "@" in candidate:
+    if "@" in candidate or not re.fullmatch(r"[0-9+().\s-]+", candidate):
         return ""
 
     clean = re.sub(r'\D', '', candidate)

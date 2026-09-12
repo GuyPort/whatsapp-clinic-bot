@@ -291,6 +291,14 @@ class IngressResolution:
     reason: str | None = None
 
 
+@dataclass(frozen=True, repr=False)
+class SenderIdentity:
+    phone: str
+    from_me: bool
+    message_id: str | None
+    raw_kind: str
+
+
 @dataclass(frozen=True)
 class MutationTarget:
     kind: str
@@ -790,6 +798,78 @@ class ConversationCoordinator:
 
     def __init__(self, store: ConversationStore, clock):
         self.store, self.clock = store, clock
+
+    @_reason_codes_only
+    def accept_ingress(self, db: Session, identity: SenderIdentity, kind: str, content: str,
+                       now: datetime, lease: ContactLease, broker: BrokerPort) -> IngressReceipt:
+        """Classify, deduplicate and dispatch under the caller's single lease.
+
+        Replay precedes state transitions: a dropped ID cannot expire a pause or
+        open a conversation, and a prepared secretary operation retains its ID.
+        Only this method decides pause precedence; adapters never send a reply.
+        """
+        phone, message_id = identity.phone, identity.message_id
+        anchor = self._ensure(db, phone, lease)
+        details = self.store.read_details(lease)
+        digest = hashlib.sha256(message_id.encode()).hexdigest() if message_id else None
+        previous = next((item for item in details if item.entry.kind == "dedupe"
+                         and item.entry.id == digest and now < item.entry.expected_until), None)
+        secretary_command = identity.from_me and kind == "text" and content.strip().lower() in {"/pause", "/pausar"}
+        if previous is not None:
+            receipt = self.store.finalize_ingress_once(
+                phone, None, message_id, str(anchor.last_generation), lease)
+            if receipt.disposition is None:
+                if not secretary_command or receipt.operation_id is None:
+                    raise ConversationMutationPending(FailureReason.MUTATION_PENDING)
+                self.pause_for_secretary(db, phone, "secretary_manual_pause", now, lease, receipt.operation_id)
+                return IngressReceipt(IngressDisposition.APPLIED, operation_id=receipt.operation_id)
+            if previous.body["disposition"] == IngressDisposition.BUFFERED.value:
+                return self._dispatch_ingress(phone, receipt, now, lease, broker)
+            return IngressReceipt(IngressDisposition.DUPLICATE)
+
+        if identity.from_me:
+            disposition = IngressDisposition.APPLIED if secretary_command else IngressDisposition.IGNORED
+            receipt = self.store.finalize_ingress_once(
+                phone, None, message_id, str(anchor.last_generation), lease, disposition=disposition)
+            if secretary_command:
+                self.pause_for_secretary(db, phone, "secretary_manual_pause", now, lease, receipt.operation_id)
+                return IngressReceipt(IngressDisposition.APPLIED, operation_id=receipt.operation_id)
+            return receipt
+
+        resolution = self.resolve_ingress(db, phone, now, lease)
+        if resolution.state is ConversationState.SECRETARY_ATTENDANCE:
+            return self.store.finalize_ingress_once(
+                phone, None, message_id, resolution.generation, lease,
+                disposition=IngressDisposition.DROPPED, paused_until=resolution.paused_until)
+        if not content:
+            return self.store.finalize_ingress_once(
+                phone, None, message_id, resolution.generation, lease, disposition=IngressDisposition.IGNORED)
+        if kind == "text" and content.strip().lower() in {"/pause", "/pausar"}:
+            kind, content = "pause_help", "Para falar com a Beatriz, envie ATENDIMENTO."
+        envelope = InboundEnvelope(kind, content, now, resolution.generation, message_id)
+        receipt = self.store.finalize_ingress_once(phone, envelope, message_id, resolution.generation, lease)
+        return self._dispatch_ingress(phone, receipt, now, lease, broker)
+
+    def _dispatch_ingress(self, phone: str, receipt: IngressReceipt, now: datetime,
+                          lease: ContactLease, broker: BrokerPort) -> IngressReceipt:
+        # Use the batch's original generation on replay, never the current one.
+        batch = next((item for item in self.store.read_details(lease)
+                      if item.entry.kind == "batch" and item.entry.id == receipt.batch_id), None)
+        if batch is None:
+            raise ConversationGenerationUnavailable(FailureReason.GENERATION_UNAVAILABLE)
+        command = ProcessingCommand(phone, batch.entry.id, batch.body["epoch"], batch.body["generation"],
+                                    batch.body["processing_id"], batch.body["operation_id"])
+        dispatch = self.store.dispatch(command, lease)
+        if dispatch.phase in (DispatchPhase.PROCESSED, DispatchPhase.EXHAUSTED):
+            return IngressReceipt(IngressDisposition.DUPLICATE)
+        self.store.ensure_consumer(broker, command, now, lease)
+        dispatch = self.store.dispatch(command, lease)
+        if dispatch.phase is DispatchPhase.PENDING:
+            # An earlier failed/ambiguous reservation is not an existing consumer.
+            raise BrokerUnavailable(FailureReason.BROKER_UNAVAILABLE)
+        if dispatch.phase in (DispatchPhase.PROCESSED, DispatchPhase.EXHAUSTED):
+            return IngressReceipt(IngressDisposition.DUPLICATE)
+        return IngressReceipt(IngressDisposition.BUFFERED, receipt.batch_id)
 
     def _ensure(self, db: Session, phone: str, lease: ContactLease) -> ContactAnchor:
         if lease.phone != phone:

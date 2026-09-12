@@ -477,3 +477,70 @@ class ForbiddenAgentEffects:
             self.calls.append(name)
             raise AssertionError("forbidden agent effect")
         return forbidden
+
+
+class WebhookRequest:
+    """Header/body separation detects premature JSON access."""
+    def __init__(self, app, payload=None, *, signature="synthetic-webhook-secret", json_error=None):
+        from starlette.datastructures import Headers
+        self.app = app
+        self.headers = Headers({} if signature is None else {"X-Webhook-Signature": signature})
+        self.payload, self.json_error = payload, json_error
+        self.json_calls = 0
+
+    async def json(self):
+        self.json_calls += 1
+        if self.json_error is not None:
+            raise self.json_error
+        return self.payload
+
+
+def webhook_payload(*, jid="5551999990000@s.whatsapp.net", text="Mensagem sintética",
+                    from_me=False, message_id="synthetic-message-id", media=None,
+                    key_fields=None, nested=True):
+    key = {"remoteJid": jid, "fromMe": from_me, "id": message_id, **(key_fields or {})}
+    message = {"conversation": text} if media is None else {media: {"url": "synthetic-media-url"}}
+    data = {"key": key, "message": message, "messageTimestamp": 0, "pushName": "Synthetic"}
+    return {"event": "messages.upsert", "data": {"messages": data} if nested else data}
+
+
+class IngressRuntime:
+    """Real coordinator/store with in-memory SQL and scripted external boundary."""
+    def __init__(self, factory, config):
+        from app.conversation_state import ConversationCoordinator, DependencyName
+        self.store = InMemoryConversationStore(config)
+        self.clock = self.store.clock
+        self.coordinator = ConversationCoordinator(self.store, self.clock)
+        self.processing_broker = ScriptedBroker()
+        self._factory = factory
+        self.dependencies = {name: True for name in DependencyName}
+        self.readiness_calls = self.session_calls = self.lease_calls = 0
+        self.store.client.before_operation["acquire"] = self._acquired
+
+    def _acquired(self, *args):
+        self.lease_calls += 1
+
+    def readiness_status(self):
+        from app.conversation_state import DependencyStatus, ReadinessReport
+        self.readiness_calls += 1
+        return ReadinessReport(tuple(DependencyStatus(name, ready) for name, ready in self.dependencies.items()))
+
+    def session_factory(self):
+        self.session_calls += 1
+        session = self._factory()
+        assert session.bind.url.database in (None, "", ":memory:")
+        return session
+
+    def details(self, phone="5551999990000"):
+        with self.store.contact_lease(phone) as lease:
+            return self.store.read_details(lease)
+
+    def envelopes(self, phone="5551999990000"):
+        return [envelope for detail in self.details(phone) if detail.entry.kind in ("buffer", "staging")
+                for envelope in detail.body.get("envelopes", [])]
+
+    def pause(self, phone="5551999990000"):
+        from uuid import uuid4
+        with self.store.contact_lease(phone) as lease, self._factory() as db:
+            return self.coordinator.pause_for_secretary(
+                db, phone, "secretary_manual_pause", self.clock.now(), lease, str(uuid4()))

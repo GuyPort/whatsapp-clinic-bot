@@ -51,8 +51,73 @@ def session_factory():
 
 
 @pytest.fixture
-def app_client(monkeypatch):
-    from app import main
+def main_module(monkeypatch):
+    """Import the actual routes with external construction/effects replaced."""
+    import importlib.util
+    import socket
+    import sys
+    from pathlib import Path
+    from types import SimpleNamespace
+    import app
+    from app import database
+    from tests.fakes import ForbiddenAgentEffects
+
+    effects = ForbiddenAgentEffects()
+    original_connect = socket.socket.connect
+    def guarded_connect(sock, address):
+        # Windows implements asyncio's internal self-pipe with a socketpair.
+        # Only the stdlib socketpair frame may create its loopback connection.
+        caller = sys._getframe(1)
+        if (caller.f_code.co_name == "_fallback_socketpair"
+                and caller.f_globals.get("__name__") == "socket"
+                and address[0] in ("127.0.0.1", "::1")):
+            return original_connect(sock, address)
+        return effects.boundary("network")()
+    monkeypatch.setattr(socket.socket, "connect", guarded_connect)
+    monkeypatch.setattr(database, "init_db", effects.boundary("init_db"))
+    monkeypatch.setattr(database, "get_db", effects.boundary("implicit_session"))
+    transport = SimpleNamespace(redis_client=None,
+        send_message=effects.boundary("send"), add_message_to_buffer=effects.boundary("legacy_buffer"))
+
+    def task_decorator(**options):
+        def decorate(function):
+            function.delay = effects.boundary("legacy_delay")
+            function.apply_async = effects.boundary("legacy_enqueue")
+            return function
+        return decorate
+
+    for name, module in {
+        "app.ai_agent": SimpleNamespace(ai_agent=SimpleNamespace(
+            _handle_secretary_pause=effects.boundary("legacy_pause"))),
+        "app.whatsapp_service": SimpleNamespace(whatsapp_service=transport),
+        "app.scheduler": SimpleNamespace(start_scheduler=effects.boundary("scheduler"),
+                                          stop_scheduler=effects.boundary("scheduler")),
+        "app.celery_app": SimpleNamespace(celery_app=SimpleNamespace(task=task_decorator)),
+    }.items():
+        monkeypatch.setitem(sys.modules, name, module)
+    spec = importlib.util.spec_from_file_location("app.main", Path(__file__).parents[1] / "app" / "main.py")
+    module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, "app.main", module)
+    monkeypatch.setattr(app, "main", module, raising=False)
+    spec.loader.exec_module(module)
+    module.forbidden_effects = effects
+    yield module
+    assert effects.calls == []
+
+
+@pytest.fixture
+def ingress_runtime(main_module, monkeypatch, session_factory):
+    from app.conversation_state import ConversationConfig
+    from app.simple_config import settings
+    from tests.fakes import IngressRuntime
+    runtime = IngressRuntime(session_factory, ConversationConfig.from_settings(settings))
+    monkeypatch.setattr(main_module.app.state, "conversation_runtime", runtime, raising=False)
+    return runtime
+
+
+@pytest.fixture
+def app_client(monkeypatch, main_module):
+    main = main_module
 
     @asynccontextmanager
     async def no_lifespan(_app):

@@ -7,6 +7,7 @@ from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from contextlib import asynccontextmanager
 import logging
 import secrets
+import re
 from typing import Dict, Any, List
 from datetime import datetime, date
 
@@ -17,6 +18,7 @@ from sqlalchemy.orm import Session
 from app.ai_agent import ai_agent
 from app.whatsapp_service import whatsapp_service
 from app.utils import normalize_phone
+from app.conversation_state import IngressDisposition, SenderIdentity
 from app.models import Appointment, ConversationContext, PausedContact, AppointmentStatus
 from app.scheduler import start_scheduler, stop_scheduler
 from app.celery_app import celery_app
@@ -201,155 +203,109 @@ async def health_check():
     }
 
 
+def _message_event(payload):
+    if not isinstance(payload, dict) or payload.get("event") not in ("messages.upsert", "messages.received"):
+        return None
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        return None
+    message = data.get("messages", data)
+    if not isinstance(message, dict) or not isinstance(message.get("key"), dict):
+        return None
+    return message
+
+
+def resolve_sender_identity(payload) -> SenderIdentity | None:
+    """Resolve authenticated individual identity before inspecting origin/text."""
+    event = _message_event(payload)
+    if event is None:
+        return None
+    key = event["key"]
+    raw = key.get("remoteJid")
+    if not isinstance(raw, str) or not raw:
+        return None
+    if "@g.us" in raw or "@newsletter" in raw:
+        return None
+    raw_kind = "pn"
+    if raw.endswith("@lid"):
+        raw_kind = "lid"
+        cleaned = key.get("cleanedSenderPn")
+        raw = cleaned if isinstance(cleaned, str) and re.fullmatch(r"[1-9][0-9]{9,14}", cleaned) else key.get("senderPn")
+        if not isinstance(raw, str) or not raw or (
+                "@" in raw and not raw.endswith(("@s.whatsapp.net", "@c.us"))):
+            return None
+    elif "@" in raw:
+        if not raw.endswith(("@s.whatsapp.net", "@c.us")):
+            return None
+        raw_kind = "jid"
+    phone = normalize_phone(raw)
+    if not phone:
+        return None
+    from_me = key.get("fromMe", False)
+    message_id = key.get("id")
+    if not isinstance(from_me, bool):
+        return None
+    if message_id is not None and (not isinstance(message_id, str) or not message_id):
+        return None
+    return SenderIdentity(phone, from_me, message_id, raw_kind)
+
+
+def _ingress_content(payload) -> tuple[str, str]:
+    message = _message_event(payload).get("message")
+    if not isinstance(message, dict):
+        return "text", ""
+    text = message.get("conversation")
+    if isinstance(text, str) and text:
+        return "text", text
+    extended = message.get("extendedTextMessage")
+    if isinstance(extended, dict) and isinstance(extended.get("text"), str) and extended["text"]:
+        return "text", extended["text"]
+    image = message.get("imageMessage")
+    if isinstance(image, dict) and isinstance(image.get("caption"), str) and image["caption"]:
+        return "text", image["caption"]
+    for field, label in (
+        ("imageMessage", "imagem"), ("audioMessage", "áudio"), ("videoMessage", "vídeo"),
+        ("documentMessage", "documento"), ("stickerMessage", "figurinha"),
+    ):
+        if field in message:
+            return "media", label
+    return "text", ""
+
+
 @app.post("/webhook/whatsapp")
 async def whatsapp_webhook(request: Request):
-    """
-    Webhook para receber mensagens do Evolution API.
-    
-    Evolution API envia payloads no formato:
-    {
-        "event": "messages.upsert",
-        "instance": "instance_name",
-        "data": {
-            "key": {
-                "remoteJid": "5511999999999@s.whatsapp.net",
-                "fromMe": false,
-                "id": "message_id"
-            },
-            "message": {
-                "conversation": "texto da mensagem",
-                "extendedTextMessage": {
-                    "text": "texto"
-                }
-            },
-            "messageTimestamp": "1234567890",
-            "pushName": "Nome do Usuário"
-        }
-    }
-    """
+    """Authenticate headers, require readiness and delegate canonical ingress."""
+    secret = settings.webhook_secret
+    signature = request.headers.get("X-Webhook-Signature")
+    if secret is None:
+        return JSONResponse({"status": "temporarily_unavailable"}, status_code=503)
+    if signature is None or not secrets.compare_digest(signature.encode("utf-8"), secret.encode("utf-8")):
+        return JSONResponse({"status": "unauthorized"}, status_code=401)
+    # Task 9 owns production composition. Absence is closed, never legacy fallback.
+    runtime = getattr(request.app.state, "conversation_runtime", None)
+    try:
+        if runtime is None or not runtime.readiness_status().ready:
+            return JSONResponse({"status": "temporarily_unavailable"}, status_code=503)
+    except Exception:
+        return JSONResponse({"status": "temporarily_unavailable"}, status_code=503)
     try:
         payload = await request.json()
-        logger.info(f"Webhook recebido: {payload.get('event')}")
-        logger.info(f"Payload completo: {payload}")  # DEBUG: Ver payload completo
-        
-        # Verificar se é mensagem recebida (não enviada por nós)
-        event = payload.get('event', '')
-        if event not in ['messages.upsert', 'messages.received']:
-            return {"status": "ignored", "reason": "not a message event"}
-        
-        data = payload.get('data', {})
-        messages = data.get('messages', {})
-        key = messages.get('key', {})
-        message_data = messages.get('message', {})
-        remote_jid = key.get('remoteJid', '')
-        
-        # Extrair texto da mensagem (antes de tratar fromMe)
-        message_text = None
-        media_type = None  # Tipo de mídia não suportada
-        if 'conversation' in message_data:
-            message_text = message_data['conversation']
-        elif 'extendedTextMessage' in message_data:
-            message_text = message_data['extendedTextMessage'].get('text', '')
-        elif 'imageMessage' in message_data:
-            message_text = message_data['imageMessage'].get('caption', '')
-            if not message_text:
-                media_type = 'imagem'
-        elif 'audioMessage' in message_data:
-            media_type = 'áudio'
-        elif 'videoMessage' in message_data:
-            media_type = 'vídeo'
-        elif 'documentMessage' in message_data:
-            media_type = 'documento'
-        elif 'stickerMessage' in message_data:
-            media_type = 'figurinha'
-        
-        is_from_me = key.get('fromMe', False)
-        
-        # Tratar comando /pause da secretária (mensagens enviadas pelo número da clínica)
-        if is_from_me:
-            lowered = (message_text or '').strip().lower()
-            if lowered in {"/pausar", "/pause"} and remote_jid and '@newsletter' not in remote_jid and '@g.us' not in remote_jid:
-                patient_phone = remote_jid.replace('@s.whatsapp.net', '')
-                if patient_phone:
-                    logger.info(f"⏸️ Comando /pause recebido da secretária para {patient_phone}")
-                    with get_db() as db:
-                        ai_agent._handle_secretary_pause(db, patient_phone)
-                    return {"status": "processed", "action": "secretary_pause", "patient": patient_phone}
-            # Outras mensagens enviadas por nós devem ser ignoradas
-            return {"status": "ignored", "reason": "message from bot"}
-        
-        # Extrair informações
-        phone = remote_jid
-
-        # Ignorar mensagens de newsletter e grupos
-        if '@newsletter' in phone or '@g.us' in phone:
-            logger.info(f"Ignorando mensagem de newsletter/grupo: {phone}")
-            return {"status": "ignored", "reason": "newsletter or group message"}
-
-        # Tratar números @lid (Linked Device ID)
-        if '@lid' in phone:
-            # O número real vem no campo senderPn ou cleanedSenderPn do payload
-            cleaned_sender = key.get('cleanedSenderPn')
-            sender_pn = key.get('senderPn', '')
-
-            if cleaned_sender:
-                phone = cleaned_sender
-                logger.info(f"✅ LID detectado, usando cleanedSenderPn: {phone}")
-            elif sender_pn:
-                phone = sender_pn.replace('@s.whatsapp.net', '').replace('@c.us', '')
-                logger.info(f"✅ LID detectado, usando senderPn: {phone}")
-            else:
-                logger.warning(f"⚠️ LID detectado mas senderPn não disponível, ignorando")
-                return {"status": "ignored", "reason": "LID without senderPn"}
-        else:
-            phone = phone.replace('@s.whatsapp.net', '').replace('@c.us', '')
-        
-        if not phone:
-            logger.warning("Mensagem sem telefone")
-            return {"status": "ignored", "reason": "no phone"}
-
-        if not message_text:
-            if media_type:
-                # Responde que não processa mídia
-                logger.info(f"Mídia recebida de {phone}: {media_type}")
-                resposta = (
-                    f"Desculpe, não consigo receber {media_type}. "
-                    f"Se puder me explicar por texto, consigo te ajudar!\n\n"
-                    f"Caso prefira, posso te transferir para nossa secretária Beatriz."
-                )
-                send_message_task.delay(phone, resposta)
-                return {"status": "processed", "action": "media_response", "media_type": media_type}
-            logger.warning("Mensagem sem texto")
-            return {"status": "ignored", "reason": "no text"}
-
-        logger.info(f"Mensagem de {phone}: {message_text[:50]}...")
-
-        # Sistema de debounce: adicionar ao buffer e agendar task com delay
-        # Isso permite agrupar múltiplas mensagens enviadas em sequência
-        message_id = key.get('id')
-
-        # Adicionar mensagem ao buffer Redis
-        buffer_added = whatsapp_service.add_message_to_buffer(phone, message_text, message_id)
-
-        if buffer_added:
-            # Agendar task com delay de 7 segundos
-            # Se outra mensagem chegar, essa task vai verificar e ignorar se não passou o tempo
-            debounce_seconds = whatsapp_service.MESSAGE_DEBOUNCE_SECONDS
-            task = process_message_task.apply_async(
-                args=[phone, None, message_id],  # message_text=None pois vamos pegar do buffer
-                countdown=debounce_seconds
-            )
-            logger.info(f"[DEBOUNCE] Task agendada para {phone} em {debounce_seconds}s (task: {task.id})")
-            return {"status": "buffered", "task_id": task.id, "debounce_seconds": debounce_seconds}
-        else:
-            # Fallback: se Redis não disponível, processar imediatamente (comportamento antigo)
-            task = process_message_task.delay(phone, message_text, message_id)
-            logger.info(f"Task enfileirada (sem buffer): {task.id} para {phone}")
-            return {"status": "processing", "task_id": task.id}
-        
-    except Exception as e:
-        logger.error(f"Erro no webhook: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+    except (ValueError, UnicodeError):
+        return JSONResponse({"status": "invalid_request"}, status_code=400)
+    identity = resolve_sender_identity(payload)
+    if identity is None:
+        return JSONResponse({"status": "ignored"})
+    kind, content = _ingress_content(payload)
+    try:
+        with runtime.store.contact_lease(identity.phone) as lease:
+            with runtime.session_factory() as db:
+                receipt = runtime.coordinator.accept_ingress(
+                    db, identity, kind, content, runtime.clock.now(), lease, runtime.processing_broker)
+    except Exception:
+        logger.warning("conversation_ingress_unavailable")
+        return JSONResponse({"status": "temporarily_unavailable"}, status_code=503)
+    logger.info("conversation_ingress_accepted")
+    return JSONResponse({"status": "buffered" if receipt.disposition is IngressDisposition.BUFFERED else "ignored"})
 
 
 def _send_message_sync(phone: str, message: str) -> bool:
