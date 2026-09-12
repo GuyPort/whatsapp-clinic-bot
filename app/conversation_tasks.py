@@ -12,6 +12,7 @@ from enum import Enum
 import asyncio
 import inspect
 from typing import Callable, Protocol, TYPE_CHECKING
+from uuid import uuid4
 
 from celery.exceptions import Retry as CeleryRetry
 from sqlalchemy.exc import SQLAlchemyError
@@ -25,6 +26,7 @@ from app.conversation_state import (
     EnqueueResult, FailureReason, OutboundEnvelope, ProcessingCommand,
     ReadinessReport, ReadinessUnavailable,
     OutboundKind, TransportUnavailable, fixed_reply_result,
+    IngressDisposition, SenderIdentity,
 )
 
 if TYPE_CHECKING:
@@ -173,6 +175,48 @@ def process_batch(command: ProcessingCommand, runtime: ConversationRuntime) -> P
         return ProcessingOutcome.TERMINAL
     except RETRYABLE_ERRORS as exc:
         raise RetryRequested(exc.reason_code, command) from None
+
+
+class _SimulatorCapture:
+    """Acknowledgement means captured in this request, never provider delivery."""
+    def __init__(self):
+        self.commands: list[ProcessingCommand] = []
+        self.outbound: list[OutboundEnvelope] = []
+
+    def enqueue_processing(self, command: ProcessingCommand) -> EnqueueResult:
+        command = ProcessingCommand.from_payload(command.to_payload())
+        if command.phone != ConversationCoordinator.TEST_PHONE:
+            raise BrokerUnavailable(FailureReason.BROKER_UNAVAILABLE)
+        self.commands.append(command)
+        return EnqueueResult.CONFIRMED
+
+    def enqueue_outbound(self, outbound: OutboundEnvelope) -> EnqueueResult:
+        outbound = OutboundEnvelope.from_payload(outbound.to_payload())
+        if outbound.phone != ConversationCoordinator.TEST_PHONE:
+            raise BrokerUnavailable(FailureReason.BROKER_UNAVAILABLE)
+        self.outbound.append(outbound)
+        return EnqueueResult.CONFIRMED
+
+
+def simulate_message(message: str, runtime: ConversationRuntime) -> str:
+    """Run synthetic patient ingress and the canonical task with local captures."""
+    _require_ready(runtime)
+    capture = _SimulatorCapture()
+    local = ConversationRuntime(runtime.coordinator, runtime.store, runtime.session_factory,
+        runtime.agent, capture, capture, None, runtime.clock, runtime.readiness_status)
+    phone = ConversationCoordinator.TEST_PHONE
+    with local.store.contact_lease(phone) as lease, _session(local) as db:
+        receipt = local.coordinator.accept_ingress(db,
+            SenderIdentity(phone, False, str(uuid4()), "pn"), "text", message,
+            local.clock.now(), lease, capture)
+    if receipt.disposition is IngressDisposition.DROPPED:
+        return "[Bot pausado para este número - aguardando atendimento humano]"
+    if receipt.disposition is not IngressDisposition.BUFFERED or not capture.commands:
+        raise BrokerUnavailable(FailureReason.BROKER_UNAVAILABLE)
+    for command in capture.commands:
+        if process_batch(command, local) is not ProcessingOutcome.PROCESSED:
+            raise BrokerUnavailable(FailureReason.BROKER_UNAVAILABLE)
+    return "\n\n".join(outbound.text for outbound in capture.outbound)
 
 
 def send_outbound(outbound: OutboundEnvelope, runtime: ConversationRuntime) -> SendOutcome:

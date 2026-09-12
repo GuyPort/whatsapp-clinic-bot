@@ -22,6 +22,350 @@ from tests.fakes import ForbiddenAgentEffects, ManualClock, ScriptedClaude
 from tests.fakes import WebhookRequest, webhook_payload
 
 
+ADMIN_PHONE = "5551999990011"
+SIMULATOR_PHONE = "5500000000000"
+
+
+def _anchor(runtime, phone):
+    with runtime.store.contact_lease(phone) as lease:
+        return runtime.store.read_anchor(lease)
+
+
+def _admin_request(client, action, *, hours=3.5, phone=ADMIN_PHONE):
+    if action == "create":
+        return client.post("/api/paused-contacts", json={"phone": phone, "hours": hours})
+    if action == "extend":
+        return client.put(f"/api/paused-contacts/{phone}/extend", json={"hours": hours})
+    return client.delete(f"/api/paused-contacts/{phone}")
+
+
+def test_dashboard_manual_pause_create_extend_unpause_rotates_and_preserves_context(admin_client, admin_runtime, session_factory):
+    from app.models import ConversationContext, PausedContact
+    rt = admin_runtime
+    rt.seed_contact(ADMIN_PHONE)
+    rt.seed_contact(SIMULATOR_PHONE, paused_hours=5)
+    other = rt.store.contact_snapshot(SIMULATOR_PHONE)
+    generation = _anchor(rt, ADMIN_PHONE).last_generation
+    for action, expected in [("create", "2026-09-12T15:30:00+00:00"),
+                             ("extend", "2026-09-12T19:00:00+00:00"), ("unpause", None)]:
+        response = _admin_request(admin_client, action)
+        assert response.status_code == 200
+        if expected:
+            assert response.json()["paused_until"] == expected
+        anchor = _anchor(rt, ADMIN_PHONE)
+        assert anchor.last_generation != generation
+        generation = anchor.last_generation
+        assert anchor.cycle is (domain.ConversationCycle.OPEN if action == "unpause" else domain.ConversationCycle.PAUSED)
+        with session_factory() as db:
+            assert db.get(ConversationContext, ADMIN_PHONE).messages[0]["content"] == "synthetic history"
+            assert (db.get(PausedContact, ADMIN_PHONE) is None) is (action == "unpause")
+        assert rt.store.contact_snapshot(SIMULATOR_PHONE) == other
+    assert rt.legacy_sessions == 0
+    assert sum(s.events.count("commit_returned") for s in rt.sessions) == 3
+    assert len({id(s.session) for s in rt.sessions}) == 3
+
+
+@pytest.mark.parametrize("action,hours", [("create", 8760), ("extend", 8759)])
+def test_dashboard_manual_pause_accepts_exact_365_day_result(admin_client, admin_runtime, action, hours):
+    if action == "extend":
+        admin_runtime.seed_contact(ADMIN_PHONE, paused_hours=1)
+    response = _admin_request(admin_client, action, hours=hours)
+    assert response.status_code == 200
+    assert response.json()["paused_until"] == "2027-09-12T12:00:00+00:00"
+    assert admin_runtime.legacy_sessions == 0
+
+
+@pytest.mark.parametrize("action", ["create", "extend"])
+@pytest.mark.parametrize("hours", [0, -1, "24", None, True, float("inf"), 1e308, 10 ** 400, 1e-308, 8760 + 1 / 3600])
+def test_dashboard_manual_pause_rejects_invalid_duration_before_preparation(admin_client, admin_runtime, action, hours):
+    rt = admin_runtime
+    rt.seed_contact(ADMIN_PHONE, paused_hours=1)
+    before = rt.store.contact_snapshot(ADMIN_PHONE)
+    prepared = rt.store.client.operation_calls.get("prepare_mutation", 0)
+    path = "/api/paused-contacts" if action == "create" else f"/api/paused-contacts/{ADMIN_PHONE}/extend"
+    response = admin_client.request("POST" if action == "create" else "PUT", path,
+        content=json.dumps({"phone": ADMIN_PHONE, "hours": hours}), headers={"Content-Type": "application/json"})
+    assert response.status_code == 400
+    assert rt.store.contact_snapshot(ADMIN_PHONE) == before
+    assert rt.store.client.operation_calls.get("prepare_mutation", 0) == prepared
+    assert not any("commit_entered" in s.events for s in rt.sessions)
+
+
+def test_dashboard_extend_rejects_365_days_plus_one_second_result(admin_client, admin_runtime):
+    rt = admin_runtime
+    rt.seed_contact(ADMIN_PHONE, paused_hours=1)
+    before = rt.store.contact_snapshot(ADMIN_PHONE)
+    response = _admin_request(admin_client, "extend", hours=8759 + 1 / 3600)
+    assert response.status_code == 400
+    assert rt.store.contact_snapshot(ADMIN_PHONE) == before
+
+
+def test_dashboard_manual_pause_datetime_overflow_precedes_lease(admin_client, admin_runtime):
+    rt = admin_runtime
+    rt.clock.set(datetime.max.replace(tzinfo=timezone.utc))
+    response = _admin_request(admin_client, "create", hours=1)
+    assert response.status_code == 400
+    assert rt.lease_calls == rt.session_calls == 0
+
+
+def test_manual_pause_duration_must_represent_a_future_deadline():
+    with pytest.raises(domain.InvalidManualPauseDuration):
+        domain.manual_pause_deadline(datetime(2026, 9, 12, 12, tzinfo=timezone.utc), 1e-308)
+
+
+@pytest.mark.parametrize("action", ["create", "extend", "unpause"])
+@pytest.mark.parametrize("phone", ["invalid", "123", "0551999990000", "1" * 16])
+def test_dashboard_invalid_phone_never_acquires_lease(admin_client, admin_runtime, action, phone):
+    response = _admin_request(admin_client, action, phone=phone)
+    assert response.status_code == 400
+    assert admin_runtime.lease_calls == admin_runtime.session_calls == 0
+
+
+@pytest.mark.parametrize("action", ["extend", "unpause"])
+def test_dashboard_missing_paused_contact_is_404_without_mutation(admin_client, admin_runtime, action):
+    response = _admin_request(admin_client, action)
+    assert response.status_code == 404
+    assert not any("commit_entered" in s.events for s in admin_runtime.sessions)
+    assert admin_runtime.store.client.operation_calls.get("prepare_mutation", 0) == 0
+
+
+@pytest.mark.parametrize("message", ["Mensagem sintética", "/pausar", "/pause"])
+def test_test_chat_simulator_uses_central_batch_and_local_capture(admin_client, admin_runtime, session_factory, message):
+    from app.models import ConversationContext, PausedContact
+    rt = admin_runtime
+    rt.seed_contact(ADMIN_PHONE, paused_hours=5)
+    other = rt.store.contact_snapshot(ADMIN_PHONE)
+    response = admin_client.post("/test/chat", json={"message": message, "phone": ADMIN_PHONE, "fromMe": True})
+    assert response.status_code == 200
+    assert response.json()["phone"] == SIMULATOR_PHONE
+    assert response.json()["response"] == ("Para falar com a Beatriz, envie ATENDIMENTO." if message.startswith("/") else "Resposta sintética")
+    assert len(rt.agent.calls) == (0 if message.startswith("/") else 1)
+    assert all(call[1] == SIMULATOR_PHONE for call in rt.agent.calls)
+    assert rt.outbound_broker.calls == rt.processing_broker.calls == rt.transport.calls == []
+    assert rt.store.contact_snapshot(ADMIN_PHONE) == other
+    assert any(item.body.get("disposition") == "PROCESSED" for item in rt.details(SIMULATOR_PHONE))
+    with session_factory() as db:
+        assert db.get(PausedContact, SIMULATOR_PHONE) is None
+        assert (db.get(ConversationContext, SIMULATOR_PHONE) is None) is message.startswith("/")
+    assert rt.legacy_sessions == 0
+
+
+def test_test_chat_simulator_paused_contact_drops_without_agent(admin_client, admin_runtime):
+    rt = admin_runtime
+    rt.seed_contact(SIMULATOR_PHONE, paused_hours=3)
+    response = admin_client.post("/test/chat", json={"message": "Mensagem sintética"})
+    assert response.status_code == 200
+    assert "pausado" in response.json()["response"]
+    assert rt.agent.calls == rt.outbound_broker.calls == rt.transport.calls == []
+    assert any(item.body.get("disposition") == "DROPPED" for item in rt.details(SIMULATOR_PHONE))
+
+
+def test_reset_simulator_deletes_only_test_state_in_one_fenced_transaction(admin_client, admin_runtime, session_factory):
+    from app.models import Appointment, ConversationContext, PausedContact
+    rt = admin_runtime
+    for phone in (SIMULATOR_PHONE, ADMIN_PHONE):
+        rt.seed_contact(phone, paused_hours=3, appointment=True)
+    old = _anchor(rt, SIMULATOR_PHONE).last_generation
+    other = rt.store.contact_snapshot(ADMIN_PHONE)
+    response = admin_client.post("/test/reset", json={"phone": ADMIN_PHONE})
+    assert response.status_code == 200
+    assert response.json()["phone"] == SIMULATOR_PHONE
+    with session_factory() as db:
+        for model in (ConversationContext, PausedContact):
+            assert db.get(model, SIMULATOR_PHONE) is None
+            assert db.get(model, ADMIN_PHONE) is not None
+        assert db.query(Appointment).filter_by(patient_phone=SIMULATOR_PHONE).count() == 0
+        assert db.query(Appointment).filter_by(patient_phone=ADMIN_PHONE).count() == 1
+    anchor = _anchor(rt, SIMULATOR_PHONE)
+    assert anchor.last_generation != old and anchor.cycle is domain.ConversationCycle.OPEN
+    assert rt.store.contact_snapshot(ADMIN_PHONE) == other
+    assert sum(s.events.count("commit_returned") for s in rt.sessions) == 1
+    assert rt.legacy_sessions == 0
+
+
+@pytest.mark.parametrize("paused", [False, True])
+def test_scheduler_inactive_context_closes_and_preserves_administrative_pause(scheduler_module, admin_runtime, session_factory, paused):
+    import asyncio
+    from app.models import ConversationContext, PausedContact
+    rt = admin_runtime
+    rt.seed_contact(ADMIN_PHONE, age_minutes=61, paused_hours=3 if paused else None)
+    rt.seed_contact(SIMULATOR_PHONE, age_minutes=60)
+    old = _anchor(rt, ADMIN_PHONE).last_generation
+    other = rt.store.contact_snapshot(SIMULATOR_PHONE)
+    asyncio.run(scheduler_module.check_inactive_contexts(rt))
+    with session_factory() as db:
+        assert db.get(ConversationContext, ADMIN_PHONE) is None
+        assert db.get(ConversationContext, SIMULATOR_PHONE) is not None
+        pause = db.get(PausedContact, ADMIN_PHONE)
+        assert (pause is not None) is paused
+        if paused:
+            assert pause.paused_until == datetime(2026, 9, 12, 15)
+            assert pause.reason == "secretary_dashboard_pause"
+    anchor = _anchor(rt, ADMIN_PHONE)
+    assert anchor.last_generation != old
+    assert anchor.cycle is (domain.ConversationCycle.PAUSED if paused else domain.ConversationCycle.CLOSED)
+    assert rt.store.contact_snapshot(SIMULATOR_PHONE) == other
+    assert sum(s.events.count("commit_returned") for s in rt.sessions) == 1
+
+
+def test_scheduler_inactive_refresh_at_conditional_delete_preserves_updated_context(scheduler_module, admin_runtime, session_factory):
+    import asyncio
+    from sqlalchemy import update
+    from app.models import ConversationContext
+    rt = admin_runtime
+    rt.seed_contact(ADMIN_PHONE, age_minutes=61)
+    refreshed = []
+    def refresh():
+        with session_factory() as db:
+            assert db.bind.url.database in (None, "", ":memory:")
+            db.execute(update(ConversationContext).where(ConversationContext.phone == ADMIN_PHONE).values(last_activity=datetime(2026, 9, 12, 12)))
+            db.commit()
+        refreshed.append(True)
+    rt.persistent_session_hooks["before_context_delete"] = refresh
+    asyncio.run(scheduler_module.check_inactive_contexts(rt))
+    assert refreshed == [True]
+    with session_factory() as db:
+        assert db.get(ConversationContext, ADMIN_PHONE).last_activity == datetime(2026, 9, 12, 12)
+    anchor = _anchor(rt, ADMIN_PHONE)
+    assert anchor.cycle is domain.ConversationCycle.OPEN
+    assert anchor.mutation_fence is None
+    assert any(item.body.get("phase") == "ABORTED" for item in rt.details(ADMIN_PHONE)
+               if item.entry.kind == "mutation")
+    assert not any("commit_entered" in s.events for s in rt.sessions)
+
+
+def test_scheduler_inactive_lock_failure_isolated_from_other_contact(scheduler_module, admin_runtime, session_factory, monkeypatch):
+    import asyncio
+    from contextlib import contextmanager
+    from app.models import ConversationContext
+    rt = admin_runtime
+    for phone in (ADMIN_PHONE, SIMULATOR_PHONE):
+        rt.seed_contact(phone, age_minutes=61)
+    original = rt.store.contact_lease
+    blocked = rt.store.contact_snapshot(ADMIN_PHONE)
+    @contextmanager
+    def fail_one_contact(phone):
+        if phone == ADMIN_PHONE:
+            raise domain.ContactLockUnavailable(domain.FailureReason.CONTACT_LOCK_UNAVAILABLE)
+        with original(phone) as lease:
+            yield lease
+    monkeypatch.setattr(rt.store, "contact_lease", fail_one_contact)
+    asyncio.run(scheduler_module.check_inactive_contexts(rt))
+    with session_factory() as db:
+        remaining = db.query(ConversationContext.phone).all()
+        assert remaining == [(ADMIN_PHONE,)]
+    assert rt.store.contact_snapshot(ADMIN_PHONE) == blocked
+    assert sum(s.events.count("commit_returned") for s in rt.sessions) == 1
+
+
+def test_test_chat_simulator_uses_reservation_capture_ack_completion_order(admin_client, admin_runtime, task_api, monkeypatch):
+    rt = admin_runtime
+    trace = []
+    original_process = task_api.process_batch
+    def process(command, local):
+        assert isinstance(command, domain.ProcessingCommand)
+        assert command.phone == SIMULATOR_PHONE
+        assert local.store is rt.store and local.coordinator is rt.coordinator
+        assert local.transport is None
+        return original_process(command, local)
+    monkeypatch.setattr(task_api, "process_batch", process)
+    for name, label in [("reserve_outbound_enqueue", "reserved"),
+                        ("record_outbound_attempt", "acknowledged"), ("complete_batch", "completed")]:
+        original = getattr(rt.store, name)
+        def at_boundary(*args, _original=original, _label=label, **kwargs):
+            result = _original(*args, **kwargs)
+            if _label == "reserved":
+                assert isinstance(result, domain.OutboundReservation)
+            trace.append(_label)
+            return result
+        monkeypatch.setattr(rt.store, name, at_boundary)
+    original_capture = task_api._SimulatorCapture.enqueue_outbound
+    def capture(broker, outbound):
+        assert trace == ["reserved"]
+        result = original_capture(broker, outbound)
+        assert broker.outbound == [outbound]
+        assert result is domain.EnqueueResult.CONFIRMED
+        trace.append("captured")
+        return result
+    monkeypatch.setattr(task_api._SimulatorCapture, "enqueue_outbound", capture)
+    response = admin_client.post("/test/chat", json={"message": "synthetic"})
+    assert response.status_code == 200
+    assert trace == ["reserved", "captured", "acknowledged", "completed"]
+    assert rt.processing_broker.calls == rt.outbound_broker.calls == rt.transport.calls == []
+
+
+def test_dashboard_normalizes_formatted_phone_once_in_adapter(admin_client, main_module, monkeypatch):
+    original = main_module.normalize_phone
+    calls = []
+    def normalize(raw):
+        calls.append(raw)
+        return original(raw)
+    monkeypatch.setattr(main_module, "normalize_phone", normalize)
+    response = _admin_request(admin_client, "create", phone="+55 (51) 99999-0011")
+    assert response.status_code == 200
+    assert response.json()["phone"] == ADMIN_PHONE
+    assert calls == ["+55 (51) 99999-0011"]
+
+
+def test_reset_rolls_back_context_and_pause_if_appointment_delete_fails(admin_client, admin_runtime, session_factory):
+    from app.models import Appointment, ConversationContext, PausedContact
+    rt = admin_runtime
+    rt.seed_contact(SIMULATOR_PHONE, paused_hours=3, appointment=True)
+    def fail():
+        raise RuntimeError("synthetic appointment delete failure")
+    rt.session_hooks["before_appointment_delete"] = fail
+    response = admin_client.post("/test/reset")
+    assert response.status_code == 503
+    assert rt.sessions[-1].events.count("before_context_delete") == 1
+    assert rt.sessions[-1].events.count("before_appointment_delete") == 1
+    assert "commit_entered" not in rt.sessions[-1].events
+    with session_factory() as db:
+        assert db.get(ConversationContext, SIMULATOR_PHONE) is not None
+        assert db.get(PausedContact, SIMULATOR_PHONE) is not None
+        assert db.query(Appointment).filter_by(patient_phone=SIMULATOR_PHONE).count() == 1
+
+
+def test_scheduler_refresh_after_scan_before_lease_preserves_context(scheduler_module, admin_runtime, session_factory, monkeypatch):
+    import asyncio
+    from contextlib import contextmanager
+    from sqlalchemy import update
+    from app.models import ConversationContext
+    rt = admin_runtime
+    rt.seed_contact(ADMIN_PHONE, age_minutes=61)
+    original = rt.store.contact_lease
+    refreshed = []
+    @contextmanager
+    def lease_after_refresh(phone):
+        if not refreshed:
+            with session_factory() as db:
+                assert db.bind.url.database in (None, "", ":memory:")
+                db.execute(update(ConversationContext).where(ConversationContext.phone == phone).values(
+                    last_activity=datetime(2026, 9, 12, 12)))
+                db.commit()
+            refreshed.append(phone)
+        with original(phone) as lease:
+            yield lease
+    monkeypatch.setattr(rt.store, "contact_lease", lease_after_refresh)
+    asyncio.run(scheduler_module.check_inactive_contexts(rt))
+    assert refreshed == [ADMIN_PHONE]
+    with session_factory() as db:
+        assert db.get(ConversationContext, ADMIN_PHONE).last_activity == datetime(2026, 9, 12, 12)
+    assert not any("commit_entered" in s.events for s in rt.sessions)
+
+
+def test_scheduler_inactive_cutoff_converts_injected_clock_to_sql_utc(scheduler_module, admin_runtime, session_factory):
+    import asyncio
+    from app.models import ConversationContext
+    rt = admin_runtime
+    rt.seed_contact(ADMIN_PHONE, age_minutes=61)
+    rt.seed_contact(SIMULATOR_PHONE, age_minutes=59)
+    rt.clock.set(datetime(2026, 9, 12, 9, tzinfo=timezone(timedelta(hours=-3))))
+    asyncio.run(scheduler_module.check_inactive_contexts(rt))
+    with session_factory() as db:
+        assert db.get(ConversationContext, ADMIN_PHONE) is None
+        assert db.get(ConversationContext, SIMULATOR_PHONE) is not None
+
+
 @pytest.fixture
 def task_api():
     assert importlib.util.find_spec("app.conversation_tasks") is not None, "recoverable task bodies are missing"

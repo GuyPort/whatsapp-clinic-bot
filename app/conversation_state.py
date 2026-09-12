@@ -883,6 +883,8 @@ def manual_pause_deadline(now: datetime, hours: object) -> datetime:
         maximum = now + MAX_MANUAL_PAUSE
     except OverflowError as exc:
         raise InvalidManualPauseDuration("overflow") from exc
+    if deadline <= now:
+        raise InvalidManualPauseDuration("invalid_value")
     if deadline > maximum:
         raise InvalidManualPauseDuration("above_maximum")
     return deadline

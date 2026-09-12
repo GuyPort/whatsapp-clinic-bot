@@ -4,12 +4,13 @@ Aplicação FastAPI principal com webhooks do WhatsApp.
 from fastapi import FastAPI, Request, HTTPException, Depends
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 import logging
 import secrets
 import re
 from typing import Dict, Any, List
 from datetime import datetime, date
+from uuid import uuid4
 
 from app.simple_config import settings
 
@@ -20,8 +21,9 @@ from app.whatsapp_service import whatsapp_service
 from app.utils import normalize_phone
 from app.conversation_state import (
     IngressDisposition, SenderIdentity, ConversationDomainError, OutboundEnvelope, ProcessingCommand,
+    ConversationCoordinator, InvalidManualPauseDuration, PauseReason, manual_pause_deadline,
 )
-from app.conversation_tasks import process_batch, send_outbound, RetryRequested
+from app.conversation_tasks import process_batch, send_outbound, RetryRequested, simulate_message, _require_ready
 from app.models import Appointment, ConversationContext, PausedContact, AppointmentStatus
 from app.scheduler import start_scheduler, stop_scheduler
 from app.celery_app import celery_app
@@ -2919,86 +2921,97 @@ async def get_paused_contacts(admin: str = Depends(verify_admin_credentials)):
         return {"paused_contacts": result, "count": len(result)}
 
 
+def _administrative_runtime(request: Request):
+    runtime = getattr(request.app.state, "conversation_runtime", None)
+    try:
+        _require_ready(runtime)
+    except Exception:
+        raise HTTPException(status_code=503, detail="temporarily_unavailable") from None
+    return runtime
+
+
+async def _administrative_payload(request: Request):
+    try:
+        data = await request.json()
+    except (ValueError, UnicodeError):
+        raise HTTPException(status_code=400, detail="invalid_request") from None
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=400, detail="invalid_request")
+    return data
+
+
+def _administrative_phone(raw):
+    phone = normalize_phone(raw)
+    if not phone:
+        raise HTTPException(status_code=400, detail="invalid_phone")
+    return phone
+
+
+def _administrative_duration(data, now):
+    hours = data.get("hours", 24)
+    try:
+        manual_pause_deadline(now, hours)
+    except InvalidManualPauseDuration:
+        raise HTTPException(status_code=400, detail="invalid_pause_duration") from None
+    return hours
+
+
+@contextmanager
+def _administrative_session(runtime, phone):
+    try:
+        with runtime.store.contact_lease(phone) as lease, runtime.session_factory() as db:
+            yield db, lease
+    except InvalidManualPauseDuration:
+        raise HTTPException(status_code=400, detail="invalid_pause_duration") from None
+    except HTTPException:
+        raise
+    except Exception:
+        logger.warning("conversation_administration_unavailable")
+        raise HTTPException(status_code=503, detail="temporarily_unavailable") from None
+
+
 @app.post("/api/paused-contacts")
 async def pause_contact(request: Request, admin: str = Depends(verify_admin_credentials)):
-    """Pausar um contato manualmente"""
-    from datetime import datetime, timedelta
-
-    data = await request.json()
-    phone = data.get("phone", "").strip()
-    hours = data.get("hours", 24)
-    reason = data.get("reason", "secretary_dashboard_pause")
-
-    if not phone:
-        raise HTTPException(status_code=400, detail="Telefone é obrigatório")
-
-    # Normalizar telefone
-    phone = normalize_phone(phone)
-
-    with get_db() as db:
-        # Verificar se já existe
-        existing = db.query(PausedContact).filter(PausedContact.phone == phone).first()
-
-        paused_until = datetime.utcnow() + timedelta(hours=hours)
-
-        if existing:
-            existing.paused_until = paused_until
-            existing.reason = reason
-            existing.paused_at = datetime.utcnow()
-        else:
-            new_pause = PausedContact(
-                phone=phone,
-                paused_until=paused_until,
-                reason=reason,
-                paused_at=datetime.utcnow()
-            )
-            db.add(new_pause)
-
-        db.commit()
-
-        logger.info(f"⏸️ Contato {phone} pausado via dashboard até {paused_until}")
-        return {"success": True, "phone": phone, "paused_until": paused_until.isoformat()}
+    """Create a fenced manual pause without deleting the conversation context."""
+    runtime = _administrative_runtime(request)
+    data = await _administrative_payload(request)
+    phone = _administrative_phone(data.get("phone"))
+    now = runtime.clock.now()
+    hours = _administrative_duration(data, now)
+    try:
+        reason = PauseReason(data.get("reason", PauseReason.DASHBOARD.value)).value
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=400, detail="invalid_pause_reason") from None
+    with _administrative_session(runtime, phone) as (db, lease):
+        transition = runtime.coordinator.pause_manual(db, phone, hours, reason, now, lease, str(uuid4()))
+    return {"success": True, "phone": phone, "paused_until": transition.paused_until.isoformat()}
 
 
 @app.delete("/api/paused-contacts/{phone}")
-async def unpause_contact(phone: str, admin: str = Depends(verify_admin_credentials)):
+async def unpause_contact(phone: str, request: Request, admin: str = Depends(verify_admin_credentials)):
     """Despausar um contato"""
-    phone = normalize_phone(phone)
-
-    with get_db() as db:
-        existing = db.query(PausedContact).filter(PausedContact.phone == phone).first()
-
-        if not existing:
+    runtime = _administrative_runtime(request)
+    phone = _administrative_phone(phone)
+    with _administrative_session(runtime, phone) as (db, lease):
+        if db.get(PausedContact, phone) is None:
             raise HTTPException(status_code=404, detail="Contato não encontrado na lista de pausados")
-
-        db.delete(existing)
-        db.commit()
-
-        logger.info(f"▶️ Contato {phone} despausado via dashboard")
-        return {"success": True, "phone": phone}
+        runtime.coordinator.unpause(db, phone, runtime.clock.now(), lease, str(uuid4()))
+    return {"success": True, "phone": phone}
 
 
 @app.put("/api/paused-contacts/{phone}/extend")
 async def extend_pause(phone: str, request: Request, admin: str = Depends(verify_admin_credentials)):
     """Estender pausa de um contato"""
-    from datetime import datetime, timedelta
-
-    data = await request.json()
-    hours = data.get("hours", 24)
-    phone = normalize_phone(phone)
-
-    with get_db() as db:
-        existing = db.query(PausedContact).filter(PausedContact.phone == phone).first()
-
-        if not existing:
+    runtime = _administrative_runtime(request)
+    data = await _administrative_payload(request)
+    phone = _administrative_phone(phone)
+    now = runtime.clock.now()
+    hours = _administrative_duration(data, now)
+    with _administrative_session(runtime, phone) as (db, lease):
+        if db.get(PausedContact, phone) is None:
             raise HTTPException(status_code=404, detail="Contato não encontrado na lista de pausados")
-
-        # Adicionar horas ao tempo atual de pausa
-        existing.paused_until = existing.paused_until + timedelta(hours=hours)
-        db.commit()
-
-        logger.info(f"⏸️ Pausa do contato {phone} estendida por +{hours}h até {existing.paused_until}")
-        return {"success": True, "phone": phone, "paused_until": existing.paused_until.isoformat()}
+        transition = runtime.coordinator.extend_pause(db, phone, hours, now, lease, str(uuid4()))
+    return {"success": True, "phone": phone, "paused_until": transition.paused_until.isoformat()}
 
 
 @app.get("/api/active-conversations")
@@ -4071,10 +4084,10 @@ async def domiciliares_dashboard(admin: str = Depends(verify_admin_credentials))
 # AMBIENTE DE TESTE - Simulador de Chat WhatsApp
 # =============================================================================
 
-TEST_PHONE = "5500000000000"  # Número simulado para testes
+TEST_PHONE = ConversationCoordinator.TEST_PHONE
 
 @app.get("/test/chat", response_class=HTMLResponse)
-async def test_chat_page():
+async def test_chat_page(admin: str = Depends(verify_admin_credentials)):
     """Página de teste com interface de chat estilo WhatsApp"""
     return """
     <!DOCTYPE html>
@@ -4396,82 +4409,28 @@ async def test_chat_page():
 
 
 @app.post("/test/chat")
-async def test_chat_send(request: Request):
-    """
-    Endpoint de teste que processa mensagem e retorna resposta diretamente.
-    Simula exatamente o comportamento do bot no WhatsApp, mas sem:
-    - Celery (processamento síncrono)
-    - Evolution API (não envia para WhatsApp)
-    - Redis locks (não precisa)
-    """
+async def test_chat_send(request: Request, admin: str = Depends(verify_admin_credentials)):
+    """Authenticated synthetic patient ingress with capture-only processing."""
+    runtime = _administrative_runtime(request)
+    data = await _administrative_payload(request)
+    message = data.get("message")
+    if not isinstance(message, str) or not message.strip():
+        raise HTTPException(status_code=400, detail="invalid_message")
     try:
-        data = await request.json()
-        message_text = data.get("message", "").strip()
-
-        if not message_text:
-            return JSONResponse({"error": "Mensagem vazia"}, status_code=400)
-
-        phone = TEST_PHONE
-        logger.info(f"[TEST] Mensagem recebida: {message_text}")
-
-        # Verificar comandos administrativos
-        lowered = message_text.lower()
-        if lowered in {"/pausar", "/pause"}:
-            with get_db() as db:
-                response = ai_agent._handle_request_human_assistance({}, db, phone)
-                return {"response": response, "phone": phone}
-
-        # Verificar se bot está pausado
-        with get_db() as db:
-            paused = db.query(PausedContact).filter_by(phone=phone).first()
-            if paused:
-                from datetime import datetime
-                if datetime.utcnow() < paused.paused_until:
-                    return {"response": "[Bot pausado para este número - aguardando atendimento humano]", "phone": phone}
-                else:
-                    db.delete(paused)
-                    db.commit()
-
-            # Processar com IA (mesmo código do webhook real)
-            response = ai_agent.process_message(message_text, phone, db)
-
-            logger.info(f"[TEST] Resposta gerada: {response[:100] if response else 'None'}...")
-
-            return {"response": response or "[Sem resposta]", "phone": phone}
-
-    except Exception as e:
-        logger.error(f"[TEST] Erro: {str(e)}", exc_info=True)
-        return JSONResponse({"error": str(e)}, status_code=500)
+        response = simulate_message(message.strip(), runtime)
+    except Exception:
+        logger.warning("conversation_simulator_unavailable")
+        raise HTTPException(status_code=503, detail="temporarily_unavailable") from None
+    return {"response": response or "[Sem resposta]", "phone": TEST_PHONE}
 
 
 @app.post("/test/reset")
-async def test_chat_reset():
+async def test_chat_reset(request: Request, admin: str = Depends(verify_admin_credentials)):
     """Reseta o contexto de conversa do número de teste"""
-    try:
-        with get_db() as db:
-            # Deletar contexto de conversa
-            context = db.query(ConversationContext).filter_by(phone=TEST_PHONE).first()
-            if context:
-                db.delete(context)
-
-            # Deletar pausa se existir
-            paused = db.query(PausedContact).filter_by(phone=TEST_PHONE).first()
-            if paused:
-                db.delete(paused)
-
-            # Deletar agendamentos de teste
-            appointments = db.query(Appointment).filter_by(patient_phone=TEST_PHONE).all()
-            for apt in appointments:
-                db.delete(apt)
-
-            db.commit()
-
-        logger.info(f"[TEST] Contexto resetado para {TEST_PHONE}")
-        return {"message": "Conversa resetada com sucesso!", "phone": TEST_PHONE}
-
-    except Exception as e:
-        logger.error(f"[TEST] Erro ao resetar: {str(e)}", exc_info=True)
-        return JSONResponse({"error": str(e)}, status_code=500)
+    runtime = _administrative_runtime(request)
+    with _administrative_session(runtime, TEST_PHONE) as (db, lease):
+        runtime.coordinator.reset_test_state(db, TEST_PHONE, runtime.clock.now(), lease, str(uuid4()))
+    return {"message": "Conversa resetada com sucesso!", "phone": TEST_PHONE}
 
 
 if __name__ == "__main__":

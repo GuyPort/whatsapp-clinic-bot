@@ -387,6 +387,10 @@ class BarrierSession:
         self._at("add_returned")
 
     def execute(self, statement, *args, **kwargs):
+        if getattr(statement, "is_delete", False) and statement.table.name == "conversation_contexts":
+            self._at("before_context_delete")
+        if getattr(statement, "is_delete", False) and statement.table.name == "appointments":
+            self._at("before_appointment_delete")
         self._at("execute")
         return self.session.execute(statement, *args, **kwargs)
 
@@ -601,6 +605,7 @@ class ProcessingRuntime(IngressRuntime):
         self.transport = ScriptedTransport()
         self.sessions = []
         self.session_hooks = {}
+        self.persistent_session_hooks = {}
 
     def session_factory(self):
         from contextlib import contextmanager
@@ -608,6 +613,7 @@ class ProcessingRuntime(IngressRuntime):
         def session_scope():
             with super(ProcessingRuntime, self).session_factory() as session:
                 observed = BarrierSession(session)
+                observed.hooks.update(self.persistent_session_hooks)
                 observed.hooks.update(self.session_hooks)
                 self.session_hooks.clear()
                 self.sessions.append(observed)
@@ -621,6 +627,25 @@ class ProcessingRuntime(IngressRuntime):
             self.coordinator.accept_ingress(db, SenderIdentity(phone, False, message_id or str(uuid4()), "pn"),
                 kind, content, self.clock.now(), lease, self.processing_broker)
         return self.processing_broker.calls[-1]
+
+    def seed_contact(self, phone, *, age_minutes=0, paused_hours=None, appointment=False):
+        """Disposable fixtures retain a genuine central anchor and SQL rows."""
+        from uuid import uuid4
+        from app.models import ConversationContext, Appointment
+        with self.store.contact_lease(phone) as lease, self._factory() as db:
+            assert db.bind.url.database in (None, "", ":memory:")
+            self.coordinator.resolve_ingress(db, phone, self.clock.now(), lease)
+            db.add(ConversationContext(phone=phone, messages=[{"role": "user", "content": "synthetic history"}],
+                last_activity=(self.clock.now() - timedelta(minutes=age_minutes)).replace(tzinfo=None),
+                created_at=self.clock.now().replace(tzinfo=None)))
+            if appointment:
+                db.add(Appointment(patient_name="Synthetic", patient_phone=phone, patient_birth_date="01/01/2000",
+                    appointment_date="20260914", appointment_time="12:00",
+                    created_at=self.clock.now().replace(tzinfo=None), updated_at=self.clock.now().replace(tzinfo=None)))
+            db.commit()
+            if paused_hours is not None:
+                self.coordinator.pause_manual(db, phone, paused_hours, "secretary_dashboard_pause",
+                    self.clock.now(), lease, str(uuid4()))
 
 
 class RetryTask:

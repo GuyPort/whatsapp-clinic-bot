@@ -10,6 +10,155 @@ from app.conversation_state import DependencyName
 from tests.fakes import WebhookRequest, webhook_payload
 
 
+@pytest.mark.parametrize("method,path", [("GET", "/test/chat"), ("POST", "/test/chat"), ("POST", "/test/reset")])
+@pytest.mark.parametrize("auth", [None, ("synthetic-admin", "wrong-password")])
+def test_test_chat_reset_auth_precedes_state_agent_and_body(admin_client, admin_runtime, method, path, auth):
+    rt = admin_runtime
+    before = rt.store.snapshot()
+    response = admin_client.request(method, path, auth=auth, content="{malformed")
+    assert response.status_code == 401
+    assert response.headers["www-authenticate"] == "Basic"
+    assert rt.readiness_calls == rt.lease_calls == rt.session_calls == rt.legacy_sessions == 0
+    assert rt.agent.calls == [] and rt.store.snapshot() == before
+
+
+@pytest.mark.parametrize("route", ["create", "extend", "unpause", "test_chat", "reset"])
+@pytest.mark.parametrize("dependency", list(DependencyName))
+def test_dashboard_test_chat_reset_readiness_precedes_content_lease_sql(admin_runtime, main_module, route, dependency):
+    from tests.test_conversation_flow import ADMIN_PHONE
+    from fastapi import HTTPException
+    rt = admin_runtime
+    rt.dependencies[dependency] = False
+    request = WebhookRequest(main_module.app, json_error=AssertionError("body read before readiness"))
+    if route == "create":
+        call = main_module.pause_contact(request, admin="synthetic")
+    elif route == "extend":
+        call = main_module.extend_pause(ADMIN_PHONE, request, admin="synthetic")
+    elif route == "unpause":
+        call = main_module.unpause_contact(ADMIN_PHONE, request=request, admin="synthetic")
+    elif route == "test_chat":
+        call = main_module.test_chat_send(request, admin="synthetic")
+    else:
+        call = main_module.test_chat_reset(request=request, admin="synthetic")
+    try:
+        response = asyncio.run(call)
+        status = response.status_code
+    except HTTPException as exc:
+        status = exc.status_code
+    assert status == 503
+    assert request.json_calls == rt.lease_calls == rt.session_calls == rt.legacy_sessions == 0
+    assert rt.agent.calls == rt.outbound_broker.calls == rt.transport.calls == []
+
+
+@pytest.mark.parametrize("action", ["create", "extend", "unpause", "test_chat", "reset"])
+@pytest.mark.parametrize("failure", ["lease", "database", "commit", "lease_loss"])
+def test_dashboard_simulator_reset_failure_is_closed_and_sanitized(admin_client, admin_runtime, session_factory, caplog, action, failure):
+    from tests.test_conversation_flow import ADMIN_PHONE, SIMULATOR_PHONE, _admin_request
+    from app.models import ConversationContext, PausedContact, Appointment
+    rt = admin_runtime
+    phone = SIMULATOR_PHONE if action in ("test_chat", "reset") else ADMIN_PHONE
+    rt.seed_contact(phone, paused_hours=None if action == "test_chat" else 2, appointment=True)
+    sentinel = "PRIVATE_EXCEPTION message-text token=synthetic"
+    def fail():
+        raise RuntimeError(sentinel)
+    if failure == "lease":
+        rt.store.fail_next_atomic("acquire")
+    elif failure == "database":
+        rt.session_factory = fail
+    elif failure == "commit":
+        rt.persistent_session_hooks["commit_entered"] = fail
+    else:
+        from app.conversation_redis import contact_keys
+        rt.persistent_session_hooks["flush"] = lambda: rt.store.client.values.pop(contact_keys(phone).lease, None)
+    with caplog.at_level(logging.INFO):
+        response = (admin_client.post("/test/chat", json={"message": "synthetic content"}) if action == "test_chat"
+            else admin_client.post("/test/reset") if action == "reset" else _admin_request(admin_client, action))
+        logging.getLogger("unaffected_control").info("unaffected_control")
+    assert response.status_code == 503
+    application_logs = "\n".join(record.getMessage() for record in caplog.records if record.name.startswith("app."))
+    assert sentinel not in response.text + application_logs
+    assert phone not in application_logs
+    assert "synthetic content" not in application_logs
+    assert "unaffected_control" in caplog.text
+    assert rt.outbound_broker.calls == rt.transport.calls == []
+    with session_factory() as db:
+        assert db.get(ConversationContext, phone) is not None
+        assert (db.get(PausedContact, phone) is not None) is (action != "test_chat")
+        assert db.query(Appointment).filter_by(patient_phone=phone).count() == 1
+
+
+@pytest.mark.parametrize("dependency", list(DependencyName))
+def test_scheduler_readiness_closed_before_scan_or_lock(scheduler_module, admin_runtime, dependency):
+    rt = admin_runtime
+    rt.dependencies[dependency] = False
+    asyncio.run(scheduler_module.check_inactive_contexts(rt))
+    assert rt.session_calls == rt.lease_calls == 0
+
+
+def test_scheduler_missing_runtime_is_closed(scheduler_module, admin_runtime):
+    asyncio.run(scheduler_module.check_inactive_contexts())
+    assert admin_runtime.session_calls == admin_runtime.lease_calls == 0
+
+
+def test_test_chat_page_accepts_synthetic_auth_without_reading_state(admin_client, admin_runtime):
+    response = admin_client.get("/test/chat")
+    assert response.status_code == 200
+    assert admin_runtime.lease_calls == admin_runtime.session_calls == 0
+    assert admin_runtime.agent.calls == []
+
+
+@pytest.mark.parametrize("path", ["/api/paused-contacts", "/api/paused-contacts/5551999990011/extend", "/test/chat"])
+@pytest.mark.parametrize("body", ["{malformed", "[]", "null"])
+def test_dashboard_test_chat_bad_json_is_400_before_lease(admin_client, admin_runtime, path, body):
+    response = admin_client.request("PUT" if path.endswith("extend") else "POST", path,
+        content=body, headers={"Content-Type": "application/json"})
+    assert response.status_code == 400
+    assert admin_runtime.lease_calls == admin_runtime.session_calls == 0
+
+
+@pytest.mark.parametrize("failure", ["missing", "readiness_exception"])
+@pytest.mark.parametrize("method,path", [("POST", "/api/paused-contacts"),
+    ("PUT", "/api/paused-contacts/5551999990011/extend"), ("DELETE", "/api/paused-contacts/5551999990011"),
+    ("POST", "/test/chat"), ("POST", "/test/reset")])
+def test_dashboard_simulator_reset_missing_or_failed_readiness_is_503(admin_client, main_module, admin_runtime, monkeypatch, failure, method, path):
+    def fail():
+        raise RuntimeError("synthetic readiness failure")
+    if failure == "missing":
+        monkeypatch.delattr(main_module.app.state, "conversation_runtime")
+    else:
+        monkeypatch.setattr(admin_runtime, "readiness_status", fail)
+    response = admin_client.request(method, path, content="{malformed")
+    assert response.status_code == 503
+    assert admin_runtime.lease_calls == admin_runtime.session_calls == 0
+    assert admin_runtime.agent.calls == []
+
+
+@pytest.mark.parametrize("failure", ["database", "readiness", "lease_loss"])
+def test_scheduler_failure_is_sanitized_and_preserves_context(scheduler_module, admin_runtime, session_factory, caplog, monkeypatch, failure):
+    from tests.test_conversation_flow import ADMIN_PHONE
+    from app.models import ConversationContext
+    from app.conversation_redis import contact_keys
+    rt = admin_runtime
+    rt.seed_contact(ADMIN_PHONE, age_minutes=61)
+    sentinel = "PRIVATE_EXCEPTION patient=synthetic token=synthetic"
+    def fail():
+        raise RuntimeError(sentinel)
+    if failure == "database":
+        monkeypatch.setattr(rt, "session_factory", fail)
+    elif failure == "readiness":
+        monkeypatch.setattr(rt, "readiness_status", fail)
+    else:
+        rt.persistent_session_hooks["flush"] = lambda: rt.store.client.values.pop(contact_keys(ADMIN_PHONE).lease, None)
+    with caplog.at_level(logging.INFO):
+        asyncio.run(scheduler_module.check_inactive_contexts(rt))
+        logging.getLogger("unaffected_control").info("unaffected_control")
+    application_logs = "\n".join(record.getMessage() for record in caplog.records if record.name.startswith("app."))
+    assert sentinel not in application_logs and ADMIN_PHONE not in application_logs
+    assert "unaffected_control" in caplog.text
+    with session_factory() as db:
+        assert db.get(ConversationContext, ADMIN_PHONE) is not None
+
+
 def call_webhook(main, payload=None, **kwargs):
     request = WebhookRequest(main.app, payload, **kwargs)
     return asyncio.run(main.whatsapp_webhook(request)), request

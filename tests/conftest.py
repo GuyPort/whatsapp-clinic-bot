@@ -126,3 +126,46 @@ def app_client(monkeypatch, main_module):
     monkeypatch.setattr(main.app.router, "lifespan_context", no_lifespan)
     with TestClient(main.app) as client:
         yield client
+
+
+@pytest.fixture
+def admin_runtime(main_module, monkeypatch, session_factory):
+    from app.conversation_state import ConversationConfig
+    from tests.fakes import ProcessingRuntime
+    runtime = ProcessingRuntime(session_factory, ConversationConfig.from_settings(main_module.settings))
+    monkeypatch.setattr(main_module.app.state, "conversation_runtime", runtime, raising=False)
+    monkeypatch.setattr(main_module.settings, "admin_password", "synthetic-admin-password")
+    # Exercise old adapters against disposable SQL during RED, never a real DB.
+    from contextlib import contextmanager
+    @contextmanager
+    def legacy_session():
+        runtime.legacy_sessions += 1
+        with session_factory() as db:
+            assert db.bind.url.database in (None, "", ":memory:")
+            yield db
+    runtime.legacy_sessions = 0
+    monkeypatch.setattr(main_module, "get_db", legacy_session)
+    return runtime
+
+
+@pytest.fixture
+def admin_client(monkeypatch, main_module, admin_runtime):
+    @asynccontextmanager
+    async def no_lifespan(_app):
+        yield
+    monkeypatch.setattr(main_module.app.router, "lifespan_context", no_lifespan)
+    with TestClient(main_module.app, raise_server_exceptions=False) as client:
+        client.auth = ("synthetic-admin", "synthetic-admin-password")
+        yield client
+
+
+@pytest.fixture
+def scheduler_module(main_module, admin_runtime):
+    import importlib.util
+    from pathlib import Path
+    spec = importlib.util.spec_from_file_location(
+        "synthetic_scheduler", Path(__file__).parents[1] / "app" / "scheduler.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    module.get_db = admin_runtime.session_factory
+    return module
