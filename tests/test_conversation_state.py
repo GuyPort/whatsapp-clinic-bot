@@ -709,3 +709,64 @@ def test_mutation_new_agent_result_is_blocked_during_administrative_pause(transi
         assert store.contact_snapshot(PHONE) == before
         assert db.get(ConversationContext, PHONE) is not None
         assert db.events.count("commit_entered") == 1
+
+
+def test_closed_direct_close_rejects_valid_pause_without_changing_sql_or_cycle(transition_env):
+    from app.conversation_state import ConversationMutationPending
+    from app.models import PausedContact, ConversationContext
+    coordinator, db, store, clock = transition_env
+    with store.contact_lease(PHONE) as lease:
+        coordinator.resolve_ingress(db, PHONE, clock.now(), lease)
+        seed_context(db, PHONE, clock.now())
+        coordinator.pause_manual(db, PHONE, 24, "secretary_dashboard_pause", clock.now(), lease, "pause-1")
+        before = store.contact_snapshot(PHONE)
+        with pytest.raises(ConversationMutationPending):
+            coordinator.close_context(db, PHONE, clock.now(), lease, "close-1")
+        assert store.contact_snapshot(PHONE) == before
+        assert db.get(PausedContact, PHONE) is not None
+        assert db.get(ConversationContext, PHONE) is not None
+        assert db.events.count("commit_entered") == 1
+
+
+@pytest.mark.parametrize("reason,allowed", [("secretary_dashboard_pause", False),
+                                           ("secretary_manual_pause", False),
+                                           ("user_requested_human_assistance", True)])
+def test_send_transfer_requires_patient_requested_reason(transition_env, reason, allowed):
+    coordinator, db, store, clock = transition_env
+    with store.contact_lease(PHONE) as lease:
+        ref = coordinator.pause_for_secretary(db, PHONE, reason, clock.now(), lease, "pause-1")
+        outbound = OutboundEnvelope(PHONE, "synthetic", OutboundKind.TRANSFER_CONFIRMATION,
+                                    ref.generation, "p-1", "pause-1", pause_ref=ref)
+        assert coordinator.may_send(db, outbound, clock.now(), lease) is allowed
+
+
+@pytest.mark.parametrize("method", ["secretary", "manual"])
+def test_pause_freeform_reason_is_rejected_before_sql_or_redis_metadata(transition_env, method):
+    from app.models import PausedContact
+    coordinator, db, store, clock = transition_env
+    with store.contact_lease(PHONE) as lease:
+        coordinator.resolve_ingress(db, PHONE, clock.now(), lease)
+        before = store.contact_snapshot(PHONE)
+        with pytest.raises(ConversationStateUnavailable) as caught:
+            if method == "secretary":
+                coordinator.pause_for_secretary(db, PHONE, "synthetic-private-note", clock.now(), lease, "pause-1")
+            else:
+                coordinator.pause_manual(db, PHONE, 24, "synthetic-private-note", clock.now(), lease, "pause-1")
+        assert caught.value.reason_code is FailureReason.INVALID_VALUE
+        assert "synthetic-private-note" not in str(caught.value)
+        assert store.contact_snapshot(PHONE) == before
+        assert db.get(PausedContact, PHONE) is None
+        assert "commit_entered" not in db.events
+
+
+def test_pause_extend_maps_legacy_freeform_reason_to_safe_administrative_code(transition_env):
+    from app.models import PausedContact
+    coordinator, db, store, clock = transition_env
+    with store.contact_lease(PHONE) as lease:
+        coordinator.pause_manual(db, PHONE, 24, "secretary_dashboard_pause", clock.now(), lease, "pause-1")
+        db.get(PausedContact, PHONE).reason = "synthetic-private-note"
+        db.session.commit()
+        ref = coordinator.extend_pause(db, PHONE, 1, clock.now(), lease, "extend-1")
+        assert ref.reason == "secretary_dashboard_pause"
+        assert db.get(PausedContact, PHONE).reason == "secretary_dashboard_pause"
+        assert "synthetic-private-note" not in json.dumps(store.contact_snapshot(PHONE))

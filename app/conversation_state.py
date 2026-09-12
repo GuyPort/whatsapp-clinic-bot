@@ -80,6 +80,12 @@ class AgentIntent(str, Enum):
     CLOSE_CONTEXT = "CLOSE_CONTEXT"
 
 
+class PauseReason(str, Enum):
+    HUMAN_REQUEST = "user_requested_human_assistance"
+    SECRETARY_COMMAND = "secretary_manual_pause"
+    DASHBOARD = "secretary_dashboard_pause"
+
+
 class DependencyName(str, Enum):
     SECRET = "secret"
     SQL = "sql"
@@ -95,6 +101,7 @@ class FailureReason(str, Enum):
     GENERATION_UNAVAILABLE = "conversation_generation_unavailable"
     MUTATION_PENDING = "conversation_mutation_pending"
     MUTATION_AMBIGUOUS = "conversation_mutation_ambiguous"
+    MUTATION_ABORTED = "conversation_mutation_aborted"
     INVALID_CANONICAL_CONTACT = "invalid_canonical_contact"
     INVALID_TYPE = "invalid_type"
     INVALID_VALUE = "invalid_value"
@@ -159,6 +166,11 @@ class ConversationMutationPending(ConversationDomainError):
 
 
 class ConversationMutationAmbiguous(ConversationDomainError):
+    pass
+
+
+class ConversationMutationAborted(ConversationDomainError):
+    """Terminal operation receipt: callers must not retry its DML."""
     pass
 
 
@@ -247,6 +259,10 @@ class MutationTarget:
     reason: str | None = None
     context_hash: str | None = None
 
+    def __post_init__(self) -> None:
+        if self.reason is not None:
+            _pause_reason(self.reason)
+
     @property
     def fingerprint(self) -> str:
         return _hash({"kind": self.kind, "expected_hash": self.expected_hash,
@@ -270,6 +286,7 @@ class MutationAttempt:
     owner_token_hash: str
     paused_until: datetime | None = None
     reason: str | None = None
+    started_at: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -419,7 +436,8 @@ class ConversationStore(Protocol):
     def inspect_mutation(self, phone: str, operation_id: str, lease: ContactLease,
                          *, operational: bool = False) -> MutationAttempt | None: ...
 
-    def assert_mutation_available(self, lease: ContactLease, now: datetime) -> None: ...
+    def assert_mutation_available(self, lease: ContactLease, now: datetime,
+                                  *, operation_id: str | None = None) -> None: ...
 
     def prepare_mutation(self, phone: str, kind: str, target_fingerprint: str,
                          lease: ContactLease, operation_id: str, now: datetime,
@@ -574,6 +592,15 @@ def _sql_time(value: datetime) -> datetime:
     return _utc(value).replace(tzinfo=None)
 
 
+def _pause_reason(value: object, *, legacy: bool = False) -> str:
+    try:
+        return PauseReason(value).value
+    except (ValueError, TypeError):
+        if legacy:
+            return PauseReason.DASHBOARD.value
+        raise ConversationStateUnavailable(FailureReason.INVALID_VALUE) from None
+
+
 def _reason_codes_only(method):
     @wraps(method)
     def guarded(*args, **kwargs):
@@ -625,14 +652,16 @@ class ConversationCoordinator:
 
     def _request(self, db, phone, lease, operation_id, now, kind, parameters):
         self._ensure(db, phone, lease)
-        self.store.assert_mutation_available(lease, now)
         request_hash = _hash({"kind": kind, "parameters": parameters})
         previous = self.store.inspect_mutation(phone, operation_id, lease)
         if previous is not None:
-            if previous.request_fingerprint != request_hash:
+            if previous.kind != kind or previous.request_fingerprint != request_hash:
                 raise ConversationStateUnavailable(FailureReason.INVALID_VALUE)
-            if previous.phase is not MutationPhase.COMMITTED:
+            if previous.phase is MutationPhase.ABORTED:
+                raise ConversationMutationAborted(FailureReason.MUTATION_ABORTED)
+            if previous.phase not in (MutationPhase.COMMITTED, MutationPhase.PREPARED):
                 raise ConversationMutationPending(FailureReason.MUTATION_PENDING)
+        self.store.assert_mutation_available(lease, now, operation_id=operation_id)
         return request_hash, previous
 
     def _run_mutation(self, db: Session, phone: str, kind: str, target: MutationTarget,
@@ -657,7 +686,9 @@ class ConversationCoordinator:
             proof = _issue_rollback_proof(operation_id, lease)
             try:
                 self.store.restore_prepared_after_rollback(phone, operation_id, lease, self.clock.now(), proof=proof)
-                self.store.preserve_or_abort_prepared(phone, operation_id, lease, self.clock.now())
+                terminal = (isinstance(exc, ConversationDomainError) and exc.reason_code is FailureReason.CONDITION_CHANGED)
+                if terminal or self.clock.now() >= attempt.processing_deadline:
+                    self.store.preserve_or_abort_prepared(phone, operation_id, lease, self.clock.now())
             except ConversationDomainError:
                 pass  # Owner loss must never remove another owner's fence.
             finally:
@@ -698,22 +729,25 @@ class ConversationCoordinator:
         if agent_request is not None:
             parameters["agent"] = agent_request
         request_hash, previous = self._request(db, phone, lease, operation_id, now, kind, parameters)
-        if previous is not None:
+        if previous is not None and previous.phase is MutationPhase.COMMITTED:
             return self._pause_ref(previous)
-        if agent_request is not None:
+        if agent_request is not None and previous is None:
             self._assert_open(db, phone, lease)
-        deadline = _utc(now) + DEFAULT_SECRETARY_PAUSE if hours is None else manual_pause_deadline(_utc(now), hours)
-        if kind == "EXTEND_PAUSE":
+        deadline = previous.paused_until if previous is not None else (
+            _utc(now) + DEFAULT_SECRETARY_PAUSE if hours is None else manual_pause_deadline(_utc(now), hours))
+        if previous is not None:
+            reason = previous.reason
+        elif kind == "EXTEND_PAUSE":
             pause = db.get(PausedContact, phone)
             if pause is None:
                 raise ConversationStateUnavailable(FailureReason.INVALID_VALUE)
             deadline = manual_pause_deadline(_utc(pause.paused_until), hours)
             if deadline > _utc(now) + MAX_MANUAL_PAUSE:
                 raise InvalidManualPauseDuration(FailureReason.ABOVE_MAXIMUM)
-            reason = pause.reason
+            reason = _pause_reason(pause.reason, legacy=True)
         target = MutationTarget(kind, request_hash, self._db_hash(db, phone), ConversationCycle.PAUSED,
                                 paused_until=deadline, reason=reason)
-        def dml(session, _attempt):
+        def dml(session, attempt):
             self._check_target(session, phone, target)
             if kind == "PAUSE_FOR_SECRETARY":
                 session.execute(delete(ConversationContext).where(ConversationContext.phone == phone))
@@ -723,19 +757,19 @@ class ConversationCoordinator:
                 session.add(row)
             row.paused_until, row.reason = _sql_time(deadline), reason
             if kind != "EXTEND_PAUSE":
-                row.paused_at = _sql_time(now)
+                row.paused_at = _sql_time(attempt.started_at or now)
         return self._pause_ref(self._run_mutation(db, phone, kind, target, lease, operation_id, now, dml))
 
     @_reason_codes_only
     def pause_for_secretary(self, db: Session, phone: str, reason: str, now: datetime,
                             lease: ContactLease, operation_id: str) -> PauseTransitionRef:
-        return self._pause(db, phone, reason, now, lease, operation_id, kind="PAUSE_FOR_SECRETARY")
+        return self._pause(db, phone, _pause_reason(reason), now, lease, operation_id, kind="PAUSE_FOR_SECRETARY")
 
     @_reason_codes_only
     def pause_manual(self, db: Session, phone: str, hours: object, reason: str, now: datetime,
                      lease: ContactLease, operation_id: str) -> PauseTransitionRef:
         valid_hours = validate_manual_pause_hours(hours)
-        return self._pause(db, phone, reason, now, lease, operation_id, kind="PAUSE_MANUAL", hours=valid_hours)
+        return self._pause(db, phone, _pause_reason(reason), now, lease, operation_id, kind="PAUSE_MANUAL", hours=valid_hours)
 
     @_reason_codes_only
     def extend_pause(self, db: Session, phone: str, hours: object, now: datetime,
@@ -749,9 +783,9 @@ class ConversationCoordinator:
             parameters["agent"] = agent_request
         request_hash, previous = self._request(db, phone, lease, operation_id, now, kind,
                                                parameters)
-        if previous is not None:
+        if previous is not None and previous.phase is MutationPhase.COMMITTED:
             return previous
-        if agent_request is not None:
+        if previous is None and (agent_request is not None or kind == "CLOSE_CONTEXT"):
             self._assert_open(db, phone, lease)
         cycle = ConversationCycle.OPEN if kind in ("UNPAUSE", "EXPIRE_PAUSE", "RESET_TEST") else ConversationCycle.CLOSED
         if kind == "CLEAN_INACTIVE":
@@ -761,6 +795,8 @@ class ConversationCoordinator:
             pause = db.get(PausedContact, phone)
             if pause is not None and _utc(pause.paused_until) > _utc(now):
                 cycle = ConversationCycle.PAUSED
+        if previous is not None:
+            cycle = previous.target_cycle
         target = MutationTarget(kind, request_hash, self._db_hash(db, phone, appointments=kind == "RESET_TEST"), cycle)
         def dml(session, _attempt):
             self._check_target(session, phone, target, appointments=kind == "RESET_TEST")
@@ -813,7 +849,10 @@ class ConversationCoordinator:
     def resolve_ingress(self, db: Session, phone: str, now: datetime,
                          lease: ContactLease) -> IngressResolution:
         anchor = self._ensure(db, phone, lease)
-        self.store.assert_mutation_available(lease, now)
+        fence = anchor.mutation_fence
+        expiry_operation = (fence["operation_id"] if fence is not None
+                            and fence["kind"] == "EXPIRE_PAUSE" and fence["phase"] == MutationPhase.PREPARED.value else None)
+        self.store.assert_mutation_available(lease, now, operation_id=expiry_operation)
         pause = db.get(PausedContact, phone)
         if pause is not None:
             if _utc(now) < _utc(pause.paused_until):
@@ -821,7 +860,7 @@ class ConversationCoordinator:
                     raise ConversationGenerationUnavailable(FailureReason.GENERATION_UNAVAILABLE)
                 return IngressResolution(ConversationState.SECRETARY_ATTENDANCE, anchor.cycle,
                                          str(anchor.last_generation), _utc(pause.paused_until), pause.reason)
-            operation = "expire-" + _hash({"generation": str(anchor.last_generation),
+            operation = expiry_operation or "expire-" + _hash({"generation": str(anchor.last_generation),
                                           "deadline": _utc(pause.paused_until).isoformat()})
             self._remove(db, phone, now, lease, operation, "EXPIRE_PAUSE")
             anchor = self.store.read_anchor(lease)
@@ -852,21 +891,21 @@ class ConversationCoordinator:
         payload = {"messages": result.messages, "flow": result.current_flow, "data": result.flow_data}
         request_hash, previous = self._request(db, phone, lease, operation_id, now, "SAVE_CONTEXT",
                                                {"context": payload, "processing": processing_id, "text": result.text})
-        if previous is None:
+        if previous is None or previous.phase is MutationPhase.PREPARED:
             anchor = self.store.read_anchor(lease)
             pause = db.get(PausedContact, phone)
-            if anchor.cycle is not ConversationCycle.OPEN or pause is not None:
+            if previous is None and (anchor.cycle is not ConversationCycle.OPEN or pause is not None):
                 raise ConversationMutationPending(FailureReason.MUTATION_PENDING)
             target = MutationTarget("SAVE_CONTEXT", request_hash, self._db_hash(db, phone), ConversationCycle.OPEN,
                                     rotate_generation=False, context_hash=_hash(payload))
-            def dml(session, _attempt):
+            def dml(session, attempt):
                 self._check_target(session, phone, target)
                 row = session.get(ConversationContext, phone)
                 if row is None:
-                    row = ConversationContext(phone=phone, created_at=_sql_time(now))
+                    row = ConversationContext(phone=phone, created_at=_sql_time(attempt.started_at or now))
                     session.add(row)
                 row.messages, row.current_flow, row.flow_data = deepcopy(result.messages), result.current_flow, deepcopy(result.flow_data)
-                row.status, row.last_activity = "active", _sql_time(now)
+                row.status, row.last_activity = "active", _sql_time(attempt.started_at or now)
             previous = self._run_mutation(db, phone, "SAVE_CONTEXT", target, lease, operation_id, now, dml)
         return OutboundEnvelope(phone, result.text, OutboundKind.NORMAL, str(previous.generation), processing_id, operation_id)
 
@@ -888,7 +927,8 @@ class ConversationCoordinator:
             ref = outbound.pause_ref
             return (anchor.cycle is ConversationCycle.PAUSED and pause is not None and ref is not None
                     and ref.generation == outbound.generation and _utc(now) < _utc(pause.paused_until)
-                    and ref.paused_until == _utc(pause.paused_until) and ref.reason == pause.reason)
+                    and ref.paused_until == _utc(pause.paused_until)
+                    and ref.reason == pause.reason == "user_requested_human_assistance")
         if outbound.kind is OutboundKind.CLOSURE_CONFIRMATION:
             ref = outbound.closure_ref
             if (anchor.cycle is not ConversationCycle.CLOSED or pause is not None or ref is None

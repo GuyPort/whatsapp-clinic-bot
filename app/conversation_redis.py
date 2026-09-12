@@ -24,6 +24,7 @@ from app.conversation_state import (
     DependencyName, DependencyStatus, FailureReason, InvalidCanonicalContact,
     ManifestEntry, ReadinessReport, ReadinessUnavailable,
     MutationAttempt, MutationTarget, MutationPhase, ConversationMutationPending,
+    ConversationMutationAborted,
     DefinitiveRollbackProof, _consume_rollback_proof,
 )
 from app.utils import normalize_phone
@@ -404,18 +405,41 @@ class RedisConversationStore:
         """Recover only compact metadata, even after bounded detail payloads vanished."""
         body = {**anchor.mutation_fence, "phase": MutationPhase.QUARANTINED.value,
                 "paused_until": None, "reason": None}
+        body.pop("detail_fingerprint", None)
         prior = next(item for item in anchor.manifest if item.kind == "mutation"
                      and item.id == self._attempt_id(body["operation_id"]))
         entry = replace(prior, version=prior.version + 1, index_flags=())
+        receipts = []
+        for candidate in anchor.manifest:
+            if candidate == prior or candidate.kind != "mutation" or self._now() >= candidate.expected_until:
+                continue
+            key = self._detail_key(lease.phone, candidate)
+            raw = self._get(key)
+            checks.append(self._check(key, raw, "generation"))
+            try:
+                value = json.loads(raw)
+                detail = ContactDetail(candidate, value["body"], value["terminal"])
+                if value["entry"] != _entry_data(candidate) or not self._is_replay_receipt(detail):
+                    raise ValueError("invalid_value")
+                receipts.append(detail)
+            except (KeyError, TypeError, ValueError, ConversationStateUnavailable):
+                self._atomic(lease.phone, "validate", checks, quarantine=True)
+        entries = tuple(sorted((entry, *(item.entry for item in receipts)), key=lambda item: (item.kind, item.id)))
         updated = replace(anchor, contact_revision=anchor.contact_revision + 1,
-                          manifest=(entry,), manifest_fingerprint=manifest_fingerprint((entry,)),
-                          cycle=ConversationCycle.QUARANTINED, mutation_fence=body)
+                          manifest=entries, manifest_fingerprint=manifest_fingerprint(entries),
+                          cycle=ConversationCycle.QUARANTINED,
+                          mutation_fence={**body, "detail_fingerprint": hashlib.sha256(_json(body).encode()).hexdigest()})
         writes = []
         for item in anchor.manifest:
             writes.append({"op": "DEL", "key": self._detail_key(lease.phone, item)})
             for flag in item.index_flags:
                 writes.append({"op": "SREM", "key": INDEX_KEYS[flag], "value": self._member(lease.phone, item)})
         keys = contact_keys(lease.phone)
+        for receipt in receipts:
+            writes.append({"op": "SET", "key": self._detail_key(lease.phone, receipt.entry),
+                           "value": _json({"entry": _entry_data(receipt.entry), "body": dict(receipt.body), "terminal": True}),
+                           "ttl": int((receipt.entry.expected_until + timedelta(seconds=self.config.ttl_margin_seconds)
+                                       - self._now()).total_seconds() * 1000)})
         writes.extend([
             {"op": "SET", "key": self._detail_key(lease.phone, entry),
              "value": _json({"entry": _entry_data(entry), "body": body, "terminal": False})},
@@ -425,6 +449,22 @@ class RedisConversationStore:
         ])
         self._atomic(lease.phone, "quarantine_mutation", checks, writes)
         raise ConversationMutationPending(FailureReason.MUTATION_PENDING)
+
+    def _trim_quarantine_receipts(self, lease, anchor, checks):
+        current = self._attempt_id(anchor.mutation_fence["operation_id"])
+        expired = tuple(item for item in anchor.manifest if item.kind == "mutation"
+                        and item.id != current and self._now() >= item.expected_until)
+        if not expired:
+            return False
+        retained = tuple(item for item in anchor.manifest if item not in expired)
+        updated = replace(anchor, contact_revision=anchor.contact_revision + 1,
+                          manifest=retained, manifest_fingerprint=manifest_fingerprint(retained))
+        keys = contact_keys(lease.phone)
+        writes = [{"op": "DEL", "key": self._detail_key(lease.phone, item)} for item in expired]
+        writes.extend([{"op": "SET", "key": keys.anchor, "value": _json(_anchor_data(updated))},
+                       {"op": "SET", "key": keys.generation, "value": _generation_control(updated)}])
+        self._atomic(lease.phone, "trim_quarantine_receipts", checks, writes)
+        return True
 
     def _snapshot(self, lease, *, operational=False):
         self.assert_owned(lease)
@@ -470,6 +510,12 @@ class RedisConversationStore:
                 raise AssertionError("unreachable")
             if attempt.phase is MutationPhase.COMMITTING and self._now() >= attempt.processing_deadline:
                 self._compact_mutation_fence(lease, anchor, checks)
+        if anchor.cycle is ConversationCycle.QUARANTINED:
+            if not operational:
+                self._atomic(lease.phone, "validate", checks)
+                raise ConversationMutationPending(FailureReason.MUTATION_PENDING)
+            if fence is not None and self._trim_quarantine_receipts(lease, anchor, checks):
+                return self._snapshot(lease, operational=True)
         details = []
         for entry in entries:
             key = self._detail_key(lease.phone, entry)
@@ -481,8 +527,14 @@ class RedisConversationStore:
                     raise ValueError("invalid_value")
                 if not isinstance(data["body"], dict):
                     raise ValueError("invalid_value")
-                details.append(ContactDetail(entry, data["body"], data["terminal"]))
-            except (TypeError, KeyError, ValueError):
+                detail = ContactDetail(entry, data["body"], data["terminal"])
+                if fence is not None and entry.kind == "mutation" and entry.id == self._attempt_id(fence["operation_id"]):
+                    if (data["terminal"] is not False
+                            or self._mutation_receipt(self._attempt_load(detail)) != fence
+                            or hashlib.sha256(_json(data["body"]).encode()).hexdigest() != fence.get("detail_fingerprint")):
+                        raise ValueError("invalid_value")
+                details.append(detail)
+            except (TypeError, KeyError, ValueError, ConversationStateUnavailable):
                 if fence is not None and fence["phase"] == MutationPhase.COMMITTING.value:
                     self._compact_mutation_fence(lease, anchor, checks)
                 self._atomic(lease.phone, "validate", checks, quarantine=True)
@@ -638,7 +690,8 @@ class RedisConversationStore:
                 "expected_until": attempt.expected_until.isoformat(),
                 "owner_token_hash": attempt.owner_token_hash,
                 "paused_until": attempt.paused_until.isoformat() if attempt.paused_until else None,
-                "reason": attempt.reason}
+                "reason": attempt.reason,
+                "started_at": attempt.started_at.isoformat() if attempt.started_at else None}
 
     def _attempt_load(self, item: ContactDetail) -> MutationAttempt:
         try:
@@ -649,7 +702,7 @@ class RedisConversationStore:
                 ConversationCycle(value["prior_cycle"]), ConversationCycle(value["target_cycle"]),
                 datetime.fromisoformat(value["processing_deadline"]), datetime.fromisoformat(value["expected_until"]),
                 value["owner_token_hash"], datetime.fromisoformat(value["paused_until"]) if value["paused_until"] else None,
-                value["reason"])
+                value["reason"], datetime.fromisoformat(value["started_at"]) if value.get("started_at") else None)
             if (attempt.epoch != self.config.coordination_epoch
                     or self._attempt_id(attempt.operation_id) != item.entry.id
                     or attempt.processing_deadline.tzinfo is None or attempt.expected_until.tzinfo is None):
@@ -676,20 +729,33 @@ class RedisConversationStore:
                               previous.entry.version + 1 if previous else 1, attempt.expected_until)
         updated = ContactDetail(entry, self._attempt_data(attempt),
                                 attempt.phase in (MutationPhase.COMMITTED, MutationPhase.ABORTED))
-        retained = () if compact else tuple(item for item in details if item != previous)
-        fence = self._attempt_data(replace(attempt, paused_until=None, reason=None)) if attempt.phase in (
+        retained = tuple(item for item in details if item != previous
+                         and (not compact or self._is_replay_receipt(item)))
+        fence = self._mutation_receipt(attempt) if attempt.phase in (
             MutationPhase.PREPARED, MutationPhase.COMMITTING, MutationPhase.QUARANTINED) else None
         self._transition(lease, anchor, (*retained, updated), attempt.generation,
                          operation=operation, cycle=cycle, operational=operational,
                          deadline=deadline, mutation_fence=fence)
         return attempt
 
-    def assert_mutation_available(self, lease: ContactLease, now: datetime) -> None:
+    def _mutation_receipt(self, attempt: MutationAttempt) -> dict:
+        return {**self._attempt_data(replace(attempt, paused_until=None, reason=None)),
+                "detail_fingerprint": hashlib.sha256(_json(self._attempt_data(attempt)).encode()).hexdigest()}
+
+    def _is_replay_receipt(self, item: ContactDetail) -> bool:
+        return (item.entry.kind == "mutation" and item.terminal is True
+                and self._now() < item.entry.expected_until
+                and self._attempt_load(item).phase in (MutationPhase.COMMITTED, MutationPhase.ABORTED))
+
+    def assert_mutation_available(self, lease: ContactLease, now: datetime,
+                                  *, operation_id: str | None = None) -> None:
         _, details, _ = self._snapshot(lease)
         for item in details:
             if item.entry.kind != "mutation":
                 continue
             attempt = self._attempt_load(item)
+            if attempt.phase is MutationPhase.PREPARED and attempt.operation_id == operation_id:
+                continue
             if attempt.phase is MutationPhase.COMMITTING and self._now() >= attempt.processing_deadline:
                 self.quarantine_ambiguous_commit(lease.phone, attempt.operation_id, lease, now)
             if attempt.phase in (MutationPhase.PREPARED, MutationPhase.COMMITTING, MutationPhase.QUARANTINED):
@@ -700,15 +766,29 @@ class RedisConversationStore:
                          *, target: MutationTarget) -> MutationAttempt:
         with self._lock:
             anchor, details, previous, attempt = self._mutation_snapshot(phone, operation_id, lease)
-            self.assert_mutation_available(lease, now)
+            self.assert_mutation_available(lease, now, operation_id=operation_id)
             if target.kind != kind or target.fingerprint != target_fingerprint:
                 raise ConversationStateUnavailable(FailureReason.INVALID_VALUE)
             if attempt is not None:
                 if (attempt.request_fingerprint != target.request_fingerprint
-                        or attempt.target_fingerprint != target_fingerprint):
+                        or attempt.target_fingerprint != target_fingerprint
+                        or attempt.target_cycle is not target.cycle):
                     raise ConversationStateUnavailable(FailureReason.INVALID_VALUE)
                 if attempt.phase is MutationPhase.COMMITTED:
                     return attempt
+                if attempt.phase is MutationPhase.ABORTED:
+                    raise ConversationMutationAborted(FailureReason.MUTATION_ABORTED)
+                if attempt.phase is MutationPhase.PREPARED:
+                    if anchor.last_generation != attempt.generation:
+                        raise ConversationGenerationUnavailable(FailureReason.GENERATION_UNAVAILABLE)
+                    if self._now() >= attempt.processing_deadline:
+                        self._write_attempt(lease, anchor, details, previous, replace(attempt, phase=MutationPhase.ABORTED),
+                                            "abort_prepared", cycle=attempt.prior_cycle)
+                        raise ConversationMutationAborted(FailureReason.MUTATION_ABORTED)
+                    resumed = replace(attempt, owner_token_hash=hashlib.sha256(lease.owner_token.encode()).hexdigest())
+                    return self._write_attempt(lease, anchor, details, previous, resumed,
+                                               "resume_prepared", cycle=ConversationCycle.MUTATING,
+                                               deadline=attempt.processing_deadline)
                 raise ConversationMutationPending(FailureReason.MUTATION_PENDING)
             now = self._now()
             attempt = MutationAttempt(
@@ -717,7 +797,7 @@ class RedisConversationStore:
                 uuid4() if target.rotate_generation else anchor.last_generation,
                 anchor.cycle, target.cycle, now + timedelta(seconds=self.config.processing_retry_seconds),
                 now + timedelta(seconds=self.config.replay_window_seconds),
-                hashlib.sha256(lease.owner_token.encode()).hexdigest(), target.paused_until, target.reason)
+                hashlib.sha256(lease.owner_token.encode()).hexdigest(), target.paused_until, target.reason, now)
             return self._write_attempt(lease, anchor, details, previous, attempt,
                                        "prepare_mutation", cycle=ConversationCycle.MUTATING)
 
@@ -795,7 +875,7 @@ class RedisConversationStore:
             if (attempt is None or attempt.epoch != epoch or attempt.operation_id != operation_id
                     or attempt.phase is not MutationPhase.QUARANTINED or anchor.cycle is not ConversationCycle.QUARANTINED):
                 raise ConversationStateUnavailable(FailureReason.INVALID_VALUE)
-            resolved = replace(attempt, phase=outcome,
+            resolved = replace(attempt, phase=outcome, generation=uuid4(),
                                expected_until=self._now() + timedelta(seconds=self.config.replay_window_seconds))
             return self._write_attempt(lease, anchor, details, item, resolved, "resolve_quarantine",
                                        cycle=attempt.target_cycle if outcome is MutationPhase.COMMITTED else attempt.prior_cycle,
