@@ -871,6 +871,15 @@ class ConversationCoordinator:
                             and fence["kind"] == "EXPIRE_PAUSE" and fence["phase"] == MutationPhase.PREPARED.value else None)
         self.store.assert_mutation_available(lease, now, operation_id=expiry_operation)
         pause = db.get(PausedContact, phone)
+        if expiry_operation is not None:
+            attempt = self.store.inspect_mutation(phone, expiry_operation, lease)
+            if attempt is None or attempt.phase is not MutationPhase.PREPARED:
+                raise ConversationMutationPending(FailureReason.MUTATION_PENDING)
+            if (pause is None or _utc(now) < _utc(pause.paused_until)
+                    or self.clock.now() >= attempt.processing_deadline):
+                self.store.abort_prepared(phone, expiry_operation, lease, now,
+                                          request_fingerprint=attempt.request_fingerprint)
+                raise ConversationMutationAborted(FailureReason.MUTATION_ABORTED)
         if pause is not None:
             if _utc(now) < _utc(pause.paused_until):
                 if anchor.cycle is not ConversationCycle.PAUSED:

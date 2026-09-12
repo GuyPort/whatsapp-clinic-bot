@@ -578,6 +578,79 @@ def test_pause_expiry_prepared_retry_uses_original_internal_operation(transition
         assert db.events.count("commit_entered") == 2
 
 
+@pytest.mark.parametrize("change", ["removed", "extended"])
+@pytest.mark.parametrize("elapsed", [0, 601])
+@pytest.mark.parametrize("phase", ["PREPARED", "COMMITTING", "QUARANTINED"])
+def test_pause_expiry_ingress_reconciles_only_inapplicable_prepared(transition_env, change, elapsed, phase):
+    """A changed SQL pause must not strand internal expiry or release uncertain commit."""
+    from sqlalchemy import event
+    from app.conversation_state import (ConversationMutationAborted, ConversationMutationPending,
+                                        ConversationCycle, ConversationState, MutationPhase)
+    from app.models import PausedContact
+    coordinator, db, store, clock = transition_env
+    with store.contact_lease(PHONE) as lease:
+        ref = coordinator.pause_for_secretary(db, PHONE, "secretary_manual_pause", clock.now(), lease, "pause-1")
+    clock.set(ref.paused_until)
+    with store.contact_lease(PHONE) as lease:
+        def interrupted():
+            raise RuntimeError("synthetic")
+        store.client.after_operation["prepare_mutation"] = interrupted
+        with pytest.raises(ConversationStateUnavailable):
+            coordinator.resolve_ingress(db, PHONE, clock.now(), lease)
+        operation = store.read_anchor(lease).mutation_fence["operation_id"]
+        pending = mutation_for(store, lease, operation)
+        if phase != "PREPARED":
+            store.enter_committing(PHONE, operation, lease, clock.now(), pending.processing_deadline)
+        if phase == "QUARANTINED":
+            store.quarantine_ambiguous_commit(PHONE, operation, lease, clock.now())
+        pause = db.get(PausedContact, PHONE)
+        if change == "removed":
+            db.session.delete(pause)
+        else:
+            pause.paused_until = (clock.now() + timedelta(hours=1)).replace(tzinfo=None)
+        db.session.commit()
+    clock.advance(timedelta(seconds=elapsed))
+    db.events.clear()
+    statements = []
+    def after_sql(_connection, _cursor, statement, _parameters, _context, _many):
+        operation = statement.lstrip().split()[0].upper()
+        if operation in ("INSERT", "UPDATE", "DELETE"):
+            statements.append(operation)
+    engine = db.get_bind()
+    event.listen(engine, "after_cursor_execute", after_sql)
+    try:
+        with store.contact_lease(PHONE) as lease:
+            error = ConversationMutationAborted if phase == "PREPARED" else ConversationMutationPending
+            with pytest.raises(error):
+                coordinator.resolve_ingress(db, PHONE, clock.now(), lease)
+            attempt = mutation_for(store, lease, operation, operational=phase != "PREPARED")
+            if phase == "PREPARED":
+                assert attempt.phase is MutationPhase.ABORTED
+                anchor = store.read_anchor(lease)
+                assert anchor.cycle is ConversationCycle.PAUSED
+                assert anchor.mutation_fence is None
+                if change == "extended":
+                    result = coordinator.resolve_ingress(db, PHONE, clock.now(), lease)
+                    assert result.state is ConversationState.SECRETARY_ATTENDANCE
+                    assert result.cycle is ConversationCycle.PAUSED
+                else:
+                    with pytest.raises(ConversationGenerationUnavailable):
+                        coordinator.resolve_ingress(db, PHONE, clock.now(), lease)
+            else:
+                expected = MutationPhase.QUARANTINED if phase == "QUARANTINED" or elapsed else MutationPhase.COMMITTING
+                assert attempt.phase is expected
+            assert attempt.generation == pending.generation
+            row = db.get(PausedContact, PHONE)
+            assert (row is None) is (change == "removed")
+            if row is not None:
+                assert row.paused_until == (ref.paused_until + timedelta(hours=1)).replace(tzinfo=None)
+            assert statements == []
+            assert "flush_entered" not in db.events
+            assert "commit_entered" not in db.events
+    finally:
+        event.remove(engine, "after_cursor_execute", after_sql)
+
+
 @pytest.mark.parametrize("elapsed", [1, 601])
 def test_mutation_changed_prepared_target_terminalizes_before_or_after_deadline(transition_env, elapsed):
     from app.conversation_state import ConversationDomainError, MutationPhase
