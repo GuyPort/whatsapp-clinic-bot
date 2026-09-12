@@ -795,6 +795,8 @@ class ConversationCoordinator:
     """Central SQL boundary. Every public operation consumes an existing lease."""
 
     TEST_PHONE = "5500000000000"
+    _TERMINAL_INGRESS = frozenset({IngressDisposition.PROCESSED, IngressDisposition.DROPPED,
+        IngressDisposition.APPLIED, IngressDisposition.IGNORED, IngressDisposition.FAILED})
 
     def __init__(self, store: ConversationStore, clock):
         self.store, self.clock = store, clock
@@ -802,23 +804,47 @@ class ConversationCoordinator:
     @_reason_codes_only
     def is_terminal_ingress(self, identity: SenderIdentity, now: datetime, lease: ContactLease) -> bool:
         """A validated, retained terminal receipt can be acknowledged without SQL."""
+        receipt = self._retained_ingress_receipt(identity, now, lease)
+        return receipt is not None and receipt.disposition in self._TERMINAL_INGRESS
+
+    def _retained_ingress_receipt(self, identity: SenderIdentity, now: datetime,
+                                  lease: ContactLease) -> IngressReceipt | None:
+        """One typed interpretation for both the SQL-free probe and full ingress."""
         if identity.phone != lease.phone:
             raise ContactLeaseLost(FailureReason.CONTACT_LEASE_LOST)
         if identity.message_id is None:
-            return False
+            return None
         try:
             details = self.store.read_details(lease)
         except ConversationGenerationUnavailable:
             # A missing snapshot proves no terminal receipt. The full ingress
             # path must still validate SQL presence and the anchor before any
             # effect; it cannot treat this probe as initialization permission.
-            return False
+            return None
         digest = hashlib.sha256(identity.message_id.encode()).hexdigest()
-        return any(item.entry.kind == "dedupe" and item.entry.id == digest
-                   and item.terminal and now < item.entry.expected_until
-                   and item.body.get("schema") == "batch_v1"
-                   and item.body.get("disposition") in {"PROCESSED", "DROPPED", "APPLIED", "IGNORED", "FAILED"}
-                   for item in details)
+        previous = next((item for item in details if item.entry.kind == "dedupe"
+                         and item.entry.id == digest and now < item.entry.expected_until), None)
+        if previous is None:
+            return None
+        try:
+            body = previous.body
+            if body["schema"] != "batch_v1":
+                raise ValueError
+            disposition = IngressDisposition(body["disposition"]) if body["disposition"] is not None else None
+            if disposition is IngressDisposition.DUPLICATE:  # Return-only, never a persisted outcome.
+                raise ValueError
+            if previous.terminal is not (disposition in self._TERMINAL_INGRESS):
+                raise ValueError
+            batch_id, operation_id = body["batch_id"], body["operation_id"]
+            for value in (batch_id, operation_id):
+                if value is not None and (not isinstance(value, str) or str(UUID(value)) != value):
+                    raise ValueError
+            if ((disposition is IngressDisposition.BUFFERED and batch_id is None)
+                    or (disposition is None and operation_id is None)):
+                raise ValueError
+            return IngressReceipt(disposition, batch_id, operation_id)
+        except (ValueError, KeyError, TypeError, AttributeError):
+            raise ConversationStateUnavailable(FailureReason.INVALID_VALUE) from None
 
     @_reason_codes_only
     def accept_ingress(self, db: Session, identity: SenderIdentity, kind: str, content: str,
@@ -830,11 +856,10 @@ class ConversationCoordinator:
         Only this method decides pause precedence; adapters never send a reply.
         """
         phone, message_id = identity.phone, identity.message_id
+        previous = self._retained_ingress_receipt(identity, now, lease)
+        if previous is not None and previous.disposition in self._TERMINAL_INGRESS:
+            return IngressReceipt(IngressDisposition.DUPLICATE)
         anchor = self._ensure(db, phone, lease)
-        details = self.store.read_details(lease)
-        digest = hashlib.sha256(message_id.encode()).hexdigest() if message_id else None
-        previous = next((item for item in details if item.entry.kind == "dedupe"
-                         and item.entry.id == digest and now < item.entry.expected_until), None)
         secretary_command = identity.from_me and kind == "text" and content.strip().lower() in {"/pause", "/pausar"}
         if previous is not None:
             receipt = self.store.finalize_ingress_once(
@@ -844,9 +869,9 @@ class ConversationCoordinator:
                     raise ConversationMutationPending(FailureReason.MUTATION_PENDING)
                 self.pause_for_secretary(db, phone, "secretary_manual_pause", now, lease, receipt.operation_id)
                 return IngressReceipt(IngressDisposition.APPLIED, operation_id=receipt.operation_id)
-            if previous.body["disposition"] == IngressDisposition.BUFFERED.value:
+            if previous.disposition is IngressDisposition.BUFFERED:
                 return self._dispatch_ingress(phone, receipt, now, lease, broker)
-            return IngressReceipt(IngressDisposition.DUPLICATE)
+            raise ConversationStateUnavailable(FailureReason.INVALID_VALUE)
 
         if identity.from_me:
             disposition = IngressDisposition.APPLIED if secretary_command else IngressDisposition.IGNORED

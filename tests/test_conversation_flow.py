@@ -217,6 +217,58 @@ def test_webhook_broker_failure_keeps_one_batch_and_replay_respects_due_time(mai
     assert len(ingress_runtime.envelopes()) == 1
 
 
+@pytest.mark.parametrize("body_changes,terminal", [
+    ({"disposition": "UNKNOWN_DISPOSITION"}, False),
+    ({"schema": "unknown_schema"}, False),
+    *[({"disposition": value}, False) for value in ("PROCESSED", "DROPPED", "APPLIED", "IGNORED", "FAILED")],
+    ({}, True),
+    ({"disposition": "DUPLICATE"}, False),
+    ({"disposition": None}, False),
+])
+@pytest.mark.parametrize("bypass_shortcut", [False, True])
+def test_webhook_invalid_retained_receipt_fails_closed_before_sql_or_dispatch(
+        main_module, ingress_runtime, session_factory, monkeypatch, body_changes, terminal, bypass_shortcut):
+    from dataclasses import replace
+    from sqlalchemy import event
+
+    ingress_runtime.processing_broker.next_result = domain.EnqueueResult.AMBIGUOUS
+    assert webhook(main_module).status_code == 503
+    command = ingress_runtime.processing_broker.calls[0]
+    with ingress_runtime.store.contact_lease(PHONE) as lease:
+        assert ingress_runtime.store.dispatch(command, lease).phase is domain.DispatchPhase.PENDING
+        anchor = ingress_runtime.store.read_anchor(lease)
+        details = ingress_runtime.store.read_details(lease)
+        altered = tuple(replace(item, entry=replace(item.entry, version=item.entry.version + 1),
+                                body={**item.body, **body_changes}, terminal=terminal)
+                        if item.entry.kind == "dedupe" else item for item in details)
+        ingress_runtime.store.compare_and_set(lease, anchor, altered)
+    if bypass_shortcut:
+        # Exercise accept_ingress itself through the complete authenticated route.
+        monkeypatch.setattr(ingress_runtime.coordinator, "is_terminal_ingress", lambda *args: False)
+    before = ingress_runtime.store.snapshot()
+    before_leases, before_sessions = ingress_runtime.lease_calls, ingress_runtime.session_calls
+    before_operations = dict(ingress_runtime.store.client.operation_calls)
+    sql_calls = []
+    def record_sql(*args, **kwargs):
+        sql_calls.append("unexpected_sql")
+    engine = session_factory.kw["bind"]
+    event.listen(engine, "before_cursor_execute", record_sql)
+    try:
+        response = webhook(main_module)
+    finally:
+        event.remove(engine, "before_cursor_execute", record_sql)
+
+    assert response.status_code == 503
+    assert json.loads(response.body) == {"status": "temporarily_unavailable"}
+    assert ingress_runtime.session_calls == before_sessions + int(bypass_shortcut)
+    assert sql_calls == []
+    assert ingress_runtime.lease_calls == before_leases + 1
+    assert ingress_runtime.processing_broker.calls == [command]
+    assert ingress_runtime.store.snapshot() == before
+    for operation in ("initialize", "finalize_ingress_once", "reserve_enqueue", "prepare_mutation"):
+        assert ingress_runtime.store.client.operation_calls.get(operation, 0) == before_operations.get(operation, 0)
+
+
 def test_webhook_replay_after_dispatch_deadline_is_terminal_without_rebuffer(main_module, ingress_runtime):
     assert webhook(main_module).status_code == 200
     ingress_runtime.clock.advance(timedelta(seconds=900))
@@ -353,8 +405,9 @@ def test_webhook_lease_counter_does_not_consume_or_repeat_one_shot_fault_hooks(m
 
 
 @pytest.mark.parametrize("disposition", ["DROPPED", "APPLIED", "IGNORED", "FAILED", "PROCESSED"])
+@pytest.mark.parametrize("bypass_shortcut", [False, True])
 def test_webhook_terminal_replay_reads_no_sql_or_session_and_mutates_no_state(
-        main_module, ingress_runtime, session_factory, monkeypatch, disposition):
+        main_module, ingress_runtime, session_factory, monkeypatch, disposition, bypass_shortcut):
     from sqlalchemy import event
     options = {}
     if disposition == "DROPPED":
@@ -382,12 +435,17 @@ def test_webhook_terminal_replay_reads_no_sql_or_session_and_mutates_no_state(
     assert len(receipts) == 1 and receipts[0].body["disposition"] == disposition and receipts[0].terminal
     before = ingress_runtime.store.snapshot()
     before_leases = ingress_runtime.lease_calls
+    before_sessions = ingress_runtime.session_calls
     before_broker = list(ingress_runtime.processing_broker.calls)
     calls = []
     def forbidden(*args, **kwargs):
         calls.append("unexpected_boundary")
         raise AssertionError("terminal replay crossed effect boundary")
-    for target, method in ((ingress_runtime, "session_factory"), (ingress_runtime.coordinator, "_ensure"),
+    if bypass_shortcut:
+        monkeypatch.setattr(ingress_runtime.coordinator, "is_terminal_ingress", lambda *args: False)
+    else:
+        monkeypatch.setattr(ingress_runtime, "session_factory", forbidden)
+    for target, method in ((ingress_runtime.coordinator, "_ensure"),
                            (ingress_runtime.coordinator, "resolve_ingress"), (ingress_runtime.store, "ensure_consumer"),
                            (ingress_runtime.store, "finalize_ingress_once")):
         monkeypatch.setattr(target, method, forbidden)
@@ -400,16 +458,20 @@ def test_webhook_terminal_replay_reads_no_sql_or_session_and_mutates_no_state(
     assert response.status_code == 200
     assert json.loads(response.body) == {"status": "ignored"}
     assert calls == []
+    assert ingress_runtime.session_calls == before_sessions + int(bypass_shortcut)
     assert ingress_runtime.lease_calls == before_leases + 1
     assert ingress_runtime.store.snapshot() == before
     assert ingress_runtime.processing_broker.calls == before_broker
 
 
-@pytest.mark.parametrize("fault", ["epoch_absent", "generation", "fingerprint"])
+@pytest.mark.parametrize("fault", ["epoch_absent", "epoch_mismatch", "generation", "fingerprint", "manifest", "missing_receipt"])
 def test_webhook_terminal_replay_does_not_bypass_invalid_coordination(main_module, ingress_runtime, fault):
     assert webhook(main_module, from_me=True).status_code == 200
-    if fault == "epoch_absent":
+    if fault.startswith("epoch_"):
         ingress_runtime.store.inject_fault(fault)
+    elif fault == "missing_receipt":
+        receipt = next(item for item in ingress_runtime.details() if item.entry.kind == "dedupe")
+        ingress_runtime.store.delete_detail(PHONE, receipt.entry)
     else:
         ingress_runtime.store.corrupt_contact(PHONE, fault)
     response = webhook(main_module, from_me=True)
@@ -427,6 +489,17 @@ def test_webhook_expired_terminal_receipt_does_not_suppress_new_ingress(main_mod
     assert json.loads(response.body) == {"status": "buffered"}
     assert ingress_runtime.session_calls == sessions + 1
     assert len(ingress_runtime.envelopes()) == 1
+
+
+def test_webhook_no_matching_retained_receipt_accepts_new_message(main_module, ingress_runtime):
+    assert webhook(main_module, from_me=True).status_code == 200
+    sessions = ingress_runtime.session_calls
+    response = webhook(main_module, message_id="new-synthetic-message")
+    assert response.status_code == 200
+    assert json.loads(response.body) == {"status": "buffered"}
+    assert ingress_runtime.session_calls == sessions + 1
+    assert len(ingress_runtime.envelopes()) == 1
+    assert len(ingress_runtime.processing_broker.calls) == 1
 
 
 @pytest.fixture
