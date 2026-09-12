@@ -50,6 +50,8 @@ class ScriptRedis:
         self.acl_check_available = True
         self.before_operation = {}
         self.after_operation = {}
+        self.write_counts = {}
+        self.fail_write_at = None
 
     def _acl_command(self, command, key):
         if (command, key) in self.denied_commands:
@@ -125,7 +127,13 @@ class ScriptRedis:
             # Same contract as Lua: validate the entire batch, then authorize all
             # normal and possible quarantine writes, before touching any value.
             simulated_types = {}
-            for write in plan["writes"]:
+            self.write_counts[plan["operation"]] = len(plan["writes"])
+            for index, write in enumerate(plan["writes"] + plan.get("deadline_writes", []) + plan.get("quarantine_writes", [])):
+                # Dependency fault at each planned write is discovered in the
+                # same ACL preflight the real Lua executes before its first write.
+                if self.fail_write_at == (plan["operation"], index):
+                    self.fail_write_at = None
+                    raise PermissionError("NOPERM")
                 if (type(write.get("key")) is not int or not 1 <= write["key"] <= len(keys)
                         or write.get("op") not in ("SET", "ACQUIRE", "PEXPIRE", "DEL", "SADD", "SREM")):
                     return "unavailable"
@@ -154,6 +162,9 @@ class ScriptRedis:
             if keys[plan["quarantine_key"] - 1] in self.values:
                 return "unavailable"
             def quarantine():
+                for write in plan.get("quarantine_writes", []):
+                    self.values.pop(key(write), None)
+                    self.expiry.pop(key(write), None)
                 self._acl_command("SET", keys[plan["anchor_key"] - 1])
                 self.values[keys[plan["anchor_key"] - 1]] = '{"cycle":"QUARANTINED"}'
                 self._acl_command("SADD", keys[plan["quarantine_key"] - 1])
@@ -166,9 +177,9 @@ class ScriptRedis:
                     return quarantine() if check["failure"] == "generation" else check["failure"]
             if plan["quarantine"]:
                 return quarantine()
-            if "deadline_us" in plan and int(self.clock.now().timestamp() * 1000000) >= plan["deadline_us"]:
-                return "pending"
-            for write in plan["writes"]:
+            expired = "deadline_us" in plan and int(self.clock.now().timestamp() * 1000000) >= plan["deadline_us"]
+            selected_writes = plan.get("deadline_writes", []) if expired else plan["writes"]
+            for write in selected_writes:
                 target, op = key(write), write["op"]
                 self._acl_command("SET" if op == "ACQUIRE" else op, target)
                 if op in ("SET", "ACQUIRE"):
@@ -199,7 +210,7 @@ class ScriptRedis:
             operation_hook = self.after_operation.pop(plan["operation"], None)
             if operation_hook is not None:
                 operation_hook()
-            return "ok"
+            return "pending" if expired else "ok"
 
 
 from app.conversation_redis import RedisConversationStore
@@ -369,3 +380,21 @@ class BarrierSession:
     def rollback(self):
         self.session.rollback()
         self._at("rollback")
+
+
+class ScriptedBroker:
+    """No network: typed confirmation, definitive failure or ambiguous outcome."""
+    def __init__(self):
+        self.calls = []
+        self.next_result = None
+        self.on_enqueue = None
+
+    def probe(self):
+        return True
+
+    def enqueue_processing(self, command):
+        from app.conversation_state import EnqueueResult
+        self.calls.append(command)
+        if self.on_enqueue:
+            self.on_enqueue(command)
+        return self.next_result or EnqueueResult.CONFIRMED

@@ -790,3 +790,269 @@ def test_pause_extend_maps_legacy_freeform_reason_to_safe_administrative_code(tr
         assert ref.reason == "secretary_dashboard_pause"
         assert db.get(PausedContact, PHONE).reason == "secretary_dashboard_pause"
         assert "synthetic-private-note" not in json.dumps(store.contact_snapshot(PHONE))
+
+
+# Task 4: real store algorithms with synthetic Redis/broker boundaries.
+def batch_api():
+    from app import conversation_state as domain
+    assert hasattr(domain, "ProcessingCommand"), "Task 4 processing command is missing"
+    return domain
+
+
+def append_batch(store, lease, *, message_id="synthetic-id", content="synthetic text"):
+    domain = batch_api()
+    anchor = store.read_anchor(lease)
+    envelope = domain.InboundEnvelope("text", content, store.clock.now(), str(anchor.last_generation), message_id)
+    return store.finalize_ingress_once(lease.phone, envelope, message_id,
+                                      str(anchor.last_generation), lease)
+
+
+def batch_command(store, lease, receipt):
+    domain = batch_api()
+    return domain.ProcessingCommand(lease.phone, receipt.batch_id, str(store.config.coordination_epoch),
+                                    str(store.read_anchor(lease).last_generation))
+
+
+def batch_details(store, lease, kind):
+    return [item for item in store.read_details(lease) if item.entry.kind == kind]
+
+
+def test_dedup_buffer_accepts_once_and_preserves_raw_id_only_in_envelope():
+    from tests.test_conversation_concurrency import make_store
+    import hashlib
+    domain, store = batch_api(), make_store()
+    with store.contact_lease(PHONE) as lease:
+        store.initialize_contact(PHONE, lease, db_state_present=False)
+        first = append_batch(store, lease)
+        second = append_batch(store, lease, content="changed replay content")
+        assert first.disposition is domain.IngressDisposition.BUFFERED
+        assert second.disposition is domain.IngressDisposition.DUPLICATE
+        assert second.batch_id == first.batch_id
+        assert len(batch_details(store, lease, "batch")) == 1
+        buffer = batch_details(store, lease, "buffer")[0]
+        assert [e["content"] for e in buffer.body["envelopes"]] == ["synthetic text"]
+        assert buffer.body["envelopes"][0]["message_id"] == "synthetic-id"
+        digest = batch_details(store, lease, "dedupe")[0]
+        assert digest.entry.id == hashlib.sha256(b"synthetic-id").hexdigest()
+        assert "synthetic-id" not in json.dumps(dict(digest.body))
+        assert digest.entry.expected_until >= store.clock.now() + timedelta(days=7)
+        assert len(store.recoverable_batches()) == 1
+
+
+def test_buffer_without_id_accepts_twice_without_replay_guarantee():
+    from tests.test_conversation_concurrency import make_store
+    store = make_store()
+    with store.contact_lease(PHONE) as lease:
+        store.initialize_contact(PHONE, lease, db_state_present=False)
+        first = append_batch(store, lease, message_id=None)
+        second = append_batch(store, lease, message_id=None)
+        assert first.batch_id == second.batch_id
+        assert len(batch_details(store, lease, "buffer")[0].body["envelopes"]) == 2
+        assert batch_details(store, lease, "dedupe") == []
+
+
+@pytest.mark.parametrize("action", ["DROPPED", "IGNORED"])
+def test_dedup_dropped_and_ignored_retain_no_message_content(transition_env, action):
+    coordinator, db, store, clock = transition_env
+    domain = batch_api()
+    with store.contact_lease(PHONE) as lease:
+        coordinator.resolve_ingress(db, PHONE, clock.now(), lease)
+        ref = coordinator.pause_manual(db, PHONE, 24 * 30, "secretary_dashboard_pause", clock.now(), lease, "pause-long")
+        receipt = store.finalize_ingress_once(PHONE, None, "synthetic-drop", ref.generation, lease,
+                    disposition=domain.IngressDisposition(action), paused_until=ref.paused_until)
+        assert receipt.disposition.value == action
+        detail = batch_details(store, lease, "dedupe")[0]
+        if action == "DROPPED":
+            assert detail.entry.expected_until >= ref.paused_until + timedelta(days=7, seconds=300)
+        assert batch_details(store, lease, "buffer") == []
+        assert store.recoverable_batches() == ()
+    clock.advance(timedelta(days=31))
+    with store.contact_lease(PHONE) as lease:
+        if action == "DROPPED":
+            replay = store.finalize_ingress_once(PHONE, None, "synthetic-drop", ref.generation, lease,
+                        disposition=domain.IngressDisposition.DROPPED, paused_until=ref.paused_until)
+            assert replay.disposition is domain.IngressDisposition.DUPLICATE
+
+
+def test_dedup_secretary_command_applied_only_with_committed_finalization(transition_env):
+    coordinator, db, store, clock = transition_env
+    domain = batch_api()
+    with store.contact_lease(PHONE) as lease:
+        resolution = coordinator.resolve_ingress(db, PHONE, clock.now(), lease)
+        pending = store.finalize_ingress_once(PHONE, None, "synthetic-command", resolution.generation, lease,
+                                             disposition=domain.IngressDisposition.APPLIED)
+        assert pending.disposition is None
+        replay = store.finalize_ingress_once(PHONE, None, "synthetic-command", resolution.generation, lease,
+                                            disposition=domain.IngressDisposition.APPLIED)
+        assert replay.operation_id == pending.operation_id
+        assert batch_details(store, lease, "dedupe")[0].body["disposition"] is None
+        store.fail_next_atomic("finalize_committed")
+        with pytest.raises(domain.ConversationMutationAmbiguous):
+            coordinator.pause_for_secretary(db, PHONE, "secretary_manual_pause", clock.now(), lease, pending.operation_id)
+        assert batch_details(store, lease, "dedupe")[0].body["disposition"] is None
+        store.finalize_committed(PHONE, pending.operation_id, lease, clock.now())
+        assert batch_details(store, lease, "dedupe")[0].body["disposition"] == "APPLIED"
+        replay = store.finalize_ingress_once(PHONE, None, "synthetic-command", resolution.generation, lease,
+                                            disposition=domain.IngressDisposition.APPLIED)
+        assert replay.disposition is domain.IngressDisposition.DUPLICATE
+
+
+@pytest.mark.parametrize("outcome,delay,phase", [("CONFIRMED", 60, "SCHEDULED"),
+    ("DEFINITIVE_FAILURE", 30, "PENDING"), ("AMBIGUOUS", 60, "PENDING")])
+@pytest.mark.parametrize("offset,called", [(-1, False), (0, True), (1, True)])
+def test_enqueue_reserves_before_broker_and_obeys_inclusive_next_time(outcome, delay, phase, offset, called):
+    from tests.test_conversation_concurrency import make_store
+    from tests.fakes import ScriptedBroker
+    domain, store = batch_api(), make_store()
+    broker = ScriptedBroker()
+    broker.next_result = domain.EnqueueResult(outcome)
+    with store.contact_lease(PHONE) as lease:
+        store.initialize_contact(PHONE, lease, db_state_present=False)
+        command = batch_command(store, lease, append_batch(store, lease))
+        started = store.clock.now()
+        def at_broker(_command):
+            reserved = store.dispatch(command, lease)
+            assert reserved.enqueue_attempt_id is not None
+            assert reserved.next_enqueue_at == started + timedelta(seconds=60)
+        broker.on_enqueue = at_broker
+        if outcome == "CONFIRMED":
+            assert store.ensure_consumer(broker, command, started, lease) is domain.EnsureConsumerResult.SCHEDULED
+        else:
+            with pytest.raises(domain.BrokerUnavailable):
+                store.ensure_consumer(broker, command, started, lease)
+        reserved = store.dispatch(command, lease)
+        assert reserved.phase.value == phase
+        assert reserved.next_enqueue_at == started + timedelta(seconds=delay)
+        assert reserved.scheduled_at == (started if outcome == "CONFIRMED" else None)
+    store.clock.set(started + timedelta(seconds=delay, microseconds=offset))
+    broker.on_enqueue = None
+    broker.next_result = domain.EnqueueResult.CONFIRMED
+    with store.contact_lease(PHONE) as lease:
+        result = store.ensure_consumer(broker, command, store.clock.now(), lease)
+        assert len(broker.calls) == (2 if called else 1)
+        assert result is (domain.EnsureConsumerResult.SCHEDULED if called else domain.EnsureConsumerResult.NOT_DUE)
+        assert (store.dispatch(command, lease).enqueue_attempt_id != reserved.enqueue_attempt_id) is called
+
+
+@pytest.mark.parametrize("delta,terminal", [(-1, False), (0, True), (1, True)])
+def test_batch_dispatch_deadline_exhausts_without_content_or_recreation(delta, terminal):
+    from tests.test_conversation_concurrency import make_store
+    domain, store = batch_api(), make_store()
+    with store.contact_lease(PHONE) as lease:
+        store.initialize_contact(PHONE, lease, db_state_present=False)
+        command = batch_command(store, lease, append_batch(store, lease))
+        deadline = store.dispatch(command, lease).dispatch_deadline
+    store.clock.set(deadline + timedelta(microseconds=delta))
+    with store.contact_lease(PHONE) as lease:
+        claim = store.claim_or_resume_batch(command, store.clock.now(), lease)
+        assert claim.outcome.value == ("TERMINAL" if terminal else "CLAIMED")
+        assert store.dispatch(command, lease).phase.value == ("EXHAUSTED" if terminal else "STAGED")
+        if terminal:
+            assert claim.envelopes == ()
+            assert batch_details(store, lease, "staging") == []
+            assert batch_details(store, lease, "buffer") == []
+            assert batch_details(store, lease, "dedupe")[0].body["disposition"] == "FAILED"
+            assert append_batch(store, lease).disposition is domain.IngressDisposition.DUPLICATE
+            assert store.claim_or_resume_batch(command, store.clock.now(), lease).outcome.value == "TERMINAL"
+            assert store.recoverable_batches() == ()
+
+
+def test_staged_ignores_old_dispatch_deadline_and_never_drains_new_buffer():
+    from tests.test_conversation_concurrency import make_store
+    domain, store = batch_api(), make_store()
+    with store.contact_lease(PHONE) as lease:
+        store.initialize_contact(PHONE, lease, db_state_present=False)
+        command = batch_command(store, lease, append_batch(store, lease))
+        deadline = store.dispatch(command, lease).dispatch_deadline
+    store.clock.set(deadline - timedelta(seconds=1))
+    with store.contact_lease(PHONE) as lease:
+        first = store.claim_or_resume_batch(command, store.clock.now(), lease)
+        new = append_batch(store, lease, message_id="new-id", content="new input")
+        assert new.batch_id != command.batch_id
+    store.clock.set(first.attempt.claim_deadline)
+    with store.contact_lease(PHONE) as lease:
+        resumed = store.claim_or_resume_batch(command, store.clock.now(), lease)
+        assert resumed.outcome.value == "CLAIMED"
+        assert resumed.attempt.processing_id == first.attempt.processing_id
+        assert resumed.attempt.operation_id == first.attempt.operation_id
+        assert resumed.attempt.processing_deadline == first.attempt.processing_deadline
+        assert resumed.attempt.claim_token != first.attempt.claim_token
+        assert [e.content for e in resumed.envelopes] == ["synthetic text"]
+        assert batch_details(store, lease, "buffer")[0].body["envelopes"][0]["content"] == "new input"
+        assert store.finalize_ingress_once(PHONE, None, "synthetic-id", command.generation, lease).disposition is domain.IngressDisposition.DUPLICATE
+
+
+def test_result_ready_complete_batch_lifecycle_reuses_result_and_purges_content(transition_env):
+    coordinator, db, store, clock = transition_env
+    domain = batch_api()
+    with store.contact_lease(PHONE) as lease:
+        coordinator.resolve_ingress(db, PHONE, clock.now(), lease)
+        command = batch_command(store, lease, append_batch(store, lease))
+        claim = store.claim_or_resume_batch(command, clock.now(), lease)
+        result = domain.AgentResult("synthetic response", [{"role": "user", "content": "synthetic text"}], None, {}, domain.AgentIntent.SAVE_CONTEXT)
+        store.stage_agent_result(command, claim.attempt, result, clock.now(), lease)
+    with store.contact_lease(PHONE) as lease:
+        resumed = store.claim_or_resume_batch(command, clock.now(), lease)
+        assert resumed.outcome.value == "RESULT_READY"
+        assert resumed.result == result
+        outbound = coordinator.apply_agent_result(db, PHONE, resumed.result, resumed.attempt.processing_id,
+                    resumed.attempt.operation_id, clock.now(), lease)
+        assert outbound.text == "synthetic response"
+        store.complete_batch(command, resumed.attempt, clock.now(), lease)
+        store.complete_batch(command, resumed.attempt, clock.now(), lease)
+        assert store.dispatch(command, lease).phase is domain.DispatchPhase.PROCESSED
+        assert batch_details(store, lease, "processing")[0].body["phase"] == "DONE"
+        assert batch_details(store, lease, "dedupe")[0].body["disposition"] == "PROCESSED"
+        assert batch_details(store, lease, "staging") == []
+        assert "synthetic response" not in str(store.contact_snapshot(PHONE))
+        assert "synthetic text" not in str(store.contact_snapshot(PHONE))
+        assert store.recoverable_batches() == ()
+
+
+@pytest.mark.parametrize("offset,accepted", [(-1, True), (0, False), (1, False)])
+def test_result_ready_processing_deadline_is_inclusive(offset, accepted):
+    from tests.test_conversation_concurrency import make_store
+    domain, store = batch_api(), make_store()
+    with store.contact_lease(PHONE) as lease:
+        store.initialize_contact(PHONE, lease, db_state_present=False)
+        command = batch_command(store, lease, append_batch(store, lease))
+        claim = store.claim_or_resume_batch(command, store.clock.now(), lease)
+        # Advance the clock at the atomic boundary; the Python check happened earlier.
+        target = claim.attempt.processing_deadline + timedelta(microseconds=offset)
+        store.client.before_operation["stage_agent_result"] = lambda: store.clock.set(target)
+        # Keep the lease valid over the synthetic long call; only the processing deadline moves.
+        from app.conversation_redis import contact_keys
+        store.client.expiry[contact_keys(PHONE).lease] = (target + timedelta(seconds=60)).timestamp()
+        result = domain.AgentResult("late result", [], None, {}, domain.AgentIntent.SAVE_CONTEXT)
+        if accepted:
+            store.stage_agent_result(command, claim.attempt, result, store.clock.now(), lease)
+        else:
+            with pytest.raises(domain.ConversationMutationPending):
+                store.stage_agent_result(command, claim.attempt, result, store.clock.now(), lease)
+            assert store.dispatch(command, lease).phase is domain.DispatchPhase.EXHAUSTED
+            assert "late result" not in str(store.contact_snapshot(PHONE))
+
+
+def test_batch_command_rejects_invalid_or_extra_payload_without_leaking_input():
+    domain = batch_api()
+    with pytest.raises(domain.ConversationStateUnavailable) as caught:
+        domain.ProcessingCommand.from_payload({"sensitive": "synthetic secret"})
+    assert caught.value.reason_code.value == "invalid_task_command"
+    assert "synthetic secret" not in str(caught.value)
+    command = domain.ProcessingCommand(PHONE, "00000000-0000-4000-8000-000000000003",
+        "00000000-0000-4000-8000-000000000001", "00000000-0000-4000-8000-000000000002")
+    assert domain.ProcessingCommand.from_payload(json.loads(json.dumps(command.to_payload()))) == command
+
+
+def test_enqueue_initial_time_and_dispatch_deadline_use_received_at():
+    from tests.test_conversation_concurrency import make_store
+    domain, store = batch_api(), make_store()
+    with store.contact_lease(PHONE) as lease:
+        anchor = store.initialize_contact(PHONE, lease, db_state_present=False)
+        received = store.clock.now()
+        envelope = domain.InboundEnvelope("text", "synthetic", received, str(anchor.last_generation), "delayed-ingress")
+        store.clock.advance(timedelta(seconds=2))
+        receipt = store.finalize_ingress_once(PHONE, envelope, envelope.message_id, envelope.generation, lease)
+        dispatch = store.dispatch(batch_command(store, lease, receipt), lease)
+        assert dispatch.next_enqueue_at == received
+        assert dispatch.dispatch_deadline == received + timedelta(seconds=900)

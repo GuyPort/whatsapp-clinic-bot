@@ -26,6 +26,10 @@ from app.conversation_state import (
     MutationAttempt, MutationTarget, MutationPhase, ConversationMutationPending,
     ConversationMutationAborted, PauseReason,
     DefinitiveRollbackProof, _consume_rollback_proof,
+    InboundEnvelope, IngressReceipt, IngressDisposition, ProcessingCommand,
+    BufferDispatch, DispatchPhase, ProcessingAttempt, ProcessingPhase, ConversationDomainError,
+    BatchClaim, ClaimOutcome, AgentResult, AgentIntent, EnqueueResult,
+    EnsureConsumerResult, BrokerUnavailable,
 )
 from app.utils import normalize_phone
 
@@ -131,21 +135,29 @@ if not permitted(quarantine_commands[1]) or not permitted(quarantine_commands[2]
 end
 local quarantine_type = redis.call('TYPE', quarantine_key).ok
 if quarantine_type ~= 'none' and quarantine_type ~= 'set' then return 'unavailable' end
+local function preflight(writes)
 local commands, kinds = {}, {}
-for _, w in ipairs(p.writes) do
+for _, w in ipairs(writes) do
     local args = command(w)
-    if not args or not permitted(args) then return 'unavailable' end
+    if not args or not permitted(args) then return nil end
     local key, op = args[2], args[1]
     local kind = kinds[key] or redis.call('TYPE', key).ok
     if (op == 'SADD' or op == 'SREM') and kind ~= 'none' and kind ~= 'set' then
-        return 'unavailable'
+        return nil
     end
     if op == 'SET' then kinds[key] = 'string'
     elseif op == 'DEL' then kinds[key] = 'none'
     elseif op == 'SADD' then kinds[key] = 'set' end
     table.insert(commands, args)
 end
+return commands
+end
+local commands = preflight(p.writes)
+local deadline_commands = preflight(p.deadline_writes or {})
+local purge_commands = preflight(p.quarantine_writes or {})
+if not commands or not deadline_commands or not purge_commands then return 'unavailable' end
 local function quarantine()
+    for _, args in ipairs(purge_commands) do redis.call(unpack(args)) end
     for _, args in ipairs(quarantine_commands) do redis.call(unpack(args)) end
     return 'generation'
 end
@@ -165,6 +177,7 @@ if p.deadline_us ~= nil then
     if type(p.deadline_us) ~= 'number' or not permitted({'TIME'}) then return 'unavailable' end
     local current = redis.call('TIME')
     if tonumber(current[1]) * 1000000 + tonumber(current[2]) >= p.deadline_us then
+        for _, args in ipairs(deadline_commands) do redis.call(unpack(args)) end
         return 'pending'
     end
 end
@@ -310,7 +323,8 @@ class RedisConversationStore:
         if not self.readiness().ready:
             raise ReadinessUnavailable(FailureReason.READINESS_UNAVAILABLE)
 
-    def _atomic(self, phone, operation, checks=(), writes=(), quarantine=False, *, deadline=None):
+    def _atomic(self, phone, operation, checks=(), writes=(), quarantine=False, *, deadline=None,
+                deadline_writes=()):
         self._ready()
         keys = contact_keys(phone)
         key_list = [GLOBAL_EPOCH_KEY, keys.anchor, QUARANTINE_INDEX_KEY]
@@ -318,12 +332,20 @@ class RedisConversationStore:
             if key not in key_list:
                 key_list.append(key)
             return key_list.index(key) + 1
+        # Corruption must purge protected content in the quarantine CAS itself.
+        try:
+            content_keys = tuple(_text(key) for prefix in (keys.buffer_prefix, keys.staging_prefix)
+                                 for key in self.client.scan_iter(match=prefix + "*"))
+        except Exception:
+            raise ConversationStateUnavailable(FailureReason.STATE_UNAVAILABLE) from None
         plan = {"operation": operation, "epoch_key": 1, "anchor_key": 2,
                 "quarantine_key": 3, "epoch": str(self.config.coordination_epoch),
                 "run_id": self.config.redis_expected_run_id, "digest": contact_digest(phone),
                 "quarantine": quarantine,
                 "checks": [{**c, "key": index(c["key"])} for c in checks],
-                "writes": [{**w, "key": index(w["key"])} for w in writes]}
+                "writes": [{**w, "key": index(w["key"])} for w in writes],
+                "deadline_writes": [{**w, "key": index(w["key"])} for w in deadline_writes],
+                "quarantine_writes": [{"op": "DEL", "key": index(key)} for key in content_keys]}
         if deadline is not None:
             plan["deadline_us"] = int(deadline.timestamp() * 1000000)
         try:
@@ -410,7 +432,7 @@ class RedisConversationStore:
         entry = replace(prior, version=prior.version + 1, index_flags=())
         receipts = []
         for candidate in anchor.manifest:
-            if candidate == prior or candidate.kind != "mutation" or self._now() >= candidate.expected_until:
+            if candidate == prior or candidate.kind not in ("mutation", "dedupe") or self._now() >= candidate.expected_until:
                 continue
             key = self._detail_key(lease.phone, candidate)
             raw = self._get(key)
@@ -418,6 +440,8 @@ class RedisConversationStore:
             try:
                 value = json.loads(raw)
                 detail = ContactDetail(candidate, value["body"], value["terminal"])
+                if candidate.kind == "dedupe" and detail.body.get("operation_id") == body["operation_id"]:
+                    detail = self._changed(detail, body={**detail.body, "disposition": None}, terminal=False)
                 if value["entry"] != _entry_data(candidate) or not self._is_replay_receipt(detail):
                     raise ValueError("invalid_value")
                 receipts.append(detail)
@@ -436,9 +460,7 @@ class RedisConversationStore:
         keys = contact_keys(lease.phone)
         for receipt in receipts:
             writes.append({"op": "SET", "key": self._detail_key(lease.phone, receipt.entry),
-                           "value": _json({"entry": _entry_data(receipt.entry), "body": dict(receipt.body), "terminal": True}),
-                           "ttl": int((receipt.entry.expected_until + timedelta(seconds=self.config.ttl_margin_seconds)
-                                       - self._now()).total_seconds() * 1000)})
+                           "value": _json({"entry": _entry_data(receipt.entry), "body": dict(receipt.body), "terminal": receipt.terminal})})
         writes.extend([
             {"op": "SET", "key": self._detail_key(lease.phone, entry),
              "value": _json({"entry": _entry_data(entry), "body": body, "terminal": False})},
@@ -543,9 +565,43 @@ class RedisConversationStore:
                                "member": self._member(lease.phone, entry), "value": 1,
                                "failure": "generation"})
         self._atomic(lease.phone, "validate", checks)
+        self._validate_batch_details(lease, details, checks)
         if anchor.cycle is ConversationCycle.QUARANTINED and not operational:
             raise ConversationMutationPending(FailureReason.MUTATION_PENDING)
         return anchor, tuple(details), checks
+
+    def _validate_batch_details(self, lease, details, checks):
+        """Manifest integrity also includes mandatory batch/claim relationships."""
+        try:
+            for batch in details:
+                if batch.entry.kind != "batch" or batch.body.get("schema") != "batch_v1":
+                    continue
+                dispatch = self._dispatch_load(batch)
+                if batch.body["phone"] != lease.phone or batch.body["epoch"] != str(self.config.coordination_epoch):
+                    raise ValueError
+                if dispatch.phase in (DispatchPhase.PENDING, DispatchPhase.SCHEDULED):
+                    if self._find(details, "buffer", batch.entry.id) is None or batch.entry.index_flags != ("dispatch",):
+                        raise ValueError
+                elif dispatch.phase is DispatchPhase.STAGED:
+                    processing = self._find(details, "processing", dispatch.processing_id)
+                    staging = self._find(details, "staging", batch.entry.id)
+                    if processing is None or staging is None or batch.entry.index_flags != ("staging",):
+                        raise ValueError
+                    attempt = self._processing_load(processing)
+                    if (attempt.batch_id != batch.entry.id or attempt.generation != dispatch.generation
+                            or attempt.operation_id != dispatch.operation_id
+                            or attempt.coordination_epoch != batch.body["epoch"]
+                            or attempt.processing_deadline != dispatch.processing_deadline
+                            or not attempt.claim_token):
+                        raise ValueError
+                    if attempt.phase in (ProcessingPhase.RESULT_READY, ProcessingPhase.APPLYING, ProcessingPhase.DONE) and not staging.body.get("result"):
+                        raise ValueError
+            for item in details:
+                if item.entry.kind == "dedupe" and item.body.get("schema") == "batch_v1" and item.body.get("disposition") == "BUFFERED":
+                    if self._find(details, "batch", item.body["batch_id"]) is None:
+                        raise ValueError
+        except (ValueError, KeyError, TypeError, ConversationGenerationUnavailable):
+            self._atomic(lease.phone, "validate", checks, quarantine=True)
 
     def initialize_contact(self, phone: str, lease: ContactLease | None = None,
                            *, db_state_present: bool | None = None) -> ContactAnchor:
@@ -591,7 +647,8 @@ class RedisConversationStore:
         return self._snapshot(lease)[1]
 
     def _transition(self, lease, expected, details, generation=None, operation="cas", extra=(),
-                    *, cycle=None, operational=False, deadline=None, mutation_fence=...):
+                    *, cycle=None, operational=False, deadline=None, mutation_fence=...,
+                    deadline_transition=None, _plan_only=False):
         with self._lock:
             anchor, previous, checks = self._snapshot(lease, operational=operational)
             if (anchor.contact_revision != expected.contact_revision
@@ -633,12 +690,15 @@ class RedisConversationStore:
                                       and item.body.get("phase") == MutationPhase.QUARANTINED.value)
                 horizon = item.entry.expected_until + timedelta(seconds=self.config.ttl_margin_seconds)
                 ttl = int((horizon - self._now()).total_seconds() * 1000)
-                if ttl <= 0 and not durable_quarantine:
+                live_batch = item.body.get("schema") == "batch_v1" and not item.terminal
+                if ttl <= 0 and not durable_quarantine and not live_batch and not item.terminal:
                     raise ConversationStateUnavailable(FailureReason.INVALID_VALUE)
                 write = {"op": "SET", "key": self._detail_key(lease.phone, item.entry),
                          "value": _json({"entry": _entry_data(item.entry),
                                          "body": dict(item.body), "terminal": item.terminal})}
-                if not durable_quarantine:
+                # Live batches never disappear passively before their resolver.
+                # Their finite deadlines bound valid work; terminal CAS purges content.
+                if not durable_quarantine and not live_batch and not item.terminal:
                     write["ttl"] = ttl
                 writes.append(write)
                 for flag in item.entry.index_flags:
@@ -653,7 +713,14 @@ class RedisConversationStore:
                                "value": contact_digest(lease.phone)})
             writes.extend([{"op": "SET", "key": keys.anchor, "value": _json(_anchor_data(updated))},
                            {"op": "SET", "key": keys.generation, "value": _generation_control(updated)}, *extra])
-            self._atomic(lease.phone, operation, checks, writes, deadline=deadline)
+            if _plan_only:
+                return writes
+            deadline_writes = ()
+            if deadline_transition is not None:
+                deadline_writes = self._transition(lease, expected, operation=operation,
+                                                   _plan_only=True, **deadline_transition)
+            self._atomic(lease.phone, operation, checks, writes, deadline=deadline,
+                         deadline_writes=deadline_writes)
             return updated
 
     def compare_and_set(self, lease: ContactLease, expected: ContactAnchor,
@@ -676,6 +743,435 @@ class RedisConversationStore:
         if not isinstance(operation_id, str) or not operation_id:
             raise ConversationStateUnavailable(FailureReason.INVALID_VALUE)
         return hashlib.sha256(operation_id.encode()).hexdigest()
+
+    def _replay_until(self, now=None):
+        return (now or self._now()) + timedelta(seconds=max(
+            7 * 86400, self.config.replay_window_seconds,
+            self.config.dispatch_retry_seconds + self.config.processing_retry_seconds + self.config.ttl_margin_seconds))
+
+    @staticmethod
+    def _find(details, kind, identity):
+        return next((item for item in details if item.entry.kind == kind and item.entry.id == identity), None)
+
+    @staticmethod
+    def _changed(item, *, body=None, until=None, flags=None, terminal=None):
+        return ContactDetail(replace(item.entry, version=item.entry.version + 1,
+                             expected_until=until or item.entry.expected_until,
+                             index_flags=item.entry.index_flags if flags is None else flags),
+                             dict(item.body) if body is None else body,
+                             item.terminal if terminal is None else terminal)
+
+    @staticmethod
+    def _replace_details(details, *replacements, remove=()):
+        by_id = {(item.entry.kind, item.entry.id): item for item in replacements}
+        return tuple(item for item in details if (item.entry.kind, item.entry.id) not in by_id
+                     and (item.entry.kind, item.entry.id) not in remove) + tuple(replacements)
+
+    @staticmethod
+    def _date(timestamp):
+        return datetime.fromtimestamp(timestamp, timezone.utc)
+
+    def _dispatch_load(self, item):
+        value = item.body
+        try:
+            return BufferDispatch(item.entry.id, value["generation"], DispatchPhase(value["phase"]),
+                self._date(value["dispatch_deadline"]), self._date(value["next_enqueue_at"]),
+                value["enqueue_attempt_id"], self._date(value["scheduled_at"]) if value["scheduled_at"] is not None else None,
+                self._date(value["processing_deadline"]) if value["processing_deadline"] is not None else None,
+                value["processing_id"], value["operation_id"])
+        except (KeyError, TypeError, ValueError, OverflowError):
+            raise ConversationGenerationUnavailable(FailureReason.GENERATION_UNAVAILABLE) from None
+
+    def _processing_load(self, item):
+        value = item.body
+        try:
+            return ProcessingAttempt(item.entry.id, value["batch_id"], value["generation"],
+                ProcessingPhase(value["phase"]), value["claim_token"], self._date(value["claim_deadline"]),
+                self._date(value["processing_deadline"]), value["operation_id"], value["epoch"])
+        except (KeyError, TypeError, ValueError, OverflowError):
+            raise ConversationGenerationUnavailable(FailureReason.GENERATION_UNAVAILABLE) from None
+
+    def _command_for(self, phone, batch):
+        return ProcessingCommand(phone, batch.entry.id, batch.body["epoch"], batch.body["generation"],
+                                  batch.body["processing_id"], batch.body["operation_id"])
+
+    def _batch_snapshot(self, command, lease):
+        if lease.phone != command.phone:
+            raise ContactLeaseLost(FailureReason.CONTACT_LEASE_LOST)
+        if command.coordination_epoch != str(self.config.coordination_epoch):
+            raise ConversationGenerationUnavailable(FailureReason.GENERATION_UNAVAILABLE)
+        anchor, details, checks = self._snapshot(lease)
+        item = self._find(details, "batch", command.batch_id)
+        if item is None:
+            raise ConversationGenerationUnavailable(FailureReason.GENERATION_UNAVAILABLE)
+        if (item.body.get("schema") != "batch_v1" or item.body["generation"] != command.generation
+                or item.body["epoch"] != command.coordination_epoch
+                or (command.processing_id is not None and command.processing_id != item.body["processing_id"])
+                or (command.operation_id is not None and command.operation_id != item.body["operation_id"])):
+            raise ConversationGenerationUnavailable(FailureReason.GENERATION_UNAVAILABLE)
+        return anchor, details, item, checks
+
+    def dispatch(self, command: ProcessingCommand, lease: ContactLease) -> BufferDispatch:
+        return self._dispatch_load(self._batch_snapshot(command, lease)[2])
+
+    def _compatible_generation(self, anchor, details, batch):
+        if str(anchor.last_generation) == batch.body["generation"]:
+            return True
+        operation = batch.body["operation_id"]
+        mutation = self._find(details, "mutation", self._attempt_id(operation)) if operation else None
+        if mutation is None:
+            return False
+        attempt = self._attempt_load(mutation)
+        return (attempt.generation == anchor.last_generation
+                and attempt.phase in (MutationPhase.PREPARED, MutationPhase.COMMITTING, MutationPhase.COMMITTED))
+
+    def finalize_ingress_once(self, phone, envelope, message_id, generation, lease, *,
+                              disposition=IngressDisposition.BUFFERED, paused_until=None):
+        """One logical append and its receipt, batch, index and manifest share a CAS.
+
+        APPLIED reserves a secretary operation; only committed mutation finalization
+        publishes APPLIED. A replay of that reservation returns the same operation.
+        """
+        if lease.phone != phone:
+            raise ContactLeaseLost(FailureReason.CONTACT_LEASE_LOST)
+        if message_id is not None and (not isinstance(message_id, str) or not message_id):
+            raise ConversationStateUnavailable(FailureReason.INVALID_VALUE)
+        with self._lock:
+            anchor, details, _ = self._snapshot(lease)
+            identity = hashlib.sha256(message_id.encode()).hexdigest() if message_id else None
+            if any(item.terminal and self._now() >= item.entry.expected_until for item in details):
+                self.cleanup(lease, anchor)
+                anchor, details, _ = self._snapshot(lease)
+            old = self._find(details, "dedupe", identity) if identity else None
+            if old is not None and self._now() < old.entry.expected_until:
+                if old.body["disposition"] == "BUFFERED" and old.body["batch_id"]:
+                    batch = self._find(details, "batch", old.body["batch_id"])
+                    dispatch = self._dispatch_load(batch)
+                    deadline = dispatch.processing_deadline if dispatch.phase is DispatchPhase.STAGED else dispatch.dispatch_deadline
+                    if dispatch.phase in (DispatchPhase.PENDING, DispatchPhase.SCHEDULED, DispatchPhase.STAGED) and self._now() >= deadline:
+                        self.exhaust_batch(self._command_for(phone, batch), self._now(), lease)
+                return IngressReceipt(IngressDisposition.DUPLICATE if old.body["disposition"] is not None else None,
+                                      old.body["batch_id"], old.body["operation_id"])
+            self.assert_mutation_available(lease, self._now())
+            if generation != str(anchor.last_generation):
+                raise ConversationGenerationUnavailable(FailureReason.GENERATION_UNAVAILABLE)
+            if disposition not in (IngressDisposition.BUFFERED, IngressDisposition.DROPPED,
+                                   IngressDisposition.IGNORED, IngressDisposition.APPLIED):
+                raise ConversationStateUnavailable(FailureReason.INVALID_VALUE)
+            now, until, batch_id, operation_id = self._now(), self._replay_until(), None, None
+            updates = []
+            if disposition is IngressDisposition.BUFFERED:
+                if (anchor.cycle is not ConversationCycle.OPEN or not isinstance(envelope, InboundEnvelope)
+                        or envelope.generation != generation or envelope.message_id != message_id
+                        or envelope.received_at.tzinfo is None or not isinstance(envelope.content, str)
+                        or envelope.kind not in ("text", "media", "pause_help") or envelope.received_at > now):
+                    raise ConversationStateUnavailable(FailureReason.INVALID_VALUE)
+                batch = next((item for item in details if item.entry.kind == "batch"
+                              and item.body.get("generation") == generation
+                              and item.body.get("phase") in ("PENDING", "SCHEDULED")), None)
+                if batch and now >= self._dispatch_load(batch).dispatch_deadline:
+                    self.exhaust_batch(self._command_for(phone, batch), now, lease)
+                    anchor, details, _ = self._snapshot(lease)
+                    batch = None
+                if batch is None:
+                    batch_id = str(uuid4())
+                    deadline = envelope.received_at + timedelta(seconds=self.config.dispatch_retry_seconds)
+                    if now >= deadline:
+                        raise ConversationMutationPending(FailureReason.MUTATION_PENDING)
+                    batch = ContactDetail(ManifestEntry("batch", batch_id, 1, deadline, ("dispatch",)),
+                        {"schema": "batch_v1", "phone": phone, "epoch": str(self.config.coordination_epoch),
+                         "generation": generation, "phase": "PENDING", "dispatch_deadline": deadline.timestamp(),
+                         "next_enqueue_at": envelope.received_at.timestamp(), "enqueue_attempt_id": None, "scheduled_at": None,
+                         "processing_deadline": None, "processing_id": None, "operation_id": None})
+                    buffer = ContactDetail(ManifestEntry("buffer", batch_id, 1, deadline),
+                                            {"schema": "batch_v1", "envelopes": []})
+                    updates.append(batch)
+                else:
+                    batch_id = batch.entry.id
+                    buffer = self._find(details, "buffer", batch_id)
+                data = {"kind": envelope.kind, "content": envelope.content, "received_at": envelope.received_at.isoformat(),
+                        "generation": envelope.generation, "message_id": message_id}
+                updates.append(self._changed(buffer, body={**buffer.body, "envelopes": [*buffer.body["envelopes"], data]}))
+            elif disposition is IngressDisposition.DROPPED:
+                if anchor.cycle is not ConversationCycle.PAUSED or paused_until is None or paused_until <= now:
+                    raise ConversationStateUnavailable(FailureReason.INVALID_VALUE)
+                until = max(until, paused_until + timedelta(seconds=max(7 * 86400, self.config.replay_window_seconds)
+                                                           + self.config.ttl_margin_seconds))
+            elif disposition is IngressDisposition.APPLIED:
+                operation_id = str(uuid4())
+            if identity:
+                entry = ManifestEntry("dedupe", identity, old.entry.version + 1 if old else 1, until)
+                updates.append(ContactDetail(entry, {"schema": "batch_v1", "disposition":
+                    None if disposition is IngressDisposition.APPLIED else disposition.value,
+                    "batch_id": batch_id, "operation_id": operation_id},
+                    disposition in (IngressDisposition.DROPPED, IngressDisposition.IGNORED)))
+            if updates:
+                self._transition(lease, anchor, self._replace_details(details, *updates), operation="finalize_ingress_once")
+            return IngressReceipt(None if disposition is IngressDisposition.APPLIED else disposition, batch_id, operation_id)
+
+    def ensure_consumer(self, broker, command, now, lease):
+        with self._lock:
+            anchor, details, batch, _ = self._batch_snapshot(command, lease)
+            self.assert_mutation_available(lease, self._now(), operation_id=batch.body["operation_id"])
+            dispatch = self._dispatch_load(batch)
+            if dispatch.phase in (DispatchPhase.PROCESSED, DispatchPhase.EXHAUSTED):
+                return EnsureConsumerResult.NOT_DUE
+            deadline = dispatch.processing_deadline if dispatch.phase is DispatchPhase.STAGED else dispatch.dispatch_deadline
+            mutation = self._find(details, "mutation", self._attempt_id(dispatch.operation_id)) if dispatch.operation_id else None
+            committed = mutation is not None and self._attempt_load(mutation).phase is MutationPhase.COMMITTED
+            if not self._compatible_generation(anchor, details, batch) or (self._now() >= deadline and not committed):
+                self.exhaust_batch(command, self._now(), lease)
+                return EnsureConsumerResult.NOT_DUE
+            if dispatch.phase is DispatchPhase.STAGED:
+                processing = self._find(details, "processing", dispatch.processing_id)
+                if processing.body["phase"] == "CLAIMED" and self._now() < self._date(processing.body["claim_deadline"]):
+                    return EnsureConsumerResult.NOT_DUE
+            if self._now() < dispatch.next_enqueue_at:
+                return EnsureConsumerResult.NOT_DUE
+            started = self._now()
+            reserved = self._changed(batch, body={**batch.body, "enqueue_attempt_id": str(uuid4()),
+                "next_enqueue_at": (started + timedelta(seconds=self.config.enqueue_visibility_seconds)).timestamp()})
+            self._transition(lease, anchor, self._replace_details(details, reserved), operation="reserve_enqueue",
+                             deadline=None if committed else deadline,
+                             deadline_transition=None if committed else self._terminal_plan(anchor, details, batch))
+        lease.assert_owned()
+        try:
+            outcome = broker.enqueue_processing(command)
+        except Exception:
+            raise BrokerUnavailable(FailureReason.BROKER_UNAVAILABLE) from None
+        if not isinstance(outcome, EnqueueResult) or outcome is EnqueueResult.AMBIGUOUS:
+            raise BrokerUnavailable(FailureReason.BROKER_UNAVAILABLE)
+        with self._lock:
+            anchor, details, current, _ = self._batch_snapshot(command, lease)
+            if (current.body["enqueue_attempt_id"] != reserved.body["enqueue_attempt_id"]
+                    or current.body["phase"] != reserved.body["phase"]):
+                raise ConversationMutationPending(FailureReason.MUTATION_PENDING)
+            phase = "STAGED" if dispatch.phase is DispatchPhase.STAGED else "SCHEDULED" if outcome is EnqueueResult.CONFIRMED else "PENDING"
+            body = {**current.body, "phase": phase}
+            if outcome is EnqueueResult.CONFIRMED:
+                body["scheduled_at"] = started.timestamp()
+            else:
+                body["scheduled_at"] = None
+                body["next_enqueue_at"] = (self._now() + timedelta(seconds=self.config.enqueue_backoff_seconds)).timestamp()
+            self._transition(lease, anchor, self._replace_details(details, self._changed(current, body=body)),
+                             operation="finish_enqueue", deadline=None if committed else deadline,
+                             deadline_transition=None if committed else self._terminal_plan(anchor, details, current))
+        if outcome is EnqueueResult.DEFINITIVE_FAILURE:
+            raise BrokerUnavailable(FailureReason.BROKER_UNAVAILABLE)
+        return EnsureConsumerResult.SCHEDULED
+
+    def _terminal_plan(self, anchor, details, batch, *, processed=False):
+        until = self._replay_until()
+        updates = [self._changed(batch, body={**batch.body, "phase": "PROCESSED" if processed else "EXHAUSTED"},
+                                 until=until, flags=(), terminal=True)]
+        processing = self._find(details, "processing", batch.body["processing_id"])
+        if processing:
+            updates.append(self._changed(processing, body={**processing.body, "phase": "DONE"}, until=until, flags=(), terminal=True))
+        cycle, fence = anchor.cycle, anchor.mutation_fence
+        operation = batch.body["operation_id"]
+        if operation:
+            mutation = self._find(details, "mutation", self._attempt_id(operation))
+            if mutation and self._attempt_load(mutation).phase is MutationPhase.PREPARED:
+                attempt = replace(self._attempt_load(mutation), phase=MutationPhase.ABORTED)
+                updates.append(self._changed(mutation, body=self._attempt_data(attempt), terminal=True))
+                cycle, fence = attempt.prior_cycle, None
+        for item in details:
+            if item.entry.kind == "dedupe" and item.body.get("batch_id") == batch.entry.id:
+                updates.append(self._changed(item, body={**item.body, "disposition": "PROCESSED" if processed else "FAILED"},
+                                             until=max(until, item.entry.expected_until), terminal=True))
+        return {"details": self._replace_details(details, *updates,
+                remove=(("buffer", batch.entry.id), ("staging", batch.entry.id))),
+                "cycle": cycle, "mutation_fence": fence}
+
+    def exhaust_batch(self, command, now, lease):
+        with self._lock:
+            anchor, details, batch, _ = self._batch_snapshot(command, lease)
+            dispatch = self._dispatch_load(batch)
+            if dispatch.phase in (DispatchPhase.PROCESSED, DispatchPhase.EXHAUSTED):
+                return
+            operation = batch.body["operation_id"]
+            mutation = self._find(details, "mutation", self._attempt_id(operation)) if operation else None
+            if mutation and self._attempt_load(mutation).phase is MutationPhase.COMMITTING:
+                self.quarantine_ambiguous_commit(command.phone, operation, lease, now)
+                raise ConversationMutationPending(FailureReason.MUTATION_PENDING)
+            if mutation and self._attempt_load(mutation).phase is MutationPhase.COMMITTED:
+                # The processing deadline only exhausts pre-commit work. Preserve
+                # result/index until the caller crosses its local enqueue boundary.
+                return
+            deadline = dispatch.processing_deadline if dispatch.phase is DispatchPhase.STAGED else dispatch.dispatch_deadline
+            if self._now() < deadline and self._compatible_generation(anchor, details, batch):
+                return
+            self._transition(lease, anchor, operation="exhaust_batch", **self._terminal_plan(anchor, details, batch))
+
+    def claim_or_resume_batch(self, command, now, lease):
+        with self._lock:
+            anchor, details, batch, _ = self._batch_snapshot(command, lease)
+            dispatch = self._dispatch_load(batch)
+            if dispatch.phase in (DispatchPhase.EXHAUSTED, DispatchPhase.PROCESSED):
+                return BatchClaim(ClaimOutcome.TERMINAL)
+            self.assert_mutation_available(lease, now, operation_id=dispatch.operation_id)
+            mutation = self._find(details, "mutation", self._attempt_id(dispatch.operation_id)) if dispatch.operation_id else None
+            committed = mutation is not None and self._attempt_load(mutation).phase is MutationPhase.COMMITTED
+            deadline = dispatch.processing_deadline if dispatch.phase is DispatchPhase.STAGED else dispatch.dispatch_deadline
+            if not self._compatible_generation(anchor, details, batch) or (self._now() >= deadline and not committed):
+                self.exhaust_batch(command, now, lease)
+                return BatchClaim(ClaimOutcome.TERMINAL)
+            if dispatch.phase is not DispatchPhase.STAGED:
+                if any(item.entry.kind == "processing" and not item.terminal for item in details):
+                    raise ConversationMutationPending(FailureReason.MUTATION_PENDING)
+                deadline = self._now() + timedelta(seconds=self.config.processing_retry_seconds)
+                processing_id, operation_id, token = str(uuid4()), str(uuid4()), str(uuid4())
+                processing = ContactDetail(ManifestEntry("processing", processing_id, 1, deadline),
+                    {"schema": "batch_v1", "batch_id": batch.entry.id, "epoch": command.coordination_epoch,
+                     "generation": command.generation, "phase": "CLAIMED", "operation_id": operation_id,
+                     "claim_token": token, "owner_token_hash": hashlib.sha256(lease.owner_token.encode()).hexdigest(),
+                     "claim_deadline": min(self._now() + timedelta(seconds=self.config.claim_ttl_seconds), deadline).timestamp(),
+                     "processing_deadline": deadline.timestamp()})
+                buffer = self._find(details, "buffer", batch.entry.id)
+                staging = ContactDetail(ManifestEntry("staging", batch.entry.id, 1, deadline), dict(buffer.body))
+                updated = self._changed(batch, body={**batch.body, "phase": "STAGED", "processing_id": processing_id,
+                    "operation_id": operation_id, "processing_deadline": deadline.timestamp()}, until=deadline, flags=("staging",))
+                receipts = tuple(self._changed(item, body={**item.body, "operation_id": operation_id})
+                                 for item in details if item.entry.kind == "dedupe" and item.body.get("batch_id") == batch.entry.id)
+                self._transition(lease, anchor, self._replace_details(details, updated, processing, staging, *receipts,
+                                   remove=(("buffer", batch.entry.id),)), operation="claim_or_resume_batch",
+                                   deadline=dispatch.dispatch_deadline,
+                                   deadline_transition=self._terminal_plan(anchor, details, batch))
+                outcome = ClaimOutcome.CLAIMED
+            else:
+                processing = self._find(details, "processing", dispatch.processing_id)
+                staging = self._find(details, "staging", batch.entry.id)
+                phase = ProcessingPhase(processing.body["phase"])
+                if phase is ProcessingPhase.CLAIMED and self._now() < self._date(processing.body["claim_deadline"]):
+                    return BatchClaim(ClaimOutcome.DUPLICATE)
+                if phase is ProcessingPhase.CLAIMED:
+                    processing = self._changed(processing, body={**processing.body, "claim_token": str(uuid4()),
+                        "owner_token_hash": hashlib.sha256(lease.owner_token.encode()).hexdigest(),
+                        "claim_deadline": min(self._now() + timedelta(seconds=self.config.claim_ttl_seconds), deadline).timestamp()})
+                    outcome = ClaimOutcome.CLAIMED
+                else:
+                    processing = self._changed(processing, body={**processing.body,
+                        "owner_token_hash": hashlib.sha256(lease.owner_token.encode()).hexdigest()})
+                    outcome = ClaimOutcome.RESULT_READY if phase is ProcessingPhase.RESULT_READY else ClaimOutcome.APPLYING
+                self._transition(lease, anchor, self._replace_details(details, processing), operation="claim_or_resume_batch",
+                                 deadline=None if committed else deadline,
+                                 deadline_transition=None if committed else self._terminal_plan(anchor, details, batch))
+            envelopes = tuple(InboundEnvelope(e["kind"], e["content"], datetime.fromisoformat(e["received_at"]),
+                                              e["generation"], e["message_id"]) for e in staging.body["envelopes"])
+            result = staging.body.get("result")
+            return BatchClaim(outcome, self._processing_load(processing), envelopes,
+                              self._result_load(result) if result else None)
+
+    @staticmethod
+    def _result_data(result):
+        return {"text": result.text, "messages": result.messages, "current_flow": result.current_flow,
+                "flow_data": result.flow_data, "intent": result.intent.value}
+
+    @staticmethod
+    def _result_load(value):
+        return AgentResult(value["text"], value["messages"], value["current_flow"], value["flow_data"], AgentIntent(value["intent"]))
+
+    def stage_agent_result(self, command, attempt, result, now, lease):
+        with self._lock:
+            anchor, details, batch, _ = self._batch_snapshot(command, lease)
+            self.assert_mutation_available(lease, now, operation_id=attempt.operation_id)
+            processing = self._find(details, "processing", batch.body["processing_id"])
+            if (processing is None or batch.body["phase"] != "STAGED"
+                    or processing.entry.id != attempt.processing_id or processing.body["claim_token"] != attempt.claim_token
+                    or attempt.operation_id != processing.body["operation_id"]
+                    or attempt.coordination_epoch != command.coordination_epoch
+                    or attempt.generation != command.generation or attempt.batch_id != command.batch_id
+                    or processing.body["owner_token_hash"] != hashlib.sha256(lease.owner_token.encode()).hexdigest()
+                    or not self._compatible_generation(anchor, details, batch)):
+                raise ConversationMutationPending(FailureReason.MUTATION_PENDING)
+            deadline = self._date(processing.body["processing_deadline"])
+            if self._now() >= deadline:
+                self.exhaust_batch(command, now, lease)
+                raise ConversationMutationPending(FailureReason.MUTATION_PENDING)
+            if processing.body["phase"] == "RESULT_READY":
+                return  # An already published result wins over every repeated response.
+            if processing.body["phase"] != "CLAIMED":
+                raise ConversationMutationPending(FailureReason.MUTATION_PENDING)
+            staging = self._find(details, "staging", command.batch_id)
+            changed = self._changed(staging, body={**staging.body, "result": self._result_data(result)})
+            ready = self._changed(processing, body={**processing.body, "phase": "RESULT_READY"})
+            self._transition(lease, anchor, self._replace_details(details, changed, ready), operation="stage_agent_result",
+                             deadline=deadline, deadline_transition=self._terminal_plan(anchor, details, batch))
+
+    def validate_agent_application(self, phone, processing_id, operation_id, result, lease):
+        if phone != lease.phone:
+            raise ContactLeaseLost(FailureReason.CONTACT_LEASE_LOST)
+        # Tasks 1-3 also expose a direct coordinator contract, before a batch exists.
+        if self._get(contact_keys(phone).anchor) is None:
+            return
+        anchor, details, _ = self._snapshot(lease)
+        processing = self._find(details, "processing", processing_id)
+        if processing is None:
+            if any(item.entry.kind == "processing" and item.body.get("schema") == "batch_v1" and not item.terminal for item in details):
+                raise ConversationMutationPending(FailureReason.MUTATION_PENDING)
+            return
+        if processing.terminal:
+            return  # The coordinator validates the terminal mutation's request hash.
+        if (processing.body["operation_id"] != operation_id
+                or processing.body["phase"] not in ("RESULT_READY", "APPLYING", "DONE")
+                or processing.body["owner_token_hash"] != hashlib.sha256(lease.owner_token.encode()).hexdigest()):
+            raise ConversationMutationPending(FailureReason.MUTATION_PENDING)
+        batch = self._find(details, "batch", processing.body["batch_id"])
+        staging = self._find(details, "staging", processing.body["batch_id"])
+        if (not self._compatible_generation(anchor, details, batch)
+                or staging.body.get("result") != self._result_data(result)):
+            raise ConversationMutationPending(FailureReason.MUTATION_PENDING)
+        mutation = self._find(details, "mutation", self._attempt_id(operation_id))
+        committed = mutation and self._attempt_load(mutation).phase is MutationPhase.COMMITTED
+        if self._now() >= self._date(processing.body["processing_deadline"]) and not committed:
+            self.exhaust_batch(self._command_for(phone, batch), self._now(), lease)
+            raise ConversationMutationPending(FailureReason.MUTATION_PENDING)
+
+    def complete_batch(self, command, attempt, now, lease):
+        with self._lock:
+            anchor, details, batch, _ = self._batch_snapshot(command, lease)
+            if batch.body["phase"] in ("EXHAUSTED", "PROCESSED"):
+                return
+            mutation = self._find(details, "mutation", self._attempt_id(attempt.operation_id))
+            processing = self._find(details, "processing", attempt.processing_id)
+            if (mutation is None or self._attempt_load(mutation).phase is not MutationPhase.COMMITTED
+                    or processing is None or processing.body["claim_token"] != attempt.claim_token
+                    or batch.body["operation_id"] != attempt.operation_id):
+                raise ConversationMutationPending(FailureReason.MUTATION_PENDING)
+            self._transition(lease, anchor, operation="complete_batch", **self._terminal_plan(anchor, details, batch, processed=True))
+
+    def recoverable_batches(self, limit=100):
+        """Bounded index read returns metadata only; the caller then acquires leases."""
+        self._ready()
+        if type(limit) is not int or not 1 <= limit <= 1000:
+            raise ConversationStateUnavailable(FailureReason.INVALID_VALUE)
+        commands, seen = [], set()
+        try:
+            for index in (DISPATCH_INDEX_KEY, STAGING_INDEX_KEY):
+                for raw_member in self.client.sscan_iter(index, match="*"):
+                    digest, kind, identity = _text(raw_member).split(":")
+                    if kind != "batch" or (digest, identity) in seen:
+                        continue
+                    seen.add((digest, identity))
+                    key = f"conversation:contact:{digest}:batch:{identity}"
+                    raw = self._get(key)
+                    if raw is None:
+                        raise ConversationGenerationUnavailable(FailureReason.GENERATION_UNAVAILABLE)
+                    value = json.loads(raw)
+                    body = value["body"]
+                    if contact_digest(body["phone"]) != digest or body["epoch"] != str(self.config.coordination_epoch):
+                        raise ConversationGenerationUnavailable(FailureReason.GENERATION_UNAVAILABLE)
+                    commands.append(ProcessingCommand(body["phone"], identity, body["epoch"], body["generation"],
+                                                       body["processing_id"], body["operation_id"]))
+                    if len(commands) >= limit:
+                        return tuple(commands)
+        except ConversationDomainError:
+            raise
+        except (KeyError, TypeError, ValueError):
+            raise ConversationGenerationUnavailable(FailureReason.GENERATION_UNAVAILABLE) from None
+        except Exception:
+            raise ConversationStateUnavailable(FailureReason.STATE_UNAVAILABLE) from None
+        return tuple(commands)
 
     @staticmethod
     def _attempt_data(attempt: MutationAttempt) -> dict:
@@ -732,13 +1228,33 @@ class RedisConversationStore:
                               previous.entry.version + 1 if previous else 1, attempt.expected_until)
         updated = ContactDetail(entry, self._attempt_data(attempt),
                                 attempt.phase in (MutationPhase.COMMITTED, MutationPhase.ABORTED))
-        retained = tuple(item for item in details if item != previous
+        batch = next((item for item in details if item.entry.kind == "batch"
+                      and item.body.get("operation_id") == attempt.operation_id), None)
+        deadline_transition = self._terminal_plan(anchor, details, batch) if batch and deadline else None
+        coordinated = []
+        for item in details:
+            if item.entry.kind == "processing" and item.body.get("operation_id") == attempt.operation_id:
+                phase = {MutationPhase.PREPARED: "APPLYING", MutationPhase.COMMITTING: "APPLYING",
+                         MutationPhase.COMMITTED: "DONE", MutationPhase.ABORTED: "RESULT_READY"}.get(attempt.phase)
+                if phase:
+                    item = self._changed(item, body={**item.body, "phase": phase})
+            elif item.entry.kind == "dedupe" and item.body.get("operation_id") == attempt.operation_id:
+                if attempt.phase is MutationPhase.COMMITTED:
+                    disposition = "PROCESSED" if item.body.get("batch_id") else "APPLIED"
+                    item = self._changed(item, body={**item.body, "disposition": disposition},
+                                         until=max(item.entry.expected_until, self._replay_until()), terminal=True)
+                elif attempt.phase is MutationPhase.QUARANTINED:
+                    item = self._changed(item, body={**item.body, "disposition": None}, terminal=False)
+                elif attempt.phase is MutationPhase.ABORTED and operational:
+                    item = self._changed(item, body={**item.body, "disposition": "FAILED"}, terminal=True)
+            coordinated.append(item)
+        retained = tuple(item for item in coordinated if item != previous
                          and (not compact or self._is_replay_receipt(item)))
         fence = self._mutation_receipt(attempt) if attempt.phase in (
             MutationPhase.PREPARED, MutationPhase.COMMITTING, MutationPhase.QUARANTINED) else None
         self._transition(lease, anchor, (*retained, updated), attempt.generation,
                          operation=operation, cycle=cycle, operational=operational,
-                         deadline=deadline, mutation_fence=fence)
+                         deadline=deadline, mutation_fence=fence, deadline_transition=deadline_transition)
         return attempt
 
     def _mutation_receipt(self, attempt: MutationAttempt) -> dict:
@@ -747,6 +1263,8 @@ class RedisConversationStore:
                 "detail_fingerprint": hashlib.sha256(_json(self._attempt_data(attempt)).encode()).hexdigest()}
 
     def _is_replay_receipt(self, item: ContactDetail) -> bool:
+        if item.entry.kind == "dedupe" and self._now() < item.entry.expected_until:
+            return (item.terminal or (item.body.get("disposition") is None and item.body.get("operation_id") is not None))
         return (item.entry.kind == "mutation" and item.terminal is True
                 and self._now() < item.entry.expected_until
                 and self._attempt_load(item).phase in (MutationPhase.COMMITTED, MutationPhase.ABORTED))
@@ -795,21 +1313,37 @@ class RedisConversationStore:
                         raise ConversationStateUnavailable(FailureReason.INVALID_VALUE)
                     return attempt
                 raise ConversationMutationPending(FailureReason.MUTATION_PENDING)
+            processing = next((item for item in details if item.entry.kind == "processing"
+                               and item.body.get("operation_id") == operation_id), None)
+            batch = self._find(details, "batch", processing.body["batch_id"]) if processing else None
+            if processing:
+                if (processing.body["phase"] != "RESULT_READY"
+                        or processing.body["owner_token_hash"] != hashlib.sha256(lease.owner_token.encode()).hexdigest()):
+                    raise ConversationMutationPending(FailureReason.MUTATION_PENDING)
+                if self._now() >= self._date(processing.body["processing_deadline"]):
+                    self.exhaust_batch(self._command_for(phone, batch), self._now(), lease)
+                    raise ConversationMutationPending(FailureReason.MUTATION_PENDING)
             now = self._now()
             attempt = MutationAttempt(
                 self.config.coordination_epoch, operation_id, kind, MutationPhase.PREPARED,
                 target_fingerprint, target.request_fingerprint,
                 uuid4() if target.rotate_generation else anchor.last_generation,
-                anchor.cycle, target.cycle, now + timedelta(seconds=self.config.processing_retry_seconds),
+                anchor.cycle, target.cycle, self._date(processing.body["processing_deadline"]) if processing else now + timedelta(seconds=self.config.processing_retry_seconds),
                 now + timedelta(seconds=self.config.replay_window_seconds),
                 hashlib.sha256(lease.owner_token.encode()).hexdigest(), target.paused_until, target.reason, now)
             return self._write_attempt(lease, anchor, details, previous, attempt,
-                                       "prepare_mutation", cycle=ConversationCycle.MUTATING)
+                                       "prepare_mutation", cycle=ConversationCycle.MUTATING,
+                                       deadline=attempt.processing_deadline if processing else None)
 
     def enter_committing(self, phone: str, operation_id: str, lease: ContactLease,
                          now: datetime, processing_deadline: datetime) -> MutationAttempt:
         with self._lock:
             anchor, details, item, attempt = self._mutation_snapshot(phone, operation_id, lease)
+            if attempt is not None and attempt.phase is MutationPhase.PREPARED and self._now() >= attempt.processing_deadline:
+                batch = next((row for row in details if row.entry.kind == "batch" and row.body.get("operation_id") == operation_id), None)
+                if batch:
+                    self.exhaust_batch(self._command_for(phone, batch), self._now(), lease)
+                raise ConversationMutationPending(FailureReason.MUTATION_PENDING)
             if (attempt is None or attempt.phase is not MutationPhase.PREPARED
                     or attempt.owner_token_hash != hashlib.sha256(lease.owner_token.encode()).hexdigest()
                     or processing_deadline != attempt.processing_deadline
@@ -916,6 +1450,10 @@ class RedisConversationStore:
                 changed = False
                 for item in details:
                     if item.entry.kind == "processing" and item.body.get("phase") == "CLAIMED":
+                        if (item.body.get("schema") == "batch_v1"
+                                and item.body.get("owner_token_hash") != hashlib.sha256(lease.owner_token.encode()).hexdigest()):
+                            renewed.append(item)
+                            continue
                         deadline = min(self._now().timestamp() + self.config.claim_ttl_seconds,
                                        item.body["processing_deadline"])
                         if deadline <= self._now().timestamp():

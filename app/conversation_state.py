@@ -74,6 +74,26 @@ class DispatchPhase(str, Enum):
     EXHAUSTED = "EXHAUSTED"
 
 
+class EnqueueResult(str, Enum):
+    CONFIRMED = "CONFIRMED"
+    DEFINITIVE_FAILURE = "DEFINITIVE_FAILURE"
+    AMBIGUOUS = "AMBIGUOUS"
+
+
+class EnsureConsumerResult(str, Enum):
+    SCHEDULED = "SCHEDULED"
+    NOT_DUE = "NOT_DUE"
+    RETRY = "RETRY"
+
+
+class ClaimOutcome(str, Enum):
+    CLAIMED = "CLAIMED"
+    DUPLICATE = "DUPLICATE"
+    RESULT_READY = "RESULT_READY"
+    APPLYING = "APPLYING"
+    TERMINAL = "TERMINAL"
+
+
 class AgentIntent(str, Enum):
     SAVE_CONTEXT = "SAVE_CONTEXT"
     PAUSE_FOR_SECRETARY = "PAUSE_FOR_SECRETARY"
@@ -112,6 +132,8 @@ class FailureReason(str, Enum):
     COMMIT_RESULT_UNKNOWN = "commit_result_unknown"
     REDIS_FINALIZE_AFTER_COMMIT_FAILED = "redis_finalize_after_commit_failed"
     CONDITION_CHANGED = "mutation_condition_changed"
+    BROKER_UNAVAILABLE = "broker_unavailable"
+    INVALID_TASK_COMMAND = "invalid_task_command"
 
 
 class ConfigurationIssue(str, Enum):
@@ -187,6 +209,10 @@ class ConfigurationInvalid(ConversationDomainError):
 
 
 class ReadinessUnavailable(ConversationDomainError):
+    pass
+
+
+class BrokerUnavailable(ConversationDomainError):
     pass
 
 
@@ -371,6 +397,90 @@ class AgentResult:
     intent: AgentIntent
 
 
+@dataclass(frozen=True, repr=False)
+class ProcessingCommand:
+    phone: str
+    batch_id: str
+    coordination_epoch: str
+    generation: str
+    processing_id: str | None = None
+    operation_id: str | None = None
+
+    def __post_init__(self):
+        from app.utils import normalize_phone
+        try:
+            if not isinstance(self.phone, str) or normalize_phone(self.phone) != self.phone or not self.phone:
+                raise ValueError
+            for value in (self.batch_id, self.coordination_epoch, self.generation):
+                if not isinstance(value, str) or str(UUID(value)) != value:
+                    raise ValueError
+            for value in (self.processing_id, self.operation_id):
+                if value is not None and (not isinstance(value, str) or str(UUID(value)) != value):
+                    raise ValueError
+        except (ValueError, TypeError, AttributeError):
+            raise ConversationStateUnavailable(FailureReason.INVALID_TASK_COMMAND) from None
+
+    def to_payload(self) -> dict[str, str | None]:
+        return {name: getattr(self, name) for name in self.__dataclass_fields__}
+
+    @classmethod
+    def from_payload(cls, payload):
+        if not isinstance(payload, dict) or set(payload) != set(cls.__dataclass_fields__):
+            raise ConversationStateUnavailable(FailureReason.INVALID_TASK_COMMAND)
+        return cls(**payload)
+
+
+@dataclass(frozen=True, repr=False)
+class InboundEnvelope:
+    kind: str
+    content: str
+    received_at: datetime
+    generation: str
+    message_id: str | None = None
+
+
+@dataclass(frozen=True, repr=False)
+class IngressReceipt:
+    disposition: IngressDisposition | None
+    batch_id: str | None = None
+    operation_id: str | None = None
+
+
+@dataclass(frozen=True, repr=False)
+class BufferDispatch:
+    batch_id: str
+    generation: str
+    phase: DispatchPhase
+    dispatch_deadline: datetime
+    next_enqueue_at: datetime
+    enqueue_attempt_id: str | None = None
+    scheduled_at: datetime | None = None
+    processing_deadline: datetime | None = None
+    processing_id: str | None = None
+    operation_id: str | None = None
+
+
+@dataclass(frozen=True, repr=False)
+class ProcessingAttempt:
+    processing_id: str
+    batch_id: str
+    generation: str
+    phase: ProcessingPhase
+    claim_token: str
+    claim_deadline: datetime
+    processing_deadline: datetime
+    operation_id: str
+    coordination_epoch: str
+
+
+@dataclass(frozen=True, repr=False)
+class BatchClaim:
+    outcome: ClaimOutcome
+    attempt: ProcessingAttempt | None = None
+    envelopes: tuple[InboundEnvelope, ...] = ()
+    result: AgentResult | None = None
+
+
 @dataclass(frozen=True)
 class OutboundEnvelope:
     phone: str
@@ -409,6 +519,32 @@ class OutboundEnvelope:
 
 
 class ConversationStore(Protocol):
+    def finalize_ingress_once(self, phone: str, envelope: InboundEnvelope | None,
+                              message_id: str | None, generation: str, lease: ContactLease, *,
+                              disposition: IngressDisposition = IngressDisposition.BUFFERED,
+                              paused_until: datetime | None = None) -> IngressReceipt: ...
+
+    def ensure_consumer(self, broker: BrokerPort, command: ProcessingCommand,
+                        now: datetime, lease: ContactLease) -> EnsureConsumerResult: ...
+
+    def dispatch(self, command: ProcessingCommand, lease: ContactLease) -> BufferDispatch: ...
+
+    def claim_or_resume_batch(self, command: ProcessingCommand, now: datetime,
+                              lease: ContactLease) -> BatchClaim: ...
+
+    def stage_agent_result(self, command: ProcessingCommand, attempt: ProcessingAttempt,
+                           result: AgentResult, now: datetime, lease: ContactLease) -> None: ...
+
+    def complete_batch(self, command: ProcessingCommand, attempt: ProcessingAttempt,
+                       now: datetime, lease: ContactLease) -> None: ...
+
+    def exhaust_batch(self, command: ProcessingCommand, now: datetime, lease: ContactLease) -> None: ...
+
+    def recoverable_batches(self, limit: int = 100) -> tuple[ProcessingCommand, ...]: ...
+
+    def validate_agent_application(self, phone: str, processing_id: str, operation_id: str,
+                                    result: AgentResult, lease: ContactLease) -> None: ...
+
     def readiness(self) -> ReadinessReport: ...
 
     def contact_lease(self, phone: str) -> AbstractContextManager[ContactLease]: ...
@@ -467,6 +603,8 @@ class ConversationStore(Protocol):
 
 
 class BrokerPort(Protocol):
+    def enqueue_processing(self, command: ProcessingCommand) -> EnqueueResult: ...
+
     def probe(self) -> bool: ...
 
 
@@ -900,6 +1038,7 @@ class ConversationCoordinator:
     @_reason_codes_only
     def apply_agent_result(self, db: Session, phone: str, result: AgentResult, processing_id: str,
                            operation_id: str, now: datetime, lease: ContactLease) -> OutboundEnvelope:
+        self.store.validate_agent_application(phone, processing_id, operation_id, result, lease)
         agent_request = {"text": result.text, "messages": result.messages, "flow": result.current_flow,
                          "data": result.flow_data, "processing": processing_id}
         if result.intent is AgentIntent.PAUSE_FOR_SECRETARY:
