@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import math
 from contextlib import AbstractContextManager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import Enum
-from typing import Any, Protocol, Sequence
+from typing import Any, Callable, Mapping, Protocol, Sequence
 from uuid import UUID
 
 
@@ -179,12 +179,49 @@ class ReadinessReport:
     def ready(self) -> bool:
         return all(item.ready for item in self.dependencies)
 
+    @property
+    def components(self) -> dict[str, str]:
+        return {item.name.value: "ready" if item.ready else "unavailable"
+                for item in self.dependencies}
+
 
 @dataclass(frozen=True)
 class ContactLease:
     phone: str
     owner_token: str
     lease_deadline: datetime
+    ownership_guard: Callable[[], None] | None = field(default=None, repr=False, compare=False)
+
+    def assert_owned(self) -> None:
+        if self.ownership_guard is None:
+            raise ContactLeaseLost(FailureReason.CONTACT_LEASE_LOST)
+        self.ownership_guard()
+
+
+@dataclass(frozen=True)
+class ManifestEntry:
+    kind: str
+    id: str
+    version: int
+    expected_until: datetime
+    index_flags: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class ContactDetail:
+    entry: ManifestEntry
+    body: Mapping[str, Any]
+    terminal: bool = False
+
+
+@dataclass(frozen=True)
+class ContactAnchor:
+    contact_revision: int
+    last_generation: UUID
+    manifest: tuple[ManifestEntry, ...]
+    manifest_fingerprint: str
+    generation_history: tuple[UUID, ...]
+    cycle: ConversationCycle = ConversationCycle.OPEN
 
 
 @dataclass(frozen=True)
@@ -260,6 +297,25 @@ class ConversationStore(Protocol):
     def readiness(self) -> ReadinessReport: ...
 
     def contact_lease(self, phone: str) -> AbstractContextManager[ContactLease]: ...
+
+    def initialize_contact(self, phone: str, lease: ContactLease | None = None,
+                           *, db_state_present: bool | None = None) -> ContactAnchor: ...
+
+    def assert_owned(self, lease: ContactLease) -> None: ...
+
+    def renew_lease(self, lease: ContactLease) -> None: ...
+
+    def release_lease(self, lease: ContactLease) -> None: ...
+
+    def read_anchor(self, lease: ContactLease) -> ContactAnchor: ...
+
+    def read_details(self, lease: ContactLease) -> tuple[ContactDetail, ...]: ...
+
+    def compare_and_set(self, lease: ContactLease, expected: ContactAnchor,
+                        details: tuple[ContactDetail, ...], *,
+                        generation: UUID | None = None) -> ContactAnchor: ...
+
+    def cleanup(self, lease: ContactLease, expected: ContactAnchor) -> ContactAnchor: ...
 
 
 class BrokerPort(Protocol):
