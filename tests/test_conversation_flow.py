@@ -9,6 +9,7 @@ import traceback
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
+from uuid import uuid4
 
 import anthropic
 import pytest
@@ -24,6 +25,386 @@ from tests.fakes import WebhookRequest, webhook_payload
 
 ADMIN_PHONE = "5551999990011"
 SIMULATOR_PHONE = "5500000000000"
+
+
+def recovery_api():
+    assert importlib.util.find_spec("app.conversation_recovery") is not None, "recovery service missing"
+    return importlib.import_module("app.conversation_recovery")
+
+
+@pytest.mark.parametrize("ready", [False, True])
+def test_ready_lifespan_preserves_schema_initialization_only_after_gate(main_module, admin_runtime, monkeypatch, ready):
+    import asyncio
+    main_module.app.state.conversation_runtime = admin_runtime
+    admin_runtime.dependencies[domain.DependencyName.SQL] = ready
+    started, stopped, initialized = [], [], []
+    monkeypatch.setattr(main_module, "init_db", lambda: initialized.append(True))
+    monkeypatch.setattr(main_module, "start_scheduler", lambda rt=None: started.append(rt))
+    monkeypatch.setattr(main_module, "stop_scheduler", lambda: stopped.append(True))
+    async def run():
+        async with main_module.lifespan(main_module.app):
+            assert main_module.app.state.conversation_runtime is admin_runtime
+    asyncio.run(run())
+    assert initialized == ([True] if ready else [])
+    assert started == ([admin_runtime] if ready else [])
+    assert stopped == ([True] if ready else [])
+
+
+def test_ready_worker_and_recovery_share_one_composed_runtime(main_module, admin_runtime, monkeypatch):
+    api = recovery_api()
+    monkeypatch.delattr(main_module.app.state, "conversation_runtime")
+    calls = []
+    def build(**kwargs):
+        calls.append(kwargs)
+        return admin_runtime
+    monkeypatch.setattr(api, "build_runtime", build)
+    assert hasattr(main_module, "get_conversation_runtime"), "worker composition missing"
+    assert main_module.get_conversation_runtime() is admin_runtime
+    assert main_module.get_conversation_runtime() is admin_runtime
+    assert len(calls) == 1
+    assert calls[0]["processing_task"] is main_module.process_message_task
+    assert calls[0]["outbound_task"] is main_module.send_message_task
+    assert hasattr(main_module, "recover_conversations_task"), "beat recovery body missing"
+    assert main_module.recover_conversations_task() == {
+        "scanned": 0, "rescheduled": 0, "completed": 0, "aborted": 0,
+        "quarantined": 0, "exhausted": 0, "skipped": 0, "failed": 0}
+
+
+@pytest.mark.parametrize("dependency", list(domain.DependencyName))
+def test_ready_closed_gates_all_phase_one_effects(main_module, admin_runtime, scheduler_module, task_api, monkeypatch, dependency):
+    import asyncio
+    api = recovery_api()
+    rt = admin_runtime
+    command = rt.buffer()
+    task_api.process_batch(command, rt)
+    outbound = rt.outbound_broker.calls[-1]
+    rt.dependencies[dependency] = False
+    probes = {name: (lambda name=name: rt.dependencies[name]) for name in domain.DependencyName}
+    rt.readiness_status = api.DependencyReadiness(probes).check
+    before = (rt.store.snapshot(), rt.lease_calls, rt.session_calls,
+              len(rt.processing_broker.calls), len(rt.outbound_broker.calls), len(rt.agent.calls))
+    with pytest.raises(task_api.RetryRequested):
+        task_api.process_batch(command, rt)
+    with pytest.raises(task_api.RetryRequested):
+        task_api.send_outbound(outbound, rt)
+    response = webhook(main_module)
+    assert response.status_code == 503
+    asyncio.run(scheduler_module.check_inactive_contexts(rt))
+    assert api.RecoveryService(rt).run_once(rt.clock.now()) == domain.RecoveryReport()
+    assert before == (rt.store.snapshot(), rt.lease_calls, rt.session_calls,
+              len(rt.processing_broker.calls), len(rt.outbound_broker.calls), len(rt.agent.calls))
+    assert rt.transport.calls == []
+
+
+def test_ready_composition_uses_bounded_sql_and_only_select_one(session_factory):
+    from sqlalchemy import event
+    api = recovery_api()
+    with session_factory() as db:
+        engine = db.bind
+        assert engine.url.database in (None, "", ":memory:")
+    queries, options = [], []
+    event.listen(engine, "before_cursor_execute", lambda conn, cursor, statement, parameters, context, many: queries.append(statement))
+    _, probe = api.bounded_sql_dependencies("postgresql://synthetic.invalid/synthetic",
+        engine_factory=lambda url, **kwargs: options.append(kwargs) or engine)
+    assert probe() is True
+    assert queries == ["SELECT 1"]
+    assert options[0]["connect_args"]["connect_timeout"] == 2
+    assert "statement_timeout=2000" in options[0]["connect_args"]["options"]
+    assert options[0]["pool_timeout"] == 2
+
+
+def test_ready_broker_probe_is_bounded_and_never_publishes(main_module, monkeypatch):
+    from pathlib import Path
+    import celery
+    class FakeCelery:
+        def __init__(self, *args, **kwargs):
+            self.conf = {}
+    monkeypatch.setattr(celery, "Celery", FakeCelery)
+    spec = importlib.util.spec_from_file_location("synthetic_celery_probe", Path(__file__).parents[1] / "app" / "celery_app.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    assert hasattr(module, "probe_broker"), "bounded broker probe missing"
+    from contextlib import contextmanager
+    class Connection:
+        connected = True
+        def ensure_connection(self, **kwargs):
+            assert kwargs == {"max_retries": 0}
+    @contextmanager
+    def connection_for_read(**kwargs):
+        assert kwargs["connect_timeout"] == 2
+        assert kwargs["transport_options"]["socket_timeout"] == 2
+        yield Connection()
+    assert module.probe_broker(SimpleNamespace(connection_for_read=connection_for_read)) is True
+    schedule = module.celery_app.conf.get("beat_schedule", {})
+    assert any(entry["task"] == "app.main.recover_conversations_task" for entry in schedule.values())
+
+
+def test_recovery_healthy_claim_is_not_listed_and_busy_contact_does_not_block_next(processing_runtime, monkeypatch):
+    from contextlib import contextmanager
+    api = recovery_api()
+    rt = processing_runtime
+    healthy = rt.buffer(phone="5551999990090")
+    stale = rt.buffer(phone="5551999990091")
+    other = rt.buffer(phone="5551999990092")
+    rt.clock.advance(timedelta(seconds=61))
+    with rt.store.contact_lease(healthy.phone) as lease:
+        rt.store.claim_or_resume_batch(healthy, rt.clock.now(), lease)
+    page = rt.store.recoverable_batches(now=rt.clock.now())
+    assert healthy.phone not in [command.phone for command in page.commands]
+    original = rt.store.contact_lease
+    @contextmanager
+    def contact_lease(phone):
+        if phone == stale.phone:
+            raise domain.ContactLockUnavailable(domain.FailureReason.CONTACT_LOCK_UNAVAILABLE)
+        with original(phone) as lease:
+            yield lease
+    monkeypatch.setattr(rt.store, "contact_lease", contact_lease)
+    before = len(rt.processing_broker.calls)
+    report = api.RecoveryService(rt).run_once(rt.clock.now())
+    assert report.failed == 1 and report.rescheduled == 1
+    assert [c.phone for c in rt.processing_broker.calls[before:]] == [other.phone]
+
+
+def test_recovery_committed_without_ack_only_republishes_internal_work(task_api, processing_runtime):
+    api = recovery_api()
+    rt = processing_runtime
+    command = rt.buffer()
+    rt.outbound_broker.next_result = domain.EnqueueResult.AMBIGUOUS
+    with pytest.raises(task_api.RetryRequested):
+        task_api.process_batch(command, rt)
+    before = (len(rt.agent.calls), len(rt.outbound_broker.calls))
+    rt.clock.advance(timedelta(seconds=601))
+    assert api.RecoveryService(rt).run_once(rt.clock.now()).rescheduled == 1
+    assert before == (len(rt.agent.calls), len(rt.outbound_broker.calls))
+    assert rt.transport.calls == []
+
+
+@pytest.mark.parametrize("staged", [False, True])
+def test_recovery_reschedules_stale_dispatch_without_agent_or_transport(processing_runtime, staged):
+    api = recovery_api()
+    rt = processing_runtime
+    command = rt.buffer()
+    if staged:
+        with rt.store.contact_lease(command.phone) as lease:
+            claim = rt.store.claim_or_resume_batch(command, rt.clock.now(), lease)
+    rt.clock.advance(timedelta(seconds=61))
+    before = len(rt.processing_broker.calls)
+    service = api.RecoveryService(rt)
+    report = service.run_once(rt.clock.now())
+    assert report.rescheduled == 1
+    assert len(rt.processing_broker.calls) == before + 1
+    recovered = rt.processing_broker.calls[-1]
+    assert recovered.batch_id == command.batch_id
+    if staged:
+        assert recovered.processing_id == claim.attempt.processing_id
+        assert recovered.staging_id == command.batch_id
+    assert service.run_once(rt.clock.now()).rescheduled == 0
+    assert rt.agent.calls == rt.outbound_broker.calls == rt.transport.calls == []
+
+
+@pytest.mark.parametrize("staged", [False, True])
+def test_recovery_exhausts_only_at_configured_horizon_and_purges_content(processing_runtime, staged):
+    api = recovery_api()
+    rt = processing_runtime
+    command = rt.buffer()
+    if staged:
+        with rt.store.contact_lease(command.phone) as lease:
+            rt.store.claim_or_resume_batch(command, rt.clock.now(), lease)
+    horizon = rt.store.config.processing_retry_seconds if staged else rt.store.config.dispatch_retry_seconds
+    rt.clock.advance(timedelta(seconds=horizon))
+    before = len(rt.processing_broker.calls)
+    service = api.RecoveryService(rt)
+    assert service.run_once(rt.clock.now()).exhausted == 1
+    assert service.run_once(rt.clock.now()).exhausted == 0
+    assert rt.envelopes() == []
+    assert len(rt.processing_broker.calls) == before
+    assert rt.agent.calls == rt.transport.calls == []
+
+
+@pytest.mark.parametrize("boundary", ["complete_batch", "finalize_committed"])
+def test_recovery_applied_attempt_uses_receipts_and_never_repeats_sql_or_outbound(task_api, processing_runtime, boundary):
+    api = recovery_api()
+    rt = processing_runtime
+    command = rt.buffer()
+    rt.store.fail_next_atomic(boundary)
+    with pytest.raises(task_api.RetryRequested):
+        task_api.process_batch(command, rt)
+    before_agent, before_outbound = len(rt.agent.calls), len(rt.outbound_broker.calls)
+    before_commits = sum(s.events.count("commit_entered") for s in rt.sessions)
+    rt.clock.advance(timedelta(seconds=601))
+    service = api.RecoveryService(rt)
+    report = service.run_once(rt.clock.now())
+    if boundary == "finalize_committed":
+        assert report.quarantined == 1
+        assert rt.store.is_quarantined(command.phone)
+    else:
+        assert report.completed == 1
+        assert any(d.body.get("phase") == "PROCESSED" for d in rt.details() if d.entry.kind == "batch")
+    assert len(rt.agent.calls) == before_agent
+    assert len(rt.outbound_broker.calls) == before_outbound
+    assert sum(s.events.count("commit_entered") for s in rt.sessions) == before_commits
+    assert service.run_once(rt.clock.now()).completed == 0
+    assert rt.transport.calls == []
+
+
+def test_recovery_standalone_prepared_is_aborted_and_committing_is_quarantined(processing_runtime):
+    api = recovery_api()
+    rt = processing_runtime
+    phones = ("5551999990000", "5551999990001")
+    operations = []
+    for phone in phones:
+        with rt.store.contact_lease(phone) as lease, rt.session_factory() as db:
+            rt.coordinator.resolve_ingress(db, phone, rt.clock.now(), lease)
+            operation = str(uuid4())
+            target = domain.MutationTarget("PAUSE_MANUAL", "synthetic", "synthetic", domain.ConversationCycle.PAUSED,
+                paused_until=rt.clock.now() + timedelta(hours=2), reason=domain.PauseReason.DASHBOARD.value)
+            attempt = rt.store.prepare_mutation(phone, target.kind, target.fingerprint, lease, operation, rt.clock.now(), target=target)
+            if phone == phones[1]:
+                rt.store.enter_committing(phone, operation, lease, rt.clock.now(), attempt.processing_deadline)
+            operations.append(operation)
+    rt.clock.advance(timedelta(seconds=601))
+    service = api.RecoveryService(rt)
+    report = service.run_once(rt.clock.now())
+    assert (report.aborted, report.quarantined) == (1, 1)
+    with rt.store.contact_lease(phones[0]) as lease:
+        assert rt.store.inspect_mutation(phones[0], operations[0], lease).phase is domain.MutationPhase.ABORTED
+    assert rt.store.is_quarantined(phones[1])
+    assert service.run_once(rt.clock.now()).aborted == 0
+    assert rt.agent.calls == rt.processing_broker.calls == rt.outbound_broker.calls == rt.transport.calls == []
+
+
+def test_recovery_test_phone_keeps_request_local_capture_and_done_is_never_replayed(task_api, processing_runtime):
+    api = recovery_api()
+    rt = processing_runtime
+    command = rt.buffer(phone=domain.ConversationCoordinator.TEST_PHONE)
+    rt.clock.advance(timedelta(seconds=61))
+    before = list(rt.processing_broker.calls)
+    assert api.RecoveryService(rt).run_once(rt.clock.now()).rescheduled == 1
+    assert rt.processing_broker.calls == before
+    assert rt.agent.calls == rt.transport.calls == rt.outbound_broker.calls == []
+    task_api.process_batch(command, rt)
+    before = len(rt.processing_broker.calls), len(rt.agent.calls), len(rt.outbound_broker.calls)
+    rt.clock.advance(timedelta(seconds=1000))
+    assert api.RecoveryService(rt).run_once(rt.clock.now()).completed == 0
+    assert before == (len(rt.processing_broker.calls), len(rt.agent.calls), len(rt.outbound_broker.calls))
+
+
+def test_recovery_cursor_progresses_past_healthy_and_busy_contact(processing_runtime):
+    from contextlib import contextmanager
+    api = recovery_api()
+    rt = processing_runtime
+    commands = [rt.buffer(phone=f"55519999900{i:02d}") for i in range(6)]
+    rt.clock.advance(timedelta(seconds=61))
+    rt.store.client.sscan_chunk_limit = 2
+    service = api.RecoveryService(rt, page_size=1, max_pages=1)
+    before = len(rt.processing_broker.calls)
+    for _ in range(30):
+        report = service.run_once(rt.clock.now())
+        assert report.scanned <= 1
+    assert len(rt.processing_broker.calls) == before + len(commands)
+    assert rt.agent.calls == rt.transport.calls == []
+
+
+def test_recovery_checkpoint_shared_across_fresh_services_prevents_first_page_starvation(processing_runtime):
+    api = recovery_api()
+    rt = processing_runtime
+    for i in range(7):
+        rt.buffer(phone=f"55519999900{i:02d}")
+    rt.clock.advance(timedelta(seconds=61))
+    before = len(rt.processing_broker.calls)
+    for _ in range(40):
+        api.RecoveryService(rt, page_size=1, max_pages=1).run_once(rt.clock.now())
+    assert len(rt.processing_broker.calls) == before + 7
+
+
+def test_recovery_poisoned_index_does_not_starve_valid_contact(processing_runtime):
+    from app.conversation_redis import DISPATCH_INDEX_KEY
+    api = recovery_api()
+    rt = processing_runtime
+    rt.buffer()
+    rt.clock.advance(timedelta(seconds=61))
+    rt.store.client.sets[DISPATCH_INDEX_KEY].add("000:private-token")
+    before = len(rt.processing_broker.calls)
+    reports = [api.RecoveryService(rt, page_size=1, max_pages=1).run_once(rt.clock.now()) for _ in range(10)]
+    assert len(rt.processing_broker.calls) == before + 1
+    assert any(report.failed for report in reports)
+    assert "private-token" not in repr(reports)
+
+
+def test_recovery_future_scan_time_cannot_abort_a_live_preparation(processing_runtime):
+    rt = processing_runtime
+    phone = "5551999990000"
+    with rt.store.contact_lease(phone) as lease, rt.session_factory() as db:
+        rt.coordinator.resolve_ingress(db, phone, rt.clock.now(), lease)
+        operation = str(uuid4())
+        target = domain.MutationTarget("PAUSE_MANUAL", "synthetic", "synthetic", domain.ConversationCycle.PAUSED)
+        rt.store.prepare_mutation(phone, target.kind, target.fingerprint, lease, operation, rt.clock.now(), target=target)
+        assert rt.store.recover_mutation(phone, operation, rt.clock.now() + timedelta(days=1), lease) == "skipped"
+        assert rt.store.inspect_mutation(phone, operation, lease).phase is domain.MutationPhase.PREPARED
+
+
+def test_recovery_gate_closes_after_discovery_before_lease_or_sql(processing_runtime, monkeypatch):
+    api = recovery_api()
+    rt = processing_runtime
+    rt.buffer()
+    rt.clock.advance(timedelta(seconds=61))
+    original = rt.store.recoverable_batches
+    def discover(*args, **kwargs):
+        page = original(*args, **kwargs)
+        rt.dependencies[domain.DependencyName.SQL] = False
+        return page
+    monkeypatch.setattr(rt.store, "recoverable_batches", discover)
+    before = (rt.lease_calls, rt.session_calls, len(rt.processing_broker.calls))
+    report = api.RecoveryService(rt).run_once(rt.clock.now())
+    assert report.rescheduled == 0
+    assert before == (rt.lease_calls, rt.session_calls, len(rt.processing_broker.calls))
+
+
+def test_recovery_live_committing_attempt_is_excluded_until_its_deadline(processing_runtime, task_api):
+    api = recovery_api()
+    rt = processing_runtime
+    command = rt.buffer()
+    rt.store.fail_next_atomic("finalize_committed")
+    with pytest.raises(task_api.RetryRequested):
+        task_api.process_batch(command, rt)
+    rt.clock.advance(timedelta(seconds=61))
+    before = rt.lease_calls, rt.session_calls
+    report = api.RecoveryService(rt).run_once(rt.clock.now())
+    assert report.failed == report.rescheduled == report.quarantined == 0
+    assert before == (rt.lease_calls, rt.session_calls)
+
+
+def test_ready_build_runtime_constructs_bounded_clients_and_canonical_contract(main_module, admin_runtime, monkeypatch):
+    import redis
+    from app.conversation_tasks import ConversationRuntime
+    api = recovery_api()
+    created = []
+    def from_url(url, **options):
+        created.append(options)
+        return admin_runtime.store.client
+    monkeypatch.setattr(redis.Redis, "from_url", from_url)
+    monkeypatch.setattr(api, "bounded_sql_dependencies", lambda url: (admin_runtime.session_factory, lambda: True))
+    class ProcessingBroker:
+        def __init__(self, task, *, probe):
+            self.task, self._probe = task, probe
+        def probe(self):
+            return self._probe()
+    class OutboundBroker:
+        def __init__(self, task):
+            self.task = task
+    monkeypatch.setitem(sys.modules, "app.celery_app", SimpleNamespace(
+        CeleryProcessingBroker=ProcessingBroker, CeleryOutboundBroker=OutboundBroker,
+        probe_broker=lambda app: True))
+    runtime = api.build_runtime(settings=main_module.settings,
+        processing_task=main_module.process_message_task, outbound_task=main_module.send_message_task,
+        celery=main_module.celery_app)
+    assert isinstance(runtime, ConversationRuntime)
+    assert runtime.coordinator.store is runtime.store
+    assert runtime.store.client is admin_runtime.store.client
+    assert runtime.readiness_status().ready is True
+    assert created == [{"socket_connect_timeout": 2, "socket_timeout": 2,
+                        "retry_on_timeout": False, "decode_responses": True}]
+    assert admin_runtime.lease_calls == admin_runtime.session_calls == 0
 
 
 def _anchor(runtime, phone):

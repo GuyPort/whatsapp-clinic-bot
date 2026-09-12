@@ -5,6 +5,8 @@ from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
 
 import pytest
+import importlib
+import importlib.util
 
 from tests.fakes import ManualClock
 from app.conversation_state import (
@@ -41,6 +43,93 @@ from app.conversation_state import (
 )
 from app.simple_config import Settings
 from app.utils import normalize_phone
+
+
+def recovery_api():
+    assert importlib.util.find_spec("app.conversation_recovery") is not None, "readiness/recovery missing"
+    return importlib.import_module("app.conversation_recovery")
+
+
+@pytest.mark.parametrize("failed", [(), ("secret",), ("sql",), ("redis",), ("epoch",),
+                                  ("broker",), ("sql", "epoch", "broker")])
+def test_ready_dependency_matrix_is_allowlisted_and_fail_closed(failed):
+    api = recovery_api()
+    probes = {name: (lambda name=name: name.value not in failed) for name in DependencyName}
+    probes["private-host"] = lambda: pytest.fail("unknown dependency was probed")
+    readiness = api.DependencyReadiness(probes)
+    report = readiness.check()
+    assert tuple(row.name for row in report.dependencies) == tuple(DependencyName)
+    assert {row.name.value for row in report.dependencies if not row.ready} == set(failed)
+    assert report.ready is (not failed)
+    if failed:
+        with pytest.raises(api.DependencyNotReady, match="conversation dependencies unavailable"):
+            readiness.require_ready()
+    else:
+        readiness.require_ready()
+
+
+@pytest.mark.parametrize("value", [None, 1, "ready", object(), RuntimeError("private-token")])
+def test_ready_probe_missing_exception_and_nonboolean_never_open(value, caplog):
+    api = recovery_api()
+    def probe():
+        if isinstance(value, Exception):
+            raise value
+        return value
+    report = api.DependencyReadiness({DependencyName.SQL: probe}).check()
+    assert report.ready is False
+    assert all(row.ready is False for row in report.dependencies)
+    assert "private-token" not in caplog.text + repr(report)
+
+
+@pytest.mark.parametrize("fault", [None, "epoch_absent", "epoch_mismatch", "run_id_mismatch",
+                                  "noeviction_invalid", "persistence_invalid"])
+def test_ready_real_attestation_separates_redis_availability_from_epoch(fault):
+    from tests.fakes import InMemoryConversationStore
+    api = recovery_api()
+    store = InMemoryConversationStore(ConversationConfig.from_settings(Settings(_valid_environment())))
+    if fault:
+        store.inject_fault(fault)
+    readiness = api.DependencyReadiness.for_dependencies(secret=lambda: "synthetic",
+        sql_probe=lambda: True, store=store, broker=type("Broker", (), {"probe": lambda self: True})())
+    report = readiness.check()
+    states = {row.name.value: row.ready for row in report.dependencies}
+    assert states == {"secret": True, "sql": True, "redis": True, "epoch": fault is None, "broker": True}
+    assert store.global_epoch_writes == 0
+
+
+@pytest.mark.parametrize("fault", ["cas", "acl", "epoch", "run_id", "persistence", "invalid"])
+def test_recovery_checkpoint_cas_attestation_and_argument_preflight(fault):
+    from app.conversation_redis import RECOVERY_CHECKPOINT_KEY, GLOBAL_EPOCH_KEY
+    from tests.fakes import InMemoryConversationStore
+    from app.conversation_state import ConversationDomainError
+    store = InMemoryConversationStore(ConversationConfig.from_settings(Settings(_valid_environment())))
+    expected, position = store.recovery_checkpoint()
+    assert position == (0, None, None)
+    if fault == "cas":
+        store.save_recovery_checkpoint(expected, (1, None, None))
+    elif fault == "acl":
+        store.client.denied_commands.add(("SET", RECOVERY_CHECKPOINT_KEY))
+    elif fault == "epoch":
+        store.before_atomic = lambda: store.client.values.update({GLOBAL_EPOCH_KEY: "unavailable"})
+    elif fault == "run_id":
+        store.before_atomic = lambda: store.client.server.update(run_id="unavailable")
+    elif fault == "persistence":
+        store.before_atomic = lambda: store.client.persistence.update(aof_last_write_status="err")
+    before = store.client.get(RECOVERY_CHECKPOINT_KEY)
+    with pytest.raises(ConversationDomainError):
+        store.save_recovery_checkpoint(expected, (1, "private-token", None) if fault == "invalid" else (1, None, None))
+    assert store.client.get(RECOVERY_CHECKPOINT_KEY) == before
+
+
+@pytest.mark.parametrize("cursor", ["private-token", "[0,0]", "m1.WzAsLTFd", "m1.W3RydWUsMF0", "m1." + "A" * 200])
+def test_recovery_mutation_invalid_cursor_is_sanitized_and_has_no_writes(cursor):
+    from tests.fakes import InMemoryConversationStore
+    store = InMemoryConversationStore(ConversationConfig.from_settings(Settings(_valid_environment())))
+    before = store.snapshot()
+    with pytest.raises(ConversationStateUnavailable) as raised:
+        store.recoverable_mutations(store.clock.now(), cursor=cursor)
+    assert cursor not in str(raised.value)
+    assert store.snapshot() == before
 
 
 @pytest.mark.parametrize(

@@ -11,6 +11,7 @@ import re
 from typing import Dict, Any, List
 from datetime import datetime, date
 from uuid import uuid4
+from threading import Lock
 
 from app.simple_config import settings
 
@@ -35,22 +36,41 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+_runtime_lock = Lock()
+
+
+def get_conversation_runtime():
+    """One process-local composition shared by HTTP, workers and cleanup."""
+    with _runtime_lock:
+        runtime = getattr(app.state, "conversation_runtime", None)
+        if runtime is None:
+            try:
+                from app.conversation_recovery import build_runtime
+                runtime = build_runtime(settings=settings, processing_task=process_message_task,
+                    outbound_task=send_message_task, celery=celery_app)
+                app.state.conversation_runtime = runtime
+            except Exception:
+                logger.warning("conversation_runtime_unavailable")
+        return runtime
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Lifecycle da aplicação"""
-    # Startup
-    logger.info("🚀 Iniciando bot da clínica...")
-    init_db()
-    start_scheduler()  # Iniciar scheduler de timeout proativo
-    logger.info("✅ Bot iniciado com sucesso!")
-    
-    yield
-    
-    # Shutdown
-    stop_scheduler()  # Parar scheduler
-    logger.info("👋 Encerrando bot da clínica...")
+    """Compose dependencies and preserve existing startup only after readiness."""
+    runtime = get_conversation_runtime()
+    started = False
+    try:
+        _require_ready(runtime)
+        init_db()
+        start_scheduler(runtime)
+        started = True
+    except Exception:
+        logger.warning("conversation_startup_not_ready")
+    try:
+        yield
+    finally:
+        if started:
+            stop_scheduler()
 
 
 # Criar aplicação FastAPI
@@ -208,6 +228,13 @@ async def health_check():
     }
 
 
+@app.get("/ready")
+def readiness_check():
+    from app.conversation_recovery import public_readiness
+    body, status = public_readiness(getattr(app.state, "conversation_runtime", None))
+    return JSONResponse(body, status_code=status)
+
+
 def _message_event(payload):
     if not isinstance(payload, dict) or payload.get("event") not in ("messages.upsert", "messages.received"):
         return None
@@ -323,7 +350,7 @@ def send_message_task(self, payload):
     """Parse a typed outbound and delegate all authorization to the sender."""
     outbound = OutboundEnvelope.from_payload(payload)
     try:
-        return send_outbound(outbound, getattr(app.state, "conversation_runtime", None)).value
+        return send_outbound(outbound, get_conversation_runtime()).value
     except RetryRequested as error:
         raise self.retry(exc=ConversationDomainError(error.reason_code),
             args=[outbound.to_payload()], kwargs={},
@@ -335,12 +362,34 @@ def process_message_task(self, payload):
     """Retries carry the original batch and the persisted staging identities."""
     command = ProcessingCommand.from_payload(payload)
     try:
-        return process_batch(command, getattr(app.state, "conversation_runtime", None)).value
+        return process_batch(command, get_conversation_runtime()).value
     except RetryRequested as error:
         retry_command = error.command or command
         raise self.retry(exc=ConversationDomainError(error.reason_code),
             args=[retry_command.to_payload()], kwargs={}, countdown=60,
             argsrepr="(<conversation_command>,)", kwargsrepr="{}") from None
+
+
+@celery_app.task(name="app.main.recover_conversations_task")
+def recover_conversations_task():
+    """Beat boundary; count-only result, never patient content or exceptions."""
+    from dataclasses import asdict
+    from app.conversation_recovery import RecoveryService
+    from app.conversation_state import RecoveryReport
+    runtime = get_conversation_runtime()
+    try:
+        _require_ready(runtime)
+    except Exception:
+        return asdict(RecoveryReport())
+    try:
+        with _runtime_lock:
+            service = getattr(app.state, "conversation_recovery", None)
+            if service is None or service.runtime is not runtime:
+                service = RecoveryService(runtime)
+                app.state.conversation_recovery = service
+        return asdict(service.run_once(runtime.clock.now()))
+    except Exception:
+        return asdict(RecoveryReport(failed=1))
 
 
 @app.get("/status")

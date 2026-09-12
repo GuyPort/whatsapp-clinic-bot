@@ -586,6 +586,21 @@ class BatchClaim:
 class RecoveryPage:
     commands: tuple[ProcessingCommand, ...]
     next_cursor: str | None = None
+    mutations: tuple[tuple[str, str], ...] = ()
+    scanned: int = 0
+    failed: int = 0
+
+
+@dataclass(frozen=True)
+class RecoveryReport:
+    scanned: int = 0
+    rescheduled: int = 0
+    completed: int = 0
+    aborted: int = 0
+    quarantined: int = 0
+    exhausted: int = 0
+    skipped: int = 0
+    failed: int = 0
 
 
 @dataclass(frozen=True, repr=False)
@@ -709,7 +724,21 @@ class ConversationStore(Protocol):
 
     def exhaust_batch(self, command: ProcessingCommand, now: datetime, lease: ContactLease) -> None: ...
 
-    def recoverable_batches(self, limit: int = 100, *, cursor: str | None = None) -> RecoveryPage: ...
+    def recoverable_batches(self, limit: int = 100, *, cursor: str | None = None,
+                            now: datetime | None = None) -> RecoveryPage: ...
+
+    def recoverable_mutations(self, now: datetime, limit: int = 100,
+                              *, cursor: str | None = None) -> RecoveryPage: ...
+
+    def recover_batch(self, command: ProcessingCommand, broker: BrokerPort,
+                      now: datetime, lease: ContactLease) -> str: ...
+
+    def recover_mutation(self, phone: str, operation_id: str,
+                         now: datetime, lease: ContactLease) -> str: ...
+
+    def recovery_checkpoint(self) -> tuple[str | None, tuple]: ...
+
+    def save_recovery_checkpoint(self, expected: str | None, position: tuple) -> None: ...
 
     def validate_agent_application(self, phone: str, processing_id: str, operation_id: str,
                                     result: AgentResult, lease: ContactLease) -> None: ...
@@ -794,6 +823,8 @@ class ConversationConfig:
     ttl_margin_seconds: int | None
     batch_recovery_interval_seconds: int | None
     issues: tuple[ConfigurationIssue, ...]
+    recovery_page_size: int = 100
+    recovery_max_pages: int = 2
 
     @classmethod
     def from_settings(cls, settings: Any) -> ConversationConfig:

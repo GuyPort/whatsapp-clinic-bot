@@ -365,6 +365,89 @@ cp data/appointments.db data/appointments.db.backup
 zip backup-$(date +%Y%m%d).zip data/appointments.db
 ```
 
+## Readiness e recuperação das conversas
+
+`GET /health` é apenas liveness: responde 200 quando o processo HTTP está vivo,
+sem sondar SQL, Redis ou broker. `GET /ready` responde 200 somente quando todas
+as dependências obrigatórias estão disponíveis; caso contrário, responde 503.
+O corpo contém somente `status` (`ready`/`not_ready`) e `dependencies`, com as
+chaves `secret`, `sql`, `redis`, `epoch` e `broker`, cada uma com
+`ready`/`not_ready`. O segredo é verificado por presença; nenhum valor de
+configuração ou detalhe de exceção é publicado.
+
+A coordenação exige `CONVERSATION_COORDINATION_EPOCH` válido e já existente no
+Redis, `CONVERSATION_REDIS_EXPECTED_RUN_ID` igual ao servidor e as atestações
+`CONVERSATION_REDIS_ATTEST_NOEVICTION=true` e
+`CONVERSATION_REDIS_ATTEST_PERSISTENCE=true`. O servidor também precisa reportar
+`noeviction`, AOF habilitado, última escrita AOF `ok` e `loading=0`.
+Readiness nunca cria ou corrige o epoch. Os clientes de sondagem usam limites
+de conexão e socket de 2 segundos; SQL PostgreSQL também limita cada statement
+e espera por lock a 2 segundos. Falhas mantêm os fluxos da conversa fechados.
+O startup preserva a inicialização SQL e o cleanup de 20 minutos somente depois
+de readiness passar. Se o processo iniciou indisponível, reinicie-o após corrigir
+as dependências para iniciar também esse cleanup.
+
+HTTP, workers e cleanup usam o mesmo contrato `ConversationRuntime`. O Celery
+beat registra `app.main.recover_conversations_task`, no intervalo
+`BATCH_RECOVERY_INTERVAL_SECONDS`. Execute uma única instância de beat na
+topologia operacional existente. Cada passagem lê páginas de metadados e
+retorna somente contagens: `scanned`, `rescheduled`, `completed`, `aborted`,
+`quarantined`, `exhausted`, `skipped` e `failed`. Os limites são
+`BATCH_RECOVERY_PAGE_SIZE` (padrão 100; máximo 1000) e
+`BATCH_RECOVERY_MAX_PAGES` (padrão 2; máximo 100). A continuação fica em um
+checkpoint Redis compartilhado, protegido por CAS e pelo epoch; reinícios ou
+workers alternados retomam esse progresso. Índices e cursores não contêm
+telefone, mensagem ou credenciais. Entradas danificadas são contadas e não
+impedem a visita de outras entradas; metadados incertos não são apagados para
+simular uma recuperação bem-sucedida.
+
+A recuperação readquire a lease, relê SQL e Redis e pode republicar apenas
+comandos internos canônicos. Nunca chama Claude ou o transporte do provedor.
+Uma confirmação local de enqueue já persistida permite concluir o lote sem
+reenviar; `DONE` não é reproduzido. Sem confirmação, resultados compatíveis já
+confirmados no SQL ou com reserva válida permanecem recuperáveis. Preparações
+provadamente anteriores ao commit podem ser abortadas após o prazo; um
+`COMMITTING` incerto entra em quarentena. O conteúdo SQL atual não comprova
+qual operação foi confirmada. Resolver essa ambiguidade exige evidência externa
+e o procedimento operacional de resolução em quiescência; não há replay de DML.
+O esgotamento de trabalho não confirmado respeita os horizontes configurados
+de dispatch/processamento e as cercas existentes.
+
+O contato sintético do simulador permanece em captura local durante recovery.
+Essa captura não entrega uma resposta ao navegador nem ao provedor. Tentativas
+interrompidas do simulador podem exigir o reset autenticado de seu estado.
+Confirmação local de enqueue não comprova entrega e não oferece exactly-once.
+Redis/Lua/ACL, broker, SQL hospedado, serviços externos e os procedimentos reais
+de recovery/rotação continuam **NÃO VERIFICADOS** por testes locais simulados.
+
+### Rotação do epoch com quiescência obrigatória
+
+1. Pare ingresso HTTP, workers, scheduler/beat e sender em todas as instâncias.
+2. Aguarde as leases ativas e as tentativas drenarem. Resolva qualquer tentativa
+   incerta com evidência operacional; não use a rotação para ignorar pendências.
+3. Registre com segurança o UUID atual e um UUID novo e distinto. Atualize a
+   configuração externa `CONVERSATION_COORDINATION_EPOCH` para o novo UUID,
+   mantendo todos os processos parados e a atestação do Redis válida.
+4. No ambiente operacional autorizado, execute **uma única vez**:
+
+   ```bash
+   python scripts/rotate_conversation_epoch.py --expected-current-epoch 2d7ae851-8c7c-4a28-a1db-437654383e63 --new-epoch f3572ad0-a11c-47ac-a516-d01ac570878a --confirm-quiescent
+   ```
+
+   Substitua os UUIDs de exemplo. O comando consome a configuração externa,
+   não carrega `.env`, exige que o novo UUID seja o configurado e verifica
+   SQL/Redis/broker e atestação antes do CAS atômico do anchor antigo.
+5. Reinicie os processos e confirme `GET /ready` com 200 em todas as instâncias.
+
+O comando imprime somente `epoch_rotation_succeeded` (exit 0),
+`epoch_rotation_rejected` (exit 2: argumentos/configuração/confirmação) ou
+`epoch_rotation_failed` (exit 3: dependência/CAS). Não imprime UUIDs, URLs,
+payloads Redis ou exceções. Uma repetição com o UUID antigo falha por CAS.
+Uma falha de conexão após o CAS pode deixar o resultado incerto; mantenha a
+quiescência e confira o anchor por um canal operacional protegido antes de
+decidir o próximo passo. A rotação invalida owners e comandos do epoch anterior;
+não publica nem apaga dados de pacientes e não substitui a drenagem.
+
 ## 🐛 Troubleshooting
 
 ### Bot não responde mensagens

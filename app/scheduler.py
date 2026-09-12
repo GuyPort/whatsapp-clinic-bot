@@ -50,7 +50,12 @@ scheduler = BackgroundScheduler()
 
 
 def start_scheduler(runtime=None):
-    """Task 9 supplies the runtime; missing composition remains closed."""
+    """Use the composed runtime and remain inert while dependencies are closed."""
+    try:
+        _require_ready(runtime)
+    except Exception:
+        logger.warning("conversation_cleanup_unavailable")
+        return False
     scheduler.add_job(
         run_check,
         'interval',
@@ -60,6 +65,7 @@ def start_scheduler(runtime=None):
     )
     scheduler.start()
     logger.info("conversation_cleanup_started")
+    return True
 
 
 def stop_scheduler():

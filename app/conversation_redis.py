@@ -39,6 +39,8 @@ GLOBAL_EPOCH_KEY = "conversation:coordination:epoch"
 DISPATCH_INDEX_KEY = "conversation:index:dispatch"
 STAGING_INDEX_KEY = "conversation:index:staging"
 QUARANTINE_INDEX_KEY = "conversation:index:quarantine"
+MUTATION_INDEX_KEY = "conversation:index:mutation"
+RECOVERY_CHECKPOINT_KEY = "conversation:recovery:checkpoint"
 INDEX_KEYS = {"dispatch": DISPATCH_INDEX_KEY, "staging": STAGING_INDEX_KEY}
 
 
@@ -187,6 +189,93 @@ for i, args in ipairs(commands) do
     local result = redis.call(unpack(args))
     if p.writes[i].op == 'ACQUIRE' and not result then return 'locked' end
 end
+return 'ok'
+'''
+
+
+EPOCH_ROTATION_SCRIPT = r'''
+if type(redis.acl_check_cmd) ~= 'function' then return 'failed' end
+local function allowed(...)
+    local ok, result = pcall(redis.acl_check_cmd, ...)
+    return ok and result == true
+end
+if #KEYS ~= 1 or #ARGV ~= 3
+   or not allowed('GET', KEYS[1]) or not allowed('TYPE', KEYS[1])
+   or not allowed('SET', KEYS[1], ARGV[2])
+   or not allowed('INFO', 'server') or not allowed('INFO', 'memory')
+   or not allowed('INFO', 'persistence') then return 'failed' end
+if redis.call('TYPE', KEYS[1]).ok ~= 'string' then return 'failed' end
+local function info(section, field)
+    return string.match(redis.call('INFO', section), field .. ':([^\r\n]+)')
+end
+if redis.call('GET', KEYS[1]) ~= ARGV[1] or ARGV[1] == ARGV[2]
+   or info('server', 'run_id') ~= ARGV[3]
+   or info('memory', 'maxmemory_policy') ~= 'noeviction'
+   or info('persistence', 'aof_enabled') ~= '1'
+   or info('persistence', 'aof_last_write_status') ~= 'ok'
+   or info('persistence', 'loading') ~= '0' then return 'failed' end
+redis.call('SET', KEYS[1], ARGV[2])
+return 'ok'
+'''
+
+
+class EpochStore:
+    """Explicit operational CAS; regular traffic never creates the epoch anchor."""
+    def __init__(self, client, config):
+        self.client, self.config = client, config
+
+    def read(self) -> UUID:
+        try:
+            value = _text(self.client.get(GLOBAL_EPOCH_KEY))
+            epoch = UUID(value)
+            if str(epoch) != value:
+                raise ValueError
+            return epoch
+        except Exception:
+            raise ReadinessUnavailable(FailureReason.READINESS_UNAVAILABLE) from None
+
+    def rotate(self, expected_current: UUID, new_epoch: UUID) -> UUID:
+        if (not isinstance(expected_current, UUID) or not isinstance(new_epoch, UUID)
+                or expected_current == new_epoch or new_epoch != self.config.coordination_epoch
+                or self.config.issues):
+            raise ConversationStateUnavailable(FailureReason.CONFIGURATION_INVALID)
+        try:
+            current_config = replace(self.config, coordination_epoch=expected_current)
+            RedisConversationStore(self.client, current_config)._ready()
+            result = self.client.eval(EPOCH_ROTATION_SCRIPT, 1, GLOBAL_EPOCH_KEY,
+                str(expected_current), str(new_epoch), self.config.redis_expected_run_id)
+            if _text(result) != "ok":
+                raise ValueError
+            return new_epoch
+        except Exception:
+            raise ReadinessUnavailable(FailureReason.READINESS_UNAVAILABLE) from None
+
+
+RECOVERY_CHECKPOINT_SCRIPT = r'''
+if type(redis.acl_check_cmd) ~= 'function' then return 'failed' end
+local function allowed(...)
+    local ok, result = pcall(redis.acl_check_cmd, ...)
+    return ok and result == true
+end
+if #KEYS ~= 2 or #ARGV ~= 4 then return 'failed' end
+for _, key in ipairs(KEYS) do
+    if not allowed('TYPE', key) or not allowed('GET', key) then return 'failed' end
+    local kind = redis.call('TYPE', key).ok
+    if kind ~= 'string' and kind ~= 'none' then return 'failed' end
+end
+if not allowed('SET', KEYS[2], ARGV[4]) or not allowed('INFO', 'server')
+   or not allowed('INFO', 'memory') or not allowed('INFO', 'persistence') then return 'failed' end
+local function info(section, field)
+    return string.match(redis.call('INFO', section), field .. ':([^\r\n]+)')
+end
+if redis.call('GET', KEYS[1]) ~= ARGV[1]
+   or info('server', 'run_id') ~= ARGV[2]
+   or info('memory', 'maxmemory_policy') ~= 'noeviction'
+   or info('persistence', 'aof_enabled') ~= '1'
+   or info('persistence', 'aof_last_write_status') ~= 'ok'
+   or info('persistence', 'loading') ~= '0' then return 'failed' end
+if (redis.call('GET', KEYS[2]) or '') ~= ARGV[3] then return 'failed' end
+redis.call('SET', KEYS[2], ARGV[4])
 return 'ok'
 '''
 
@@ -460,6 +549,9 @@ class RedisConversationStore:
             writes.append({"op": "DEL", "key": self._detail_key(lease.phone, item)})
             for flag in item.index_flags:
                 writes.append({"op": "SREM", "key": INDEX_KEYS[flag], "value": self._member(lease.phone, item)})
+        member = self._mutation_member(lease.phone, anchor.mutation_fence)
+        writes.extend([{"op": "SREM", "key": MUTATION_INDEX_KEY, "value": member},
+                       {"op": "DEL", "key": self._mutation_recovery_key(member)}])
         keys = contact_keys(lease.phone)
         for receipt in receipts:
             writes.append({"op": "SET", "key": self._detail_key(lease.phone, receipt.entry),
@@ -684,11 +776,20 @@ class RedisConversationStore:
                 updated = replace(updated, mutation_fence=mutation_fence)
             writes = []
             for item in previous:
+                if item.entry.kind == "mutation":
+                    member = self._mutation_member(lease.phone, item.body)
+                    writes.extend([{"op": "SREM", "key": MUTATION_INDEX_KEY, "value": member},
+                                   {"op": "DEL", "key": self._mutation_recovery_key(member)}])
                 writes.append({"op": "DEL", "key": self._detail_key(lease.phone, item.entry)})
                 for flag in item.entry.index_flags:
                     writes.append({"op": "SREM", "key": INDEX_KEYS[flag],
                                    "value": self._member(lease.phone, item.entry)})
             for item in details:
+                if item.entry.kind == "mutation" and item.body.get("phase") in ("PREPARED", "COMMITTING"):
+                    member = self._mutation_member(lease.phone, item.body)
+                    writes.extend([{"op": "SADD", "key": MUTATION_INDEX_KEY, "value": member},
+                        {"op": "SET", "key": self._mutation_recovery_key(member),
+                         "value": _json([lease.phone, item.body["operation_id"], item.body["epoch"], item.body["processing_deadline"]])}])
                 durable_quarantine = (updated.cycle is ConversationCycle.QUARANTINED
                                       and item.entry.kind == "mutation"
                                       and item.body.get("phase") == MutationPhase.QUARANTINED.value)
@@ -1320,7 +1421,7 @@ class RedisConversationStore:
         except (ValueError, TypeError, UnicodeError):
             raise ConversationStateUnavailable(FailureReason.INVALID_VALUE) from None
 
-    def recoverable_batches(self, limit=100, *, cursor=None):
+    def recoverable_batches(self, limit=100, *, cursor=None, now=None):
         """Metadata pages with explicit, stateless continuation across both indexes.
 
         Task 9 starts at None and follows next_cursor, including empty pages and
@@ -1336,7 +1437,7 @@ class RedisConversationStore:
         state = self._read_recovery_cursor(cursor)
         turn = state[0]
         positions = [(state[1], state[2]), (state[3], state[4])]
-        commands, seen = [], set()
+        commands, seen, failed = [], set(), 0
         try:
             examined = 0
             # At most one chunk per index per page, including an empty first index.
@@ -1350,18 +1451,14 @@ class RedisConversationStore:
                 for raw_member in members[position:]:
                     position += 1
                     examined += 1
-                    digest, kind, identity = _text(raw_member).split(":")
-                    if kind == "batch" and (digest, identity) not in seen:
-                        seen.add((digest, identity))
-                        key = f"conversation:contact:{digest}:batch:{identity}"
-                        raw = self._get(key)
-                        if raw is None:
-                            raise ConversationGenerationUnavailable(FailureReason.GENERATION_UNAVAILABLE)
-                        body = json.loads(raw)["body"]
-                        if contact_digest(body["phone"]) != digest or body["epoch"] != str(self.config.coordination_epoch):
-                            raise ConversationGenerationUnavailable(FailureReason.GENERATION_UNAVAILABLE)
-                        commands.append(ProcessingCommand(body["phone"], identity, body["epoch"], body["generation"],
-                                                           body["processing_id"], body["operation_id"]))
+                    try:
+                        command = self._recovery_command(raw_member, now, seen)
+                        if command is not None:
+                            commands.append(command)
+                    except Exception:
+                        if now is None:
+                            raise  # Preserve the original strict diagnostic API.
+                        failed += 1
                     if examined >= limit:
                         break
                 if position < len(members):
@@ -1387,7 +1484,174 @@ class RedisConversationStore:
             raise ConversationGenerationUnavailable(FailureReason.GENERATION_UNAVAILABLE) from None
         except Exception:
             raise ConversationStateUnavailable(FailureReason.STATE_UNAVAILABLE) from None
-        return RecoveryPage(tuple(commands), self._recovery_cursor(state))
+        return RecoveryPage(tuple(commands), self._recovery_cursor(state), scanned=examined, failed=failed)
+
+    def _recovery_command(self, raw_member, now, seen):
+        digest, kind, identity = _text(raw_member).split(":")
+        if not re.fullmatch(r"[a-f0-9]{64}", digest):
+            raise ValueError
+        if kind != "batch" or (digest, identity) in seen:
+            return None
+        seen.add((digest, identity))
+        if str(UUID(identity)) != identity:
+            raise ValueError
+        body = json.loads(self._get(f"conversation:contact:{digest}:batch:{identity}"))["body"]
+        if contact_digest(body["phone"]) != digest or body["epoch"] != str(self.config.coordination_epoch):
+            raise ConversationGenerationUnavailable(FailureReason.GENERATION_UNAVAILABLE)
+        if now is not None:
+            if body["phase"] not in ("PENDING", "SCHEDULED", "STAGED"):
+                return None
+            if (now.timestamp() < body["next_enqueue_at"]
+                    and now.timestamp() < (body["processing_deadline"] or body["dispatch_deadline"])):
+                return None
+            if body["phase"] == "STAGED":
+                processing = json.loads(self._get(f"conversation:contact:{digest}:processing:{body['processing_id']}"))["body"]
+                if processing["phase"] == "CLAIMED" and now.timestamp() < processing["claim_deadline"]:
+                    return None
+                if processing["phase"] == "APPLYING":
+                    mutation_id = self._attempt_id(body["operation_id"])
+                    raw = self._get(f"conversation:contact:{digest}:mutation:{mutation_id}")
+                    if raw is not None:
+                        mutation = json.loads(raw)["body"]
+                        if (mutation["phase"] in ("PREPARED", "COMMITTING")
+                                and now < datetime.fromisoformat(mutation["processing_deadline"])):
+                            return None
+        return ProcessingCommand(body["phone"], identity, body["epoch"], body["generation"],
+            body["processing_id"], body["operation_id"], identity if body["processing_id"] else None)
+
+    @staticmethod
+    def _mutation_member(phone, body):
+        return f"{contact_digest(phone)}:mutation:{RedisConversationStore._attempt_id(body['operation_id'])}"
+
+    @staticmethod
+    def _mutation_recovery_key(member):
+        if not isinstance(member, str) or not re.fullmatch(r"[a-f0-9]{64}:mutation:[a-f0-9]{64}", member):
+            raise ConversationStateUnavailable(FailureReason.INVALID_VALUE)
+        return "conversation:recovery:mutation:" + member
+
+    @staticmethod
+    def _mutation_cursor(cursor):
+        if cursor is None:
+            return 0, 0
+        if not isinstance(cursor, str) or len(cursor) > 128 or not cursor.startswith("m1."):
+            raise ValueError
+        encoded = cursor[3:]
+        state = json.loads(base64.b64decode(encoded + "=" * (-len(encoded) % 4), altchars=b"-_", validate=True))
+        if (not isinstance(state, list) or len(state) != 2
+                or any(type(v) is not int or not 0 <= v < 2**64 for v in state)):
+            raise ValueError
+        return tuple(state)
+
+    @staticmethod
+    def _encode_mutation_cursor(scan, offset):
+        return "m1." + base64.urlsafe_b64encode(_json([scan, offset]).encode()).decode().rstrip("=")
+
+    def _validate_recovery_position(self, position):
+        if (not isinstance(position, (tuple, list)) or len(position) != 3
+                or type(position[0]) is not int or position[0] not in (0, 1)):
+            raise ValueError
+        self._mutation_cursor(position[1])
+        self._read_recovery_cursor(position[2])
+        return tuple(position)
+
+    def recovery_checkpoint(self):
+        self._ready()
+        try:
+            raw = self._get(RECOVERY_CHECKPOINT_KEY)
+            if raw is None:
+                return None, (0, None, None)
+            value = json.loads(raw)
+            if value["epoch"] != str(self.config.coordination_epoch):
+                return raw, (0, None, None)
+            return raw, self._validate_recovery_position(value["position"])
+        except Exception:
+            raise ConversationStateUnavailable(FailureReason.STATE_UNAVAILABLE) from None
+
+    def save_recovery_checkpoint(self, expected, position):
+        self._ready()
+        try:
+            position = self._validate_recovery_position(position)
+            value = _json({"epoch": str(self.config.coordination_epoch), "position": position})
+            result = self.client.eval(RECOVERY_CHECKPOINT_SCRIPT, 2, GLOBAL_EPOCH_KEY,
+                RECOVERY_CHECKPOINT_KEY, str(self.config.coordination_epoch), self.config.redis_expected_run_id,
+                expected or "", value)
+            if _text(result) != "ok":
+                raise ValueError
+        except Exception:
+            raise ConversationStateUnavailable(FailureReason.STATE_UNAVAILABLE) from None
+
+    def recoverable_mutations(self, now, limit=100, *, cursor=None):
+        """Expired IDs only; offset continuation handles oversized SSCAN chunks."""
+        self._ready()
+        try:
+            if type(limit) is not int or not 1 <= limit <= 1000:
+                raise ValueError
+            scan, offset = self._mutation_cursor(cursor)
+            following, members = self.client.sscan(MUTATION_INDEX_KEY, cursor=scan, count=100)
+            if type(following) is not int or not 0 <= following < 2**64 or not isinstance(members, (tuple, list)):
+                raise ValueError
+            selected = members[offset:offset + limit]
+            mutations, failed = [], 0
+            for raw in selected:
+                try:
+                    member = _text(raw)
+                    phone, operation, epoch, deadline = json.loads(self._get(self._mutation_recovery_key(member)))
+                    contact_digest(phone)
+                    if member != self._mutation_member(phone, {"operation_id": operation}):
+                        raise ValueError
+                    if epoch != str(self.config.coordination_epoch) or not isinstance(operation, str) or not operation:
+                        raise ValueError
+                    deadline = datetime.fromisoformat(deadline)
+                    if deadline.tzinfo is None:
+                        raise ValueError
+                    if now >= deadline:
+                        mutations.append((phone, operation))
+                except Exception:
+                    failed += 1
+            position = offset + len(selected)
+            continuation = (self._encode_mutation_cursor(scan, position) if position < len(members)
+                            else self._encode_mutation_cursor(following, 0) if following else None)
+            return RecoveryPage((), continuation, tuple(mutations), len(selected), failed)
+        except Exception:
+            raise ConversationStateUnavailable(FailureReason.STATE_UNAVAILABLE) from None
+
+    def recover_mutation(self, phone, operation_id, now, lease):
+        try:
+            attempt = self.inspect_mutation(phone, operation_id, lease)
+        except ConversationMutationPending:
+            attempt = self.inspect_mutation(phone, operation_id, lease, operational=True)
+            return "quarantined" if attempt and attempt.phase is MutationPhase.QUARANTINED else "skipped"
+        if attempt is None or self._now() < attempt.processing_deadline:
+            return "skipped"
+        if attempt.phase is MutationPhase.PREPARED:
+            self.abort_prepared(phone, operation_id, lease, now, request_fingerprint=attempt.request_fingerprint)
+            return "aborted"
+        if attempt.phase is MutationPhase.COMMITTING:
+            self.quarantine_ambiguous_commit(phone, operation_id, lease, now)
+            return "quarantined"
+        return "skipped"
+
+    def recover_batch(self, command, broker, now, lease):
+        try:
+            anchor, details, batch, _ = self._batch_snapshot(command, lease)
+        except ConversationMutationPending:
+            anchor, _, _ = self._snapshot(lease, operational=True)
+            return "quarantined" if anchor.cycle is ConversationCycle.QUARANTINED else "skipped"
+        dispatch = self._dispatch_load(batch)
+        if dispatch.phase in (DispatchPhase.PROCESSED, DispatchPhase.EXHAUSTED):
+            return "skipped"
+        processing = self._find(details, "processing", dispatch.processing_id)
+        reservation = self._outbound_reservation(anchor, details, batch)
+        if (reservation is not None and processing.body.get("outbound_attempted") is True
+                and processing.body.get("outbound_attempt_id") == reservation.reservation_id):
+            claim = self.claim_or_resume_batch(command, now, lease)
+            self.complete_batch(command, claim.attempt, now, lease, reservation=reservation)
+            return "completed"
+        self.exhaust_batch(command, now, lease)
+        if self.dispatch(command, lease).phase is DispatchPhase.EXHAUSTED:
+            return "exhausted"
+        outcome = self.ensure_consumer(broker, command, now, lease)
+        return "rescheduled" if outcome is EnsureConsumerResult.SCHEDULED else "skipped"
 
     @staticmethod
     def _attempt_data(attempt: MutationAttempt) -> dict:

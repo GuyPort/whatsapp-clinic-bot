@@ -6,6 +6,165 @@ import logging
 
 import pytest
 
+
+@pytest.mark.parametrize("failed", [None, "secret", "sql", "redis", "epoch", "broker"])
+def test_ready_endpoint_exact_shape_and_health_never_probes(app_client, ingress_runtime, failed):
+    from app.conversation_state import DependencyName
+    if failed:
+        ingress_runtime.dependencies[DependencyName(failed)] = False
+    calls = ingress_runtime.readiness_calls
+    assert app_client.get("/health").status_code == 200
+    assert ingress_runtime.readiness_calls == calls
+    response = app_client.get("/ready")
+    assert response.status_code == (503 if failed else 200)
+    assert response.json() == {"status": "not_ready" if failed else "ready", "dependencies": {
+        name: "not_ready" if name == failed else "ready" for name in ("secret", "sql", "redis", "epoch", "broker")}}
+    assert ingress_runtime.lease_calls == ingress_runtime.session_calls == 0
+
+
+@pytest.mark.parametrize("failure", ["missing", "exception", "empty"])
+def test_ready_public_failure_hides_values_and_partial_reports(main_module, app_client, ingress_runtime, monkeypatch, failure, caplog):
+    from app.conversation_state import ReadinessReport
+    if failure == "missing":
+        monkeypatch.delattr(main_module.app.state, "conversation_runtime")
+    else:
+        def check():
+            if failure == "exception":
+                raise RuntimeError("private-token redis://private.invalid")
+            return ReadinessReport(())
+        monkeypatch.setattr(ingress_runtime, "readiness_status", check)
+    response = app_client.get("/ready")
+    assert response.status_code == 503
+    assert response.json() == {"status": "not_ready", "dependencies": {
+        name: "not_ready" for name in ("secret", "sql", "redis", "epoch", "broker")}}
+    assert "private-token" not in caplog.text + response.text
+
+
+def epoch_cli():
+    import importlib.util
+    from pathlib import Path
+    path = Path(__file__).parents[1] / "scripts" / "rotate_conversation_epoch.py"
+    assert path.exists(), "guarded epoch CLI missing"
+    spec = importlib.util.spec_from_file_location("synthetic_epoch_cli", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_epoch_cli_import_and_rejected_args_never_construct_dependencies(monkeypatch, capsys):
+    import builtins
+    original = builtins.__import__
+    def guarded(name, *args, **kwargs):
+        assert not name.startswith("app"), "CLI imported application before validation"
+        return original(name, *args, **kwargs)
+    monkeypatch.setattr(builtins, "__import__", guarded)
+    cli = epoch_cli()
+    assert cli.main(["--private-token"]) == 2
+    assert capsys.readouterr() == ("epoch_rotation_rejected\n", "")
+
+
+@pytest.mark.parametrize("fault", ["owner", "cas_race", "acl", "acl_missing", "persistence", "same", "invalid"])
+def test_epoch_rotation_rejects_faults_before_any_write_and_invalidates_owner(fault):
+    from dataclasses import replace
+    from uuid import UUID
+    from app.simple_config import settings
+    from app.conversation_state import ConversationConfig, ConversationDomainError
+    from app.conversation_redis import EpochStore, GLOBAL_EPOCH_KEY
+    from tests.fakes import InMemoryConversationStore
+    store = InMemoryConversationStore(ConversationConfig.from_settings(settings))
+    old = store.config.coordination_epoch
+    new = UUID("00000000-0000-4000-8000-000000000002")
+    epoch = EpochStore(store.client, replace(store.config, coordination_epoch=new))
+    with store.contact_lease("5551999990000") as lease:
+        if fault == "owner":
+            assert epoch.rotate(old, new) == new
+            with pytest.raises(ConversationDomainError):
+                lease.assert_owned()
+            return
+        if fault == "cas_race":
+            store.client.before_atomic = lambda: store.client.values.update({GLOBAL_EPOCH_KEY: str(new)})
+        elif fault == "acl":
+            store.client.denied_commands.add(("SET", GLOBAL_EPOCH_KEY))
+        elif fault == "acl_missing":
+            store.client.acl_check_available = False
+        elif fault == "persistence":
+            store.client.persistence["aof_last_write_status"] = "err"
+        before = store.global_epoch_writes
+        with pytest.raises(ConversationDomainError):
+            epoch.rotate(old, old if fault == "same" else "private-token" if fault == "invalid" else new)
+        assert store.global_epoch_writes == before
+
+
+def test_recovery_mutation_pages_only_expired_ids_and_terminal_index_is_empty(admin_runtime):
+    from uuid import uuid4
+    from datetime import timedelta
+    from app import conversation_state as domain
+    from app.conversation_redis import MUTATION_INDEX_KEY
+    rt = admin_runtime
+    phone = "5551999990000"
+    with rt.store.contact_lease(phone) as lease, rt.session_factory() as db:
+        rt.coordinator.resolve_ingress(db, phone, rt.clock.now(), lease)
+        operation = str(uuid4())
+        target = domain.MutationTarget("PAUSE_MANUAL", "synthetic", "synthetic", domain.ConversationCycle.PAUSED)
+        rt.store.prepare_mutation(phone, target.kind, target.fingerprint, lease, operation, rt.clock.now(), target=target)
+        assert all(phone not in member and operation not in member and str(rt.store.config.coordination_epoch) not in member
+                   for member in rt.store.client.sets[MUTATION_INDEX_KEY])
+        assert rt.store.recoverable_mutations(rt.clock.now()).mutations == ()
+        rt.clock.advance(timedelta(seconds=600))
+        # The lease has expired; recovery must acquire a new owner below.
+    page = rt.store.recoverable_mutations(rt.clock.now())
+    assert page.mutations == ((phone, operation),)
+    with rt.store.contact_lease(phone) as lease:
+        assert rt.store.recover_mutation(phone, operation, rt.clock.now(), lease) == "aborted"
+    assert rt.store.client.sets.get(MUTATION_INDEX_KEY, set()) == set()
+    assert rt.store.recoverable_mutations(rt.clock.now()).mutations == ()
+    assert phone not in repr(page) and operation not in repr(page)
+
+
+@pytest.mark.parametrize("fault,code,output", [(None, 0, "succeeded"), ("confirmation", 2, "rejected"),
+    ("invalid", 2, "rejected"), ("same", 2, "rejected"), ("config", 2, "rejected"),
+    ("cas", 3, "failed"), ("dependency", 3, "failed"), ("attestation", 3, "failed")])
+def test_epoch_rotation_cli_is_injected_guarded_cas_and_sanitized(fault, code, output, capsys):
+    from dataclasses import replace
+    from uuid import UUID
+    from app.simple_config import settings
+    from app.conversation_state import ConversationConfig
+    from tests.fakes import InMemoryConversationStore
+    from app import conversation_redis
+    cli = epoch_cli()
+    old = UUID("00000000-0000-4000-8000-000000000001")
+    new = UUID("00000000-0000-4000-8000-000000000002")
+    config = ConversationConfig.from_settings(settings)
+    store = InMemoryConversationStore(config)
+    assert hasattr(conversation_redis, "EpochStore"), "epoch CAS store missing"
+    epoch = conversation_redis.EpochStore(store.client, replace(config, coordination_epoch=new))
+    args = ["--expected-current-epoch", str(old), "--new-epoch", str(new), "--confirm-quiescent"]
+    configured = new
+    if fault == "confirmation":
+        args.pop()
+    elif fault == "invalid":
+        args[3] = "private-token"
+    elif fault == "same":
+        args[3] = str(old)
+    elif fault == "config":
+        configured = old
+    elif fault == "cas":
+        store.client.values[conversation_redis.GLOBAL_EPOCH_KEY] = str(new)
+    elif fault == "attestation":
+        store.client.memory["maxmemory_policy"] = "allkeys-lru"
+    def dependencies():
+        if fault == "dependency":
+            raise RuntimeError("private-token redis://private.invalid")
+        return True
+    result = cli.main(args, configured_epoch=configured, epoch_store=epoch, dependency_probe=dependencies)
+    assert result == code
+    assert capsys.readouterr() == (f"epoch_rotation_{output}\n", "")
+    assert store.global_epoch_writes == (1 if code == 0 else 0)
+    if code == 0:
+        assert epoch.read() == new
+        assert cli.main(args, configured_epoch=new, epoch_store=epoch, dependency_probe=lambda: True) == 3
+        assert store.global_epoch_writes == 1
+
 from app.conversation_state import DependencyName
 from tests.fakes import WebhookRequest, webhook_payload
 

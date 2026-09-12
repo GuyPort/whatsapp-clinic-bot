@@ -111,7 +111,51 @@ class ScriptRedis:
             return (0 if stop >= len(members) else stop), members[start:stop]
 
     def eval(self, script, count, *args):
-        from app.conversation_redis import ATOMIC_SCRIPT
+        from app.conversation_redis import (ATOMIC_SCRIPT, EPOCH_ROTATION_SCRIPT, GLOBAL_EPOCH_KEY,
+                                            RECOVERY_CHECKPOINT_SCRIPT, RECOVERY_CHECKPOINT_KEY)
+        if script == RECOVERY_CHECKPOINT_SCRIPT:
+            with self.lock:
+                if self.before_atomic is not None:
+                    hook, self.before_atomic = self.before_atomic, None
+                    hook()
+                if count != 2 or len(args) != 6 or args[:2] != (GLOBAL_EPOCH_KEY, RECOVERY_CHECKPOINT_KEY) or not self.acl_check_available:
+                    return "failed"
+                epoch_key, checkpoint_key, epoch, run_id, expected, new = args
+                for target in (epoch_key, checkpoint_key):
+                    self._acl_command("GET", target)
+                    self._acl_command("TYPE", target)
+                    if target in self.sets:
+                        return "failed"
+                for section in ("server", "memory", "persistence"):
+                    self._acl_command("INFO", section)
+                self._acl_command("SET", checkpoint_key)
+                if (self.get(epoch_key) != epoch or self.server["run_id"] != run_id
+                        or self.memory["maxmemory_policy"] != "noeviction"
+                        or self.persistence != {"aof_enabled": 1, "aof_last_write_status": "ok", "loading": 0}
+                        or (self.get(checkpoint_key) or "") != expected):
+                    return "failed"
+                self.values[checkpoint_key] = new
+                self.expiry.pop(checkpoint_key, None)
+                return "ok"
+        if script == EPOCH_ROTATION_SCRIPT:
+            with self.lock:
+                if self.before_atomic is not None:
+                    hook, self.before_atomic = self.before_atomic, None
+                    hook()
+                if count != 1 or len(args) != 4 or args[0] != GLOBAL_EPOCH_KEY or not self.acl_check_available:
+                    return "failed"
+                key, expected, new, run_id = args
+                for command, target in (("GET", key), ("TYPE", key), ("SET", key),
+                        ("INFO", "server"), ("INFO", "memory"), ("INFO", "persistence")):
+                    self._acl_command(command, target)
+                if (key in self.sets or self.get(key) != expected or expected == new
+                        or self.server["run_id"] != run_id or self.memory["maxmemory_policy"] != "noeviction"
+                        or self.persistence != {"aof_enabled": 1, "aof_last_write_status": "ok", "loading": 0}):
+                    return "failed"
+                self.values[key] = new
+                self.expiry.pop(key, None)
+                self.global_epoch_writes += 1
+                return "ok"
         if script != ATOMIC_SCRIPT:
             raise ValueError("unsupported script")
         keys, plan = args[:count], json.loads(args[count])

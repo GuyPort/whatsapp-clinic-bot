@@ -35,6 +35,15 @@ celery_app.conf.update(
     
     # Resultado expira após 1 hora
     result_expires=3600,
+    broker_connection_timeout=2,
+    broker_transport_options={"socket_connect_timeout": 2, "socket_timeout": 2,
+                              "retry_on_timeout": False},
+    task_publish_retry=False,
+    beat_schedule={"conversation-recovery": {
+        "task": "app.main.recover_conversations_task",
+        "schedule": settings.batch_recovery_interval_seconds or 20,
+        "options": {"expires": settings.batch_recovery_interval_seconds or 20},
+    }},
     
     # Configurações de worker
     worker_prefetch_multiplier=1,
@@ -48,6 +57,18 @@ celery_app.conf.update(
 )
 
 logger.info("conversation_celery_configured")
+
+
+def probe_broker(app):
+    """Connection only, one bounded attempt; never publish or consume work."""
+    try:
+        with app.connection_for_read(connect_timeout=2, transport_options={
+                "socket_connect_timeout": 2, "socket_timeout": 2,
+                "retry_on_timeout": False}) as connection:
+            connection.ensure_connection(max_retries=0)
+            return connection.connected is True
+    except Exception:
+        return False
 
 
 class CeleryProcessingBroker:
