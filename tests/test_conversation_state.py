@@ -585,6 +585,26 @@ def test_send_exact_pause_reference_and_current_open_generation_only(transition_
         assert not coordinator.may_send(db, transfer, clock.now(), lease)
 
 
+@pytest.mark.parametrize("kind", list(OutboundKind))
+def test_send_missing_coordination_never_initializes_contact(transition_env, kind):
+    """Sender authorization must not recreate state after coordination loss."""
+    from app.models import ConversationContext, PausedContact
+    coordinator, db, store, clock = transition_env
+    outbound = OutboundEnvelope(PHONE, "synthetic", kind,
+                                "00000000-0000-4000-8000-000000000002", "p-1", "op-1")
+    with store.contact_lease(PHONE) as lease:
+        before = store.snapshot()
+        with pytest.raises(ConversationGenerationUnavailable) as raised:
+            coordinator.may_send(db, outbound, clock.now(), lease)
+        assert raised.value.reason_code is FailureReason.GENERATION_UNAVAILABLE
+        assert store.snapshot() == before
+        assert db.get(ConversationContext, PHONE) is None
+        assert db.get(PausedContact, PHONE) is None
+        assert "execute" not in db.events
+        assert "flush_entered" not in db.events
+        assert "commit_entered" not in db.events
+
+
 @pytest.mark.parametrize("intent,kind,cycle", [
     (AgentIntent.SAVE_CONTEXT, OutboundKind.NORMAL, ConversationCycle.OPEN),
     (AgentIntent.PAUSE_FOR_SECRETARY, OutboundKind.TRANSFER_CONFIRMATION, ConversationCycle.PAUSED),

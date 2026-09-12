@@ -449,6 +449,9 @@ class ConversationStore(Protocol):
     def preserve_or_abort_prepared(self, phone: str, operation_id: str,
                                   lease: ContactLease, now: datetime) -> None: ...
 
+    def abort_prepared(self, phone: str, operation_id: str, lease: ContactLease, now: datetime,
+                       *, request_fingerprint: str) -> MutationAttempt: ...
+
     def restore_prepared_after_rollback(self, phone: str, operation_id: str, lease: ContactLease,
                                         now: datetime, *, proof: DefinitiveRollbackProof) -> None: ...
 
@@ -661,6 +664,9 @@ class ConversationCoordinator:
                 raise ConversationMutationAborted(FailureReason.MUTATION_ABORTED)
             if previous.phase not in (MutationPhase.COMMITTED, MutationPhase.PREPARED):
                 raise ConversationMutationPending(FailureReason.MUTATION_PENDING)
+            if previous.phase is MutationPhase.PREPARED and self.clock.now() >= previous.processing_deadline:
+                self.store.abort_prepared(phone, operation_id, lease, now, request_fingerprint=request_hash)
+                raise ConversationMutationAborted(FailureReason.MUTATION_ABORTED)
         self.store.assert_mutation_available(lease, now, operation_id=operation_id)
         return request_hash, previous
 
@@ -672,7 +678,10 @@ class ConversationCoordinator:
         if attempt.phase is MutationPhase.COMMITTED:
             return attempt
         try:
-            apply_dml(db, attempt)
+            lease.assert_owned()
+            with db.no_autoflush:
+                apply_dml(db, attempt)
+            lease.assert_owned()
             db.flush()
             lease.assert_owned()
             self.store.enter_committing(phone, operation_id, lease, self.clock.now(),
@@ -719,6 +728,11 @@ class ConversationCoordinator:
             raise ConversationStateUnavailable(FailureReason.CONDITION_CHANGED)
 
     @staticmethod
+    def _execute_dml(db: Session, lease: ContactLease, statement):
+        lease.assert_owned()
+        return db.execute(statement)
+
+    @staticmethod
     def _pause_ref(attempt: MutationAttempt) -> PauseTransitionRef:
         if attempt.paused_until is None or attempt.reason is None:
             raise ConversationStateUnavailable(FailureReason.STATE_UNAVAILABLE)
@@ -750,10 +764,11 @@ class ConversationCoordinator:
         def dml(session, attempt):
             self._check_target(session, phone, target)
             if kind == "PAUSE_FOR_SECRETARY":
-                session.execute(delete(ConversationContext).where(ConversationContext.phone == phone))
+                self._execute_dml(session, lease, delete(ConversationContext).where(ConversationContext.phone == phone))
             row = session.get(PausedContact, phone)
             if row is None:
                 row = PausedContact(phone=phone)
+                lease.assert_owned()
                 session.add(row)
             row.paused_until, row.reason = _sql_time(deadline), reason
             if kind != "EXTEND_PAUSE":
@@ -791,6 +806,8 @@ class ConversationCoordinator:
         if kind == "CLEAN_INACTIVE":
             row = db.get(ConversationContext, phone)
             if row is None or _utc(row.last_activity) >= _utc(cutoff):
+                if previous is not None:
+                    self.store.abort_prepared(phone, operation_id, lease, now, request_fingerprint=request_hash)
                 return None
             pause = db.get(PausedContact, phone)
             if pause is not None and _utc(pause.paused_until) > _utc(now):
@@ -804,18 +821,18 @@ class ConversationCoordinator:
                 statement = delete(ConversationContext).where(ConversationContext.phone == phone)
                 if cutoff is not None:
                     statement = statement.where(ConversationContext.last_activity < _sql_time(cutoff))
-                result = session.execute(statement)
+                result = self._execute_dml(session, lease, statement)
                 if cutoff is not None and result.rowcount != 1:
                     raise ConversationStateUnavailable(FailureReason.CONDITION_CHANGED)
             if kind in ("UNPAUSE", "EXPIRE_PAUSE", "RESET_TEST"):
                 statement = delete(PausedContact).where(PausedContact.phone == phone)
                 if kind == "EXPIRE_PAUSE":
                     statement = statement.where(PausedContact.paused_until <= _sql_time(now))
-                result = session.execute(statement)
+                result = self._execute_dml(session, lease, statement)
                 if kind == "EXPIRE_PAUSE" and result.rowcount != 1:
                     raise ConversationStateUnavailable(FailureReason.CONDITION_CHANGED)
             if kind == "RESET_TEST":
-                session.execute(delete(Appointment).where(Appointment.patient_phone == phone))
+                self._execute_dml(session, lease, delete(Appointment).where(Appointment.patient_phone == phone))
         return self._run_mutation(db, phone, kind, target, lease, operation_id, now, dml)
 
     @_reason_codes_only
@@ -903,6 +920,7 @@ class ConversationCoordinator:
                 row = session.get(ConversationContext, phone)
                 if row is None:
                     row = ConversationContext(phone=phone, created_at=_sql_time(attempt.started_at or now))
+                    lease.assert_owned()
                     session.add(row)
                 row.messages, row.current_flow, row.flow_data = deepcopy(result.messages), result.current_flow, deepcopy(result.flow_data)
                 row.status, row.last_activity = "active", _sql_time(attempt.started_at or now)
@@ -916,7 +934,12 @@ class ConversationCoordinator:
 
     @_reason_codes_only
     def may_send(self, db: Session, outbound: OutboundEnvelope, now: datetime, lease: ContactLease) -> bool:
-        anchor = self._ensure(db, outbound.phone, lease)
+        if lease.phone != outbound.phone:
+            raise ContactLeaseLost(FailureReason.CONTACT_LEASE_LOST)
+        lease.assert_owned()
+        if db.new or db.dirty or db.deleted:
+            raise ConversationStateUnavailable(FailureReason.INVALID_VALUE)
+        anchor = self.store.read_anchor(lease)
         self.store.assert_mutation_available(lease, now)
         if outbound.generation != str(anchor.last_generation):
             return False

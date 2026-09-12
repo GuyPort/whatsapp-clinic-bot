@@ -349,8 +349,13 @@ class BarrierSession:
             hook()
 
     def flush(self):
+        self._at("flush_entered")
         self.session.flush()
         self._at("flush")
+
+    def add(self, instance, *args, **kwargs):
+        self.session.add(instance, *args, **kwargs)
+        self._at("add_returned")
 
     def execute(self, statement, *args, **kwargs):
         self._at("execute")
