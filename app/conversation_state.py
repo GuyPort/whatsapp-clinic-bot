@@ -3,12 +3,22 @@
 from __future__ import annotations
 
 import math
+import hashlib
+import json
+from copy import deepcopy
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Any, Callable, Mapping, Protocol, Sequence
-from uuid import UUID
+from threading import Lock
+from functools import wraps
+from uuid import UUID, uuid4
+
+from sqlalchemy import delete, select
+from sqlalchemy.orm import Session
+
+from app.models import Appointment, ConversationContext, PausedContact
 
 
 class ConversationState(str, Enum):
@@ -92,6 +102,9 @@ class FailureReason(str, Enum):
     ABOVE_MAXIMUM = "above_maximum"
     CONFIGURATION_INVALID = "configuration_invalid"
     READINESS_UNAVAILABLE = "readiness_unavailable"
+    COMMIT_RESULT_UNKNOWN = "commit_result_unknown"
+    REDIS_FINALIZE_AFTER_COMMIT_FAILED = "redis_finalize_after_commit_failed"
+    CONDITION_CHANGED = "mutation_condition_changed"
 
 
 class ConfigurationIssue(str, Enum):
@@ -215,6 +228,81 @@ class ContactDetail:
 
 
 @dataclass(frozen=True)
+class IngressResolution:
+    state: ConversationState
+    cycle: ConversationCycle
+    generation: str
+    paused_until: datetime | None = None
+    reason: str | None = None
+
+
+@dataclass(frozen=True)
+class MutationTarget:
+    kind: str
+    request_fingerprint: str
+    expected_hash: str
+    cycle: ConversationCycle
+    rotate_generation: bool = True
+    paused_until: datetime | None = None
+    reason: str | None = None
+    context_hash: str | None = None
+
+    @property
+    def fingerprint(self) -> str:
+        return _hash({"kind": self.kind, "expected_hash": self.expected_hash,
+                      "paused_until": self.paused_until.isoformat() if self.paused_until else None,
+                      "reason": self.reason, "context_hash": self.context_hash})
+
+
+@dataclass(frozen=True)
+class MutationAttempt:
+    epoch: UUID
+    operation_id: str
+    kind: str
+    phase: MutationPhase
+    target_fingerprint: str
+    request_fingerprint: str
+    generation: UUID
+    prior_cycle: ConversationCycle
+    target_cycle: ConversationCycle
+    processing_deadline: datetime
+    expected_until: datetime
+    owner_token_hash: str
+    paused_until: datetime | None = None
+    reason: str | None = None
+
+
+@dataclass(frozen=True)
+class DefinitiveRollbackProof:
+    """Local rollback receipt; only valid before SQL commit has been invoked."""
+    operation_id: str
+    owner_token_hash: str
+    receipt_token: UUID
+
+
+_rollback_receipts: dict[UUID, tuple[str, str]] = {}
+_rollback_receipt_lock = Lock()
+
+
+def _issue_rollback_proof(operation_id: str, lease: ContactLease) -> DefinitiveRollbackProof:
+    proof = DefinitiveRollbackProof(operation_id, hashlib.sha256(lease.owner_token.encode()).hexdigest(), uuid4())
+    with _rollback_receipt_lock:
+        _rollback_receipts[proof.receipt_token] = (proof.operation_id, proof.owner_token_hash)
+    return proof
+
+
+def _consume_rollback_proof(proof: DefinitiveRollbackProof, operation_id: str, lease: ContactLease) -> bool:
+    if not isinstance(proof, DefinitiveRollbackProof):
+        return False
+    expected = (operation_id, hashlib.sha256(lease.owner_token.encode()).hexdigest())
+    with _rollback_receipt_lock:
+        if (proof.operation_id, proof.owner_token_hash) != expected or _rollback_receipts.get(proof.receipt_token) != expected:
+            return False
+        del _rollback_receipts[proof.receipt_token]
+    return True
+
+
+@dataclass(frozen=True)
 class ContactAnchor:
     contact_revision: int
     last_generation: UUID
@@ -222,6 +310,7 @@ class ContactAnchor:
     manifest_fingerprint: str
     generation_history: tuple[UUID, ...]
     cycle: ConversationCycle = ConversationCycle.OPEN
+    mutation_fence: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
         if (type(self.contact_revision) is not int or self.contact_revision < 0
@@ -322,9 +411,38 @@ class ConversationStore(Protocol):
 
     def compare_and_set(self, lease: ContactLease, expected: ContactAnchor,
                         details: tuple[ContactDetail, ...], *,
-                        generation: UUID | None = None) -> ContactAnchor: ...
+                        generation: UUID | None = None,
+                        cycle: ConversationCycle | None = None) -> ContactAnchor: ...
 
     def cleanup(self, lease: ContactLease, expected: ContactAnchor) -> ContactAnchor: ...
+
+    def inspect_mutation(self, phone: str, operation_id: str, lease: ContactLease,
+                         *, operational: bool = False) -> MutationAttempt | None: ...
+
+    def assert_mutation_available(self, lease: ContactLease, now: datetime) -> None: ...
+
+    def prepare_mutation(self, phone: str, kind: str, target_fingerprint: str,
+                         lease: ContactLease, operation_id: str, now: datetime,
+                         *, target: MutationTarget) -> MutationAttempt: ...
+
+    def enter_committing(self, phone: str, operation_id: str, lease: ContactLease,
+                         now: datetime, processing_deadline: datetime) -> MutationAttempt: ...
+
+    def preserve_or_abort_prepared(self, phone: str, operation_id: str,
+                                  lease: ContactLease, now: datetime) -> None: ...
+
+    def restore_prepared_after_rollback(self, phone: str, operation_id: str, lease: ContactLease,
+                                        now: datetime, *, proof: DefinitiveRollbackProof) -> None: ...
+
+    def quarantine_ambiguous_commit(self, phone: str, operation_id: str,
+                                    lease: ContactLease, now: datetime) -> MutationAttempt: ...
+
+    def finalize_committed(self, phone: str, operation_id: str, lease: ContactLease,
+                           now: datetime) -> MutationAttempt: ...
+
+    def resolve_quarantined_mutation(self, phone: str, operation_id: str, epoch: UUID,
+                                     lease: ContactLease, now: datetime, *, quiescent: bool,
+                                     outcome: MutationPhase) -> MutationAttempt: ...
 
 
 class BrokerPort(Protocol):
@@ -440,3 +558,343 @@ def manual_pause_deadline(now: datetime, hours: object) -> datetime:
     if deadline > maximum:
         raise InvalidManualPauseDuration("above_maximum")
     return deadline
+
+
+def _hash(value: Any) -> str:
+    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"),
+                                     ensure_ascii=True, allow_nan=False).encode()).hexdigest()
+
+
+def _utc(value: datetime) -> datetime:
+    # Existing SQL columns are timezone-naive UTC; public references are aware UTC.
+    return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
+
+
+def _sql_time(value: datetime) -> datetime:
+    return _utc(value).replace(tzinfo=None)
+
+
+def _reason_codes_only(method):
+    @wraps(method)
+    def guarded(*args, **kwargs):
+        try:
+            return method(*args, **kwargs)
+        except ConversationDomainError:
+            raise
+        except Exception:
+            raise ConversationStateUnavailable(FailureReason.STATE_UNAVAILABLE) from None
+    return guarded
+
+
+class ConversationCoordinator:
+    """Central SQL boundary. Every public operation consumes an existing lease."""
+
+    TEST_PHONE = "5500000000000"
+
+    def __init__(self, store: ConversationStore, clock):
+        self.store, self.clock = store, clock
+
+    def _ensure(self, db: Session, phone: str, lease: ContactLease) -> ContactAnchor:
+        if lease.phone != phone:
+            raise ContactLeaseLost(FailureReason.CONTACT_LEASE_LOST)
+        lease.assert_owned()
+        if db.new or db.dirty or db.deleted:
+            raise ConversationStateUnavailable(FailureReason.INVALID_VALUE)
+        with db.no_autoflush:
+            present = (db.get(PausedContact, phone) is not None
+                       or db.get(ConversationContext, phone) is not None)
+        return self.store.initialize_contact(phone, lease, db_state_present=present)
+
+    def _db_hash(self, db: Session, phone: str, *, appointments: bool = False) -> str:
+        with db.no_autoflush:
+            pause = db.get(PausedContact, phone, populate_existing=True)
+            context = db.get(ConversationContext, phone, populate_existing=True)
+            state = {
+                "pause": None if pause is None else {
+                    "until": _utc(pause.paused_until).isoformat(), "reason": pause.reason,
+                    "at": _utc(pause.paused_at).isoformat()},
+                "context": None if context is None else {
+                    "messages": context.messages, "flow": context.current_flow,
+                    "data": context.flow_data, "status": context.status,
+                    "activity": _utc(context.last_activity).isoformat()},
+            }
+            if appointments:
+                state["appointments"] = list(db.scalars(select(Appointment.id).where(
+                    Appointment.patient_phone == phone).order_by(Appointment.id)))
+        return _hash(state)
+
+    def _request(self, db, phone, lease, operation_id, now, kind, parameters):
+        self._ensure(db, phone, lease)
+        self.store.assert_mutation_available(lease, now)
+        request_hash = _hash({"kind": kind, "parameters": parameters})
+        previous = self.store.inspect_mutation(phone, operation_id, lease)
+        if previous is not None:
+            if previous.request_fingerprint != request_hash:
+                raise ConversationStateUnavailable(FailureReason.INVALID_VALUE)
+            if previous.phase is not MutationPhase.COMMITTED:
+                raise ConversationMutationPending(FailureReason.MUTATION_PENDING)
+        return request_hash, previous
+
+    def _run_mutation(self, db: Session, phone: str, kind: str, target: MutationTarget,
+                      lease: ContactLease, operation_id: str, now: datetime,
+                      apply_dml: Callable[[Session, MutationAttempt], Any]) -> MutationAttempt:
+        attempt = self.store.prepare_mutation(phone, kind, target.fingerprint, lease,
+                                               operation_id, now, target=target)
+        if attempt.phase is MutationPhase.COMMITTED:
+            return attempt
+        try:
+            apply_dml(db, attempt)
+            db.flush()
+            lease.assert_owned()
+            self.store.enter_committing(phone, operation_id, lease, self.clock.now(),
+                                        attempt.processing_deadline)
+        except Exception as exc:
+            try:
+                db.rollback()
+            except Exception:
+                # No definitive rollback proof: preserve PREPARED and block contenders.
+                raise ConversationStateUnavailable(FailureReason.STATE_UNAVAILABLE) from None
+            proof = _issue_rollback_proof(operation_id, lease)
+            try:
+                self.store.restore_prepared_after_rollback(phone, operation_id, lease, self.clock.now(), proof=proof)
+                self.store.preserve_or_abort_prepared(phone, operation_id, lease, self.clock.now())
+            except ConversationDomainError:
+                pass  # Owner loss must never remove another owner's fence.
+            finally:
+                with _rollback_receipt_lock:
+                    _rollback_receipts.pop(proof.receipt_token, None)
+            if isinstance(exc, ConversationDomainError):
+                raise
+            raise ConversationStateUnavailable(FailureReason.STATE_UNAVAILABLE) from None
+        try:
+            db.commit()
+        except Exception:
+            try:
+                db.rollback()
+            except Exception:
+                pass
+            try:
+                self.store.quarantine_ambiguous_commit(phone, operation_id, lease, self.clock.now())
+            except ConversationDomainError:
+                pass  # COMMITTING remains durable until later quarantine processing.
+            raise ConversationMutationAmbiguous(FailureReason.COMMIT_RESULT_UNKNOWN) from None
+        try:
+            return self.store.finalize_committed(phone, operation_id, lease, self.clock.now())
+        except Exception:
+            raise ConversationMutationAmbiguous(FailureReason.REDIS_FINALIZE_AFTER_COMMIT_FAILED) from None
+
+    def _check_target(self, db, phone, target, *, appointments=False):
+        if self._db_hash(db, phone, appointments=appointments) != target.expected_hash:
+            raise ConversationStateUnavailable(FailureReason.CONDITION_CHANGED)
+
+    @staticmethod
+    def _pause_ref(attempt: MutationAttempt) -> PauseTransitionRef:
+        if attempt.paused_until is None or attempt.reason is None:
+            raise ConversationStateUnavailable(FailureReason.STATE_UNAVAILABLE)
+        return PauseTransitionRef(str(attempt.generation), attempt.paused_until, attempt.reason)
+
+    def _pause(self, db, phone, reason, now, lease, operation_id, *, kind, hours=None, agent_request=None):
+        parameters = {"reason": reason, "hours": hours}
+        if agent_request is not None:
+            parameters["agent"] = agent_request
+        request_hash, previous = self._request(db, phone, lease, operation_id, now, kind, parameters)
+        if previous is not None:
+            return self._pause_ref(previous)
+        if agent_request is not None:
+            self._assert_open(db, phone, lease)
+        deadline = _utc(now) + DEFAULT_SECRETARY_PAUSE if hours is None else manual_pause_deadline(_utc(now), hours)
+        if kind == "EXTEND_PAUSE":
+            pause = db.get(PausedContact, phone)
+            if pause is None:
+                raise ConversationStateUnavailable(FailureReason.INVALID_VALUE)
+            deadline = manual_pause_deadline(_utc(pause.paused_until), hours)
+            if deadline > _utc(now) + MAX_MANUAL_PAUSE:
+                raise InvalidManualPauseDuration(FailureReason.ABOVE_MAXIMUM)
+            reason = pause.reason
+        target = MutationTarget(kind, request_hash, self._db_hash(db, phone), ConversationCycle.PAUSED,
+                                paused_until=deadline, reason=reason)
+        def dml(session, _attempt):
+            self._check_target(session, phone, target)
+            if kind == "PAUSE_FOR_SECRETARY":
+                session.execute(delete(ConversationContext).where(ConversationContext.phone == phone))
+            row = session.get(PausedContact, phone)
+            if row is None:
+                row = PausedContact(phone=phone)
+                session.add(row)
+            row.paused_until, row.reason = _sql_time(deadline), reason
+            if kind != "EXTEND_PAUSE":
+                row.paused_at = _sql_time(now)
+        return self._pause_ref(self._run_mutation(db, phone, kind, target, lease, operation_id, now, dml))
+
+    @_reason_codes_only
+    def pause_for_secretary(self, db: Session, phone: str, reason: str, now: datetime,
+                            lease: ContactLease, operation_id: str) -> PauseTransitionRef:
+        return self._pause(db, phone, reason, now, lease, operation_id, kind="PAUSE_FOR_SECRETARY")
+
+    @_reason_codes_only
+    def pause_manual(self, db: Session, phone: str, hours: object, reason: str, now: datetime,
+                     lease: ContactLease, operation_id: str) -> PauseTransitionRef:
+        valid_hours = validate_manual_pause_hours(hours)
+        return self._pause(db, phone, reason, now, lease, operation_id, kind="PAUSE_MANUAL", hours=valid_hours)
+
+    @_reason_codes_only
+    def extend_pause(self, db: Session, phone: str, hours: object, now: datetime,
+                     lease: ContactLease, operation_id: str) -> PauseTransitionRef:
+        valid_hours = validate_manual_pause_hours(hours)
+        return self._pause(db, phone, None, now, lease, operation_id, kind="EXTEND_PAUSE", hours=valid_hours)
+
+    def _remove(self, db, phone, now, lease, operation_id, kind, *, cutoff=None, agent_request=None):
+        parameters = {"cutoff": _utc(cutoff).isoformat() if cutoff else None}
+        if agent_request is not None:
+            parameters["agent"] = agent_request
+        request_hash, previous = self._request(db, phone, lease, operation_id, now, kind,
+                                               parameters)
+        if previous is not None:
+            return previous
+        if agent_request is not None:
+            self._assert_open(db, phone, lease)
+        cycle = ConversationCycle.OPEN if kind in ("UNPAUSE", "EXPIRE_PAUSE", "RESET_TEST") else ConversationCycle.CLOSED
+        if kind == "CLEAN_INACTIVE":
+            row = db.get(ConversationContext, phone)
+            if row is None or _utc(row.last_activity) >= _utc(cutoff):
+                return None
+            pause = db.get(PausedContact, phone)
+            if pause is not None and _utc(pause.paused_until) > _utc(now):
+                cycle = ConversationCycle.PAUSED
+        target = MutationTarget(kind, request_hash, self._db_hash(db, phone, appointments=kind == "RESET_TEST"), cycle)
+        def dml(session, _attempt):
+            self._check_target(session, phone, target, appointments=kind == "RESET_TEST")
+            if kind in ("CLOSE_CONTEXT", "CLEAN_INACTIVE", "RESET_TEST"):
+                statement = delete(ConversationContext).where(ConversationContext.phone == phone)
+                if cutoff is not None:
+                    statement = statement.where(ConversationContext.last_activity < _sql_time(cutoff))
+                result = session.execute(statement)
+                if cutoff is not None and result.rowcount != 1:
+                    raise ConversationStateUnavailable(FailureReason.CONDITION_CHANGED)
+            if kind in ("UNPAUSE", "EXPIRE_PAUSE", "RESET_TEST"):
+                statement = delete(PausedContact).where(PausedContact.phone == phone)
+                if kind == "EXPIRE_PAUSE":
+                    statement = statement.where(PausedContact.paused_until <= _sql_time(now))
+                result = session.execute(statement)
+                if kind == "EXPIRE_PAUSE" and result.rowcount != 1:
+                    raise ConversationStateUnavailable(FailureReason.CONDITION_CHANGED)
+            if kind == "RESET_TEST":
+                session.execute(delete(Appointment).where(Appointment.patient_phone == phone))
+        return self._run_mutation(db, phone, kind, target, lease, operation_id, now, dml)
+
+    @_reason_codes_only
+    def unpause(self, db: Session, phone: str, now: datetime, lease: ContactLease, operation_id: str) -> None:
+        self._remove(db, phone, now, lease, operation_id, "UNPAUSE")
+
+    @_reason_codes_only
+    def close_context(self, db: Session, phone: str, now: datetime, lease: ContactLease,
+                      operation_id: str) -> ClosureTransitionRef:
+        attempt = self._remove(db, phone, now, lease, operation_id, "CLOSE_CONTEXT")
+        return ClosureTransitionRef(str(attempt.generation), attempt.operation_id)
+
+    @_reason_codes_only
+    def close_inactive_context(self, db: Session, phone: str, cutoff: datetime, now: datetime,
+                               lease: ContactLease, operation_id: str) -> bool:
+        try:
+            return self._remove(db, phone, now, lease, operation_id, "CLEAN_INACTIVE", cutoff=cutoff) is not None
+        except ConversationStateUnavailable as exc:
+            if exc.reason_code is FailureReason.CONDITION_CHANGED:
+                return False
+            raise
+
+    @_reason_codes_only
+    def reset_test_state(self, db: Session, phone: str, now: datetime,
+                         lease: ContactLease, operation_id: str) -> None:
+        if phone != self.TEST_PHONE:
+            raise InvalidCanonicalContact(FailureReason.INVALID_CANONICAL_CONTACT)
+        self._remove(db, phone, now, lease, operation_id, "RESET_TEST")
+
+    @_reason_codes_only
+    def resolve_ingress(self, db: Session, phone: str, now: datetime,
+                         lease: ContactLease) -> IngressResolution:
+        anchor = self._ensure(db, phone, lease)
+        self.store.assert_mutation_available(lease, now)
+        pause = db.get(PausedContact, phone)
+        if pause is not None:
+            if _utc(now) < _utc(pause.paused_until):
+                if anchor.cycle is not ConversationCycle.PAUSED:
+                    raise ConversationGenerationUnavailable(FailureReason.GENERATION_UNAVAILABLE)
+                return IngressResolution(ConversationState.SECRETARY_ATTENDANCE, anchor.cycle,
+                                         str(anchor.last_generation), _utc(pause.paused_until), pause.reason)
+            operation = "expire-" + _hash({"generation": str(anchor.last_generation),
+                                          "deadline": _utc(pause.paused_until).isoformat()})
+            self._remove(db, phone, now, lease, operation, "EXPIRE_PAUSE")
+            anchor = self.store.read_anchor(lease)
+        elif anchor.cycle is ConversationCycle.PAUSED:
+            raise ConversationGenerationUnavailable(FailureReason.GENERATION_UNAVAILABLE)
+        if anchor.cycle is ConversationCycle.CLOSED:
+            anchor = self.store.compare_and_set(lease, anchor, self.store.read_details(lease),
+                                                generation=uuid4(), cycle=ConversationCycle.OPEN)
+        return IngressResolution(ConversationState.BOT_ACTIVE, anchor.cycle, str(anchor.last_generation))
+
+    @_reason_codes_only
+    def apply_agent_result(self, db: Session, phone: str, result: AgentResult, processing_id: str,
+                           operation_id: str, now: datetime, lease: ContactLease) -> OutboundEnvelope:
+        agent_request = {"text": result.text, "messages": result.messages, "flow": result.current_flow,
+                         "data": result.flow_data, "processing": processing_id}
+        if result.intent is AgentIntent.PAUSE_FOR_SECRETARY:
+            ref = self._pause(db, phone, "user_requested_human_assistance", now, lease, operation_id,
+                              kind="PAUSE_FOR_SECRETARY", agent_request=agent_request)
+            return OutboundEnvelope(phone, result.text, OutboundKind.TRANSFER_CONFIRMATION,
+                                    ref.generation, processing_id, operation_id, pause_ref=ref)
+        if result.intent is AgentIntent.CLOSE_CONTEXT:
+            attempt = self._remove(db, phone, now, lease, operation_id, "CLOSE_CONTEXT", agent_request=agent_request)
+            ref = ClosureTransitionRef(str(attempt.generation), attempt.operation_id)
+            return OutboundEnvelope(phone, result.text, OutboundKind.CLOSURE_CONFIRMATION,
+                                    ref.generation, processing_id, operation_id, closure_ref=ref)
+        if result.intent is not AgentIntent.SAVE_CONTEXT:
+            raise ConversationStateUnavailable(FailureReason.INVALID_VALUE)
+        payload = {"messages": result.messages, "flow": result.current_flow, "data": result.flow_data}
+        request_hash, previous = self._request(db, phone, lease, operation_id, now, "SAVE_CONTEXT",
+                                               {"context": payload, "processing": processing_id, "text": result.text})
+        if previous is None:
+            anchor = self.store.read_anchor(lease)
+            pause = db.get(PausedContact, phone)
+            if anchor.cycle is not ConversationCycle.OPEN or pause is not None:
+                raise ConversationMutationPending(FailureReason.MUTATION_PENDING)
+            target = MutationTarget("SAVE_CONTEXT", request_hash, self._db_hash(db, phone), ConversationCycle.OPEN,
+                                    rotate_generation=False, context_hash=_hash(payload))
+            def dml(session, _attempt):
+                self._check_target(session, phone, target)
+                row = session.get(ConversationContext, phone)
+                if row is None:
+                    row = ConversationContext(phone=phone, created_at=_sql_time(now))
+                    session.add(row)
+                row.messages, row.current_flow, row.flow_data = deepcopy(result.messages), result.current_flow, deepcopy(result.flow_data)
+                row.status, row.last_activity = "active", _sql_time(now)
+            previous = self._run_mutation(db, phone, "SAVE_CONTEXT", target, lease, operation_id, now, dml)
+        return OutboundEnvelope(phone, result.text, OutboundKind.NORMAL, str(previous.generation), processing_id, operation_id)
+
+    def _assert_open(self, db, phone, lease):
+        if (self.store.read_anchor(lease).cycle is not ConversationCycle.OPEN
+                or db.get(PausedContact, phone) is not None):
+            raise ConversationMutationPending(FailureReason.MUTATION_PENDING)
+
+    @_reason_codes_only
+    def may_send(self, db: Session, outbound: OutboundEnvelope, now: datetime, lease: ContactLease) -> bool:
+        anchor = self._ensure(db, outbound.phone, lease)
+        self.store.assert_mutation_available(lease, now)
+        if outbound.generation != str(anchor.last_generation):
+            return False
+        pause = db.get(PausedContact, outbound.phone, populate_existing=True)
+        if outbound.kind is OutboundKind.NORMAL:
+            return anchor.cycle is ConversationCycle.OPEN and pause is None
+        if outbound.kind is OutboundKind.TRANSFER_CONFIRMATION:
+            ref = outbound.pause_ref
+            return (anchor.cycle is ConversationCycle.PAUSED and pause is not None and ref is not None
+                    and ref.generation == outbound.generation and _utc(now) < _utc(pause.paused_until)
+                    and ref.paused_until == _utc(pause.paused_until) and ref.reason == pause.reason)
+        if outbound.kind is OutboundKind.CLOSURE_CONFIRMATION:
+            ref = outbound.closure_ref
+            if (anchor.cycle is not ConversationCycle.CLOSED or pause is not None or ref is None
+                    or ref.generation != outbound.generation or ref.operation_id != outbound.operation_id):
+                return False
+            attempt = self.store.inspect_mutation(outbound.phone, ref.operation_id, lease)
+            return (attempt is not None and attempt.phase is MutationPhase.COMMITTED
+                    and attempt.generation == anchor.last_generation and attempt.target_cycle is ConversationCycle.CLOSED)
+        return False

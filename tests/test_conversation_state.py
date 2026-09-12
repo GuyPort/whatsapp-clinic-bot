@@ -28,6 +28,7 @@ from app.conversation_state import (
     DispatchPhase,
     FailureReason,
     IngressDisposition,
+    InvalidCanonicalContact,
     InvalidManualPauseDuration,
     MutationPhase,
     OutboundEnvelope,
@@ -434,3 +435,277 @@ def test_anchor_domain_rejects_invalid_revision_or_generation_lineage(revision, 
     with pytest.raises(ConversationGenerationUnavailable) as raised:
         ContactAnchor(revision, generation, (), "unused", history)
     assert raised.value.reason_code is FailureReason.GENERATION_UNAVAILABLE
+
+
+@pytest.fixture
+def transition_env(session_factory):
+    from app import conversation_state
+    from tests.fakes import BarrierSession
+    from tests.test_conversation_concurrency import make_store
+    store = make_store()
+    with session_factory() as session:
+        db = BarrierSession(session)
+        coordinator_type = getattr(conversation_state, "ConversationCoordinator", None)
+        coordinator = coordinator_type(store, store.clock) if coordinator_type else None
+        yield coordinator, db, store, store.clock
+
+
+PHONE = "5551999990000"
+OTHER = "5551888880000"
+TEST_PHONE = "5500000000000"
+
+
+def seed_context(db, phone, now):
+    from app.models import ConversationContext
+    assert db.get_bind().url.database in (None, "", ":memory:")
+    row = ConversationContext(phone=phone, messages=[{"role": "user", "content": "synthetic"}],
+                              flow_data={"synthetic": True}, current_flow="duvidas",
+                              status="active", last_activity=now.replace(tzinfo=None), created_at=now.replace(tzinfo=None))
+    db.add(row)
+    db.session.commit()
+    return row
+
+
+def test_state_ingress_without_pause_is_open_and_does_not_commit(transition_env):
+    coordinator, db, store, clock = transition_env
+    with store.contact_lease(PHONE) as lease:
+        resolved = coordinator.resolve_ingress(db, PHONE, clock.now(), lease)
+        assert resolved.state is ConversationState.BOT_ACTIVE
+        assert resolved.cycle is ConversationCycle.OPEN
+        assert UUID(resolved.generation) == store.read_anchor(lease).last_generation
+    assert "commit_entered" not in db.events
+
+
+@pytest.mark.parametrize("delta,paused", [(-1, True), (0, False), (1, False)])
+def test_pause_exact_expiry_boundary(transition_env, delta, paused):
+    from app.models import PausedContact
+    coordinator, db, store, clock = transition_env
+    with store.contact_lease(PHONE) as lease:
+        ref = coordinator.pause_for_secretary(db, PHONE, "secretary_manual_pause", clock.now(), lease, "op-1")
+    clock.set(ref.paused_until + timedelta(microseconds=delta))
+    with store.contact_lease(PHONE) as lease:
+        result = coordinator.resolve_ingress(db, PHONE, clock.now(), lease)
+        assert (result.state is ConversationState.SECRETARY_ATTENDANCE) is paused
+        assert (result.generation == ref.generation) is paused
+        assert (db.get(PausedContact, PHONE) is not None) is paused
+        assert result.cycle is (ConversationCycle.PAUSED if paused else ConversationCycle.OPEN)
+
+
+def test_pause_transfer_atomically_deletes_context_and_preserves_other_contact(transition_env):
+    from app.models import ConversationContext, PausedContact
+    coordinator, db, store, clock = transition_env
+    with store.contact_lease(PHONE) as lease:
+        coordinator.resolve_ingress(db, PHONE, clock.now(), lease)
+        seed_context(db, PHONE, clock.now())
+        other = seed_context(db, OTHER, clock.now())
+        ref = coordinator.pause_for_secretary(db, PHONE, "user_requested_human_assistance", clock.now(), lease, "op-transfer")
+        assert db.get(ConversationContext, PHONE) is None
+        assert db.get(ConversationContext, OTHER).messages == other.messages
+        assert db.get(PausedContact, PHONE).paused_until == datetime(2026, 9, 13, 12)
+        assert ref.paused_until == datetime(2026, 9, 13, 12, tzinfo=timezone.utc)
+        assert ref.reason == "user_requested_human_assistance"
+        assert store.read_anchor(lease).cycle is ConversationCycle.PAUSED
+    assert db.events.count("commit_entered") == 1
+
+
+def test_pause_beatriz_renewal_rotates_generation_but_retry_does_not(transition_env):
+    coordinator, db, store, clock = transition_env
+    with store.contact_lease(PHONE) as lease:
+        first = coordinator.pause_for_secretary(db, PHONE, "secretary_manual_pause", clock.now(), lease, "op-1")
+    clock.advance(timedelta(hours=1))
+    with store.contact_lease(PHONE) as lease:
+        second = coordinator.pause_for_secretary(db, PHONE, "secretary_manual_pause", clock.now(), lease, "op-2")
+        clock.advance(timedelta(seconds=1))
+        retry = coordinator.pause_for_secretary(db, PHONE, "secretary_manual_pause", clock.now(), lease, "op-2")
+        assert second == retry
+        assert second.generation != first.generation
+        assert second.paused_until == datetime(2026, 9, 13, 13, tzinfo=timezone.utc)
+        assert len(store.read_anchor(lease).generation_history) == 3
+    assert db.events.count("commit_entered") == 2
+
+
+def test_pause_manual_and_extension_enforce_resulting_365_day_limit(transition_env):
+    from app.models import ConversationContext, PausedContact
+    coordinator, db, store, clock = transition_env
+    with store.contact_lease(PHONE) as lease:
+        coordinator.resolve_ingress(db, PHONE, clock.now(), lease)
+        seed_context(db, PHONE, clock.now())
+        ref = coordinator.pause_manual(db, PHONE, 8759, "secretary_dashboard_pause", clock.now(), lease, "manual-1")
+        assert db.get(ConversationContext, PHONE) is not None
+        extended = coordinator.extend_pause(db, PHONE, 1, clock.now(), lease, "extend-1")
+        assert extended.paused_until == datetime(2027, 9, 12, 12, tzinfo=timezone.utc)
+        assert extended.generation != ref.generation
+        baseline = store.contact_snapshot(PHONE)
+        for action in (
+            lambda: coordinator.pause_manual(db, PHONE, 8761, "secretary_dashboard_pause", clock.now(), lease, "invalid-1"),
+            lambda: coordinator.extend_pause(db, PHONE, 1, clock.now(), lease, "invalid-2"),
+        ):
+            with pytest.raises(InvalidManualPauseDuration):
+                action()
+        assert baseline == store.contact_snapshot(PHONE)
+        coordinator.unpause(db, PHONE, clock.now(), lease, "unpause-1")
+        assert db.get(PausedContact, PHONE) is None
+        assert db.get(ConversationContext, PHONE) is not None
+        assert store.read_anchor(lease).cycle is ConversationCycle.OPEN
+
+
+def test_closed_new_ingress_rotates_generation_and_invalidates_closure_send(transition_env):
+    from app.models import ConversationContext
+    coordinator, db, store, clock = transition_env
+    with store.contact_lease(PHONE) as lease:
+        coordinator.resolve_ingress(db, PHONE, clock.now(), lease)
+        seed_context(db, PHONE, clock.now())
+        ref = coordinator.close_context(db, PHONE, clock.now(), lease, "close-1")
+        assert db.get(ConversationContext, PHONE) is None
+        assert store.read_anchor(lease).cycle is ConversationCycle.CLOSED
+        envelope = OutboundEnvelope(PHONE, "synthetic", OutboundKind.CLOSURE_CONFIRMATION,
+                                    ref.generation, None, "close-1", closure_ref=ref)
+        assert coordinator.may_send(db, envelope, clock.now(), lease)
+        reopened = coordinator.resolve_ingress(db, PHONE, clock.now(), lease)
+        assert reopened.cycle is ConversationCycle.OPEN
+        assert reopened.generation != ref.generation
+        assert not coordinator.may_send(db, envelope, clock.now(), lease)
+
+
+def test_send_exact_pause_reference_and_current_open_generation_only(transition_env):
+    from dataclasses import replace
+    coordinator, db, store, clock = transition_env
+    with store.contact_lease(PHONE) as lease:
+        opened = coordinator.resolve_ingress(db, PHONE, clock.now(), lease)
+        normal = OutboundEnvelope(PHONE, "synthetic", OutboundKind.NORMAL, opened.generation, "p-1", "op-1")
+        assert coordinator.may_send(db, normal, clock.now(), lease)
+        ref = coordinator.pause_for_secretary(db, PHONE, "user_requested_human_assistance", clock.now(), lease, "pause-1")
+        transfer = OutboundEnvelope(PHONE, "synthetic", OutboundKind.TRANSFER_CONFIRMATION,
+                                    ref.generation, "p-1", "pause-1", pause_ref=ref)
+        assert coordinator.may_send(db, transfer, clock.now(), lease)
+        assert not coordinator.may_send(db, normal, clock.now(), lease)
+        for bad_ref in (replace(ref, reason="wrong"), replace(ref, paused_until=ref.paused_until + timedelta(microseconds=1))):
+            assert not coordinator.may_send(db, replace(transfer, pause_ref=bad_ref), clock.now(), lease)
+        coordinator.unpause(db, PHONE, clock.now(), lease, "unpause-1")
+        assert not coordinator.may_send(db, transfer, clock.now(), lease)
+
+
+@pytest.mark.parametrize("intent,kind,cycle", [
+    (AgentIntent.SAVE_CONTEXT, OutboundKind.NORMAL, ConversationCycle.OPEN),
+    (AgentIntent.PAUSE_FOR_SECRETARY, OutboundKind.TRANSFER_CONFIRMATION, ConversationCycle.PAUSED),
+    (AgentIntent.CLOSE_CONTEXT, OutboundKind.CLOSURE_CONFIRMATION, ConversationCycle.CLOSED),
+])
+def test_mutation_agent_result_is_persisted_once_with_typed_send(transition_env, intent, kind, cycle):
+    from app.models import ConversationContext
+    coordinator, db, store, clock = transition_env
+    result = AgentResult("synthetic", [{"role": "assistant", "content": "synthetic"}], "duvidas", {"done": True}, intent)
+    with store.contact_lease(PHONE) as lease:
+        coordinator.resolve_ingress(db, PHONE, clock.now(), lease)
+        outbound = coordinator.apply_agent_result(db, PHONE, result, "p-1", "op-1", clock.now(), lease)
+        retry = coordinator.apply_agent_result(db, PHONE, result, "p-1", "op-1", clock.now(), lease)
+        assert retry == outbound
+        assert outbound.kind is kind
+        assert store.read_anchor(lease).cycle is cycle
+        assert coordinator.may_send(db, outbound, clock.now(), lease)
+        row = db.get(ConversationContext, PHONE)
+        if intent is AgentIntent.SAVE_CONTEXT:
+            assert (row.messages, row.current_flow, row.flow_data, row.status) == (result.messages, "duvidas", {"done": True}, "active")
+            assert row.last_activity == datetime(2026, 9, 12, 12)
+        else:
+            assert row is None
+    assert db.events.count("commit_entered") == 1
+
+
+@pytest.mark.parametrize("age,paused,deleted", [(59, False, False), (60, False, False), (61, False, True), (61, True, True)])
+def test_state_inactivity_conditional_delete_preserves_pause_and_other_contact(transition_env, age, paused, deleted):
+    from app.models import ConversationContext
+    coordinator, db, store, clock = transition_env
+    with store.contact_lease(PHONE) as lease:
+        coordinator.resolve_ingress(db, PHONE, clock.now(), lease)
+        seed_context(db, PHONE, clock.now() - timedelta(minutes=age))
+        seed_context(db, OTHER, clock.now() - timedelta(minutes=90))
+        if paused:
+            coordinator.pause_manual(db, PHONE, 24, "secretary_dashboard_pause", clock.now(), lease, "pause-1")
+        changed = coordinator.close_inactive_context(db, PHONE, clock.now() - timedelta(hours=1), clock.now(), lease, "clean-1")
+        assert changed is deleted
+        assert (db.get(ConversationContext, PHONE) is None) is deleted
+        assert db.get(ConversationContext, OTHER) is not None
+        assert store.read_anchor(lease).cycle is (ConversationCycle.PAUSED if paused else ConversationCycle.CLOSED if deleted else ConversationCycle.OPEN)
+
+
+def test_mutation_reset_is_exact_test_contact_only(transition_env):
+    from app.models import Appointment, ConversationContext, PausedContact
+    coordinator, db, store, clock = transition_env
+    for phone in (TEST_PHONE, OTHER):
+        with store.contact_lease(phone) as lease:
+            coordinator.resolve_ingress(db, phone, clock.now(), lease)
+            seed_context(db, phone, clock.now())
+            coordinator.pause_manual(db, phone, 24, "secretary_dashboard_pause", clock.now(), lease, "pause-1")
+        db.add(Appointment(patient_name="synthetic", patient_phone=phone, patient_birth_date="01/01/2000",
+                           appointment_date="20260914", appointment_time="12:00",
+                           created_at=clock.now().replace(tzinfo=None), updated_at=clock.now().replace(tzinfo=None)))
+        db.session.commit()
+    with store.contact_lease(OTHER) as lease:
+        with pytest.raises(InvalidCanonicalContact):
+            coordinator.reset_test_state(db, OTHER, clock.now(), lease, "reset-bad")
+    with store.contact_lease(TEST_PHONE) as lease:
+        coordinator.reset_test_state(db, TEST_PHONE, clock.now(), lease, "reset-1")
+        assert db.get(ConversationContext, TEST_PHONE) is None
+        assert db.get(PausedContact, TEST_PHONE) is None
+        assert db.query(Appointment).filter_by(patient_phone=TEST_PHONE).count() == 0
+        assert store.read_anchor(lease).cycle is ConversationCycle.OPEN
+    assert db.get(ConversationContext, OTHER) is not None
+    assert db.get(PausedContact, OTHER) is not None
+    assert db.query(Appointment).filter_by(patient_phone=OTHER).count() == 1
+
+
+def test_state_existing_sql_without_anchor_fails_closed(transition_env):
+    coordinator, db, store, clock = transition_env
+    seed_context(db, PHONE, clock.now())
+    with store.contact_lease(PHONE) as lease:
+        with pytest.raises(ConversationGenerationUnavailable):
+            coordinator.resolve_ingress(db, PHONE, clock.now(), lease)
+    assert "commit_entered" not in db.events
+
+
+def test_state_sql_read_failure_has_only_enumerated_error(transition_env, monkeypatch):
+    coordinator, db, store, clock = transition_env
+    def fail(*_args, **_kwargs):
+        raise RuntimeError("synthetic-private-database-error")
+    monkeypatch.setattr(db.session, "get", fail)
+    with store.contact_lease(PHONE) as lease:
+        with pytest.raises(ConversationStateUnavailable) as caught:
+            coordinator.resolve_ingress(db, PHONE, clock.now(), lease)
+        assert caught.value.reason_code is FailureReason.STATE_UNAVAILABLE
+        assert "synthetic-private" not in str(caught.value)
+
+
+def test_mutation_runner_committed_retry_never_reapplies_dml(transition_env):
+    from app.conversation_state import MutationTarget
+    from app.models import ConversationContext
+    from sqlalchemy import delete
+    coordinator, db, store, clock = transition_env
+    with store.contact_lease(PHONE) as lease:
+        coordinator.resolve_ingress(db, PHONE, clock.now(), lease)
+        seed_context(db, PHONE, clock.now())
+        target = MutationTarget("CLOSE_CONTEXT", "synthetic-request-hash", coordinator._db_hash(db, PHONE), ConversationCycle.CLOSED)
+        def dml(session, _attempt):
+            session.execute(delete(ConversationContext).where(ConversationContext.phone == PHONE))
+        first = coordinator._run_mutation(db, PHONE, "CLOSE_CONTEXT", target, lease, "close-1", clock.now(), dml)
+        second = coordinator._run_mutation(db, PHONE, "CLOSE_CONTEXT", target, lease, "close-1", clock.now(), dml)
+        assert first == second
+        assert db.get(ConversationContext, PHONE) is None
+        assert db.events.count("execute") == 1
+        assert db.events.count("commit_entered") == 1
+
+
+@pytest.mark.parametrize("intent", list(AgentIntent))
+def test_mutation_new_agent_result_is_blocked_during_administrative_pause(transition_env, intent):
+    from app.conversation_state import ConversationMutationPending
+    from app.models import ConversationContext
+    coordinator, db, store, clock = transition_env
+    with store.contact_lease(PHONE) as lease:
+        coordinator.resolve_ingress(db, PHONE, clock.now(), lease)
+        seed_context(db, PHONE, clock.now())
+        coordinator.pause_manual(db, PHONE, 24, "secretary_dashboard_pause", clock.now(), lease, "pause-1")
+        before = store.contact_snapshot(PHONE)
+        with pytest.raises(ConversationMutationPending):
+            coordinator.apply_agent_result(db, PHONE, AgentResult("synthetic", [], None, {}, intent), "p-1", "agent-1", clock.now(), lease)
+        assert store.contact_snapshot(PHONE) == before
+        assert db.get(ConversationContext, PHONE) is not None
+        assert db.events.count("commit_entered") == 1

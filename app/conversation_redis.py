@@ -23,6 +23,8 @@ from app.conversation_state import (
     ConversationGenerationUnavailable, ConversationStateUnavailable,
     DependencyName, DependencyStatus, FailureReason, InvalidCanonicalContact,
     ManifestEntry, ReadinessReport, ReadinessUnavailable,
+    MutationAttempt, MutationTarget, MutationPhase, ConversationMutationPending,
+    DefinitiveRollbackProof, _consume_rollback_proof,
 )
 from app.utils import normalize_phone
 
@@ -158,6 +160,13 @@ for _, c in ipairs(p.checks) do
     end
 end
 if p.quarantine then return quarantine() end
+if p.deadline_us ~= nil then
+    if type(p.deadline_us) ~= 'number' or not permitted({'TIME'}) then return 'unavailable' end
+    local current = redis.call('TIME')
+    if tonumber(current[1]) * 1000000 + tonumber(current[2]) >= p.deadline_us then
+        return 'pending'
+    end
+end
 for i, args in ipairs(commands) do
     local result = redis.call(unpack(args))
     if p.writes[i].op == 'ACQUIRE' and not result then return 'locked' end
@@ -205,19 +214,25 @@ def manifest_fingerprint(entries: tuple[ManifestEntry, ...]) -> str:
 
 
 def _anchor_data(anchor: ContactAnchor) -> dict:
-    return {"contact_revision": anchor.contact_revision,
+    data = {"contact_revision": anchor.contact_revision,
             "last_generation": str(anchor.last_generation),
             "manifest": [_entry_data(entry) for entry in anchor.manifest],
             "manifest_fingerprint": anchor.manifest_fingerprint,
             "generation_history": [str(value) for value in anchor.generation_history],
             "cycle": anchor.cycle.value}
+    if anchor.mutation_fence is not None:
+        data["mutation_fence"] = dict(anchor.mutation_fence)
+    return data
 
 
 def _generation_control(anchor: ContactAnchor) -> str:
     """A durable second fence, cross-checked even when the manifest is empty."""
-    return _json({"last_generation": str(anchor.last_generation),
+    data = {"last_generation": str(anchor.last_generation),
                   "contact_revision": anchor.contact_revision,
-                  "manifest_fingerprint": anchor.manifest_fingerprint})
+                  "manifest_fingerprint": anchor.manifest_fingerprint}
+    if anchor.mutation_fence is not None:
+        data["mutation_fingerprint"] = hashlib.sha256(_json(dict(anchor.mutation_fence)).encode()).hexdigest()
+    return _json(data)
 
 
 class LeaseHeartbeat:
@@ -294,7 +309,7 @@ class RedisConversationStore:
         if not self.readiness().ready:
             raise ReadinessUnavailable(FailureReason.READINESS_UNAVAILABLE)
 
-    def _atomic(self, phone, operation, checks=(), writes=(), quarantine=False):
+    def _atomic(self, phone, operation, checks=(), writes=(), quarantine=False, *, deadline=None):
         self._ready()
         keys = contact_keys(phone)
         key_list = [GLOBAL_EPOCH_KEY, keys.anchor, QUARANTINE_INDEX_KEY]
@@ -308,6 +323,8 @@ class RedisConversationStore:
                 "quarantine": quarantine,
                 "checks": [{**c, "key": index(c["key"])} for c in checks],
                 "writes": [{**w, "key": index(w["key"])} for w in writes]}
+        if deadline is not None:
+            plan["deadline_us"] = int(deadline.timestamp() * 1000000)
         try:
             result = _text(self.client.eval(ATOMIC_SCRIPT, len(key_list), *key_list, _json(plan)))
         except Exception:
@@ -317,6 +334,7 @@ class RedisConversationStore:
             "lease": (ContactLeaseLost, FailureReason.CONTACT_LEASE_LOST),
             "locked": (ContactLockUnavailable, FailureReason.CONTACT_LOCK_UNAVAILABLE),
             "generation": (ConversationGenerationUnavailable, FailureReason.GENERATION_UNAVAILABLE),
+            "pending": (ConversationMutationPending, FailureReason.MUTATION_PENDING),
         }
         if result != "ok":
             error, reason = errors.get(result, (ConversationStateUnavailable, FailureReason.STATE_UNAVAILABLE))
@@ -382,7 +400,33 @@ class RedisConversationStore:
         except Exception:
             raise ConversationStateUnavailable(FailureReason.STATE_UNAVAILABLE) from None
 
-    def _snapshot(self, lease):
+    def _compact_mutation_fence(self, lease, anchor, checks):
+        """Recover only compact metadata, even after bounded detail payloads vanished."""
+        body = {**anchor.mutation_fence, "phase": MutationPhase.QUARANTINED.value,
+                "paused_until": None, "reason": None}
+        prior = next(item for item in anchor.manifest if item.kind == "mutation"
+                     and item.id == self._attempt_id(body["operation_id"]))
+        entry = replace(prior, version=prior.version + 1, index_flags=())
+        updated = replace(anchor, contact_revision=anchor.contact_revision + 1,
+                          manifest=(entry,), manifest_fingerprint=manifest_fingerprint((entry,)),
+                          cycle=ConversationCycle.QUARANTINED, mutation_fence=body)
+        writes = []
+        for item in anchor.manifest:
+            writes.append({"op": "DEL", "key": self._detail_key(lease.phone, item)})
+            for flag in item.index_flags:
+                writes.append({"op": "SREM", "key": INDEX_KEYS[flag], "value": self._member(lease.phone, item)})
+        keys = contact_keys(lease.phone)
+        writes.extend([
+            {"op": "SET", "key": self._detail_key(lease.phone, entry),
+             "value": _json({"entry": _entry_data(entry), "body": body, "terminal": False})},
+            {"op": "SET", "key": keys.anchor, "value": _json(_anchor_data(updated))},
+            {"op": "SET", "key": keys.generation, "value": _generation_control(updated)},
+            {"op": "SADD", "key": QUARANTINE_INDEX_KEY, "value": contact_digest(lease.phone)},
+        ])
+        self._atomic(lease.phone, "quarantine_mutation", checks, writes)
+        raise ConversationMutationPending(FailureReason.MUTATION_PENDING)
+
+    def _snapshot(self, lease, *, operational=False):
         self.assert_owned(lease)
         keys = contact_keys(lease.phone)
         raw = self._get(keys.anchor)
@@ -402,9 +446,8 @@ class RedisConversationStore:
             anchor = ContactAnchor(value["contact_revision"], UUID(value["last_generation"]),
                                    entries, value["manifest_fingerprint"],
                                    tuple(UUID(g) for g in value["generation_history"]),
-                                   ConversationCycle(value["cycle"]))
+                                   ConversationCycle(value["cycle"]), value.get("mutation_fence"))
             if (type(anchor.contact_revision) is not int or anchor.contact_revision < 0
-                    or anchor.cycle is ConversationCycle.QUARANTINED
                     or anchor.last_generation not in anchor.generation_history
                     or len(set(anchor.generation_history)) != len(anchor.generation_history)
                     or len({(e.kind, e.id) for e in entries}) != len(entries)
@@ -414,6 +457,19 @@ class RedisConversationStore:
             self._atomic(lease.phone, "validate", checks, quarantine=True)
             raise AssertionError("unreachable")
         checks.append(self._check(keys.generation, _generation_control(anchor), "generation"))
+        fence = anchor.mutation_fence
+        if fence is not None:
+            try:
+                identity = self._attempt_id(fence["operation_id"])
+                entry = next(item for item in entries if item.kind == "mutation" and item.id == identity)
+                attempt = self._attempt_load(ContactDetail(entry, fence))
+                if attempt.phase not in (MutationPhase.PREPARED, MutationPhase.COMMITTING, MutationPhase.QUARANTINED):
+                    raise ValueError("invalid_value")
+            except (KeyError, TypeError, StopIteration, ValueError, ConversationStateUnavailable):
+                self._atomic(lease.phone, "validate", checks, quarantine=True)
+                raise AssertionError("unreachable")
+            if attempt.phase is MutationPhase.COMMITTING and self._now() >= attempt.processing_deadline:
+                self._compact_mutation_fence(lease, anchor, checks)
         details = []
         for entry in entries:
             key = self._detail_key(lease.phone, entry)
@@ -427,6 +483,8 @@ class RedisConversationStore:
                     raise ValueError("invalid_value")
                 details.append(ContactDetail(entry, data["body"], data["terminal"]))
             except (TypeError, KeyError, ValueError):
+                if fence is not None and fence["phase"] == MutationPhase.COMMITTING.value:
+                    self._compact_mutation_fence(lease, anchor, checks)
                 self._atomic(lease.phone, "validate", checks, quarantine=True)
                 raise AssertionError("unreachable")
             for flag in entry.index_flags:
@@ -434,6 +492,8 @@ class RedisConversationStore:
                                "member": self._member(lease.phone, entry), "value": 1,
                                "failure": "generation"})
         self._atomic(lease.phone, "validate", checks)
+        if anchor.cycle is ConversationCycle.QUARANTINED and not operational:
+            raise ConversationMutationPending(FailureReason.MUTATION_PENDING)
         return anchor, tuple(details), checks
 
     def initialize_contact(self, phone: str, lease: ContactLease | None = None,
@@ -479,9 +539,10 @@ class RedisConversationStore:
     def read_details(self, lease: ContactLease) -> tuple[ContactDetail, ...]:
         return self._snapshot(lease)[1]
 
-    def _transition(self, lease, expected, details, generation=None, operation="cas", extra=()):
+    def _transition(self, lease, expected, details, generation=None, operation="cas", extra=(),
+                    *, cycle=None, operational=False, deadline=None, mutation_fence=...):
         with self._lock:
-            anchor, previous, checks = self._snapshot(lease)
+            anchor, previous, checks = self._snapshot(lease, operational=operational)
             if (anchor.contact_revision != expected.contact_revision
                     or anchor.manifest_fingerprint != expected.manifest_fingerprint):
                 raise ConversationStateUnavailable(FailureReason.STATE_UNAVAILABLE)
@@ -505,7 +566,10 @@ class RedisConversationStore:
                 history += (generation,)
             updated = replace(anchor, contact_revision=anchor.contact_revision + 1,
                               last_generation=generation, manifest=entries,
-                              manifest_fingerprint=fingerprint, generation_history=history)
+                              manifest_fingerprint=fingerprint, generation_history=history,
+                              cycle=cycle or anchor.cycle)
+            if mutation_fence is not ...:
+                updated = replace(updated, mutation_fence=mutation_fence)
             writes = []
             for item in previous:
                 writes.append({"op": "DEL", "key": self._detail_key(lease.phone, item.entry)})
@@ -513,27 +577,39 @@ class RedisConversationStore:
                     writes.append({"op": "SREM", "key": INDEX_KEYS[flag],
                                    "value": self._member(lease.phone, item.entry)})
             for item in details:
+                durable_quarantine = (updated.cycle is ConversationCycle.QUARANTINED
+                                      and item.entry.kind == "mutation"
+                                      and item.body.get("phase") == MutationPhase.QUARANTINED.value)
                 horizon = item.entry.expected_until + timedelta(seconds=self.config.ttl_margin_seconds)
                 ttl = int((horizon - self._now()).total_seconds() * 1000)
-                if ttl <= 0:
+                if ttl <= 0 and not durable_quarantine:
                     raise ConversationStateUnavailable(FailureReason.INVALID_VALUE)
-                writes.append({"op": "SET", "key": self._detail_key(lease.phone, item.entry),
-                               "value": _json({"entry": _entry_data(item.entry),
-                                               "body": dict(item.body), "terminal": item.terminal}),
-                               "ttl": ttl})
+                write = {"op": "SET", "key": self._detail_key(lease.phone, item.entry),
+                         "value": _json({"entry": _entry_data(item.entry),
+                                         "body": dict(item.body), "terminal": item.terminal})}
+                if not durable_quarantine:
+                    write["ttl"] = ttl
+                writes.append(write)
                 for flag in item.entry.index_flags:
                     writes.append({"op": "SADD", "key": INDEX_KEYS[flag],
                                    "value": self._member(lease.phone, item.entry)})
             keys = contact_keys(lease.phone)
+            if updated.cycle is ConversationCycle.QUARANTINED:
+                writes.append({"op": "SADD", "key": QUARANTINE_INDEX_KEY,
+                               "value": contact_digest(lease.phone)})
+            elif operational:
+                writes.append({"op": "SREM", "key": QUARANTINE_INDEX_KEY,
+                               "value": contact_digest(lease.phone)})
             writes.extend([{"op": "SET", "key": keys.anchor, "value": _json(_anchor_data(updated))},
                            {"op": "SET", "key": keys.generation, "value": _generation_control(updated)}, *extra])
-            self._atomic(lease.phone, operation, checks, writes)
+            self._atomic(lease.phone, operation, checks, writes, deadline=deadline)
             return updated
 
     def compare_and_set(self, lease: ContactLease, expected: ContactAnchor,
-                        details: tuple[ContactDetail, ...], *, generation: UUID | None = None) -> ContactAnchor:
+                        details: tuple[ContactDetail, ...], *, generation: UUID | None = None,
+                        cycle: ConversationCycle | None = None) -> ContactAnchor:
         """Replace the complete detail set, fenced by the caller's anchor snapshot."""
-        return self._transition(lease, expected, details, generation)
+        return self._transition(lease, expected, details, generation, cycle=cycle)
 
     def cleanup(self, lease: ContactLease, expected: ContactAnchor) -> ContactAnchor:
         anchor, details, _ = self._snapshot(lease)
@@ -543,6 +619,187 @@ class RedisConversationStore:
         retained = tuple(item for item in details if not (
             item.terminal and self._now() >= item.entry.expected_until))
         return self._transition(lease, expected, retained) if len(retained) != len(details) else anchor
+
+    @staticmethod
+    def _attempt_id(operation_id: str) -> str:
+        if not isinstance(operation_id, str) or not operation_id:
+            raise ConversationStateUnavailable(FailureReason.INVALID_VALUE)
+        return hashlib.sha256(operation_id.encode()).hexdigest()
+
+    @staticmethod
+    def _attempt_data(attempt: MutationAttempt) -> dict:
+        return {"epoch": str(attempt.epoch), "operation_id": attempt.operation_id,
+                "kind": attempt.kind, "phase": attempt.phase.value,
+                "target_fingerprint": attempt.target_fingerprint,
+                "request_fingerprint": attempt.request_fingerprint,
+                "generation": str(attempt.generation), "prior_cycle": attempt.prior_cycle.value,
+                "target_cycle": attempt.target_cycle.value,
+                "processing_deadline": attempt.processing_deadline.isoformat(),
+                "expected_until": attempt.expected_until.isoformat(),
+                "owner_token_hash": attempt.owner_token_hash,
+                "paused_until": attempt.paused_until.isoformat() if attempt.paused_until else None,
+                "reason": attempt.reason}
+
+    def _attempt_load(self, item: ContactDetail) -> MutationAttempt:
+        try:
+            value = item.body
+            attempt = MutationAttempt(
+                UUID(value["epoch"]), value["operation_id"], value["kind"], MutationPhase(value["phase"]),
+                value["target_fingerprint"], value["request_fingerprint"], UUID(value["generation"]),
+                ConversationCycle(value["prior_cycle"]), ConversationCycle(value["target_cycle"]),
+                datetime.fromisoformat(value["processing_deadline"]), datetime.fromisoformat(value["expected_until"]),
+                value["owner_token_hash"], datetime.fromisoformat(value["paused_until"]) if value["paused_until"] else None,
+                value["reason"])
+            if (attempt.epoch != self.config.coordination_epoch
+                    or self._attempt_id(attempt.operation_id) != item.entry.id
+                    or attempt.processing_deadline.tzinfo is None or attempt.expected_until.tzinfo is None):
+                raise ValueError("invalid_value")
+            return attempt
+        except (KeyError, TypeError, ValueError, AttributeError):
+            raise ConversationStateUnavailable(FailureReason.STATE_UNAVAILABLE) from None
+
+    def _mutation_snapshot(self, phone, operation_id, lease, *, operational=False):
+        if lease.phone != phone:
+            raise ContactLeaseLost(FailureReason.CONTACT_LEASE_LOST)
+        anchor, details, _ = self._snapshot(lease, operational=operational)
+        identity = self._attempt_id(operation_id)
+        item = next((item for item in details if item.entry.kind == "mutation" and item.entry.id == identity), None)
+        return anchor, details, item, self._attempt_load(item) if item else None
+
+    def inspect_mutation(self, phone: str, operation_id: str, lease: ContactLease,
+                         *, operational: bool = False) -> MutationAttempt | None:
+        return self._mutation_snapshot(phone, operation_id, lease, operational=operational)[3]
+
+    def _write_attempt(self, lease, anchor, details, previous, attempt, operation,
+                       *, cycle=None, compact=False, operational=False, deadline=None):
+        entry = ManifestEntry("mutation", self._attempt_id(attempt.operation_id),
+                              previous.entry.version + 1 if previous else 1, attempt.expected_until)
+        updated = ContactDetail(entry, self._attempt_data(attempt),
+                                attempt.phase in (MutationPhase.COMMITTED, MutationPhase.ABORTED))
+        retained = () if compact else tuple(item for item in details if item != previous)
+        fence = self._attempt_data(replace(attempt, paused_until=None, reason=None)) if attempt.phase in (
+            MutationPhase.PREPARED, MutationPhase.COMMITTING, MutationPhase.QUARANTINED) else None
+        self._transition(lease, anchor, (*retained, updated), attempt.generation,
+                         operation=operation, cycle=cycle, operational=operational,
+                         deadline=deadline, mutation_fence=fence)
+        return attempt
+
+    def assert_mutation_available(self, lease: ContactLease, now: datetime) -> None:
+        _, details, _ = self._snapshot(lease)
+        for item in details:
+            if item.entry.kind != "mutation":
+                continue
+            attempt = self._attempt_load(item)
+            if attempt.phase is MutationPhase.COMMITTING and self._now() >= attempt.processing_deadline:
+                self.quarantine_ambiguous_commit(lease.phone, attempt.operation_id, lease, now)
+            if attempt.phase in (MutationPhase.PREPARED, MutationPhase.COMMITTING, MutationPhase.QUARANTINED):
+                raise ConversationMutationPending(FailureReason.MUTATION_PENDING)
+
+    def prepare_mutation(self, phone: str, kind: str, target_fingerprint: str,
+                         lease: ContactLease, operation_id: str, now: datetime,
+                         *, target: MutationTarget) -> MutationAttempt:
+        with self._lock:
+            anchor, details, previous, attempt = self._mutation_snapshot(phone, operation_id, lease)
+            self.assert_mutation_available(lease, now)
+            if target.kind != kind or target.fingerprint != target_fingerprint:
+                raise ConversationStateUnavailable(FailureReason.INVALID_VALUE)
+            if attempt is not None:
+                if (attempt.request_fingerprint != target.request_fingerprint
+                        or attempt.target_fingerprint != target_fingerprint):
+                    raise ConversationStateUnavailable(FailureReason.INVALID_VALUE)
+                if attempt.phase is MutationPhase.COMMITTED:
+                    return attempt
+                raise ConversationMutationPending(FailureReason.MUTATION_PENDING)
+            now = self._now()
+            attempt = MutationAttempt(
+                self.config.coordination_epoch, operation_id, kind, MutationPhase.PREPARED,
+                target_fingerprint, target.request_fingerprint,
+                uuid4() if target.rotate_generation else anchor.last_generation,
+                anchor.cycle, target.cycle, now + timedelta(seconds=self.config.processing_retry_seconds),
+                now + timedelta(seconds=self.config.replay_window_seconds),
+                hashlib.sha256(lease.owner_token.encode()).hexdigest(), target.paused_until, target.reason)
+            return self._write_attempt(lease, anchor, details, previous, attempt,
+                                       "prepare_mutation", cycle=ConversationCycle.MUTATING)
+
+    def enter_committing(self, phone: str, operation_id: str, lease: ContactLease,
+                         now: datetime, processing_deadline: datetime) -> MutationAttempt:
+        with self._lock:
+            anchor, details, item, attempt = self._mutation_snapshot(phone, operation_id, lease)
+            if (attempt is None or attempt.phase is not MutationPhase.PREPARED
+                    or attempt.owner_token_hash != hashlib.sha256(lease.owner_token.encode()).hexdigest()
+                    or processing_deadline != attempt.processing_deadline
+                    or self._now() >= processing_deadline):
+                raise ConversationMutationPending(FailureReason.MUTATION_PENDING)
+            return self._write_attempt(lease, anchor, details, item,
+                                       replace(attempt, phase=MutationPhase.COMMITTING),
+                                       "enter_committing", cycle=ConversationCycle.MUTATING,
+                                       deadline=processing_deadline)
+
+    def preserve_or_abort_prepared(self, phone: str, operation_id: str,
+                                  lease: ContactLease, now: datetime) -> None:
+        """Called only after local rollback returned and commit never began."""
+        with self._lock:
+            anchor, details, item, attempt = self._mutation_snapshot(phone, operation_id, lease)
+            if attempt is None or attempt.phase is not MutationPhase.PREPARED:
+                return
+            if attempt.owner_token_hash != hashlib.sha256(lease.owner_token.encode()).hexdigest():
+                return
+            self._write_attempt(lease, anchor, details, item, replace(attempt, phase=MutationPhase.ABORTED),
+                                "abort_prepared", cycle=attempt.prior_cycle)
+
+    def restore_prepared_after_rollback(self, phone: str, operation_id: str, lease: ContactLease,
+                                        now: datetime, *, proof: DefinitiveRollbackProof) -> None:
+        """A consumed same-process receipt proves SQL commit was never invoked."""
+        if not _consume_rollback_proof(proof, operation_id, lease):
+            raise ConversationStateUnavailable(FailureReason.INVALID_VALUE)
+        with self._lock:
+            anchor, details, item, attempt = self._mutation_snapshot(phone, operation_id, lease)
+            if attempt is None or attempt.owner_token_hash != proof.owner_token_hash:
+                raise ConversationMutationPending(FailureReason.MUTATION_PENDING)
+            if attempt.phase is MutationPhase.PREPARED:
+                return
+            if attempt.phase is not MutationPhase.COMMITTING:
+                raise ConversationMutationPending(FailureReason.MUTATION_PENDING)
+            self._write_attempt(lease, anchor, details, item, replace(attempt, phase=MutationPhase.PREPARED),
+                                "restore_prepared", cycle=ConversationCycle.MUTATING)
+
+    def quarantine_ambiguous_commit(self, phone: str, operation_id: str,
+                                    lease: ContactLease, now: datetime) -> MutationAttempt:
+        with self._lock:
+            anchor, details, item, attempt = self._mutation_snapshot(phone, operation_id, lease)
+            if attempt is None or attempt.phase is not MutationPhase.COMMITTING:
+                raise ConversationMutationPending(FailureReason.MUTATION_PENDING)
+            compact = replace(attempt, phase=MutationPhase.QUARANTINED, paused_until=None, reason=None)
+            return self._write_attempt(lease, anchor, details, item, compact,
+                                       "quarantine_mutation", cycle=ConversationCycle.QUARANTINED, compact=True)
+
+    def finalize_committed(self, phone: str, operation_id: str, lease: ContactLease,
+                           now: datetime) -> MutationAttempt:
+        with self._lock:
+            anchor, details, item, attempt = self._mutation_snapshot(phone, operation_id, lease)
+            if (attempt is None or attempt.phase is not MutationPhase.COMMITTING
+                    or attempt.owner_token_hash != hashlib.sha256(lease.owner_token.encode()).hexdigest()):
+                raise ConversationMutationPending(FailureReason.MUTATION_PENDING)
+            return self._write_attempt(lease, anchor, details, item, replace(attempt, phase=MutationPhase.COMMITTED),
+                                       "finalize_committed", cycle=attempt.target_cycle)
+
+    def resolve_quarantined_mutation(self, phone: str, operation_id: str, epoch: UUID,
+                                     lease: ContactLease, now: datetime, *, quiescent: bool,
+                                     outcome: MutationPhase) -> MutationAttempt:
+        """Operational assertion of external SQL proof; never called by reads/workers."""
+        if (quiescent is not True or epoch != self.config.coordination_epoch
+                or outcome not in (MutationPhase.COMMITTED, MutationPhase.ABORTED)):
+            raise ConversationStateUnavailable(FailureReason.INVALID_VALUE)
+        with self._lock:
+            anchor, details, item, attempt = self._mutation_snapshot(phone, operation_id, lease, operational=True)
+            if (attempt is None or attempt.epoch != epoch or attempt.operation_id != operation_id
+                    or attempt.phase is not MutationPhase.QUARANTINED or anchor.cycle is not ConversationCycle.QUARANTINED):
+                raise ConversationStateUnavailable(FailureReason.INVALID_VALUE)
+            resolved = replace(attempt, phase=outcome,
+                               expected_until=self._now() + timedelta(seconds=self.config.replay_window_seconds))
+            return self._write_attempt(lease, anchor, details, item, resolved, "resolve_quarantine",
+                                       cycle=attempt.target_cycle if outcome is MutationPhase.COMMITTED else attempt.prior_cycle,
+                                       operational=True)
 
     def renew_lease(self, lease: ContactLease) -> None:
         try:

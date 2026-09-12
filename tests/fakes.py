@@ -48,6 +48,8 @@ class ScriptRedis:
         self.global_epoch_writes = 0
         self.denied_commands = set()
         self.acl_check_available = True
+        self.before_operation = {}
+        self.after_operation = {}
 
     def _acl_command(self, command, key):
         if (command, key) in self.denied_commands:
@@ -99,6 +101,9 @@ class ScriptRedis:
         with self.lock:
             if not self.acl_check_available:
                 return "unavailable"
+            operation_hook = self.before_operation.pop(plan["operation"], None)
+            if operation_hook is not None:
+                operation_hook()
             if self.before_atomic is not None:
                 hook, self.before_atomic = self.before_atomic, None
                 hook()
@@ -161,6 +166,8 @@ class ScriptRedis:
                     return quarantine() if check["failure"] == "generation" else check["failure"]
             if plan["quarantine"]:
                 return quarantine()
+            if "deadline_us" in plan and int(self.clock.now().timestamp() * 1000000) >= plan["deadline_us"]:
+                return "pending"
             for write in plan["writes"]:
                 target, op = key(write), write["op"]
                 self._acl_command("SET" if op == "ACQUIRE" else op, target)
@@ -189,6 +196,9 @@ class ScriptRedis:
                         self.sets.pop(target, None)
                 else:
                     raise ValueError("unsupported operation")
+            operation_hook = self.after_operation.pop(plan["operation"], None)
+            if operation_hook is not None:
+                operation_hook()
             return "ok"
 
 
@@ -319,3 +329,38 @@ class ControlledWait:
                     return
                 self.condition.wait(timeout=0.01)
         raise AssertionError("heartbeat did not finish its controlled iteration")
+
+
+class BarrierSession:
+    """Real in-memory SQL session with deterministic transaction boundaries."""
+    def __init__(self, session):
+        assert session.get_bind().url.database in (None, "", ":memory:")
+        self.session = session
+        self.hooks = {}
+        self.events = []
+
+    def __getattr__(self, name):
+        return getattr(self.session, name)
+
+    def _at(self, boundary):
+        self.events.append(boundary)
+        hook = self.hooks.pop(boundary, None)
+        if hook is not None:
+            hook()
+
+    def flush(self):
+        self.session.flush()
+        self._at("flush")
+
+    def execute(self, statement, *args, **kwargs):
+        self._at("execute")
+        return self.session.execute(statement, *args, **kwargs)
+
+    def commit(self):
+        self._at("commit_entered")
+        self.session.commit()
+        self._at("commit_returned")
+
+    def rollback(self):
+        self.session.rollback()
+        self._at("rollback")
