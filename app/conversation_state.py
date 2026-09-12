@@ -323,7 +323,7 @@ class ConversationConfig:
 
         lease_ttl = durations["contact_lease_ttl_seconds"]
         heartbeat = durations["contact_lease_heartbeat_seconds"]
-        if lease_ttl is not None and heartbeat is not None and heartbeat > lease_ttl / 3:
+        if lease_ttl is not None and heartbeat is not None and heartbeat * 3 > lease_ttl:
             issues.append(ConfigurationIssue.HEARTBEAT_EXCEEDS_LEASE_LIMIT)
 
         claim_ttl = durations["claim_ttl_seconds"]
@@ -356,12 +356,13 @@ MAX_MANUAL_PAUSE = timedelta(days=365)
 def validate_manual_pause_hours(value: object) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise InvalidManualPauseDuration("invalid_type")
-    hours = float(value)
-    if not math.isfinite(hours) or hours <= 0:
+    if isinstance(value, float) and not math.isfinite(value):
         raise InvalidManualPauseDuration("invalid_value")
-    if hours > MAX_MANUAL_PAUSE.total_seconds() / 3600:
+    if value <= 0:
+        raise InvalidManualPauseDuration("invalid_value")
+    if value > MAX_MANUAL_PAUSE.total_seconds() / 3600:
         raise InvalidManualPauseDuration("above_maximum")
-    return hours
+    return float(value)
 
 
 def manual_pause_deadline(now: datetime, hours: object) -> datetime:

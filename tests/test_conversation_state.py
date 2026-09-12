@@ -83,6 +83,14 @@ def test_manual_pause_hours_accepts_exact_maximum_and_rejects_above_it():
     assert raised.value.reason_code is FailureReason.ABOVE_MAXIMUM
 
 
+def test_manual_pause_rejects_huge_integer_with_enumerated_reason():
+    """Catches integer-to-float overflow escaping the domain exception contract."""
+    with pytest.raises(InvalidManualPauseDuration) as raised:
+        validate_manual_pause_hours(10 ** 400)
+
+    assert raised.value.reason_code is FailureReason.ABOVE_MAXIMUM
+
+
 def test_manual_pause_accepts_exact_maximum_and_rejects_later_deadline():
     """Catches an off-by-one error at the 365-day safety boundary."""
     now = datetime(2026, 9, 12, 12, tzinfo=timezone.utc)
@@ -163,6 +171,62 @@ def test_valid_conversation_configuration_has_typed_values_and_no_issues():
     assert config.batch_recovery_interval_seconds == 20
     assert config.redis_expected_run_id == "synthetic-run-id"
     assert config.issues == ()
+
+
+@pytest.mark.parametrize(
+    ("name", "attribute", "expected_issue"),
+    [
+        ("CONTACT_LEASE_TTL_SECONDS", "contact_lease_ttl_seconds", ConfigurationIssue.INVALID_CONTACT_LEASE_TTL),
+        (
+            "CONTACT_LEASE_HEARTBEAT_SECONDS",
+            "contact_lease_heartbeat_seconds",
+            ConfigurationIssue.INVALID_CONTACT_LEASE_HEARTBEAT,
+        ),
+        ("CLAIM_TTL_SECONDS", "claim_ttl_seconds", ConfigurationIssue.INVALID_CLAIM_TTL),
+        ("DISPATCH_RETRY_SECONDS", "dispatch_retry_seconds", ConfigurationIssue.INVALID_DISPATCH_RETRY),
+        ("PROCESSING_RETRY_SECONDS", "processing_retry_seconds", ConfigurationIssue.INVALID_PROCESSING_RETRY),
+        (
+            "ENQUEUE_VISIBILITY_SECONDS",
+            "enqueue_visibility_seconds",
+            ConfigurationIssue.INVALID_ENQUEUE_VISIBILITY,
+        ),
+        ("ENQUEUE_BACKOFF_SECONDS", "enqueue_backoff_seconds", ConfigurationIssue.INVALID_ENQUEUE_BACKOFF),
+        ("REPLAY_WINDOW_SECONDS", "replay_window_seconds", ConfigurationIssue.INVALID_REPLAY_WINDOW),
+        ("TTL_MARGIN_SECONDS", "ttl_margin_seconds", ConfigurationIssue.INVALID_TTL_MARGIN),
+        (
+            "BATCH_RECOVERY_INTERVAL_SECONDS",
+            "batch_recovery_interval_seconds",
+            ConfigurationIssue.INVALID_BATCH_RECOVERY_INTERVAL,
+        ),
+    ],
+)
+def test_malformed_duration_becomes_enumerated_configuration_issue(
+    name, attribute, expected_issue
+):
+    """Catches numeric parsing errors bypassing fail-closed configuration reporting."""
+    environment = _valid_environment()
+    malformed = "synthetic-malformed-duration"
+    environment[name] = malformed
+
+    settings = Settings(environment)
+    config = ConversationConfig.from_settings(settings)
+
+    assert getattr(config, attribute) is None
+    assert expected_issue in config.issues
+    assert malformed not in repr(settings.__dict__)
+    assert malformed not in repr(config)
+
+
+def test_large_integer_lease_relationship_is_checked_without_float_conversion():
+    """Catches overflow while validating heartbeat against a huge lease TTL."""
+    environment = _valid_environment()
+    huge_duration = "1" + ("0" * 400)
+    environment["CONTACT_LEASE_TTL_SECONDS"] = huge_duration
+    environment["CONTACT_LEASE_HEARTBEAT_SECONDS"] = huge_duration
+
+    config = ConversationConfig.from_settings(Settings(environment))
+
+    assert ConfigurationIssue.HEARTBEAT_EXCEEDS_LEASE_LIMIT in config.issues
 
 
 @pytest.mark.parametrize(

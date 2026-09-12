@@ -40,7 +40,10 @@ def _optional_positive_int(environ, name):
     raw = environ.get(name)
     if raw is None:
         return None
-    value = int(raw)
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return None
     return value if value > 0 else None
 
 
