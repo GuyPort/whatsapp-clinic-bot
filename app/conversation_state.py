@@ -188,6 +188,10 @@ class ConversationGenerationUnavailable(ConversationDomainError):
     pass
 
 
+class ConversationCoordinationAbsent(ConversationGenerationUnavailable):
+    """Affirmative clean absence: no contact anchor and no coordination remnants."""
+
+
 class ConversationMutationPending(ConversationDomainError):
     pass
 
@@ -812,14 +816,13 @@ class ConversationCoordinator:
         """One typed interpretation for both the SQL-free probe and full ingress."""
         if identity.phone != lease.phone:
             raise ContactLeaseLost(FailureReason.CONTACT_LEASE_LOST)
-        if identity.message_id is None:
-            return None
         try:
             details = self.store.read_details(lease)
-        except ConversationGenerationUnavailable:
-            # A missing snapshot proves no terminal receipt. The full ingress
-            # path must still validate SQL presence and the anchor before any
-            # effect; it cannot treat this probe as initialization permission.
+        except ConversationCoordinationAbsent:
+            # Only affirmative clean absence is optional. Initialization still
+            # requires SQL presence checks; corruption must never cross SQL.
+            return None
+        if identity.message_id is None:
             return None
         digest = hashlib.sha256(identity.message_id.encode()).hexdigest()
         previous = next((item for item in details if item.entry.kind == "dedupe"

@@ -21,7 +21,7 @@ from uuid import UUID, uuid4
 from app.conversation_state import (
     ContactAnchor, ContactDetail, ContactLease, ContactLeaseLost,
     ContactLockUnavailable, ConversationConfig, ConversationCycle,
-    ConversationGenerationUnavailable, ConversationStateUnavailable,
+    ConversationGenerationUnavailable, ConversationCoordinationAbsent, ConversationStateUnavailable,
     DependencyName, DependencyStatus, FailureReason, InvalidCanonicalContact,
     ManifestEntry, ReadinessReport, ReadinessUnavailable,
     MutationAttempt, MutationTarget, MutationPhase, ConversationMutationPending,
@@ -495,8 +495,9 @@ class RedisConversationStore:
         raw = self._get(keys.anchor)
         checks = [self._lease_check(lease), self._check(keys.anchor, raw)]
         if raw is None:
-            if self._has_remnants(lease.phone):
-                self._atomic(lease.phone, "validate", checks, quarantine=True)
+            if not self._has_remnants(lease.phone):
+                raise ConversationCoordinationAbsent(FailureReason.GENERATION_UNAVAILABLE)
+            self._atomic(lease.phone, "validate", checks, quarantine=True)
             raise ConversationGenerationUnavailable(FailureReason.GENERATION_UNAVAILABLE)
         try:
             value = json.loads(raw)

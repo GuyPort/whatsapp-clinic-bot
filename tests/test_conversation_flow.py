@@ -269,6 +269,101 @@ def test_webhook_invalid_retained_receipt_fails_closed_before_sql_or_dispatch(
         assert ingress_runtime.store.client.operation_calls.get(operation, 0) == before_operations.get(operation, 0)
 
 
+@pytest.mark.parametrize("corruption,value", [
+    ("batch_id", "invalid-batch-id"), ("batch_id", None), ("batch_id", 123), ("batch_id", []),
+    ("anchor_missing", None), ("anchor_malformed", None), ("detail_malformed", None),
+    ("batch_relation", None),
+])
+@pytest.mark.parametrize("bypass_shortcut", [False, True])
+@pytest.mark.parametrize("without_message_id", [False, True])
+def test_webhook_snapshot_corruption_is_not_clean_absence_before_sql(
+        main_module, ingress_runtime, session_factory, monkeypatch, corruption, value, bypass_shortcut, without_message_id):
+    from dataclasses import replace
+    from sqlalchemy import event
+    from app.conversation_redis import contact_keys
+
+    ingress_runtime.processing_broker.next_result = domain.EnqueueResult.AMBIGUOUS
+    assert webhook(main_module).status_code == 503
+    command = ingress_runtime.processing_broker.calls[0]
+    with ingress_runtime.store.contact_lease(PHONE) as lease:
+        assert ingress_runtime.store.dispatch(command, lease).phase is domain.DispatchPhase.PENDING
+        anchor = ingress_runtime.store.read_anchor(lease)
+        details = ingress_runtime.store.read_details(lease)
+        if corruption == "batch_id":
+            altered = tuple(replace(item, entry=replace(item.entry, version=item.entry.version + 1),
+                                    body={**item.body, "batch_id": value})
+                            if item.entry.kind == "dedupe" else item for item in details)
+            ingress_runtime.store.compare_and_set(lease, anchor, altered)
+        elif corruption == "batch_relation":
+            ingress_runtime.store.compare_and_set(lease, anchor, tuple(item for item in details if item.entry.kind != "buffer"))
+        elif corruption == "anchor_missing":
+            ingress_runtime.store.client.values.pop(contact_keys(PHONE).anchor)
+        elif corruption == "anchor_malformed":
+            ingress_runtime.store.client.values[contact_keys(PHONE).anchor] = "[]"
+        else:
+            receipt = next(item for item in details if item.entry.kind == "dedupe")
+            ingress_runtime.store.client.values[ingress_runtime.store._detail_key(PHONE, receipt.entry)] = "not-json"
+    if bypass_shortcut:
+        monkeypatch.setattr(ingress_runtime.coordinator, "is_terminal_ingress", lambda *args: False)
+    sessions, leases = ingress_runtime.session_calls, ingress_runtime.lease_calls
+    operations = dict(ingress_runtime.store.client.operation_calls)
+    sql_calls = []
+    def record_sql(*args, **kwargs):
+        sql_calls.append("statement")
+    def forbidden_sql_effect(*args, **kwargs):
+        sql_calls.append("flush_or_commit")
+        raise AssertionError("corruption reached a SQL effect")
+    monkeypatch.setattr(Session, "flush", forbidden_sql_effect)
+    monkeypatch.setattr(Session, "commit", forbidden_sql_effect)
+    engine = session_factory.kw["bind"]
+    event.listen(engine, "before_cursor_execute", record_sql)
+    try:
+        response = webhook(main_module, message_id=None if without_message_id else "synthetic-message-id")
+    finally:
+        event.remove(engine, "before_cursor_execute", record_sql)
+
+    assert response.status_code == 503
+    assert json.loads(response.body) == {"status": "temporarily_unavailable"}
+    assert ingress_runtime.session_calls == sessions + int(bypass_shortcut)
+    assert sql_calls == []
+    assert ingress_runtime.lease_calls == leases + 1
+    assert ingress_runtime.processing_broker.calls == [command]
+    assert ingress_runtime.store.is_quarantined(PHONE)
+    for operation in ("initialize", "finalize_ingress_once", "reserve_enqueue", "prepare_mutation"):
+        assert ingress_runtime.store.client.operation_calls.get(operation, 0) == operations.get(operation, 0)
+
+
+def test_webhook_virgin_clean_absence_keeps_sql_backed_initialization(main_module, ingress_runtime, session_factory):
+    from sqlalchemy import event
+
+    before = ingress_runtime.store.snapshot()
+    with ingress_runtime.store.contact_lease(PHONE) as lease:
+        with pytest.raises(domain.ConversationGenerationUnavailable) as caught:
+            ingress_runtime.store.read_details(lease)
+        assert caught.value.reason_code is domain.FailureReason.GENERATION_UNAVAILABLE
+        assert isinstance(caught.value, domain.ConversationCoordinationAbsent)
+    assert ingress_runtime.store.snapshot() == before
+    assert not ingress_runtime.store.is_quarantined(PHONE)
+    sessions, leases = ingress_runtime.session_calls, ingress_runtime.lease_calls
+    sql_calls = []
+    def record_sql(connection, cursor, statement, *args):
+        sql_calls.append(statement.split(None, 1)[0])
+    engine = session_factory.kw["bind"]
+    event.listen(engine, "before_cursor_execute", record_sql)
+    try:
+        response = webhook(main_module)
+    finally:
+        event.remove(engine, "before_cursor_execute", record_sql)
+    assert response.status_code == 200
+    assert json.loads(response.body) == {"status": "buffered"}
+    assert ingress_runtime.session_calls == sessions + 1
+    assert ingress_runtime.lease_calls == leases + 1
+    assert "SELECT" in sql_calls
+    assert ingress_runtime.store.client.operation_calls["initialize"] == 1
+    assert len(ingress_runtime.processing_broker.calls) == 1
+    assert len(ingress_runtime.envelopes()) == 1
+
+
 def test_webhook_replay_after_dispatch_deadline_is_terminal_without_rebuffer(main_module, ingress_runtime):
     assert webhook(main_module).status_code == 200
     ingress_runtime.clock.advance(timedelta(seconds=900))
@@ -474,8 +569,10 @@ def test_webhook_terminal_replay_does_not_bypass_invalid_coordination(main_modul
         ingress_runtime.store.delete_detail(PHONE, receipt.entry)
     else:
         ingress_runtime.store.corrupt_contact(PHONE, fault)
+    sessions = ingress_runtime.session_calls
     response = webhook(main_module, from_me=True)
     assert response.status_code == 503
+    assert ingress_runtime.session_calls == sessions
     assert ingress_runtime.processing_broker.calls == []
 
 
