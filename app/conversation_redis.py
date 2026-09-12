@@ -1,6 +1,6 @@
 """Fenced coordination primitives. Construction never connects or reads settings.
 
-The injected synchronous Redis client implements ping/info/get/sismember/scan_iter/sscan_iter/
+The injected synchronous Redis client implements ping/info/get/sismember/scan_iter/sscan/sscan_iter/
 eval. This keyspace targets a single Redis primary (not Redis Cluster). Only the
 atomic script writes Redis; it checks snapshots before applying a command batch.
 """
@@ -8,6 +8,7 @@ atomic script writes Redis; it checks snapshots before applying a command batch.
 from __future__ import annotations
 
 import hashlib
+import base64
 import json
 import re
 from contextlib import contextmanager
@@ -28,7 +29,7 @@ from app.conversation_state import (
     DefinitiveRollbackProof, _consume_rollback_proof,
     InboundEnvelope, IngressReceipt, IngressDisposition, ProcessingCommand,
     BufferDispatch, DispatchPhase, ProcessingAttempt, ProcessingPhase, ConversationDomainError,
-    BatchClaim, ClaimOutcome, AgentResult, AgentIntent, EnqueueResult,
+    BatchClaim, ClaimOutcome, AgentResult, AgentIntent, EnqueueResult, RecoveryPage,
     EnsureConsumerResult, BrokerUnavailable,
 )
 from app.utils import normalize_phone
@@ -432,7 +433,8 @@ class RedisConversationStore:
         entry = replace(prior, version=prior.version + 1, index_flags=())
         receipts = []
         for candidate in anchor.manifest:
-            if candidate == prior or candidate.kind not in ("mutation", "dedupe") or self._now() >= candidate.expected_until:
+            if (candidate == prior or candidate.kind not in ("mutation", "dedupe")
+                    or (candidate.kind == "mutation" and self._now() >= candidate.expected_until)):
                 continue
             key = self._detail_key(lease.phone, candidate)
             raw = self._get(key)
@@ -440,11 +442,11 @@ class RedisConversationStore:
             try:
                 value = json.loads(raw)
                 detail = ContactDetail(candidate, value["body"], value["terminal"])
-                if candidate.kind == "dedupe" and detail.body.get("operation_id") == body["operation_id"]:
-                    detail = self._changed(detail, body={**detail.body, "disposition": None}, terminal=False)
-                if value["entry"] != _entry_data(candidate) or not self._is_replay_receipt(detail):
+                if value["entry"] != _entry_data(candidate):
                     raise ValueError("invalid_value")
-                receipts.append(detail)
+                receipt = self._quarantine_replay_receipt(detail, body["operation_id"])
+                if receipt is not None:
+                    receipts.append(receipt)
             except (KeyError, TypeError, ValueError, ConversationStateUnavailable):
                 self._atomic(lease.phone, "validate", checks, quarantine=True)
         entries = tuple(sorted((entry, *(item.entry for item in receipts)), key=lambda item: (item.kind, item.id)))
@@ -734,8 +736,13 @@ class RedisConversationStore:
         if (anchor.contact_revision, anchor.manifest_fingerprint) != (
                 expected.contact_revision, expected.manifest_fingerprint):
             raise ConversationStateUnavailable(FailureReason.STATE_UNAVAILABLE)
+        required_operations = {self._attempt_id(item.body["operation_id"]) for item in details
+                               if item.entry.kind == "batch" and not item.terminal
+                               and item.body.get("phase") == DispatchPhase.STAGED.value
+                               and item.body.get("operation_id") is not None}
         retained = tuple(item for item in details if not (
-            item.terminal and self._now() >= item.entry.expected_until))
+            item.terminal and self._now() >= item.entry.expected_until
+            and not (item.entry.kind == "mutation" and item.entry.id in required_operations)))
         return self._transition(lease, expected, retained) if len(retained) != len(details) else anchor
 
     @staticmethod
@@ -1094,7 +1101,8 @@ class RedisConversationStore:
                 raise ConversationMutationPending(FailureReason.MUTATION_PENDING)
             staging = self._find(details, "staging", command.batch_id)
             changed = self._changed(staging, body={**staging.body, "result": self._result_data(result)})
-            ready = self._changed(processing, body={**processing.body, "phase": "RESULT_READY"})
+            ready = self._changed(processing, body={**processing.body, "phase": "RESULT_READY",
+                                   "result_fingerprint": hashlib.sha256(_json(self._result_data(result)).encode()).hexdigest()})
             self._transition(lease, anchor, self._replace_details(details, changed, ready), operation="stage_agent_result",
                              deadline=deadline, deadline_transition=self._terminal_plan(anchor, details, batch))
 
@@ -1110,18 +1118,28 @@ class RedisConversationStore:
             if any(item.entry.kind == "processing" and item.body.get("schema") == "batch_v1" and not item.terminal for item in details):
                 raise ConversationMutationPending(FailureReason.MUTATION_PENDING)
             return
-        if processing.terminal:
-            return  # The coordinator validates the terminal mutation's request hash.
+        batch = self._find(details, "batch", processing.body["batch_id"])
+        mutation = self._find(details, "mutation", self._attempt_id(operation_id))
         if (processing.body["operation_id"] != operation_id
                 or processing.body["phase"] not in ("RESULT_READY", "APPLYING", "DONE")
-                or processing.body["owner_token_hash"] != hashlib.sha256(lease.owner_token.encode()).hexdigest()):
+                or batch is None or batch.body["processing_id"] != processing_id
+                or batch.body["operation_id"] != operation_id
+                or batch.body["generation"] != processing.body["generation"]
+                or batch.body["epoch"] != processing.body["epoch"]
+                or processing.body["epoch"] != str(self.config.coordination_epoch)
+                or processing.body.get("result_fingerprint") != hashlib.sha256(_json(self._result_data(result)).encode()).hexdigest()):
             raise ConversationMutationPending(FailureReason.MUTATION_PENDING)
-        batch = self._find(details, "batch", processing.body["batch_id"])
+        if processing.terminal:
+            if (not batch.terminal or mutation is None
+                    or self._attempt_load(mutation).phase not in (MutationPhase.COMMITTED, MutationPhase.ABORTED)):
+                raise ConversationMutationPending(FailureReason.MUTATION_PENDING)
+            return  # Only the exact corresponding terminal operation can reconcile.
+        if processing.body["owner_token_hash"] != hashlib.sha256(lease.owner_token.encode()).hexdigest():
+            raise ConversationMutationPending(FailureReason.MUTATION_PENDING)
         staging = self._find(details, "staging", processing.body["batch_id"])
         if (not self._compatible_generation(anchor, details, batch)
                 or staging.body.get("result") != self._result_data(result)):
             raise ConversationMutationPending(FailureReason.MUTATION_PENDING)
-        mutation = self._find(details, "mutation", self._attempt_id(operation_id))
         committed = mutation and self._attempt_load(mutation).phase is MutationPhase.COMMITTED
         if self._now() >= self._date(processing.body["processing_deadline"]) and not committed:
             self.exhaust_batch(self._command_for(phone, batch), self._now(), lease)
@@ -1140,38 +1158,101 @@ class RedisConversationStore:
                 raise ConversationMutationPending(FailureReason.MUTATION_PENDING)
             self._transition(lease, anchor, operation="complete_batch", **self._terminal_plan(anchor, details, batch, processed=True))
 
-    def recoverable_batches(self, limit=100):
-        """Bounded index read returns metadata only; the caller then acquires leases."""
+    @staticmethod
+    def _recovery_cursor(state):
+        if state is None:
+            return None
+        return "r1." + base64.urlsafe_b64encode(_json(list(state)).encode()).decode().rstrip("=")
+
+    @staticmethod
+    def _read_recovery_cursor(cursor):
+        if cursor is None:
+            return 0, 0, 0, 0, 0
+        try:
+            if not isinstance(cursor, str) or len(cursor) > 128 or not cursor.startswith("r1."):
+                raise ValueError
+            encoded = cursor[3:]
+            state = json.loads(base64.b64decode(encoded + "=" * (-len(encoded) % 4), altchars=b"-_", validate=True))
+            if (not isinstance(state, list) or len(state) != 5
+                    or any(type(value) is not int for value in state)
+                    or state[0] not in (0, 1)
+                    or any(not -1 <= state[position] < 2 ** 64 for position in (1, 3))
+                    or any(not 0 <= state[position] < 2 ** 63 for position in (2, 4))
+                    or any(state[position] == -1 and state[position + 1] != 0 for position in (1, 3))
+                    or state[1 + 2 * state[0]] == -1):
+                raise ValueError
+            return tuple(state)
+        except (ValueError, TypeError, UnicodeError):
+            raise ConversationStateUnavailable(FailureReason.INVALID_VALUE) from None
+
+    def recoverable_batches(self, limit=100, *, cursor=None):
+        """Metadata pages with explicit, stateless continuation across both indexes.
+
+        Task 9 starts at None and follows next_cursor, including empty pages and
+        NOT_DUE items. The cursor encodes only the next index and scan/offset
+        positions for each index; pages alternate between unfinished indexes. A fixed
+        SSCAN COUNT lets small output pages resume within an oversized Redis chunk.
+        Redis may repeat members during concurrent changes; normal lease/CAS and
+        enqueue reservations still fence every effect. No cursor is kept locally.
+        """
         self._ready()
         if type(limit) is not int or not 1 <= limit <= 1000:
             raise ConversationStateUnavailable(FailureReason.INVALID_VALUE)
+        state = self._read_recovery_cursor(cursor)
+        turn = state[0]
+        positions = [(state[1], state[2]), (state[3], state[4])]
         commands, seen = [], set()
         try:
-            for index in (DISPATCH_INDEX_KEY, STAGING_INDEX_KEY):
-                for raw_member in self.client.sscan_iter(index, match="*"):
+            examined = 0
+            # At most one chunk per index per page, including an empty first index.
+            for _ in range(2):
+                index = turn
+                scan, offset = positions[index]
+                following, members = self.client.sscan((DISPATCH_INDEX_KEY, STAGING_INDEX_KEY)[index], cursor=scan, count=100)
+                if type(following) is not int or not 0 <= following < 2 ** 64 or not isinstance(members, (list, tuple)):
+                    raise ValueError
+                position = min(offset, len(members))
+                for raw_member in members[position:]:
+                    position += 1
+                    examined += 1
                     digest, kind, identity = _text(raw_member).split(":")
-                    if kind != "batch" or (digest, identity) in seen:
-                        continue
-                    seen.add((digest, identity))
-                    key = f"conversation:contact:{digest}:batch:{identity}"
-                    raw = self._get(key)
-                    if raw is None:
-                        raise ConversationGenerationUnavailable(FailureReason.GENERATION_UNAVAILABLE)
-                    value = json.loads(raw)
-                    body = value["body"]
-                    if contact_digest(body["phone"]) != digest or body["epoch"] != str(self.config.coordination_epoch):
-                        raise ConversationGenerationUnavailable(FailureReason.GENERATION_UNAVAILABLE)
-                    commands.append(ProcessingCommand(body["phone"], identity, body["epoch"], body["generation"],
-                                                       body["processing_id"], body["operation_id"]))
-                    if len(commands) >= limit:
-                        return tuple(commands)
+                    if kind == "batch" and (digest, identity) not in seen:
+                        seen.add((digest, identity))
+                        key = f"conversation:contact:{digest}:batch:{identity}"
+                        raw = self._get(key)
+                        if raw is None:
+                            raise ConversationGenerationUnavailable(FailureReason.GENERATION_UNAVAILABLE)
+                        body = json.loads(raw)["body"]
+                        if contact_digest(body["phone"]) != digest or body["epoch"] != str(self.config.coordination_epoch):
+                            raise ConversationGenerationUnavailable(FailureReason.GENERATION_UNAVAILABLE)
+                        commands.append(ProcessingCommand(body["phone"], identity, body["epoch"], body["generation"],
+                                                           body["processing_id"], body["operation_id"]))
+                    if examined >= limit:
+                        break
+                if position < len(members):
+                    positions[index] = scan, position
+                elif following:
+                    positions[index] = following, 0
+                else:
+                    positions[index] = -1, 0
+                other = 1 - index
+                if positions[other][0] != -1:
+                    turn = other
+                elif positions[index][0] != -1:
+                    turn = index
+                else:
+                    state = None
+                    break
+                state = turn, *positions[0], *positions[1]
+                if examined >= limit or turn == index:
+                    break
         except ConversationDomainError:
             raise
         except (KeyError, TypeError, ValueError):
             raise ConversationGenerationUnavailable(FailureReason.GENERATION_UNAVAILABLE) from None
         except Exception:
             raise ConversationStateUnavailable(FailureReason.STATE_UNAVAILABLE) from None
-        return tuple(commands)
+        return RecoveryPage(tuple(commands), self._recovery_cursor(state))
 
     @staticmethod
     def _attempt_data(attempt: MutationAttempt) -> dict:
@@ -1243,13 +1324,13 @@ class RedisConversationStore:
                     disposition = "PROCESSED" if item.body.get("batch_id") else "APPLIED"
                     item = self._changed(item, body={**item.body, "disposition": disposition},
                                          until=max(item.entry.expected_until, self._replay_until()), terminal=True)
-                elif attempt.phase is MutationPhase.QUARANTINED:
-                    item = self._changed(item, body={**item.body, "disposition": None}, terminal=False)
                 elif attempt.phase is MutationPhase.ABORTED and operational:
                     item = self._changed(item, body={**item.body, "disposition": "FAILED"}, terminal=True)
             coordinated.append(item)
-        retained = tuple(item for item in coordinated if item != previous
-                         and (not compact or self._is_replay_receipt(item)))
+        retained = tuple(item for item in coordinated if item != previous)
+        if compact:
+            retained = tuple(receipt for item in retained
+                             if (receipt := self._quarantine_replay_receipt(item, attempt.operation_id)) is not None)
         fence = self._mutation_receipt(attempt) if attempt.phase in (
             MutationPhase.PREPARED, MutationPhase.COMMITTING, MutationPhase.QUARANTINED) else None
         self._transition(lease, anchor, (*retained, updated), attempt.generation,
@@ -1268,6 +1349,16 @@ class RedisConversationStore:
         return (item.entry.kind == "mutation" and item.terminal is True
                 and self._now() < item.entry.expected_until
                 and self._attempt_load(item).phase in (MutationPhase.COMMITTED, MutationPhase.ABORTED))
+
+    def _quarantine_replay_receipt(self, item: ContactDetail, operation_id: str) -> ContactDetail | None:
+        """Keep the uncertain operation distinct from deliberately discarded siblings."""
+        if item.entry.kind == "dedupe":
+            if item.body.get("operation_id") == operation_id:
+                return self._changed(item, body={**item.body, "disposition": None}, terminal=False)
+            if item.body.get("disposition") in (None, IngressDisposition.BUFFERED.value):
+                return self._changed(item, body={**item.body, "disposition": IngressDisposition.FAILED.value},
+                                     until=max(item.entry.expected_until, self._replay_until()), terminal=True)
+        return item if self._is_replay_receipt(item) else None
 
     def assert_mutation_available(self, lease: ContactLease, now: datetime,
                                   *, operation_id: str | None = None) -> None:

@@ -52,6 +52,8 @@ class ScriptRedis:
         self.after_operation = {}
         self.write_counts = {}
         self.fail_write_at = None
+        self.sscan_calls = []
+        self.sscan_chunk_limit = None
 
     def _acl_command(self, command, key):
         if (command, key) in self.denied_commands:
@@ -92,6 +94,20 @@ class ScriptRedis:
     def sscan_iter(self, key, match):
         with self.lock:
             return iter(member for member in self.sets.get(key, set()) if member.startswith(match[:-1]))
+
+    def sscan(self, key, cursor=0, count=100):
+        """Deterministic scan pages; a COUNT-sized chunk may exceed output limit."""
+        with self.lock:
+            self._expire()
+            self.sscan_calls.append((key, cursor, count))
+            if key in self.values:
+                raise TypeError("WRONGTYPE")
+            members = sorted(self.sets.get(key, set()))
+            start = int(cursor)
+            if self.sscan_chunk_limit is not None:
+                count = min(count, self.sscan_chunk_limit)
+            stop = min(start + count, len(members))
+            return (0 if stop >= len(members) else stop), members[start:stop]
 
     def eval(self, script, count, *args):
         from app.conversation_redis import ATOMIC_SCRIPT

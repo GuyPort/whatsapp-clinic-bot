@@ -380,7 +380,7 @@ def test_staged_recovery_enqueues_abandoned_claim_without_creating_another_batch
         claim = store.claim_or_resume_batch(command, store.clock.now(), lease)
     store.clock.set(claim.attempt.claim_deadline)
     with store.contact_lease(PHONE) as lease:
-        recovered = store.recoverable_batches()[0]
+        recovered = store.recoverable_batches().commands[0]
         assert store.ensure_consumer(broker, recovered, store.clock.now(), lease) is domain.EnsureConsumerResult.SCHEDULED
         assert store.dispatch(command, lease).phase is domain.DispatchPhase.STAGED
         assert batch_details(store, lease, "buffer") == []
@@ -450,7 +450,7 @@ def test_batch_recovery_dependency_error_exposes_only_enumerated_reason():
     domain, store = batch_api(), make_store()
     def fail(*_args, **_kwargs):
         raise RuntimeError("synthetic-sensitive-redis-error")
-    store.client.sscan_iter = fail
+    store.client.sscan = fail
     with pytest.raises(domain.ConversationStateUnavailable) as caught:
         store.recoverable_batches()
     assert "synthetic-sensitive" not in str(caught.value)
@@ -547,12 +547,12 @@ def test_batch_committed_without_enqueue_remains_recoverable_past_processing_dea
         store.exhaust_batch(command, clock.now(), lease)
         assert store.dispatch(command, lease).phase is domain.DispatchPhase.STAGED
         assert len(batch_details(store, lease, "staging")) == 1
-        assert len(store.recoverable_batches()) == 1
+        assert len(store.recoverable_batches().commands) == 1
         assert db.events.count("commit_entered") == 1
         # Recovery only schedules the existing processing command, never outbound.
         from tests.fakes import ScriptedBroker
         broker = ScriptedBroker()
-        assert store.ensure_consumer(broker, store.recoverable_batches()[0], clock.now(), lease) is domain.EnsureConsumerResult.SCHEDULED
+        assert store.ensure_consumer(broker, store.recoverable_batches().commands[0], clock.now(), lease) is domain.EnsureConsumerResult.SCHEDULED
         assert broker.calls[0].operation_id == claim.attempt.operation_id
         assert store.dispatch(command, lease).phase is domain.DispatchPhase.STAGED
 
@@ -569,6 +569,194 @@ def test_enqueue_untyped_confirmation_fails_closed_and_preserves_reservation():
             store.ensure_consumer(broker, command, store.clock.now(), lease)
         assert store.dispatch(command, lease).phase is domain.DispatchPhase.PENDING
         assert store.dispatch(command, lease).enqueue_attempt_id is not None
+
+
+@pytest.mark.parametrize("other_phase", ["RESULT_READY", "CLAIMED"])
+def test_terminal_processing_batch_cannot_authorize_another_operation_or_result(transition_env, other_phase):
+    from tests.test_conversation_state import batch_api, append_batch, batch_command
+    coordinator, db, store, clock = transition_env
+    domain = batch_api()
+    with store.contact_lease(PHONE) as lease:
+        coordinator.resolve_ingress(db, PHONE, clock.now(), lease)
+        first_command = batch_command(store, lease, append_batch(store, lease))
+        first = store.claim_or_resume_batch(first_command, clock.now(), lease).attempt
+        first_result = domain.AgentResult("first result", [], None, {"version": 1}, domain.AgentIntent.SAVE_CONTEXT)
+        store.stage_agent_result(first_command, first, first_result, clock.now(), lease)
+        coordinator.apply_agent_result(db, PHONE, first_result, first.processing_id, first.operation_id, clock.now(), lease)
+        store.complete_batch(first_command, first, clock.now(), lease)
+        second_command = batch_command(store, lease, append_batch(store, lease, message_id="second-id"))
+        second = store.claim_or_resume_batch(second_command, clock.now(), lease).attempt
+        second_result = replace(first_result, text="second result", flow_data={"version": 2})
+        if other_phase == "RESULT_READY":
+            store.stage_agent_result(second_command, second, second_result, clock.now(), lease)
+        db.events.clear()
+        with pytest.raises(domain.ConversationMutationPending):
+            store.validate_agent_application(PHONE, first.processing_id, second.operation_id, second_result, lease)
+        with pytest.raises(domain.ConversationMutationPending):
+            coordinator.apply_agent_result(db, PHONE, second_result, first.processing_id, second.operation_id, clock.now(), lease)
+        assert db.events == []
+        # A retry of its own proven terminal operation still returns without SQL.
+        coordinator.apply_agent_result(db, PHONE, first_result, first.processing_id, first.operation_id, clock.now(), lease)
+        assert db.events == []
+
+
+def test_terminal_processing_batch_validates_result_fingerprint_before_short_circuit(transition_env):
+    from tests.test_conversation_state import batch_api, append_batch, batch_command
+    coordinator, db, store, clock = transition_env
+    domain = batch_api()
+    with store.contact_lease(PHONE) as lease:
+        coordinator.resolve_ingress(db, PHONE, clock.now(), lease)
+        command = batch_command(store, lease, append_batch(store, lease))
+        attempt = store.claim_or_resume_batch(command, clock.now(), lease).attempt
+        result = domain.AgentResult("winner", [], None, {}, domain.AgentIntent.SAVE_CONTEXT)
+        store.stage_agent_result(command, attempt, result, clock.now(), lease)
+        coordinator.apply_agent_result(db, PHONE, result, attempt.processing_id, attempt.operation_id, clock.now(), lease)
+        store.complete_batch(command, attempt, clock.now(), lease)
+        db.events.clear()
+        with pytest.raises(domain.ConversationMutationPending):
+            store.validate_agent_application(PHONE, attempt.processing_id, attempt.operation_id,
+                                              replace(result, text="substitution"), lease)
+        assert db.events == []
+
+
+@pytest.mark.parametrize("timeout", [False, True])
+def test_batch_quarantine_keeps_mutation_proof_and_failed_sibling_digests(transition_env, timeout):
+    from tests.test_conversation_state import batch_api, append_batch, batch_command, batch_details
+    from app.conversation_redis import contact_keys
+    coordinator, db, store, clock = transition_env
+    domain = batch_api()
+    with store.contact_lease(PHONE) as lease:
+        coordinator.resolve_ingress(db, PHONE, clock.now(), lease)
+        command = batch_command(store, lease, append_batch(store, lease))
+        attempt = store.claim_or_resume_batch(command, clock.now(), lease).attempt
+        sibling = append_batch(store, lease, message_id="sibling-replay-id", content="sibling protected text")
+        original_receipt = next(item for item in batch_details(store, lease, "dedupe") if item.body["batch_id"] == sibling.batch_id)
+        result = domain.AgentResult("ambiguous protected result", [], None, {}, domain.AgentIntent.SAVE_CONTEXT)
+        store.stage_agent_result(command, attempt, result, clock.now(), lease)
+        store.fail_next_atomic("finalize_committed")
+        with pytest.raises(domain.ConversationMutationAmbiguous):
+            coordinator.apply_agent_result(db, PHONE, result, attempt.processing_id, attempt.operation_id, clock.now(), lease)
+        if not timeout:
+            store.quarantine_ambiguous_commit(PHONE, attempt.operation_id, lease, clock.now())
+    if timeout:
+        clock.set(attempt.processing_deadline)
+    with store.contact_lease(PHONE) as lease:
+        if timeout:
+            with pytest.raises(domain.ConversationMutationPending):
+                store.read_anchor(lease)
+        proof = store.inspect_mutation(PHONE, attempt.operation_id, lease, operational=True)
+        assert proof.phase is domain.MutationPhase.QUARANTINED
+        assert proof.operation_id == attempt.operation_id
+        retained = store._snapshot(lease, operational=True)[1]
+        failed = next(item for item in retained if item.entry.kind == "dedupe" and item.entry.id == original_receipt.entry.id)
+        assert failed.body["disposition"] == "FAILED"
+        assert failed.terminal is True
+        assert failed.entry.expected_until >= original_receipt.entry.expected_until
+        assert "sibling protected text" not in str(store.contact_snapshot(PHONE))
+        assert "ambiguous protected result" not in str(store.contact_snapshot(PHONE))
+        store.resolve_quarantined_mutation(PHONE, attempt.operation_id, store.config.coordination_epoch,
+                                          lease, clock.now(), quiescent=True, outcome=domain.MutationPhase.COMMITTED)
+        replay = store.finalize_ingress_once(PHONE, None, "sibling-replay-id", command.generation, lease)
+        assert replay.disposition is domain.IngressDisposition.DUPLICATE
+        assert batch_details(store, lease, "batch") == []
+        assert batch_details(store, lease, "buffer") == []
+
+
+def test_batch_cleanup_retains_committed_proof_until_its_staged_batch_completes(transition_env):
+    from tests.test_conversation_state import batch_api, append_batch, batch_command, batch_details
+    coordinator, db, store, clock = transition_env
+    domain = batch_api()
+    with store.contact_lease(PHONE) as lease:
+        coordinator.resolve_ingress(db, PHONE, clock.now(), lease)
+        command = batch_command(store, lease, append_batch(store, lease))
+        attempt = store.claim_or_resume_batch(command, clock.now(), lease).attempt
+        result = domain.AgentResult("confirmed pending enqueue", [], None, {}, domain.AgentIntent.SAVE_CONTEXT)
+        store.stage_agent_result(command, attempt, result, clock.now(), lease)
+        coordinator.apply_agent_result(db, PHONE, result, attempt.processing_id, attempt.operation_id, clock.now(), lease)
+    clock.advance(timedelta(days=8))
+    with store.contact_lease(PHONE) as lease:
+        # An unrelated ingress invokes cleanup after the ordinary receipt window.
+        append_batch(store, lease, message_id="day-eight-id", content="later message")
+        committed = store.inspect_mutation(PHONE, attempt.operation_id, lease)
+        assert committed is not None
+        assert committed.phase is domain.MutationPhase.COMMITTED
+        resumed = store.claim_or_resume_batch(command, clock.now(), lease)
+        assert resumed.result == result
+        assert resumed.attempt.operation_id == attempt.operation_id
+        db.events.clear()
+        coordinator.apply_agent_result(db, PHONE, result, attempt.processing_id, attempt.operation_id, clock.now(), lease)
+        assert db.events == []
+        assert store.dispatch(command, lease).phase is domain.DispatchPhase.STAGED
+        assert any(item.entry.id == command.batch_id for item in batch_details(store, lease, "staging"))
+        # Task 7 owns its actual local enqueue attempt before calling completion.
+        store.complete_batch(command, resumed.attempt, clock.now(), lease)
+        store.cleanup(lease, store.read_anchor(lease))
+        assert store.inspect_mutation(PHONE, attempt.operation_id, lease) is None
+
+
+@pytest.mark.parametrize("page_size", [1, 2])
+@pytest.mark.parametrize("scan_chunk", [1, 100])
+def test_batch_recovery_cursor_visits_both_indexes_past_not_due_leading_items(page_size, scan_chunk):
+    from tests.test_conversation_state import batch_api, append_batch, batch_command
+    from tests.fakes import ScriptedBroker
+    from app.conversation_redis import RedisConversationStore
+    import base64
+    import hashlib
+    domain, store, broker = batch_api(), make_store(), ScriptedBroker()
+    store.client.sscan_chunk_limit = scan_chunk
+    phones = [PHONE, OTHER, "5551777770000", "5551666660000"]
+    expected = []
+    for position, phone in enumerate(phones):
+        with store.contact_lease(phone) as lease:
+            store.initialize_contact(phone, lease, db_state_present=False)
+            command = batch_command(store, lease, append_batch(store, lease, message_id="cursor-message-id"))
+            expected.append(command.batch_id)
+            if position < 3:
+                store.ensure_consumer(broker, command, store.clock.now(), lease)
+            else:
+                attempt = store.claim_or_resume_batch(command, store.clock.now(), lease).attempt
+    store.clock.set(attempt.claim_deadline)
+    before_calls = len(broker.calls)
+    cursor, visited, outcomes = None, [], []
+    forbidden = [*phones, *(hashlib.sha256(phone.encode()).hexdigest() for phone in phones),
+                 str(store.config.coordination_epoch), "cursor-message-id", "synthetic text"]
+    for _ in range(10):
+        # A new reader on every page proves continuation is explicit, not local state.
+        reader = RedisConversationStore(store.client, store.config, store.clock)
+        scan_calls = len(store.client.sscan_calls)
+        page = reader.recoverable_batches(limit=page_size, cursor=cursor)
+        assert len(store.client.sscan_calls) - scan_calls <= 2
+        assert len(page.commands) <= page_size
+        for command in page.commands:
+            visited.append(command.batch_id)
+            with store.contact_lease(command.phone) as lease:
+                outcomes.append(store.ensure_consumer(broker, command, store.clock.now(), lease))
+        cursor = page.next_cursor
+        if cursor is None:
+            break
+        assert isinstance(cursor, str)
+        encoded = cursor.rsplit(".", 1)[-1]
+        decoded = base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)).decode()
+        assert all(value not in cursor and value not in decoded for value in forbidden)
+    else:
+        pytest.fail("recovery cursor did not finish both indexes")
+    assert set(visited) == set(expected)
+    assert len(visited) == 4
+    if page_size == 1:
+        assert visited.index(expected[-1]) <= 1  # Each index gets a turn before a long first scan finishes.
+    assert outcomes.count(domain.EnsureConsumerResult.NOT_DUE) == 3
+    assert outcomes.count(domain.EnsureConsumerResult.SCHEDULED) == 1
+    assert len(broker.calls) == before_calls + 1
+
+
+@pytest.mark.parametrize("cursor", ["synthetic-sensitive-cursor", "r1.e30", "r1.bnVsbA", "r1.W10"])
+def test_batch_recovery_cursor_rejects_malformed_input_with_sanitized_error(cursor):
+    from tests.test_conversation_state import batch_api
+    domain, store = batch_api(), make_store()
+    with pytest.raises(domain.ConversationStateUnavailable) as caught:
+        store.recoverable_batches(limit=1, cursor=cursor)
+    assert caught.value.reason_code is domain.FailureReason.INVALID_VALUE
+    assert cursor not in str(caught.value)
 
 
 def mutation_for(store, lease, operation_id="pause-1", operational=False):

@@ -836,7 +836,7 @@ def test_dedup_buffer_accepts_once_and_preserves_raw_id_only_in_envelope():
         assert digest.entry.id == hashlib.sha256(b"synthetic-id").hexdigest()
         assert "synthetic-id" not in json.dumps(dict(digest.body))
         assert digest.entry.expected_until >= store.clock.now() + timedelta(days=7)
-        assert len(store.recoverable_batches()) == 1
+        assert len(store.recoverable_batches().commands) == 1
 
 
 def test_buffer_without_id_accepts_twice_without_replay_guarantee():
@@ -865,7 +865,7 @@ def test_dedup_dropped_and_ignored_retain_no_message_content(transition_env, act
         if action == "DROPPED":
             assert detail.entry.expected_until >= ref.paused_until + timedelta(days=7, seconds=300)
         assert batch_details(store, lease, "buffer") == []
-        assert store.recoverable_batches() == ()
+        assert store.recoverable_batches().commands == ()
     clock.advance(timedelta(days=31))
     with store.contact_lease(PHONE) as lease:
         if action == "DROPPED":
@@ -954,7 +954,7 @@ def test_batch_dispatch_deadline_exhausts_without_content_or_recreation(delta, t
             assert batch_details(store, lease, "dedupe")[0].body["disposition"] == "FAILED"
             assert append_batch(store, lease).disposition is domain.IngressDisposition.DUPLICATE
             assert store.claim_or_resume_batch(command, store.clock.now(), lease).outcome.value == "TERMINAL"
-            assert store.recoverable_batches() == ()
+            assert store.recoverable_batches().commands == ()
 
 
 def test_staged_ignores_old_dispatch_deadline_and_never_drains_new_buffer():
@@ -1006,7 +1006,7 @@ def test_result_ready_complete_batch_lifecycle_reuses_result_and_purges_content(
         assert batch_details(store, lease, "staging") == []
         assert "synthetic response" not in str(store.contact_snapshot(PHONE))
         assert "synthetic text" not in str(store.contact_snapshot(PHONE))
-        assert store.recoverable_batches() == ()
+        assert store.recoverable_batches().commands == ()
 
 
 @pytest.mark.parametrize("offset,accepted", [(-1, True), (0, False), (1, False)])

@@ -481,6 +481,12 @@ class BatchClaim:
     result: AgentResult | None = None
 
 
+@dataclass(frozen=True, repr=False)
+class RecoveryPage:
+    commands: tuple[ProcessingCommand, ...]
+    next_cursor: str | None = None
+
+
 @dataclass(frozen=True)
 class OutboundEnvelope:
     phone: str
@@ -540,7 +546,7 @@ class ConversationStore(Protocol):
 
     def exhaust_batch(self, command: ProcessingCommand, now: datetime, lease: ContactLease) -> None: ...
 
-    def recoverable_batches(self, limit: int = 100) -> tuple[ProcessingCommand, ...]: ...
+    def recoverable_batches(self, limit: int = 100, *, cursor: str | None = None) -> RecoveryPage: ...
 
     def validate_agent_application(self, phone: str, processing_id: str, operation_id: str,
                                     result: AgentResult, lease: ContactLease) -> None: ...
