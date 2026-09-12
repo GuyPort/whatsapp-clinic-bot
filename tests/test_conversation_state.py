@@ -1,5 +1,6 @@
 import json
 import math
+from uuid import UUID
 from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
 
@@ -14,6 +15,8 @@ from app.conversation_state import (
     ConfigurationIssue,
     ConfigurationInvalid,
     ContactLease,
+    ContactAnchor,
+    ConversationGenerationUnavailable,
     ConversationConfig,
     ConversationCycle,
     ConversationSnapshot,
@@ -416,3 +419,18 @@ def test_manual_clock_advances_monotonically_and_returns_new_time():
     assert clock.now() == datetime(2026, 9, 12, 12, 0, 15, tzinfo=timezone.utc)
     with pytest.raises(ValueError):
         clock.advance(timedelta(microseconds=-1))
+
+
+@pytest.mark.parametrize("revision,generation,history", [
+    (-1, UUID(int=1), (UUID(int=1),)),
+    (True, UUID(int=1), (UUID(int=1),)),
+    (0, 1, (UUID(int=1),)),
+    (0, UUID(int=1), ()),
+    (0, UUID(int=1), (UUID(int=2),)),
+    (0, UUID(int=1), (UUID(int=1), UUID(int=1))),
+])
+def test_anchor_domain_rejects_invalid_revision_or_generation_lineage(revision, generation, history):
+    """Catches invalid anchor fences entering adapters through typed domain construction."""
+    with pytest.raises(ConversationGenerationUnavailable) as raised:
+        ContactAnchor(revision, generation, (), "unused", history)
+    assert raised.value.reason_code is FailureReason.GENERATION_UNAVAILABLE

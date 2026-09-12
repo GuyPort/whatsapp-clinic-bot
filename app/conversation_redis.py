@@ -64,9 +64,11 @@ def contact_keys(phone: str) -> ContactKeys:
 
 
 # All checked keys and command targets are passed in KEYS. Values use ARGV only.
-# Type preflight precedes writes: Lua runtime errors do not roll back Redis writes.
+# ACL, argument and type preflight precede every write, including quarantine:
+# Lua runtime errors do not roll back Redis writes. Requires redis.acl_check_cmd.
 ATOMIC_SCRIPT = r'''
 local p = cjson.decode(ARGV[1])
+if type(redis.acl_check_cmd) ~= 'function' then return 'unavailable' end
 local function info(section, field)
     return string.match(redis.call('INFO', section), field .. ':([^\r\n]+)')
 end
@@ -82,17 +84,66 @@ for _, c in ipairs(p.checks) do
         return 'unavailable'
     end
 end
+local function key_at(index)
+    if type(index) ~= 'number' or index ~= math.floor(index) then return nil end
+    return KEYS[index]
+end
+local function valid_ttl(ttl)
+    return type(ttl) == 'number' and ttl >= 1 and ttl <= 9007199254740991
+           and ttl == math.floor(ttl)
+end
+local function command(w)
+    if type(w) ~= 'table' then return nil end
+    local key = key_at(w.key)
+    if not key then return nil end
+    if w.op == 'DEL' then return {'DEL', key} end
+    if w.op == 'PEXPIRE' then
+        if not valid_ttl(w.ttl) then return nil end
+        return {'PEXPIRE', key, string.format('%.0f', w.ttl)}
+    end
+    if type(w.value) ~= 'string' then return nil end
+    if w.op == 'SADD' or w.op == 'SREM' then return {w.op, key, w.value} end
+    if w.op ~= 'SET' and w.op ~= 'ACQUIRE' then return nil end
+    if w.op == 'ACQUIRE' and (#p.writes ~= 1 or not valid_ttl(w.ttl)) then return nil end
+    if w.ttl ~= nil then
+        if not valid_ttl(w.ttl) then return nil end
+        local args = {'SET', key, w.value, 'PX', string.format('%.0f', w.ttl)}
+        if w.op == 'ACQUIRE' then table.insert(args, 'NX') end
+        return args
+    end
+    return {'SET', key, w.value}
+end
+local function permitted(args)
+    local ok, allowed = pcall(redis.acl_check_cmd, unpack(args))
+    return ok and allowed == true
+end
+local anchor_key, quarantine_key = key_at(p.anchor_key), key_at(p.quarantine_key)
+if not anchor_key or not quarantine_key or type(p.digest) ~= 'string' then return 'unavailable' end
+local quarantine_commands = {
+    {'SET', anchor_key, '{"cycle":"QUARANTINED"}'},
+    {'SADD', quarantine_key, p.digest}
+}
+if not permitted(quarantine_commands[1]) or not permitted(quarantine_commands[2]) then
+    return 'unavailable'
+end
+local quarantine_type = redis.call('TYPE', quarantine_key).ok
+if quarantine_type ~= 'none' and quarantine_type ~= 'set' then return 'unavailable' end
+local commands, kinds = {}, {}
 for _, w in ipairs(p.writes) do
-    local kind = redis.call('TYPE', KEYS[w.key]).ok
-    if (w.op == 'SADD' or w.op == 'SREM') and kind ~= 'none' and kind ~= 'set' then
+    local args = command(w)
+    if not args or not permitted(args) then return 'unavailable' end
+    local key, op = args[2], args[1]
+    local kind = kinds[key] or redis.call('TYPE', key).ok
+    if (op == 'SADD' or op == 'SREM') and kind ~= 'none' and kind ~= 'set' then
         return 'unavailable'
     end
+    if op == 'SET' then kinds[key] = 'string'
+    elseif op == 'DEL' then kinds[key] = 'none'
+    elseif op == 'SADD' then kinds[key] = 'set' end
+    table.insert(commands, args)
 end
-local quarantine_type = redis.call('TYPE', KEYS[p.quarantine_key]).ok
-if quarantine_type ~= 'none' and quarantine_type ~= 'set' then return 'unavailable' end
 local function quarantine()
-    redis.call('SET', KEYS[p.anchor_key], '{"cycle":"QUARANTINED"}')
-    redis.call('SADD', KEYS[p.quarantine_key], p.digest)
+    for _, args in ipairs(quarantine_commands) do redis.call(unpack(args)) end
     return 'generation'
 end
 for _, c in ipairs(p.checks) do
@@ -107,17 +158,9 @@ for _, c in ipairs(p.checks) do
     end
 end
 if p.quarantine then return quarantine() end
-for _, w in ipairs(p.writes) do
-    if w.op == 'SET' then
-        if w.ttl then redis.call('SET', KEYS[w.key], w.value, 'PX', w.ttl)
-        else redis.call('SET', KEYS[w.key], w.value) end
-    elseif w.op == 'ACQUIRE' then
-        if not redis.call('SET', KEYS[w.key], w.value, 'NX', 'PX', w.ttl) then
-            return 'locked'
-        end
-    elseif w.op == 'PEXPIRE' then redis.call('PEXPIRE', KEYS[w.key], w.ttl)
-    elseif w.op == 'DEL' then redis.call('DEL', KEYS[w.key])
-    else redis.call(w.op, KEYS[w.key], w.value) end
+for i, args in ipairs(commands) do
+    local result = redis.call(unpack(args))
+    if p.writes[i].op == 'ACQUIRE' and not result then return 'locked' end
 end
 return 'ok'
 '''
@@ -168,6 +211,13 @@ def _anchor_data(anchor: ContactAnchor) -> dict:
             "manifest_fingerprint": anchor.manifest_fingerprint,
             "generation_history": [str(value) for value in anchor.generation_history],
             "cycle": anchor.cycle.value}
+
+
+def _generation_control(anchor: ContactAnchor) -> str:
+    """A durable second fence, cross-checked even when the manifest is empty."""
+    return _json({"last_generation": str(anchor.last_generation),
+                  "contact_revision": anchor.contact_revision,
+                  "manifest_fingerprint": anchor.manifest_fingerprint})
 
 
 class LeaseHeartbeat:
@@ -343,6 +393,11 @@ class RedisConversationStore:
             raise ConversationGenerationUnavailable(FailureReason.GENERATION_UNAVAILABLE)
         try:
             value = json.loads(raw)
+            if (not isinstance(value, dict)
+                    or not isinstance(value["last_generation"], str)
+                    or not isinstance(value["generation_history"], list)
+                    or not all(isinstance(g, str) for g in value["generation_history"])):
+                raise ValueError("invalid_value")
             entries = tuple(_entry_load(e) for e in value["manifest"])
             anchor = ContactAnchor(value["contact_revision"], UUID(value["last_generation"]),
                                    entries, value["manifest_fingerprint"],
@@ -355,10 +410,10 @@ class RedisConversationStore:
                     or len({(e.kind, e.id) for e in entries}) != len(entries)
                     or manifest_fingerprint(entries) != anchor.manifest_fingerprint):
                 raise ValueError("invalid_value")
-        except (KeyError, TypeError, ValueError, OverflowError):
+        except (KeyError, TypeError, ValueError, OverflowError, ConversationGenerationUnavailable):
             self._atomic(lease.phone, "validate", checks, quarantine=True)
             raise AssertionError("unreachable")
-        checks.append(self._check(keys.generation, str(anchor.last_generation), "generation"))
+        checks.append(self._check(keys.generation, _generation_control(anchor), "generation"))
         details = []
         for entry in entries:
             key = self._detail_key(lease.phone, entry)
@@ -401,7 +456,7 @@ class RedisConversationStore:
         self._atomic(phone, "initialize", [self._lease_check(lease),
                      self._check(keys.anchor, None), self._check(keys.generation, None, "generation")],
                      [{"op": "SET", "key": keys.anchor, "value": _json(_anchor_data(anchor))},
-                      {"op": "SET", "key": keys.generation, "value": str(generation)}])
+                      {"op": "SET", "key": keys.generation, "value": _generation_control(anchor)}])
         return anchor
 
     def _has_remnants(self, phone: str) -> bool:
@@ -471,7 +526,7 @@ class RedisConversationStore:
                                    "value": self._member(lease.phone, item.entry)})
             keys = contact_keys(lease.phone)
             writes.extend([{"op": "SET", "key": keys.anchor, "value": _json(_anchor_data(updated))},
-                           {"op": "SET", "key": keys.generation, "value": str(generation)}, *extra])
+                           {"op": "SET", "key": keys.generation, "value": _generation_control(updated)}, *extra])
             self._atomic(lease.phone, operation, checks, writes)
             return updated
 
@@ -497,7 +552,10 @@ class RedisConversationStore:
                 renewal = {"op": "PEXPIRE", "key": keys.lease,
                            "ttl": self.config.contact_lease_ttl_seconds * 1000}
                 if self._get(keys.anchor) is None:
-                    self._atomic(lease.phone, "renew", [self._lease_check(lease)], [renewal])
+                    checks = [self._lease_check(lease), self._check(keys.anchor, None)]
+                    if self._has_remnants(lease.phone):
+                        self._atomic(lease.phone, "renew", checks, quarantine=True)
+                    self._atomic(lease.phone, "renew", checks, [renewal])
                     return
                 anchor, details, checks = self._snapshot(lease)
                 renewed = []

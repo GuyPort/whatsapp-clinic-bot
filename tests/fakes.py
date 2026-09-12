@@ -46,6 +46,12 @@ class ScriptRedis:
         self.fail_operation = None
         self.before_atomic = None
         self.global_epoch_writes = 0
+        self.denied_commands = set()
+        self.acl_check_available = True
+
+    def _acl_command(self, command, key):
+        if (command, key) in self.denied_commands:
+            raise PermissionError("NOPERM")
 
     def _expire(self):
         for key, deadline in list(self.expiry.items()):
@@ -91,6 +97,8 @@ class ScriptRedis:
         def key(item):
             return keys[item["key"] - 1]
         with self.lock:
+            if not self.acl_check_available:
+                return "unavailable"
             if self.before_atomic is not None:
                 hook, self.before_atomic = self.before_atomic, None
                 hook()
@@ -109,13 +117,41 @@ class ScriptRedis:
                 if ((check["op"] == "get" and key(check) in self.sets)
                         or (check["op"] != "get" and key(check) in self.values)):
                     return "unavailable"
+            # Same contract as Lua: validate the entire batch, then authorize all
+            # normal and possible quarantine writes, before touching any value.
+            simulated_types = {}
             for write in plan["writes"]:
-                if write["op"] in ("SADD", "SREM") and key(write) in self.values:
+                if (type(write.get("key")) is not int or not 1 <= write["key"] <= len(keys)
+                        or write.get("op") not in ("SET", "ACQUIRE", "PEXPIRE", "DEL", "SADD", "SREM")):
                     return "unavailable"
+                target, op = key(write), write["op"]
+                if op not in ("DEL", "PEXPIRE") and not isinstance(write.get("value"), str):
+                    return "unavailable"
+                if op in ("ACQUIRE", "PEXPIRE") or "ttl" in write:
+                    ttl = write.get("ttl")
+                    if type(ttl) is not int or not 1 <= ttl <= 9007199254740991:
+                        return "unavailable"
+                if op == "ACQUIRE" and len(plan["writes"]) != 1:
+                    return "unavailable"
+                kind = simulated_types.get(target, "string" if target in self.values else
+                                           "set" if target in self.sets else "none")
+                if op in ("SADD", "SREM") and kind not in ("none", "set"):
+                    return "unavailable"
+                if op in ("SET", "ACQUIRE"):
+                    simulated_types[target] = "string"
+                elif op == "DEL":
+                    simulated_types[target] = "none"
+                elif op == "SADD":
+                    simulated_types[target] = "set"
+                self._acl_command("SET" if op == "ACQUIRE" else op, target)
+            self._acl_command("SET", keys[plan["anchor_key"] - 1])
+            self._acl_command("SADD", keys[plan["quarantine_key"] - 1])
             if keys[plan["quarantine_key"] - 1] in self.values:
                 return "unavailable"
             def quarantine():
+                self._acl_command("SET", keys[plan["anchor_key"] - 1])
                 self.values[keys[plan["anchor_key"] - 1]] = '{"cycle":"QUARANTINED"}'
+                self._acl_command("SADD", keys[plan["quarantine_key"] - 1])
                 self.sets.setdefault(keys[plan["quarantine_key"] - 1], set()).add(plan["digest"])
                 return "generation"
             for check in plan["checks"]:
@@ -127,6 +163,7 @@ class ScriptRedis:
                 return quarantine()
             for write in plan["writes"]:
                 target, op = key(write), write["op"]
+                self._acl_command("SET" if op == "ACQUIRE" else op, target)
                 if op in ("SET", "ACQUIRE"):
                     if op == "ACQUIRE" and (target in self.values or target in self.sets):
                         return "locked"
@@ -242,10 +279,12 @@ class InMemoryConversationStore(RedisConversationStore):
 
 
 class ControlledWait:
-    """Advance manual time, then synchronously observe a daemon renewal iteration."""
+    """Wake the daemon only when its requested interval has elapsed in manual time."""
     def __init__(self, clock):
         self.clock, self.condition = clock, Condition()
         self.requests, self.ticks = 0, 0
+        self.acknowledged = 0
+        self.deadline = None
         self.worker = None
         self.stopped = False
 
@@ -253,22 +292,29 @@ class ControlledWait:
         with self.condition:
             self.worker = current_thread()
             self.requests += 1
+            self.deadline = self.clock.now() + timedelta(seconds=interval)
             self.condition.notify_all()
-            while self.ticks < self.requests and not event.is_set():
+            while self.clock.now() < self.deadline and not event.is_set():
+                self.acknowledged = self.ticks
+                self.condition.notify_all()
                 self.condition.wait(timeout=0.01)
             self.stopped = event.is_set()
             return self.stopped
 
     def tick(self, seconds):
         with self.condition:
-            assert self.condition.wait_for(lambda: self.requests > self.ticks, timeout=2)
+            assert self.condition.wait_for(lambda: self.deadline is not None, timeout=2)
             self.clock.advance(timedelta(seconds=seconds))
             self.ticks += 1
+            tick = self.ticks
+            request = self.requests
+            due = self.clock.now() >= self.deadline
             self.condition.notify_all()
         # An unsuccessful renewal exits the daemon, so there is no next wait call.
         for _ in range(200):
             with self.condition:
-                if self.requests > self.ticks or not self.worker.is_alive():
+                completed = self.requests > request if due else self.acknowledged >= tick
+                if completed or not self.worker.is_alive():
                     self.stopped = not self.worker.is_alive()
                     return
                 self.condition.wait(timeout=0.01)

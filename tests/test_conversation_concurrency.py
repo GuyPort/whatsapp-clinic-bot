@@ -4,6 +4,7 @@ from dataclasses import replace
 from datetime import timedelta
 from threading import Barrier, Thread
 from uuid import UUID
+import json
 
 import pytest
 
@@ -127,7 +128,8 @@ def test_manifest_atomic_failure_preserves_all_keys_indices_revision():
         store.fail_next_atomic("cas")
         with pytest.raises(ConversationStateUnavailable):
             store.compare_and_set(lease, anchor, (detail(store),))
-        assert store.snapshot() == before
+        unchanged = store.snapshot() == before
+        assert unchanged
 
 
 def test_manifest_cleanup_removes_terminal_details_only_at_horizon():
@@ -194,7 +196,9 @@ def test_lease_heartbeat_renews_at_one_third_ttl_and_stops():
     waiter = ControlledWait(store.clock)
     store.heartbeat_wait = waiter
     with store.contact_lease(PHONE) as lease:
-        waiter.tick(20)
+        waiter.tick(19)
+        assert store.lease_remaining(PHONE) == 41
+        waiter.tick(1)
         store.assert_owned(lease)
         assert store.lease_remaining(PHONE) == 60
         store.fail_next_atomic("renew")
@@ -283,3 +287,129 @@ def test_lease_invalid_configuration_fails_with_domain_reason_before_acquire():
     with pytest.raises(ReadinessUnavailable):
         with store.contact_lease(PHONE):
             pytest.fail("invalid configuration acquired a lease")
+
+
+@pytest.mark.parametrize("quarantine", [False, True])
+def test_manifest_acl_denial_of_later_write_keeps_entire_state_unchanged(quarantine):
+    """Catches a denied later SADD leaving earlier SET/DEL writes committed."""
+    from app.conversation_redis import DISPATCH_INDEX_KEY, QUARANTINE_INDEX_KEY
+    store = make_store()
+    with store.contact_lease(PHONE) as lease:
+        anchor = store.initialize_contact(PHONE, lease, db_state_present=False)
+        target = QUARANTINE_INDEX_KEY if quarantine else DISPATCH_INDEX_KEY
+        store.client.denied_commands.add(("SADD", target))
+        if quarantine:
+            store.corrupt_contact(PHONE, "manifest")
+        before = store.snapshot()
+        with pytest.raises(ConversationStateUnavailable):
+            if quarantine:
+                store.read_anchor(lease)
+            else:
+                store.compare_and_set(lease, anchor, (detail(store),))
+        unchanged = store.snapshot() == before
+        assert unchanged
+
+
+@pytest.mark.parametrize("target", ["anchor", "control"])
+def test_anchor_regressive_revision_quarantines_only_that_contact(target):
+    """Catches accepting a rolled-back anchor revision after a completed CAS."""
+    from app.conversation_redis import RedisConversationStore, contact_keys
+    store = make_store()
+    with store.contact_lease(PHONE) as lease, store.contact_lease(OTHER) as peer_lease:
+        anchor = store.initialize_contact(PHONE, lease, db_state_present=False)
+        peer = store.initialize_contact(OTHER, peer_lease, db_state_present=False)
+        # Include an empty manifest: checking detail versions alone cannot fence it.
+        updated = store.compare_and_set(lease, anchor, ())
+        assert updated.contact_revision == 1
+        key = contact_keys(PHONE).anchor if target == "anchor" else contact_keys(PHONE).generation
+        raw = store.client.values[key]
+        if not raw.startswith("{"):
+            pytest.fail("generation control does not retain a durable revision fence")
+        corrupt = json.loads(raw)
+        corrupt["contact_revision"] = 0
+        store.client.values[key] = json.dumps(corrupt)
+        assert store.read_anchor(peer_lease) == peer
+    # A fresh store/lease must detect the regression without process-local memory.
+    restarted = RedisConversationStore(store.client, store.config, store.clock)
+    with restarted.contact_lease(PHONE) as lease:
+        with pytest.raises(ConversationGenerationUnavailable):
+            restarted.read_anchor(lease)
+        assert store.is_quarantined(PHONE)
+    with store.contact_lease(OTHER) as peer_lease:
+        assert store.read_anchor(peer_lease) == peer
+
+
+@pytest.mark.parametrize("ttl", [-1, True, 2 ** 63])
+def test_manifest_invalid_late_write_argument_preserves_all_state(ttl):
+    """Catches invalid TTL in a later operation failing after a prior SET."""
+    from app.conversation_redis import contact_keys
+    store = make_store()
+    with store.contact_lease(PHONE) as lease:
+        store.initialize_contact(PHONE, lease, db_state_present=False)
+        keys = contact_keys(PHONE)
+        before = store.snapshot()
+        with pytest.raises(ConversationStateUnavailable):
+            store._atomic(PHONE, "cas", [store._lease_check(lease)], [
+                {"op": "SET", "key": keys.buffer_prefix + "item-1", "value": "synthetic"},
+                {"op": "PEXPIRE", "key": keys.lease, "ttl": ttl},
+            ])
+        unchanged = store.snapshot() == before
+        assert unchanged
+
+
+def test_readiness_missing_acl_preflight_capability_blocks_acquire_without_writes():
+    """Catches mutating on Redis that cannot authorize the entire script write batch."""
+    store = make_store()
+    store.client.acl_check_available = False
+    before = store.snapshot()
+    with pytest.raises(ConversationStateUnavailable):
+        with store.contact_lease(PHONE):
+            pytest.fail("missing ACL preflight capability acquired a lease")
+    unchanged = store.snapshot() == before
+    assert unchanged
+
+
+@pytest.mark.parametrize("remnant", ["generation", "detail", "index"])
+def test_lease_renewal_after_partial_anchor_loss_quarantines_and_loses_ownership(remnant):
+    """Catches missing-anchor renewal prolonging permission to mutate lost state."""
+    from app.conversation_redis import contact_keys
+    store = make_store()
+    with store.contact_lease(PHONE) as lease:
+        anchor = store.initialize_contact(PHONE, lease, db_state_present=False)
+        item = detail(store)
+        store.compare_and_set(lease, anchor, (item,))
+        keys = contact_keys(PHONE)
+        for key in list(store.client.values):
+            if key.startswith(keys.anchor.rsplit(":", 1)[0]) and key != keys.lease:
+                if remnant == "generation" and key == keys.generation:
+                    continue
+                if remnant == "detail" and key == store._detail_key(PHONE, item.entry):
+                    continue
+                store.client.values.pop(key)
+        if remnant != "index":
+            store.client.sets.clear()
+        with pytest.raises(ContactLeaseLost):
+            store.renew_lease(lease)
+        assert store.is_quarantined(PHONE)
+        with pytest.raises(ContactLeaseLost):
+            lease.assert_owned()
+
+
+@pytest.mark.parametrize("field,value", [("last_generation", 3), ("last_generation", {}),
+                                         ("generation_history", [3]),
+                                         ("generation_history", {"invalid": 1})])
+def test_anchor_corrupt_uuid_json_types_quarantine_with_domain_reason(field, value):
+    """Catches UUID parser AttributeError escaping without quarantining corrupt state."""
+    from app.conversation_redis import contact_keys
+    from app.conversation_state import FailureReason
+    store = make_store()
+    with store.contact_lease(PHONE) as lease:
+        store.initialize_contact(PHONE, lease, db_state_present=False)
+        key = contact_keys(PHONE).anchor
+        anchor = json.loads(store.client.values[key])
+        anchor[field] = value
+        store.client.values[key] = json.dumps(anchor)
+        with pytest.raises(ConversationGenerationUnavailable) as error:
+            store.read_anchor(lease)
+        assert error.value.reason_code is FailureReason.GENERATION_UNAVAILABLE
+        assert store.is_quarantined(PHONE)

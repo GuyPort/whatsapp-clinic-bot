@@ -223,6 +223,15 @@ class ContactAnchor:
     generation_history: tuple[UUID, ...]
     cycle: ConversationCycle = ConversationCycle.OPEN
 
+    def __post_init__(self) -> None:
+        if (type(self.contact_revision) is not int or self.contact_revision < 0
+                or not isinstance(self.last_generation, UUID)
+                or not isinstance(self.generation_history, tuple)
+                or not all(isinstance(value, UUID) for value in self.generation_history)
+                or self.last_generation not in self.generation_history
+                or len(set(self.generation_history)) != len(self.generation_history)):
+            raise ConversationGenerationUnavailable(FailureReason.GENERATION_UNAVAILABLE)
+
 
 @dataclass(frozen=True)
 class PauseTransitionRef:
