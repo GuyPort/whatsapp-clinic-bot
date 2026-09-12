@@ -50,6 +50,7 @@ class ScriptRedis:
         self.acl_check_available = True
         self.before_operation = {}
         self.after_operation = {}
+        self.operation_calls = {}
         self.write_counts = {}
         self.fail_write_at = None
         self.sscan_calls = []
@@ -117,6 +118,7 @@ class ScriptRedis:
         def key(item):
             return keys[item["key"] - 1]
         with self.lock:
+            self.operation_calls[plan["operation"]] = self.operation_calls.get(plan["operation"], 0) + 1
             if not self.acl_check_available:
                 return "unavailable"
             operation_hook = self.before_operation.pop(plan["operation"], None)
@@ -514,11 +516,11 @@ class IngressRuntime:
         self.processing_broker = ScriptedBroker()
         self._factory = factory
         self.dependencies = {name: True for name in DependencyName}
-        self.readiness_calls = self.session_calls = self.lease_calls = 0
-        self.store.client.before_operation["acquire"] = self._acquired
+        self.readiness_calls = self.session_calls = 0
 
-    def _acquired(self, *args):
-        self.lease_calls += 1
+    @property
+    def lease_calls(self):
+        return self.store.client.operation_calls.get("acquire", 0)
 
     def readiness_status(self):
         from app.conversation_state import DependencyStatus, ReadinessReport

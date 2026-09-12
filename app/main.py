@@ -250,26 +250,26 @@ def resolve_sender_identity(payload) -> SenderIdentity | None:
     return SenderIdentity(phone, from_me, message_id, raw_kind)
 
 
-def _ingress_content(payload) -> tuple[str, str]:
+def _ingress_content(payload) -> tuple[str, str] | None:
     message = _message_event(payload).get("message")
     if not isinstance(message, dict):
-        return "text", ""
+        return None
     text = message.get("conversation")
-    if isinstance(text, str) and text:
+    if isinstance(text, str) and text.strip():
         return "text", text
     extended = message.get("extendedTextMessage")
-    if isinstance(extended, dict) and isinstance(extended.get("text"), str) and extended["text"]:
+    if isinstance(extended, dict) and isinstance(extended.get("text"), str) and extended["text"].strip():
         return "text", extended["text"]
     image = message.get("imageMessage")
-    if isinstance(image, dict) and isinstance(image.get("caption"), str) and image["caption"]:
+    if isinstance(image, dict) and isinstance(image.get("caption"), str) and image["caption"].strip():
         return "text", image["caption"]
     for field, label in (
         ("imageMessage", "imagem"), ("audioMessage", "áudio"), ("videoMessage", "vídeo"),
         ("documentMessage", "documento"), ("stickerMessage", "figurinha"),
     ):
-        if field in message:
+        if isinstance(message.get(field), dict):
             return "media", label
-    return "text", ""
+    return None
 
 
 @app.post("/webhook/whatsapp")
@@ -295,9 +295,14 @@ async def whatsapp_webhook(request: Request):
     identity = resolve_sender_identity(payload)
     if identity is None:
         return JSONResponse({"status": "ignored"})
-    kind, content = _ingress_content(payload)
+    useful_message = _ingress_content(payload)
+    if useful_message is None:
+        return JSONResponse({"status": "ignored"})
+    kind, content = useful_message
     try:
         with runtime.store.contact_lease(identity.phone) as lease:
+            if runtime.coordinator.is_terminal_ingress(identity, runtime.clock.now(), lease):
+                return JSONResponse({"status": "ignored"})
             with runtime.session_factory() as db:
                 receipt = runtime.coordinator.accept_ingress(
                     db, identity, kind, content, runtime.clock.now(), lease, runtime.processing_broker)

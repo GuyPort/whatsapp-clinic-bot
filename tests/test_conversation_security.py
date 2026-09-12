@@ -185,3 +185,55 @@ def test_webhook_paused_media_and_sql_failure_keep_private_values_out_of_logs(ma
     for sentinel in ("5551999990000", "synthetic-media-url", "private-media-id", "private-sql-id",
                      "private-body", "private-sql-error-with-contact-and-body"):
         assert sentinel not in captured
+
+
+@pytest.mark.parametrize("initial_state", ["virgin", "closed", "pause_at_expiry"])
+@pytest.mark.parametrize("from_me", [False, True])
+@pytest.mark.parametrize("message", [
+    None, [], {}, {"reactionMessage": {"text": "/pause"}},
+    {"conversation": ""}, {"conversation": " \n "},
+    {"extendedTextMessage": {"text": ""}}, {"audioMessage": None},
+    {"imageMessage": []}, {"unsupportedMessage": {"text": "/pausar"}},
+])
+def test_webhook_unusable_message_is_ignored_before_any_lease_or_state(
+        main_module, ingress_runtime, monkeypatch, session_factory, initial_state, from_me, message):
+    from uuid import uuid4
+    from sqlalchemy import event
+    phone = "5551999990000"
+    if initial_state == "closed":
+        with ingress_runtime.store.contact_lease(phone) as lease, session_factory() as db:
+            ingress_runtime.coordinator.resolve_ingress(db, phone, ingress_runtime.clock.now(), lease)
+            ingress_runtime.coordinator.close_context(db, phone, ingress_runtime.clock.now(), lease, str(uuid4()))
+    elif initial_state == "pause_at_expiry":
+        ref = ingress_runtime.pause()
+        ingress_runtime.clock.set(ref.paused_until)
+    before = ingress_runtime.store.snapshot()
+    calls = []
+    def forbidden(*args, **kwargs):
+        calls.append("unexpected_boundary")
+        raise AssertionError("unusable message entered coordination")
+    monkeypatch.setattr(ingress_runtime.store, "contact_lease", forbidden)
+    monkeypatch.setattr(ingress_runtime, "session_factory", forbidden)
+    monkeypatch.setattr(ingress_runtime.coordinator, "accept_ingress", forbidden)
+    engine = session_factory.kw["bind"]
+    event.listen(engine, "before_cursor_execute", forbidden)
+    payload = webhook_payload(from_me=from_me)
+    payload["data"]["messages"]["message"] = message
+    try:
+        response, _ = call_webhook(main_module, payload)
+    finally:
+        event.remove(engine, "before_cursor_execute", forbidden)
+    assert response.status_code == 200
+    assert json.loads(response.body) == {"status": "ignored"}
+    assert calls == []
+    assert ingress_runtime.store.snapshot() == before
+    assert ingress_runtime.processing_broker.calls == []
+
+
+def test_webhook_missing_message_is_ignored_before_any_lease(main_module, ingress_runtime):
+    payload = webhook_payload()
+    del payload["data"]["messages"]["message"]
+    response, _ = call_webhook(main_module, payload)
+    assert response.status_code == 200
+    assert json.loads(response.body) == {"status": "ignored"}
+    assert ingress_runtime.lease_calls == ingress_runtime.session_calls == 0

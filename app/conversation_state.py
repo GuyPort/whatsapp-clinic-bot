@@ -800,6 +800,27 @@ class ConversationCoordinator:
         self.store, self.clock = store, clock
 
     @_reason_codes_only
+    def is_terminal_ingress(self, identity: SenderIdentity, now: datetime, lease: ContactLease) -> bool:
+        """A validated, retained terminal receipt can be acknowledged without SQL."""
+        if identity.phone != lease.phone:
+            raise ContactLeaseLost(FailureReason.CONTACT_LEASE_LOST)
+        if identity.message_id is None:
+            return False
+        try:
+            details = self.store.read_details(lease)
+        except ConversationGenerationUnavailable:
+            # A missing snapshot proves no terminal receipt. The full ingress
+            # path must still validate SQL presence and the anchor before any
+            # effect; it cannot treat this probe as initialization permission.
+            return False
+        digest = hashlib.sha256(identity.message_id.encode()).hexdigest()
+        return any(item.entry.kind == "dedupe" and item.entry.id == digest
+                   and item.terminal and now < item.entry.expected_until
+                   and item.body.get("schema") == "batch_v1"
+                   and item.body.get("disposition") in {"PROCESSED", "DROPPED", "APPLIED", "IGNORED", "FAILED"}
+                   for item in details)
+
+    @_reason_codes_only
     def accept_ingress(self, db: Session, identity: SenderIdentity, kind: str, content: str,
                        now: datetime, lease: ContactLease, broker: BrokerPort) -> IngressReceipt:
         """Classify, deduplicate and dispatch under the caller's single lease.

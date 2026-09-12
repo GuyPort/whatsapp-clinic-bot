@@ -329,6 +329,106 @@ def test_webhook_staged_replay_uses_processing_deadline_not_old_dispatch_deadlin
     assert len(ingress_runtime.envelopes()) == 1
 
 
+def test_webhook_lease_counter_includes_setup_and_every_later_acquisition(main_module, ingress_runtime):
+    assert ingress_runtime.lease_calls == 0
+    ingress_runtime.pause()
+    assert ingress_runtime.lease_calls == 1
+    ingress_runtime.details()
+    assert ingress_runtime.lease_calls == 2
+    assert webhook(main_module).status_code == 200
+    assert ingress_runtime.lease_calls == 3
+    assert webhook(main_module).status_code == 200
+    assert ingress_runtime.lease_calls == 4
+    assert webhook(main_module, jid=OTHER_PHONE).status_code == 200
+    assert ingress_runtime.lease_calls == 5
+
+
+def test_webhook_lease_counter_does_not_consume_or_repeat_one_shot_fault_hooks(main_module, ingress_runtime):
+    hooks = []
+    ingress_runtime.store.client.before_operation["acquire"] = lambda: hooks.append("called")
+    assert webhook(main_module).status_code == 200
+    assert webhook(main_module, message_id="second-message").status_code == 200
+    assert hooks == ["called"]
+    assert ingress_runtime.lease_calls == 2
+
+
+@pytest.mark.parametrize("disposition", ["DROPPED", "APPLIED", "IGNORED", "FAILED", "PROCESSED"])
+def test_webhook_terminal_replay_reads_no_sql_or_session_and_mutates_no_state(
+        main_module, ingress_runtime, session_factory, monkeypatch, disposition):
+    from sqlalchemy import event
+    options = {}
+    if disposition == "DROPPED":
+        ingress_runtime.pause()
+    elif disposition in ("APPLIED", "IGNORED"):
+        options["from_me"] = True
+        if disposition == "APPLIED":
+            options["text"] = "/pause"
+    assert webhook(main_module, **options).status_code == 200
+    if disposition in ("FAILED", "PROCESSED"):
+        command = ingress_runtime.processing_broker.calls[0]
+        if disposition == "FAILED":
+            ingress_runtime.clock.advance(timedelta(seconds=900))
+            with ingress_runtime.store.contact_lease(PHONE) as lease:
+                ingress_runtime.store.exhaust_batch(command, ingress_runtime.clock.now(), lease)
+        else:
+            with ingress_runtime.store.contact_lease(PHONE) as lease, session_factory() as db:
+                claim = ingress_runtime.store.claim_or_resume_batch(command, ingress_runtime.clock.now(), lease)
+                result = domain.AgentResult("Resposta sintética", [], None, {}, domain.AgentIntent.SAVE_CONTEXT)
+                ingress_runtime.store.stage_agent_result(command, claim.attempt, result, ingress_runtime.clock.now(), lease)
+                ingress_runtime.coordinator.apply_agent_result(db, PHONE, result, claim.attempt.processing_id,
+                    claim.attempt.operation_id, ingress_runtime.clock.now(), lease)
+                ingress_runtime.store.complete_batch(command, claim.attempt, ingress_runtime.clock.now(), lease)
+    receipts = [item for item in ingress_runtime.details() if item.entry.kind == "dedupe"]
+    assert len(receipts) == 1 and receipts[0].body["disposition"] == disposition and receipts[0].terminal
+    before = ingress_runtime.store.snapshot()
+    before_leases = ingress_runtime.lease_calls
+    before_broker = list(ingress_runtime.processing_broker.calls)
+    calls = []
+    def forbidden(*args, **kwargs):
+        calls.append("unexpected_boundary")
+        raise AssertionError("terminal replay crossed effect boundary")
+    for target, method in ((ingress_runtime, "session_factory"), (ingress_runtime.coordinator, "_ensure"),
+                           (ingress_runtime.coordinator, "resolve_ingress"), (ingress_runtime.store, "ensure_consumer"),
+                           (ingress_runtime.store, "finalize_ingress_once")):
+        monkeypatch.setattr(target, method, forbidden)
+    engine = session_factory.kw["bind"]
+    event.listen(engine, "before_cursor_execute", forbidden)
+    try:
+        response = webhook(main_module, **options)
+    finally:
+        event.remove(engine, "before_cursor_execute", forbidden)
+    assert response.status_code == 200
+    assert json.loads(response.body) == {"status": "ignored"}
+    assert calls == []
+    assert ingress_runtime.lease_calls == before_leases + 1
+    assert ingress_runtime.store.snapshot() == before
+    assert ingress_runtime.processing_broker.calls == before_broker
+
+
+@pytest.mark.parametrize("fault", ["epoch_absent", "generation", "fingerprint"])
+def test_webhook_terminal_replay_does_not_bypass_invalid_coordination(main_module, ingress_runtime, fault):
+    assert webhook(main_module, from_me=True).status_code == 200
+    if fault == "epoch_absent":
+        ingress_runtime.store.inject_fault(fault)
+    else:
+        ingress_runtime.store.corrupt_contact(PHONE, fault)
+    response = webhook(main_module, from_me=True)
+    assert response.status_code == 503
+    assert ingress_runtime.processing_broker.calls == []
+
+
+def test_webhook_expired_terminal_receipt_does_not_suppress_new_ingress(main_module, ingress_runtime):
+    assert webhook(main_module, from_me=True).status_code == 200
+    receipt = next(item for item in ingress_runtime.details() if item.entry.kind == "dedupe")
+    ingress_runtime.clock.set(receipt.entry.expected_until)
+    sessions = ingress_runtime.session_calls
+    response = webhook(main_module)
+    assert response.status_code == 200
+    assert json.loads(response.body) == {"status": "buffered"}
+    assert ingress_runtime.session_calls == sessions + 1
+    assert len(ingress_runtime.envelopes()) == 1
+
+
 @pytest.fixture
 def agent_module(monkeypatch):
     effects = ForbiddenAgentEffects()
