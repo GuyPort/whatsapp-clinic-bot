@@ -31,6 +31,7 @@ from app.conversation_state import (
     BufferDispatch, DispatchPhase, ProcessingAttempt, ProcessingPhase, ConversationDomainError,
     BatchClaim, ClaimOutcome, AgentResult, AgentIntent, EnqueueResult, RecoveryPage,
     EnsureConsumerResult, BrokerUnavailable,
+    ResultApplication, fixed_reply_result,
 )
 from app.utils import normalize_phone
 
@@ -801,7 +802,8 @@ class RedisConversationStore:
 
     def _command_for(self, phone, batch):
         return ProcessingCommand(phone, batch.entry.id, batch.body["epoch"], batch.body["generation"],
-                                  batch.body["processing_id"], batch.body["operation_id"])
+                                  batch.body["processing_id"], batch.body["operation_id"],
+                                  batch.entry.id if batch.body["processing_id"] else None)
 
     def _batch_snapshot(self, command, lease):
         if lease.phone != command.phone:
@@ -1146,18 +1148,72 @@ class RedisConversationStore:
             self.exhaust_batch(self._command_for(phone, batch), self._now(), lease)
             raise ConversationMutationPending(FailureReason.MUTATION_PENDING)
 
+    def _owned_result(self, command, attempt, lease):
+        anchor, details, batch, _ = self._batch_snapshot(command, lease)
+        processing = self._find(details, "processing", attempt.processing_id)
+        staging = self._find(details, "staging", command.batch_id)
+        if (batch.body["phase"] != "STAGED" or processing is None or staging is None
+                or batch.body["processing_id"] != attempt.processing_id
+                or batch.body["operation_id"] != attempt.operation_id
+                or attempt.batch_id != command.batch_id or attempt.generation != command.generation
+                or attempt.coordination_epoch != command.coordination_epoch
+                or processing.body["claim_token"] != attempt.claim_token
+                or processing.body["owner_token_hash"] != hashlib.sha256(lease.owner_token.encode()).hexdigest()
+                or staging.body.get("result") is None):
+            raise ConversationMutationPending(FailureReason.MUTATION_PENDING)
+        result = self._result_load(staging.body["result"])
+        self.validate_agent_application(command.phone, attempt.processing_id, attempt.operation_id, result, lease)
+        return anchor, details, batch, processing, staging, result
+
+    def _fixed_staging_result(self, staging):
+        envelopes = tuple(InboundEnvelope(e["kind"], e["content"], datetime.fromisoformat(e["received_at"]),
+            e["generation"], e["message_id"]) for e in staging.body["envelopes"])
+        return fixed_reply_result(envelopes)
+
+    def prepare_fixed_response(self, command, attempt, now, lease):
+        """Publish a bound NO_SQL application, never a fabricated SQL receipt."""
+        with self._lock:
+            anchor, details, batch, processing, staging, result = self._owned_result(command, attempt, lease)
+            self.assert_mutation_available(lease, now)
+            if (anchor.cycle is not ConversationCycle.OPEN or result != self._fixed_staging_result(staging)
+                    or self._find(details, "mutation", self._attempt_id(attempt.operation_id)) is not None):
+                raise ConversationMutationPending(FailureReason.MUTATION_PENDING)
+            updated = self._changed(processing, body={**processing.body, "phase": "APPLYING",
+                "application": ResultApplication.NO_SQL.value})
+            self._transition(lease, anchor, self._replace_details(details, updated), operation="prepare_fixed_response",
+                deadline=attempt.processing_deadline, deadline_transition=self._terminal_plan(anchor, details, batch))
+
+    def _applied_result(self, command, attempt, lease):
+        anchor, details, batch, processing, staging, result = self._owned_result(command, attempt, lease)
+        mutation = self._find(details, "mutation", self._attempt_id(attempt.operation_id))
+        no_sql = (processing.body.get("application") == ResultApplication.NO_SQL.value
+                  and processing.body["phase"] == "APPLYING" and mutation is None
+                  and anchor.cycle is ConversationCycle.OPEN and result == self._fixed_staging_result(staging))
+        committed = mutation is not None and self._attempt_load(mutation).phase is MutationPhase.COMMITTED
+        if not (no_sql or committed):
+            raise ConversationMutationPending(FailureReason.MUTATION_PENDING)
+        return anchor, details, batch, processing, committed
+
+    def record_outbound_attempt(self, command, attempt, now, lease):
+        """Caller has crossed the local broker boundary; this is not delivery proof."""
+        with self._lock:
+            anchor, details, batch, processing, committed = self._applied_result(command, attempt, lease)
+            updated = self._changed(processing, body={**processing.body, "outbound_attempted": True})
+            self._transition(lease, anchor, self._replace_details(details, updated), operation="record_outbound_attempt",
+                deadline=None if committed else attempt.processing_deadline,
+                deadline_transition=None if committed else self._terminal_plan(anchor, details, batch))
+
     def complete_batch(self, command, attempt, now, lease):
         with self._lock:
             anchor, details, batch, _ = self._batch_snapshot(command, lease)
             if batch.body["phase"] in ("EXHAUSTED", "PROCESSED"):
                 return
-            mutation = self._find(details, "mutation", self._attempt_id(attempt.operation_id))
-            processing = self._find(details, "processing", attempt.processing_id)
-            if (mutation is None or self._attempt_load(mutation).phase is not MutationPhase.COMMITTED
-                    or processing is None or processing.body["claim_token"] != attempt.claim_token
-                    or batch.body["operation_id"] != attempt.operation_id):
+            anchor, details, batch, processing, committed = self._applied_result(command, attempt, lease)
+            if processing.body.get("outbound_attempted") is not True:
                 raise ConversationMutationPending(FailureReason.MUTATION_PENDING)
-            self._transition(lease, anchor, operation="complete_batch", **self._terminal_plan(anchor, details, batch, processed=True))
+            self._transition(lease, anchor, operation="complete_batch", **self._terminal_plan(anchor, details, batch, processed=True),
+                deadline=None if committed else attempt.processing_deadline,
+                deadline_transition=None if committed else self._terminal_plan(anchor, details, batch))
 
     @staticmethod
     def _recovery_cursor(state):
@@ -1318,11 +1374,15 @@ class RedisConversationStore:
             if item.entry.kind == "processing" and item.body.get("operation_id") == attempt.operation_id:
                 phase = {MutationPhase.PREPARED: "APPLYING", MutationPhase.COMMITTING: "APPLYING",
                          MutationPhase.COMMITTED: "DONE", MutationPhase.ABORTED: "RESULT_READY"}.get(attempt.phase)
+                if attempt.phase is MutationPhase.COMMITTED and batch and not batch.terminal:
+                    phase = "APPLYING"  # DONE belongs to the post-enqueue completion CAS.
                 if phase:
                     item = self._changed(item, body={**item.body, "phase": phase})
             elif item.entry.kind == "dedupe" and item.body.get("operation_id") == attempt.operation_id:
-                if attempt.phase is MutationPhase.COMMITTED:
-                    disposition = "PROCESSED" if item.body.get("batch_id") else "APPLIED"
+                if attempt.phase is MutationPhase.COMMITTED and (not item.body.get("batch_id") or operational):
+                    # Quiescent resolution invalidates the quarantined output;
+                    # its retained ingress ID must stay terminal without claiming enqueue.
+                    disposition = "FAILED" if item.body.get("batch_id") else "APPLIED"
                     item = self._changed(item, body={**item.body, "disposition": disposition},
                                          until=max(item.entry.expected_until, self._replay_until()), terminal=True)
                 elif attempt.phase is MutationPhase.ABORTED and operational:

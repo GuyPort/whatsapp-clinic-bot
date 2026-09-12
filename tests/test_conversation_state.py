@@ -998,6 +998,7 @@ def test_result_ready_complete_batch_lifecycle_reuses_result_and_purges_content(
         outbound = coordinator.apply_agent_result(db, PHONE, resumed.result, resumed.attempt.processing_id,
                     resumed.attempt.operation_id, clock.now(), lease)
         assert outbound.text == "synthetic response"
+        store.record_outbound_attempt(command, resumed.attempt, clock.now(), lease)
         store.complete_batch(command, resumed.attempt, clock.now(), lease)
         store.complete_batch(command, resumed.attempt, clock.now(), lease)
         assert store.dispatch(command, lease).phase is domain.DispatchPhase.PROCESSED

@@ -212,6 +212,7 @@ def test_batch_complete_atomic_failure_retries_without_losing_sql_receipt(transi
         store.stage_agent_result(command, claim.attempt, result, clock.now(), lease)
         coordinator.apply_agent_result(db, PHONE, result, claim.attempt.processing_id,
                                        claim.attempt.operation_id, clock.now(), lease)
+        store.record_outbound_attempt(command, claim.attempt, clock.now(), lease)
         snapshot = store.snapshot()
         store.fail_next_atomic("complete_batch")
         with pytest.raises(ConversationStateUnavailable):
@@ -583,6 +584,7 @@ def test_terminal_processing_batch_cannot_authorize_another_operation_or_result(
         first_result = domain.AgentResult("first result", [], None, {"version": 1}, domain.AgentIntent.SAVE_CONTEXT)
         store.stage_agent_result(first_command, first, first_result, clock.now(), lease)
         coordinator.apply_agent_result(db, PHONE, first_result, first.processing_id, first.operation_id, clock.now(), lease)
+        store.record_outbound_attempt(first_command, first, clock.now(), lease)
         store.complete_batch(first_command, first, clock.now(), lease)
         second_command = batch_command(store, lease, append_batch(store, lease, message_id="second-id"))
         second = store.claim_or_resume_batch(second_command, clock.now(), lease).attempt
@@ -611,6 +613,7 @@ def test_terminal_processing_batch_validates_result_fingerprint_before_short_cir
         result = domain.AgentResult("winner", [], None, {}, domain.AgentIntent.SAVE_CONTEXT)
         store.stage_agent_result(command, attempt, result, clock.now(), lease)
         coordinator.apply_agent_result(db, PHONE, result, attempt.processing_id, attempt.operation_id, clock.now(), lease)
+        store.record_outbound_attempt(command, attempt, clock.now(), lease)
         store.complete_batch(command, attempt, clock.now(), lease)
         db.events.clear()
         with pytest.raises(domain.ConversationMutationPending):
@@ -689,6 +692,7 @@ def test_batch_cleanup_retains_committed_proof_until_its_staged_batch_completes(
         assert store.dispatch(command, lease).phase is domain.DispatchPhase.STAGED
         assert any(item.entry.id == command.batch_id for item in batch_details(store, lease, "staging"))
         # Task 7 owns its actual local enqueue attempt before calling completion.
+        store.record_outbound_attempt(command, resumed.attempt, clock.now(), lease)
         store.complete_batch(command, resumed.attempt, clock.now(), lease)
         store.cleanup(lease, store.read_anchor(lease))
         assert store.inspect_mutation(PHONE, attempt.operation_id, lease) is None
@@ -1944,3 +1948,205 @@ def test_anchor_corrupt_uuid_json_types_quarantine_with_domain_reason(field, val
             store.read_anchor(lease)
         assert error.value.reason_code is FailureReason.GENERATION_UNAVAILABLE
         assert store.is_quarantined(PHONE)
+from tests.test_conversation_flow import task_api, processing_runtime
+
+
+def test_sender_pause_committed_first_discards_normal_before_provider(task_api, processing_runtime):
+    rt = processing_runtime
+    task_api.process_batch(rt.buffer(), rt)
+    outbound = rt.outbound_broker.calls[-1]
+    pause = rt.pause()
+    assert task_api.send_outbound(outbound, rt) is task_api.SendOutcome.DISCARDED
+    rt.clock.set(pause.paused_until)
+    assert task_api.send_outbound(outbound, rt) is task_api.SendOutcome.DISCARDED
+    assert rt.transport.calls == []
+
+
+def test_sender_provider_started_first_holds_lease_until_return(task_api, processing_runtime):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+    rt = processing_runtime
+    task_api.process_batch(rt.buffer(), rt)
+    outbound = rt.outbound_broker.calls[-1]
+    entered, release = Barrier(2), Barrier(2)
+    def sending():
+        entered.wait(timeout=3)
+        release.wait(timeout=3)
+    rt.transport.on_send = sending
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(task_api.send_outbound, outbound, rt)
+        entered.wait(timeout=3)
+        try:
+            with pytest.raises(ContactLockUnavailable):
+                rt.pause()
+        finally:
+            release.wait(timeout=3)
+        assert future.result(timeout=3) is task_api.SendOutcome.SENT
+    rt.pause()
+    assert len(rt.transport.calls) == 1
+
+
+@pytest.mark.parametrize("intent", ["PAUSE_FOR_SECRETARY", "CLOSE_CONTEXT"])
+@pytest.mark.parametrize("change,allowed", [("current", True), ("missing", False), ("reference", False), ("generation", False), ("later", False)])
+def test_sender_requires_current_exact_transition_reference(task_api, processing_runtime, intent, change, allowed):
+    from dataclasses import replace
+    from uuid import uuid4
+    from app.conversation_state import AgentIntent, SenderIdentity
+    rt = processing_runtime
+    rt.agent.intent = AgentIntent(intent)
+    task_api.process_batch(rt.buffer(), rt)
+    outbound = rt.outbound_broker.calls[-1]
+    if change == "missing":
+        outbound = replace(outbound, pause_ref=None, closure_ref=None)
+    elif change == "reference":
+        if outbound.pause_ref:
+            outbound = replace(outbound, pause_ref=replace(outbound.pause_ref, paused_until=rt.clock.now()))
+        else:
+            outbound = replace(outbound, closure_ref=replace(outbound.closure_ref, operation_id=str(uuid4())))
+    elif change == "generation":
+        outbound = replace(outbound, generation=str(uuid4()))
+    elif change == "later":
+        if intent == "PAUSE_FOR_SECRETARY":
+            rt.pause()
+        else:
+            rt.buffer("nova conversa")
+    assert task_api.send_outbound(outbound, rt) is (task_api.SendOutcome.SENT if allowed else task_api.SendOutcome.DISCARDED)
+    assert len(rt.transport.calls) == int(allowed)
+
+
+@pytest.mark.parametrize("fault", ["readiness", "lease", "generation", "sql", "lost_before_provider"])
+def test_sender_dependency_failure_retries_before_provider(task_api, processing_runtime, fault, monkeypatch):
+    from app.conversation_state import DependencyName
+    from app.conversation_redis import contact_keys
+    rt = processing_runtime
+    task_api.process_batch(rt.buffer(), rt)
+    outbound = rt.outbound_broker.calls[-1]
+    leases, sessions = rt.lease_calls, rt.session_calls
+    if fault == "readiness":
+        rt.dependencies[DependencyName.SQL] = False
+    elif fault == "lease":
+        rt.store.fail_next_atomic("acquire")
+    elif fault == "generation":
+        rt.store.client.values.pop(contact_keys(PHONE).generation, None)
+    elif fault == "sql":
+        from sqlalchemy.exc import SQLAlchemyError
+        from sqlalchemy.orm import Session
+        def fail(*args, **kwargs):
+            raise SQLAlchemyError("synthetic-private-sql-error")
+        monkeypatch.setattr(Session, "get", fail)
+    else:
+        original = rt.coordinator.may_send
+        def lose(*args, **kwargs):
+            result = original(*args, **kwargs)
+            rt.store.client.values.pop(contact_keys(PHONE).lease, None)
+            return result
+        monkeypatch.setattr(rt.coordinator, "may_send", lose)
+    with pytest.raises(task_api.RetryRequested):
+        task_api.send_outbound(outbound, rt)
+    assert rt.transport.calls == []
+    if fault == "readiness":
+        assert (rt.lease_calls, rt.session_calls) == (leases, sessions)
+
+
+def test_no_sql_application_cannot_be_reinterpreted_as_sql_mutation(task_api, processing_runtime):
+    from app import conversation_state as domain
+    rt = processing_runtime
+    command = rt.buffer("/pause")
+    rt.outbound_broker.next_result = domain.EnqueueResult.DEFINITIVE_FAILURE
+    with pytest.raises(task_api.RetryRequested) as caught:
+        task_api.process_batch(command, rt)
+    with rt.store.contact_lease(PHONE) as lease, rt.session_factory() as db:
+        claim = rt.store.claim_or_resume_batch(caught.value.command, rt.clock.now(), lease)
+        with pytest.raises(domain.ConversationMutationPending):
+            rt.coordinator.apply_agent_result(db, PHONE, claim.result, claim.attempt.processing_id,
+                claim.attempt.operation_id, rt.clock.now(), lease)
+        assert "commit_entered" not in db.events
+        assert not any(item.entry.kind == "mutation" for item in rt.store.read_details(lease))
+
+
+@pytest.mark.parametrize("fault", ["claim", "processing", "operation", "epoch", "generation", "text", "delta"])
+def test_no_sql_fence_rejects_old_claims_and_substituted_results(task_api, processing_runtime, fault):
+    from app import conversation_state as domain
+    from uuid import uuid4
+    rt = processing_runtime
+    command = rt.buffer("/pause")
+    with rt.store.contact_lease(PHONE) as lease:
+        claim = rt.store.claim_or_resume_batch(command, rt.clock.now(), lease)
+        result = domain.AgentResult("Para falar com a Beatriz, envie ATENDIMENTO.", [], None, {}, domain.AgentIntent.SAVE_CONTEXT)
+        if fault == "text":
+            result = replace(result, text="synthetic-substituted-output")
+        if fault == "delta":
+            result = replace(result, messages=[{"role": "user", "content": "synthetic-private-delta"}])
+        rt.store.stage_agent_result(command, claim.attempt, result, rt.clock.now(), lease)
+        attempt = claim.attempt
+        fields = {"claim": "claim_token", "processing": "processing_id", "operation": "operation_id",
+                  "epoch": "coordination_epoch", "generation": "generation"}
+        if fault in fields:
+            attempt = replace(attempt, **{fields[fault]: str(uuid4())})
+        before = rt.store.contact_snapshot(PHONE)
+        with pytest.raises(domain.ConversationMutationPending):
+            rt.store.prepare_fixed_response(command, attempt, rt.clock.now(), lease)
+        assert rt.store.contact_snapshot(PHONE) == before
+    assert rt.agent.calls == rt.outbound_broker.calls == rt.transport.calls == []
+
+
+@pytest.mark.parametrize("boundary", ["agent", "transport"])
+def test_processing_and_sender_heartbeat_cover_external_call_past_original_ttl(task_api, processing_runtime, boundary):
+    from tests.fakes import ControlledWait
+    rt = processing_runtime
+    command = rt.buffer()
+    if boundary == "transport":
+        task_api.process_batch(command, rt)
+    wait = ControlledWait(rt.clock)
+    rt.store.heartbeat_wait = wait
+    def prolonged():
+        for _ in range(4):
+            wait.tick(20)
+        with pytest.raises(ContactLockUnavailable):
+            rt.pause()
+    if boundary == "agent":
+        rt.agent.on_prepare = prolonged
+        assert task_api.process_batch(command, rt) is task_api.ProcessingOutcome.PROCESSED
+    else:
+        rt.transport.on_send = prolonged
+        assert task_api.send_outbound(rt.outbound_broker.calls[-1], rt) is task_api.SendOutcome.SENT
+    assert wait.stopped
+
+
+def test_process_batch_lost_lease_during_agent_has_zero_dml_or_outbound(task_api, processing_runtime):
+    from app.conversation_redis import contact_keys
+    rt = processing_runtime
+    command = rt.buffer()
+    rt.agent.on_prepare = lambda: rt.store.client.values.pop(contact_keys(PHONE).lease, None)
+    with pytest.raises(task_api.RetryRequested):
+        task_api.process_batch(command, rt)
+    assert not any("commit_entered" in s.events for s in rt.sessions)
+    assert rt.outbound_broker.calls == []
+
+
+def test_sender_transport_failure_releases_lease_and_exposes_only_reason(task_api, processing_runtime, caplog):
+    import traceback
+    rt = processing_runtime
+    task_api.process_batch(rt.buffer(), rt)
+    outbound = rt.outbound_broker.calls[-1]
+    def failure():
+        raise RuntimeError("synthetic-private-provider-error")
+    rt.transport.on_send = failure
+    with pytest.raises(task_api.RetryRequested) as caught:
+        task_api.send_outbound(outbound, rt)
+    assert caught.value.reason_code == "transport_unavailable"
+    assert "synthetic-private-provider-error" not in "".join(traceback.format_exception(caught.value))
+    assert "synthetic-private-provider-error" not in caplog.text
+    rt.pause()  # Transport failed but its lease has been released.
+
+
+def test_sender_missing_entire_coordination_never_initializes_old_generation(task_api, processing_runtime):
+    from app import conversation_state as domain
+    from uuid import uuid4
+    rt = processing_runtime
+    outbound = domain.OutboundEnvelope(PHONE, "synthetic", domain.OutboundKind.NORMAL,
+        str(uuid4()), str(uuid4()), str(uuid4()))
+    with pytest.raises(task_api.RetryRequested):
+        task_api.send_outbound(outbound, rt)
+    assert rt.store.contact_snapshot(PHONE)["values"] == {}
+    assert rt.transport.calls == []

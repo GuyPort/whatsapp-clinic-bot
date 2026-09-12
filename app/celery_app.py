@@ -2,7 +2,9 @@
 Configuração do Celery para processamento assíncrono de mensagens.
 """
 from celery import Celery
+from celery.exceptions import Retry as CeleryRetry
 from app.simple_config import settings
+from app.conversation_state import EnqueueResult
 import logging
 
 logger = logging.getLogger(__name__)
@@ -45,7 +47,42 @@ celery_app.conf.update(
     },
 )
 
-logger.info(f"✅ Celery configurado com broker: {settings.redis_url[:20]}...")
+logger.info("conversation_celery_configured")
+
+
+class CeleryProcessingBroker:
+    """Injected task/probe: construction never opens a broker connection."""
+    def __init__(self, task, *, probe, debounce_seconds=10):
+        self.task, self._probe, self.debounce_seconds = task, probe, debounce_seconds
+
+    def probe(self):
+        return self._probe() is True
+
+    def enqueue_processing(self, command):
+        payload = command.to_payload()
+        try:
+            self.task.apply_async(args=[payload], countdown=self.debounce_seconds,
+                argsrepr="(<conversation_command>,)", kwargsrepr="{}")
+        except CeleryRetry:
+            raise
+        except Exception:
+            return EnqueueResult.AMBIGUOUS
+        return EnqueueResult.CONFIRMED
+
+
+class CeleryOutboundBroker:
+    def __init__(self, task):
+        self.task = task
+
+    def enqueue_outbound(self, outbound):
+        payload = outbound.to_payload()
+        try:
+            self.task.apply_async(args=[payload], argsrepr="(<conversation_outbound>,)", kwargsrepr="{}")
+        except CeleryRetry:
+            raise
+        except Exception:
+            return EnqueueResult.AMBIGUOUS
+        return EnqueueResult.CONFIRMED
 
 # Importar módulo onde a task está definida para registro automático
 import app.main  # noqa: F401

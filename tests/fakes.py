@@ -546,3 +546,91 @@ class IngressRuntime:
         with self.store.contact_lease(phone) as lease, self._factory() as db:
             return self.coordinator.pause_for_secretary(
                 db, phone, "secretary_manual_pause", self.clock.now(), lease, str(uuid4()))
+
+
+class ScriptedAgent:
+    """Typed agent boundary; the real coordinator still owns all SQL effects."""
+    def __init__(self):
+        self.calls = []
+        self.on_prepare = None
+        self.intent = None
+
+    def prepare_result(self, message, phone, snapshot):
+        from app.conversation_state import AgentResult, AgentIntent
+        self.calls.append((message, phone, deepcopy(snapshot)))
+        if self.on_prepare:
+            self.on_prepare()
+        return AgentResult("Resposta sintética", snapshot.messages + [
+            {"role": "user", "content": message},
+            {"role": "assistant", "content": "Resposta sintética"}],
+            snapshot.current_flow, deepcopy(snapshot.flow_data), self.intent or AgentIntent.SAVE_CONTEXT)
+
+
+class ScriptedOutboundBroker:
+    def __init__(self):
+        self.calls = []
+        self.on_enqueue = None
+        self.next_result = None
+
+    def enqueue_outbound(self, outbound):
+        from app.conversation_state import EnqueueResult
+        self.calls.append(outbound)
+        if self.on_enqueue:
+            self.on_enqueue(outbound)
+        return self.next_result or EnqueueResult.CONFIRMED
+
+
+class ScriptedTransport:
+    def __init__(self):
+        self.calls = []
+        self.on_send = None
+        self.result = True
+
+    def send_message(self, phone, text):
+        self.calls.append((phone, text))
+        if self.on_send:
+            self.on_send()
+        return self.result
+
+
+class ProcessingRuntime(IngressRuntime):
+    def __init__(self, factory, config):
+        super().__init__(factory, config)
+        self.agent = ScriptedAgent()
+        self.outbound_broker = ScriptedOutboundBroker()
+        self.transport = ScriptedTransport()
+        self.sessions = []
+        self.session_hooks = {}
+
+    def session_factory(self):
+        from contextlib import contextmanager
+        @contextmanager
+        def session_scope():
+            with super(ProcessingRuntime, self).session_factory() as session:
+                observed = BarrierSession(session)
+                observed.hooks.update(self.session_hooks)
+                self.session_hooks.clear()
+                self.sessions.append(observed)
+                yield observed
+        return session_scope()
+
+    def buffer(self, content="Mensagem sintética", *, kind="text", phone="5551999990000", message_id=None):
+        from uuid import uuid4
+        from app.conversation_state import SenderIdentity
+        with self.store.contact_lease(phone) as lease, self.session_factory() as db:
+            self.coordinator.accept_ingress(db, SenderIdentity(phone, False, message_id or str(uuid4()), "pn"),
+                kind, content, self.clock.now(), lease, self.processing_broker)
+        return self.processing_broker.calls[-1]
+
+
+class RetryTask:
+    """Celery Retry must escape the wrapper exactly once."""
+    def __init__(self):
+        from types import SimpleNamespace
+        self.request = SimpleNamespace(id="synthetic-task", retries=0)
+        self.calls = []
+
+    def retry(self, **kwargs):
+        from celery.exceptions import Retry
+        self.calls.append(kwargs)
+        raise Retry("synthetic retry")

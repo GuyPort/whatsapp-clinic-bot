@@ -18,7 +18,10 @@ from sqlalchemy.orm import Session
 from app.ai_agent import ai_agent
 from app.whatsapp_service import whatsapp_service
 from app.utils import normalize_phone
-from app.conversation_state import IngressDisposition, SenderIdentity
+from app.conversation_state import (
+    IngressDisposition, SenderIdentity, ConversationDomainError, OutboundEnvelope, ProcessingCommand,
+)
+from app.conversation_tasks import process_batch, send_outbound, RetryRequested
 from app.models import Appointment, ConversationContext, PausedContact, AppointmentStatus
 from app.scheduler import start_scheduler, stop_scheduler
 from app.celery_app import celery_app
@@ -313,201 +316,29 @@ async def whatsapp_webhook(request: Request):
     return JSONResponse({"status": "buffered" if receipt.disposition is IngressDisposition.BUFFERED else "ignored"})
 
 
-def _send_message_sync(phone: str, message: str) -> bool:
-    """
-    Wrapper síncrono para whatsapp_service.send_message (async).
-    Usado dentro de tasks Celery que são síncronas.
-    """
+@celery_app.task(name="app.main.send_message_task", bind=True, max_retries=3, default_retry_delay=60)
+def send_message_task(self, payload):
+    """Parse a typed outbound and delegate all authorization to the sender."""
+    outbound = OutboundEnvelope.from_payload(payload)
     try:
-        return asyncio.run(whatsapp_service.send_message(phone, message))
-    except Exception as e:
-        logger.error(f"Erro ao enviar mensagem via wrapper síncrono: {str(e)}")
-        return False
+        return send_outbound(outbound, getattr(app.state, "conversation_runtime", None)).value
+    except RetryRequested as error:
+        raise self.retry(exc=ConversationDomainError(error.reason_code),
+            args=[outbound.to_payload()], kwargs={},
+            argsrepr="(<conversation_outbound>,)", kwargsrepr="{}") from None
 
 
-def _mark_message_as_read_sync(phone: str, message_id: str) -> bool:
-    """
-    Wrapper síncrono para whatsapp_service.mark_message_as_read (async).
-    Usado dentro de tasks Celery que são síncronas.
-    """
+@celery_app.task(name="app.main.process_message_task", bind=True, max_retries=3, default_retry_delay=60)
+def process_message_task(self, payload):
+    """Retries carry the original batch and the persisted staging identities."""
+    command = ProcessingCommand.from_payload(payload)
     try:
-        return asyncio.run(whatsapp_service.mark_message_as_read(phone, message_id))
-    except Exception as e:
-        logger.error(f"Erro ao marcar mensagem como lida via wrapper síncrono: {str(e)}")
-        return False
-
-
-@celery_app.task(bind=True, max_retries=3, default_retry_delay=60)
-def send_message_task(self, phone: str, message: str):
-    """
-    Task Celery dedicada para envio de mensagens para WhatsApp API.
-    Esta task é roteada para a fila 'send_queue' e usa rate limiting de 5 segundos.
-    
-    Args:
-        phone: Número do telefone
-        message: Texto da mensagem a ser enviada
-    """
-    task_id = self.request.id
-    logger.info(f"📤 Task de envio {task_id} iniciada para {phone}")
-    
-    try:
-        # Normalizar telefone
-        phone = normalize_phone(phone)
-        
-        # Enviar mensagem usando wrapper síncrono (já tem rate limiting)
-        success = _send_message_sync(phone, message)
-        
-        if success:
-            logger.info(f"✅ Task de envio {task_id} concluída - Mensagem enviada para {phone}")
-        else:
-            logger.error(f"❌ Task de envio {task_id} - Falha ao enviar mensagem para {phone}")
-            # Retry automático se falhou
-            raise Exception("Falha ao enviar mensagem")
-            
-    except Exception as e:
-        logger.error(f"❌ Task de envio {task_id} - Erro: {str(e)}", exc_info=True)
-        # Retry automático do Celery
-        raise self.retry(exc=e)
-
-
-@celery_app.task(bind=True, max_retries=3, default_retry_delay=60)
-def process_message_task(self, phone: str, message_text: str = None, message_id: str = None):
-    """
-    Processa mensagem em background usando Celery.
-    Suporta sistema de debounce: se message_text for None, busca do buffer Redis.
-
-    Args:
-        phone: Número do telefone
-        message_text: Texto da mensagem (None se usando buffer)
-        message_id: ID da mensagem (para marcar como lida)
-    """
-    task_id = self.request.id
-
-    # Normalizar telefone primeiro
-    phone = normalize_phone(phone)
-
-    # ==========================================================================
-    # SISTEMA DE DEBOUNCE: Verificar se deve processar agora
-    # ==========================================================================
-    if message_text is None:
-        # Task foi agendada com delay - verificar se deve processar
-        if not whatsapp_service.should_process_now(phone):
-            # Ainda não passou tempo suficiente - outra mensagem chegou
-            # Ignorar esta task, a próxima vai processar
-            logger.info(f"[DEBOUNCE] Task {task_id} ignorada para {phone} - aguardando mais mensagens")
-            return
-
-        # Passou o tempo de debounce - pegar mensagens concatenadas do buffer
-        message_text = whatsapp_service.get_concatenated_message(phone)
-
-        if not message_text:
-            logger.warning(f"[DEBOUNCE] Task {task_id} - Buffer vazio para {phone}")
-            return
-
-        logger.info(f"[DEBOUNCE] Task {task_id} processando {phone}: {message_text[:80]}...")
-    else:
-        # Modo antigo (fallback sem Redis) - processar diretamente
-        logger.info(f"Task {task_id} iniciada para {phone}: {message_text[:50]}...")
-
-    lock = None
-    lock_acquired = False
-
-    try:
-        # Garantir processamento serializado por contato
-        lock = whatsapp_service.acquire_chat_lock(phone)
-        if lock:
-            try:
-                lock_acquired = lock.acquire(blocking=True)
-            except Exception as lock_error:
-                logger.warning(f"Nao foi possivel adquirir lock para {phone}: {lock_error}")
-                raise self.retry(exc=lock_error, countdown=2)
-
-            if not lock_acquired:
-                logger.warning(f"Lock ocupado para {phone}, reagendando task")
-                raise self.retry(exc=Exception("chat_lock_busy"), countdown=2)
-        else:
-            logger.warning(f"Processando {phone} sem lock - Redis indisponivel")
-
-        # Marcar como lida
-        if message_id:
-            _mark_message_as_read_sync(phone, message_id)
-
-        # Verificar comandos administrativos (/pausar)
-        lowered = message_text.strip().lower()
-
-        if lowered in {"/pausar", "/pause"}:
-            with get_db() as db:
-                logger.info(f"Comando /pausar recebido para {phone}")
-                response = ai_agent._handle_request_human_assistance({}, db, phone)
-                if response:
-                    send_message_task.delay(phone, response)
-                return
-
-        # Verificar se bot está pausado para este telefone
-        with get_db() as db:
-            paused_contact = db.query(PausedContact).filter_by(phone=phone).first()
-
-            if paused_contact:
-                if datetime.utcnow() < paused_contact.paused_until:
-                    # Ainda pausado - bot ignora mensagem
-                    logger.info(f"Bot pausado para {phone} ate {paused_contact.paused_until}")
-                    return
-                else:
-                    # Passou 2 horas - reativar silenciosamente
-                    logger.info(f"Bot reativado automaticamente para {phone}")
-                    db.delete(paused_contact)
-                    db.commit()
-
-        # Processar com IA
-        response = ai_agent.process_message(message_text, phone, db)
-        
-        # Enfileirar mensagem para envio na fila separada
-        if response:
-            send_task = send_message_task.delay(phone, response)
-            logger.info(f"✅ Task {task_id} concluída - Resposta enfileirada para envio (task: {send_task.id})")
-        else:
-            logger.warning(f"⚠️ Task {task_id} - Nenhuma resposta gerada para {phone}")
-        
-    except CeleryRetry:
-        raise
-    except Exception as e:
-        try:
-            from celery.exceptions import Retry as CeleryRetry  # type: ignore
-        except ImportError:
-            CeleryRetry = None
-        
-        if CeleryRetry and isinstance(e, CeleryRetry):
-            raise e
-        
-        logger.error(f"❌ Task {task_id} - Erro ao processar mensagem: {str(e)}", exc_info=True)
-        
-        error_text = str(e).lower()
-        concurrency_issue = any(
-            issue in error_text
-            for issue in ["database is locked", "chat_lock_busy", "deadlock", "could not obtain lock"]
-        )
-        
-        if concurrency_issue:
-            logger.warning(f"⚠️ Erro de concorrência detectado para {phone}; retry silencioso.")
-        else:
-            # Tentar enfileirar mensagem de erro ao usuário
-            try:
-                send_message_task.delay(
-                    phone,
-                    "Desculpe, ocorreu um erro ao processar sua mensagem. Por favor, tente novamente em instantes."
-                )
-                logger.info(f"📤 Mensagem de erro enfileirada para {phone}")
-            except Exception as send_error:
-                logger.error(f"❌ Task {task_id} - Erro ao enfileirar mensagem de erro: {str(send_error)}")
-        
-        # Retry automático do Celery se necessário
-        raise self.retry(exc=e, countdown=2 if concurrency_issue else 60)
-    finally:
-        if lock and lock_acquired:
-            try:
-                lock.release()
-            except Exception as release_error:
-                logger.warning(f"⚠️ Erro ao liberar lock de {phone}: {release_error}")
+        return process_batch(command, getattr(app.state, "conversation_runtime", None)).value
+    except RetryRequested as error:
+        retry_command = error.command or command
+        raise self.retry(exc=ConversationDomainError(error.reason_code),
+            args=[retry_command.to_payload()], kwargs={}, countdown=60,
+            argsrepr="(<conversation_command>,)", kwargsrepr="{}") from None
 
 
 @app.get("/status")

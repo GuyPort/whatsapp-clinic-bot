@@ -94,6 +94,10 @@ class ClaimOutcome(str, Enum):
     TERMINAL = "TERMINAL"
 
 
+class ResultApplication(str, Enum):
+    NO_SQL = "NO_SQL"
+
+
 class AgentIntent(str, Enum):
     SAVE_CONTEXT = "SAVE_CONTEXT"
     PAUSE_FOR_SECRETARY = "PAUSE_FOR_SECRETARY"
@@ -139,6 +143,7 @@ class FailureReason(str, Enum):
     INVALID_AGENT_SNAPSHOT = "invalid_agent_snapshot"
     TOOL_UNAVAILABLE = "tool_unavailable"
     TOOL_ITERATION_LIMIT = "tool_iteration_limit"
+    TRANSPORT_UNAVAILABLE = "transport_unavailable"
 
 
 class ConfigurationIssue(str, Enum):
@@ -222,6 +227,10 @@ class ReadinessUnavailable(ConversationDomainError):
 
 
 class BrokerUnavailable(ConversationDomainError):
+    pass
+
+
+class TransportUnavailable(ConversationDomainError):
     pass
 
 
@@ -440,6 +449,7 @@ class ProcessingCommand:
     generation: str
     processing_id: str | None = None
     operation_id: str | None = None
+    staging_id: str | None = None
 
     def __post_init__(self):
         from app.utils import normalize_phone
@@ -452,6 +462,8 @@ class ProcessingCommand:
             for value in (self.processing_id, self.operation_id):
                 if value is not None and (not isinstance(value, str) or str(UUID(value)) != value):
                     raise ValueError
+            if self.staging_id is not None and self.staging_id != self.batch_id:
+                raise ValueError
         except (ValueError, TypeError, AttributeError):
             raise ConversationStateUnavailable(FailureReason.INVALID_TASK_COMMAND) from None
 
@@ -472,6 +484,23 @@ class InboundEnvelope:
     received_at: datetime
     generation: str
     message_id: str | None = None
+
+
+def fixed_reply_result(envelopes: Sequence[InboundEnvelope]) -> AgentResult:
+    """Fixed guidance has no agent delta and never writes conversation context."""
+    parts = []
+    for envelope in envelopes:
+        if envelope.kind == "pause_help":
+            parts.append("Para falar com a Beatriz, envie ATENDIMENTO.")
+        elif envelope.kind == "media" and envelope.content in {"imagem", "áudio", "vídeo", "documento", "figurinha"}:
+            parts.append(f"Desculpe, não consigo receber {envelope.content}. "
+                "Se puder me explicar por texto, consigo te ajudar!\n\n"
+                "Caso prefira, posso te transferir para nossa secretária Beatriz.")
+        else:
+            raise ConversationStateUnavailable(FailureReason.INVALID_VALUE)
+    if not parts:
+        raise ConversationStateUnavailable(FailureReason.INVALID_VALUE)
+    return AgentResult("\n\n".join(parts), [], None, {}, AgentIntent.SAVE_CONTEXT)
 
 
 @dataclass(frozen=True, repr=False)
@@ -522,7 +551,7 @@ class RecoveryPage:
     next_cursor: str | None = None
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, repr=False)
 class OutboundEnvelope:
     phone: str
     text: str
@@ -558,6 +587,59 @@ class OutboundEnvelope:
             "closure_ref": closure_ref,
         }
 
+    def to_payload(self) -> dict[str, Any]:
+        try:
+            payload = self.to_dict()
+            self.from_payload(payload)
+            return payload
+        except (ValueError, TypeError, AttributeError):
+            raise ConversationStateUnavailable(FailureReason.INVALID_TASK_COMMAND) from None
+
+    @classmethod
+    def from_payload(cls, payload):
+        from app.utils import normalize_phone
+        def identifier(value, *, optional=False):
+            if optional and value is None:
+                return
+            if not isinstance(value, str) or str(UUID(value)) != value:
+                raise ValueError
+        try:
+            if type(payload) is not dict or set(payload) != set(cls.__dataclass_fields__):
+                raise ValueError
+            phone = payload["phone"]
+            if not isinstance(phone, str) or not phone or normalize_phone(phone) != phone:
+                raise ValueError
+            if not isinstance(payload["text"], str) or not payload["text"]:
+                raise ValueError
+            identifier(payload["generation"])
+            identifier(payload["processing_id"], optional=True)
+            identifier(payload["operation_id"], optional=True)
+            if type(payload["kind"]) is not str:
+                raise ValueError
+            kind = OutboundKind(payload["kind"])
+            pause, closure = payload["pause_ref"], payload["closure_ref"]
+            if pause is not None:
+                if type(pause) is not dict or set(pause) != {"generation", "paused_until", "reason"}:
+                    raise ValueError
+                identifier(pause["generation"])
+                if not isinstance(pause["paused_until"], str) or not isinstance(pause["reason"], str):
+                    raise ValueError
+                deadline = datetime.fromisoformat(pause["paused_until"])
+                if deadline.tzinfo is None or deadline.utcoffset() is None:
+                    raise ValueError
+                PauseReason(pause["reason"])
+                pause = PauseTransitionRef(pause["generation"], deadline, pause["reason"])
+            if closure is not None:
+                if type(closure) is not dict or set(closure) != {"generation", "operation_id"}:
+                    raise ValueError
+                identifier(closure["generation"])
+                identifier(closure["operation_id"])
+                closure = ClosureTransitionRef(closure["generation"], closure["operation_id"])
+            return cls(phone, payload["text"], kind, payload["generation"], payload["processing_id"],
+                payload["operation_id"], pause, closure)
+        except (ValueError, TypeError, AttributeError, KeyError, OverflowError):
+            raise ConversationStateUnavailable(FailureReason.INVALID_TASK_COMMAND) from None
+
 
 class ConversationStore(Protocol):
     def finalize_ingress_once(self, phone: str, envelope: InboundEnvelope | None,
@@ -578,6 +660,12 @@ class ConversationStore(Protocol):
 
     def complete_batch(self, command: ProcessingCommand, attempt: ProcessingAttempt,
                        now: datetime, lease: ContactLease) -> None: ...
+
+    def prepare_fixed_response(self, command: ProcessingCommand, attempt: ProcessingAttempt,
+                               now: datetime, lease: ContactLease) -> None: ...
+
+    def record_outbound_attempt(self, command: ProcessingCommand, attempt: ProcessingAttempt,
+                                now: datetime, lease: ContactLease) -> None: ...
 
     def exhaust_batch(self, command: ProcessingCommand, now: datetime, lease: ContactLease) -> None: ...
 
@@ -804,6 +892,23 @@ class ConversationCoordinator:
 
     def __init__(self, store: ConversationStore, clock):
         self.store, self.clock = store, clock
+
+    @_reason_codes_only
+    def processing_snapshot(self, db: Session, phone: str, now: datetime,
+                            lease: ContactLease) -> ConversationSnapshot:
+        """Read existing authority and SQL without opening or expiring a cycle."""
+        if lease.phone != phone:
+            raise ContactLeaseLost(FailureReason.CONTACT_LEASE_LOST)
+        lease.assert_owned()
+        self.store.read_anchor(lease)  # Processing never initializes missing state.
+        self.store.assert_mutation_available(lease, now)
+        self._assert_open(db, phone, lease)
+        with db.no_autoflush:
+            row = db.get(ConversationContext, phone, populate_existing=True)
+            if row is None:
+                return ConversationSnapshot(phone, [], None, {}, "active", None)
+            return ConversationSnapshot(phone, deepcopy(row.messages or []), row.current_flow,
+                deepcopy(row.flow_data or {}), row.status, _utc(row.last_activity))
 
     @_reason_codes_only
     def is_terminal_ingress(self, identity: SenderIdentity, now: datetime, lease: ContactLease) -> bool:

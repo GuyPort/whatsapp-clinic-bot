@@ -22,6 +22,433 @@ from tests.fakes import ForbiddenAgentEffects, ManualClock, ScriptedClaude
 from tests.fakes import WebhookRequest, webhook_payload
 
 
+@pytest.fixture
+def task_api():
+    assert importlib.util.find_spec("app.conversation_tasks") is not None, "recoverable task bodies are missing"
+    return importlib.import_module("app.conversation_tasks")
+
+
+@pytest.fixture
+def processing_runtime(session_factory, monkeypatch):
+    from app.simple_config import settings
+    from tests.fakes import ProcessingRuntime
+    original_connect = socket.socket.connect
+    def guarded_connect(sock, address):
+        caller = sys._getframe(1)
+        if (caller.f_code.co_name == "_fallback_socketpair"
+                and caller.f_globals.get("__name__") == "socket"
+                and address[0] in ("127.0.0.1", "::1")):
+            return original_connect(sock, address)
+        raise AssertionError("external access is forbidden")
+    monkeypatch.setattr(socket.socket, "connect", guarded_connect)
+    return ProcessingRuntime(session_factory, domain.ConversationConfig.from_settings(settings))
+
+
+@pytest.mark.parametrize("intent,kind", [
+    (domain.AgentIntent.SAVE_CONTEXT, domain.OutboundKind.NORMAL),
+    (domain.AgentIntent.PAUSE_FOR_SECRETARY, domain.OutboundKind.TRANSFER_CONFIRMATION),
+    (domain.AgentIntent.CLOSE_CONTEXT, domain.OutboundKind.CLOSURE_CONFIRMATION),
+])
+def test_process_batch_commits_winning_result_before_enqueue_and_done(task_api, processing_runtime, session_factory, intent, kind):
+    from app.models import ConversationContext, PausedContact
+    rt = processing_runtime
+    command = rt.buffer()
+    rt.agent.intent = intent
+    acquired = rt.lease_calls
+    def at_enqueue(outbound):
+        assert outbound.kind is kind
+        assert rt.sessions[-1].events.count("commit_returned") == 1
+        assert not any(item.body.get("disposition") == "PROCESSED" for item in rt.store.read_details(rt.active_lease))
+    original = rt.coordinator.apply_agent_result
+    def apply(*args, **kwargs):
+        rt.active_lease = args[-1]
+        return original(*args, **kwargs)
+    rt.coordinator.apply_agent_result = apply
+    rt.outbound_broker.on_enqueue = at_enqueue
+    outcome = task_api.process_batch(command, rt)
+    assert outcome is task_api.ProcessingOutcome.PROCESSED
+    assert rt.lease_calls == acquired + 1
+    assert len(rt.agent.calls) == len(rt.outbound_broker.calls) == 1
+    assert rt.transport.calls == []
+    with session_factory() as db:
+        context, pause = db.get(ConversationContext, PHONE), db.get(PausedContact, PHONE)
+        assert (context is not None) is (intent is domain.AgentIntent.SAVE_CONTEXT)
+        assert (pause is not None) is (intent is domain.AgentIntent.PAUSE_FOR_SECRETARY)
+        if context:
+            assert context.messages[-1]["content"] == "Resposta sintética"
+        if pause:
+            assert pause.paused_until == (rt.clock.now() + timedelta(hours=24)).replace(tzinfo=None)
+    assert rt.envelopes() == []
+    assert any(item.body.get("disposition") == "PROCESSED" for item in rt.details())
+    sessions = rt.session_calls
+    assert task_api.process_batch(command, rt) is task_api.ProcessingOutcome.TERMINAL
+    assert rt.session_calls == sessions
+    assert len(rt.agent.calls) == len(rt.outbound_broker.calls) == 1
+
+
+def test_process_batch_retry_after_result_ready_reuses_result_and_explicit_ids(task_api, processing_runtime):
+    rt = processing_runtime
+    command = rt.buffer()
+    rt.store.fail_next_atomic("prepare_mutation")
+    with pytest.raises(task_api.RetryRequested) as caught:
+        task_api.process_batch(command, rt)
+    retry = caught.value.command
+    assert retry.batch_id == command.batch_id
+    assert retry.staging_id == command.batch_id
+    assert retry.processing_id and retry.operation_id
+    assert retry.generation == command.generation
+    assert len(rt.agent.calls) == 1
+    assert rt.outbound_broker.calls == []
+    assert task_api.process_batch(retry, rt) is task_api.ProcessingOutcome.PROCESSED
+    assert len(rt.agent.calls) == len(rt.outbound_broker.calls) == 1
+
+
+def test_process_batch_sql_commit_then_lost_finalization_never_repeats_dml(task_api, processing_runtime):
+    rt = processing_runtime
+    command = rt.buffer()
+    rt.store.fail_next_atomic("finalize_committed")
+    with pytest.raises(task_api.RetryRequested) as caught:
+        task_api.process_batch(command, rt)
+    assert rt.sessions[-1].events.count("commit_returned") == 1
+    sessions = rt.session_calls
+    with pytest.raises(task_api.RetryRequested):
+        task_api.process_batch(caught.value.command, rt)
+    assert rt.session_calls == sessions
+    assert len(rt.agent.calls) == 1
+    assert rt.outbound_broker.calls == []
+
+
+def test_process_batch_result_at_deadline_has_no_sql_or_outbound(task_api, processing_runtime):
+    rt = processing_runtime
+    command = rt.buffer()
+    rt.agent.on_prepare = lambda: rt.clock.advance(timedelta(seconds=600))
+    with pytest.raises(task_api.RetryRequested):
+        task_api.process_batch(command, rt)
+    assert not any("commit_entered" in session.events for session in rt.sessions)
+    assert rt.outbound_broker.calls == []
+    assert task_api.process_batch(command, rt) is task_api.ProcessingOutcome.TERMINAL
+
+
+def test_process_batch_outbound_before_complete_failure_reuses_commit_without_sql(task_api, processing_runtime):
+    rt = processing_runtime
+    command = rt.buffer()
+    rt.store.fail_next_atomic("complete_batch")
+    with pytest.raises(task_api.RetryRequested) as caught:
+        task_api.process_batch(command, rt)
+    assert len(rt.outbound_broker.calls) == 1
+    rt.clock.advance(timedelta(seconds=601))
+    assert task_api.process_batch(caught.value.command, rt) is task_api.ProcessingOutcome.PROCESSED
+    assert len(rt.agent.calls) == 1
+    assert sum(s.events.count("commit_entered") for s in rt.sessions) == 1
+    # The external enqueue boundary is intentionally not an exactly-once claim.
+    assert len(rt.outbound_broker.calls) == 2
+
+
+@pytest.mark.parametrize("content,kind,expected", [
+    ("/pause", "text", "Para falar com a Beatriz, envie ATENDIMENTO."),
+    ("/pausar", "text", "Para falar com a Beatriz, envie ATENDIMENTO."),
+    *[(label, "media", f"Desculpe, não consigo receber {label}. Se puder me explicar por texto, consigo te ajudar!\n\nCaso prefira, posso te transferir para nossa secretária Beatriz.")
+      for label in ("imagem", "áudio", "vídeo", "documento", "figurinha")],
+])
+def test_process_batch_fixed_reply_preserves_context_and_bypasses_claude(task_api, processing_runtime, session_factory, content, kind, expected):
+    from app.models import ConversationContext
+    rt = processing_runtime
+    task_api.process_batch(rt.buffer(), rt)
+    with session_factory() as db:
+        row = db.get(ConversationContext, PHONE)
+        original = deepcopy((row.messages, row.current_flow, row.flow_data, row.last_activity))
+    calls = len(rt.agent.calls)
+    commits = sum(s.events.count("commit_entered") for s in rt.sessions)
+    command = rt.buffer(content, kind=kind)
+    rt.clock.advance(timedelta(seconds=1))
+    assert task_api.process_batch(command, rt) is task_api.ProcessingOutcome.PROCESSED
+    assert len(rt.agent.calls) == calls
+    assert sum(s.events.count("commit_entered") for s in rt.sessions) == commits
+    with session_factory() as db:
+        row = db.get(ConversationContext, PHONE)
+        assert (row.messages, row.current_flow, row.flow_data, row.last_activity) == original
+    assert rt.outbound_broker.calls[-1].text == expected
+    assert rt.outbound_broker.calls[-1].kind is domain.OutboundKind.NORMAL
+
+
+def test_process_batch_fixed_retry_uses_staged_result_and_no_sql(task_api, processing_runtime):
+    rt = processing_runtime
+    command = rt.buffer("/pause")
+    rt.store.fail_next_atomic("prepare_fixed_response")
+    with pytest.raises(task_api.RetryRequested) as caught:
+        task_api.process_batch(command, rt)
+    assert any(item.body.get("phase") == "RESULT_READY" for item in rt.details())
+    assert task_api.process_batch(caught.value.command, rt) is task_api.ProcessingOutcome.PROCESSED
+    assert rt.agent.calls == []
+    assert not any("commit_entered" in s.events for s in rt.sessions)
+
+
+@pytest.mark.parametrize("kind", ["text", "pause_help"])
+def test_process_batch_cannot_complete_before_outbound_attempt_boundary(task_api, processing_runtime, kind):
+    rt = processing_runtime
+    command = rt.buffer("Para falar com a Beatriz, envie ATENDIMENTO." if kind == "pause_help" else "mensagem", kind=kind)
+    # A definitive broker failure leaves the committed/applied result recoverable.
+    rt.outbound_broker.next_result = domain.EnqueueResult.DEFINITIVE_FAILURE
+    with pytest.raises(task_api.RetryRequested) as caught:
+        task_api.process_batch(command, rt)
+    with rt.store.contact_lease(PHONE) as lease:
+        claim = rt.store.claim_or_resume_batch(caught.value.command, rt.clock.now(), lease)
+        with pytest.raises(domain.ConversationMutationPending):
+            rt.store.complete_batch(caught.value.command, claim.attempt, rt.clock.now(), lease)
+
+
+@pytest.mark.parametrize("fault", ["missing", "extra", "phone", "generation", "kind", "ref_extra", "ref_date", "ref_type", "processing_id"])
+def test_outbound_command_rejects_invalid_json_payload_without_exposing_values(task_api, fault):
+    from uuid import uuid4
+    payload = domain.OutboundEnvelope(PHONE, "synthetic-private-text", domain.OutboundKind.NORMAL,
+        str(uuid4()), str(uuid4()), str(uuid4())).to_dict()
+    if fault == "missing":
+        del payload["text"]
+    elif fault == "extra":
+        payload["private"] = "synthetic-private-value"
+    elif fault == "ref_extra":
+        payload["pause_ref"] = {"generation": payload["generation"], "paused_until": "2026-09-12T12:00:00+00:00",
+            "reason": "user_requested_human_assistance", "extra": "private"}
+    elif fault in ("ref_date", "ref_type"):
+        payload["pause_ref"] = {"generation": payload["generation"],
+            "paused_until": "2026-09-12T12:00:00" if fault == "ref_date" else 1,
+            "reason": "user_requested_human_assistance"}
+    else:
+        payload[fault] = "synthetic-private-value"
+    with pytest.raises(domain.ConversationDomainError) as caught:
+        domain.OutboundEnvelope.from_payload(payload)
+    assert caught.value.reason_code == "invalid_task_command"
+    assert "synthetic-private" not in "".join(traceback.format_exception(caught.value))
+
+
+def test_outbound_command_roundtrip_uses_canonical_processing_type(task_api):
+    from uuid import uuid4
+    assert task_api.ProcessingCommand is domain.ProcessingCommand
+    generation, operation = str(uuid4()), str(uuid4())
+    ref = domain.PauseTransitionRef(generation, datetime(2026, 9, 13, tzinfo=timezone.utc), "user_requested_human_assistance")
+    outbound = domain.OutboundEnvelope(PHONE, "Resposta", domain.OutboundKind.TRANSFER_CONFIRMATION,
+        generation, str(uuid4()), operation, pause_ref=ref)
+    assert domain.OutboundEnvelope.from_payload(json.loads(json.dumps(outbound.to_payload()))) == outbound
+
+
+@pytest.mark.parametrize("wrapper", ["process_message_task", "send_message_task"])
+def test_task_wrapper_invalid_payload_never_retries_or_creates_effects(main_module, processing_runtime, wrapper):
+    from tests.fakes import RetryTask
+    task = RetryTask()
+    with pytest.raises(domain.ConversationDomainError) as caught:
+        getattr(main_module, wrapper)(task, {"private": "synthetic-private-value"})
+    assert caught.value.reason_code == "invalid_task_command"
+    assert task.calls == []
+    assert processing_runtime.lease_calls == 0
+
+
+def test_task_wrapper_processing_retry_preserves_staging_ids_and_celery_retry(main_module, processing_runtime, task_api, monkeypatch, caplog):
+    from celery.exceptions import Retry
+    from tests.fakes import RetryTask
+    rt, task = processing_runtime, RetryTask()
+    monkeypatch.setattr(main_module.app.state, "conversation_runtime", rt, raising=False)
+    command = rt.buffer()
+    rt.store.fail_next_atomic("prepare_mutation")
+    with caplog.at_level(logging.INFO):
+        logging.getLogger("unrelated_control").info("visible_control")
+        with pytest.raises(Retry):
+            main_module.process_message_task(task, command.to_payload())
+    assert len(task.calls) == 1
+    retry = domain.ProcessingCommand.from_payload(task.calls[0]["args"][0])
+    assert retry.processing_id and retry.operation_id and retry.staging_id == command.batch_id
+    assert task.calls[0]["kwargs"] == {}
+    assert main_module.process_message_task(RetryTask(), retry.to_payload()) == "PROCESSED"
+    captured = "\n".join(record.getMessage() for record in caplog.records)
+    assert "visible_control" in captured
+    assert PHONE not in captured and "Mensagem sintética" not in captured
+
+
+def test_task_wrapper_sender_retries_typed_errors_and_discards_without_retry(main_module, processing_runtime, task_api, monkeypatch):
+    from celery.exceptions import Retry
+    from tests.fakes import RetryTask
+    rt, task = processing_runtime, RetryTask()
+    monkeypatch.setattr(main_module.app.state, "conversation_runtime", rt, raising=False)
+    task_api.process_batch(rt.buffer(), rt)
+    outbound = rt.outbound_broker.calls[-1]
+    rt.dependencies[domain.DependencyName.SQL] = False
+    with pytest.raises(Retry):
+        main_module.send_message_task(task, outbound.to_payload())
+    assert len(task.calls) == 1
+    assert task.calls[0]["args"] == [outbound.to_payload()]
+    rt.dependencies[domain.DependencyName.SQL] = True
+    rt.pause()
+    assert main_module.send_message_task(task, outbound.to_payload()) == "DISCARDED"
+    assert len(task.calls) == 1
+
+
+def test_task_wrapper_unexpected_errors_and_existing_celery_retry_are_not_retried(main_module, processing_runtime, monkeypatch):
+    from celery.exceptions import Retry
+    from tests.fakes import RetryTask
+    rt, task = processing_runtime, RetryTask()
+    monkeypatch.setattr(main_module.app.state, "conversation_runtime", rt, raising=False)
+    command = rt.buffer()
+    for error in (Retry("synthetic"), RuntimeError("synthetic")):
+        def fail(*args, **kwargs):
+            raise error
+        monkeypatch.setattr(main_module, "process_batch", fail)
+        with pytest.raises(type(error)):
+            main_module.process_message_task(task, command.to_payload())
+    assert task.calls == []
+
+
+def test_task_celery_brokers_publish_json_commands_and_keep_task_routes(main_module, processing_runtime, task_api, monkeypatch, caplog):
+    from pathlib import Path
+    import celery
+    class FakeCelery:
+        def __init__(self, *args, **kwargs):
+            self.conf = {}
+    monkeypatch.setattr(celery, "Celery", FakeCelery)
+    spec = importlib.util.spec_from_file_location("synthetic_celery_config", Path(__file__).parents[1] / "app" / "celery_app.py")
+    module = importlib.util.module_from_spec(spec)
+    with caplog.at_level(logging.INFO):
+        spec.loader.exec_module(module)
+    assert "synthetic.invalid" not in caplog.text
+    calls = []
+    task = SimpleNamespace(apply_async=lambda **kwargs: calls.append(kwargs))
+    broker = module.CeleryProcessingBroker(task, probe=lambda: True)
+    command = processing_runtime.buffer()
+    assert broker.probe() is True
+    assert broker.enqueue_processing(command) is domain.EnqueueResult.CONFIRMED
+    assert json.loads(json.dumps(calls[-1]["args"])) == [command.to_payload()]
+    assert calls[-1]["countdown"] == 10
+    task_api.process_batch(command, processing_runtime)
+    outbound = processing_runtime.outbound_broker.calls[-1]
+    assert module.CeleryOutboundBroker(task).enqueue_outbound(outbound) is domain.EnqueueResult.CONFIRMED
+    assert calls[-1]["args"] == [outbound.to_payload()]
+    assert module.celery_app.conf["task_routes"] == {
+        "app.main.send_message_task": {"queue": "send_queue"},
+        "app.main.process_message_task": {"queue": "celery"}}
+
+
+def test_process_batch_ack_loss_after_claim_returns_explicit_resume_command(task_api, processing_runtime):
+    rt = processing_runtime
+    command = rt.buffer()
+    def lost():
+        raise RuntimeError("synthetic lost acknowledgement")
+    rt.store.client.after_operation["claim_or_resume_batch"] = lost
+    with pytest.raises(task_api.RetryRequested) as caught:
+        task_api.process_batch(command, rt)
+    retry = caught.value.command
+    assert retry.processing_id and retry.operation_id and retry.staging_id == command.batch_id
+    rt.clock.advance(timedelta(seconds=45))
+    assert task_api.process_batch(retry, rt) is task_api.ProcessingOutcome.PROCESSED
+
+
+def test_process_batch_agent_failure_can_retry_only_same_staging_after_claim_expiry(task_api, processing_runtime):
+    rt = processing_runtime
+    command = rt.buffer("primeiro lote")
+    def failure():
+        raise domain.AgentUnavailable(domain.FailureReason.AGENT_UNAVAILABLE)
+    rt.agent.on_prepare = failure
+    with pytest.raises(task_api.RetryRequested) as caught:
+        task_api.process_batch(command, rt)
+    retry = caught.value.command
+    newer = rt.buffer("novo lote")
+    rt.agent.on_prepare = None
+    assert task_api.process_batch(retry, rt) is task_api.ProcessingOutcome.DUPLICATE
+    rt.clock.advance(timedelta(seconds=45))
+    assert task_api.process_batch(retry, rt) is task_api.ProcessingOutcome.PROCESSED
+    assert [call[0] for call in rt.agent.calls] == ["primeiro lote", "primeiro lote"]
+    assert [entry["content"] for entry in rt.envelopes()] == ["novo lote"]
+    assert task_api.process_batch(newer, rt) is task_api.ProcessingOutcome.PROCESSED
+    assert rt.agent.calls[-1][0] == "novo lote"
+
+
+@pytest.mark.parametrize("boundary", ["stage_agent_result", "record_outbound_attempt"])
+def test_process_batch_lost_ack_reuses_result_without_model_reentry(task_api, processing_runtime, boundary):
+    rt = processing_runtime
+    command = rt.buffer()
+    def lost():
+        raise RuntimeError("synthetic private ack loss")
+    rt.store.client.after_operation[boundary] = lost
+    with pytest.raises(task_api.RetryRequested) as caught:
+        task_api.process_batch(command, rt)
+    assert task_api.process_batch(caught.value.command, rt) is task_api.ProcessingOutcome.PROCESSED
+    assert len(rt.agent.calls) == 1
+    assert sum(s.events.count("commit_entered") for s in rt.sessions) == 1
+
+
+@pytest.mark.parametrize("fault", ["readiness", "lease", "generation", "session"])
+def test_process_batch_dependency_failure_before_agent_has_no_patient_response(task_api, processing_runtime, fault, monkeypatch):
+    from app.conversation_redis import contact_keys
+    rt = processing_runtime
+    command = rt.buffer()
+    leases, sessions = rt.lease_calls, rt.session_calls
+    if fault == "readiness":
+        rt.dependencies[domain.DependencyName.SQL] = False
+    elif fault == "lease":
+        rt.store.fail_next_atomic("acquire")
+    elif fault == "generation":
+        rt.store.client.values.pop(contact_keys(PHONE).generation, None)
+    else:
+        def failure():
+            raise RuntimeError("synthetic-private-session-error")
+        monkeypatch.setattr(rt, "session_factory", failure)
+    with pytest.raises(task_api.RetryRequested):
+        task_api.process_batch(command, rt)
+    assert rt.agent.calls == rt.outbound_broker.calls == rt.transport.calls == []
+    if fault == "readiness":
+        assert (rt.lease_calls, rt.session_calls) == (leases, sessions)
+
+
+def test_process_batch_mixed_fixed_and_text_keeps_fixed_inputs_out_of_agent(task_api, processing_runtime):
+    rt = processing_runtime
+    command = rt.buffer("Qual o horário?")
+    rt.buffer("/pausar")
+    rt.buffer("imagem", kind="media")
+    assert task_api.process_batch(command, rt) is task_api.ProcessingOutcome.PROCESSED
+    assert [call[0] for call in rt.agent.calls] == ["Qual o horário?"]
+    text = rt.outbound_broker.calls[0].text
+    assert "Para falar com a Beatriz, envie ATENDIMENTO." in text
+    assert "Desculpe, não consigo receber imagem." in text
+    assert "Resposta sintética" in text
+
+
+def test_sender_runs_async_transport_inside_live_lease_and_fresh_session(task_api, processing_runtime):
+    rt = processing_runtime
+    task_api.process_batch(rt.buffer(), rt)
+    outbound = rt.outbound_broker.calls[-1]
+    sessions = rt.session_calls
+    original = rt.transport.send_message
+    async def send(phone, text):
+        with pytest.raises(domain.ContactLockUnavailable):
+            rt.pause()
+        return original(phone, text)
+    rt.transport.send_message = send
+    assert task_api.send_outbound(outbound, rt) is task_api.SendOutcome.SENT
+    assert rt.session_calls == sessions + 1
+    assert rt.transport.calls == [(PHONE, "Resposta sintética")]
+
+
+@pytest.mark.parametrize("boundary", ["outbound", "processing"])
+def test_task_celery_broker_exception_is_ambiguous_without_sensitive_error(main_module, processing_runtime, monkeypatch, boundary):
+    from pathlib import Path
+    import celery
+    class FakeCelery:
+        def __init__(self, *args, **kwargs):
+            self.conf = {}
+    monkeypatch.setattr(celery, "Celery", FakeCelery)
+    spec = importlib.util.spec_from_file_location("synthetic_celery_error", Path(__file__).parents[1] / "app" / "celery_app.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    def error(**kwargs):
+        raise RuntimeError("synthetic-private-broker-error")
+    task = SimpleNamespace(apply_async=error)
+    command = processing_runtime.buffer()
+    if boundary == "processing":
+        result = module.CeleryProcessingBroker(task, probe=lambda: True).enqueue_processing(command)
+    else:
+        from uuid import uuid4
+        result = module.CeleryOutboundBroker(task).enqueue_outbound(domain.OutboundEnvelope(
+            PHONE, "synthetic", domain.OutboundKind.NORMAL, command.generation, str(uuid4()), str(uuid4())))
+    assert result is domain.EnqueueResult.AMBIGUOUS
+
+
 PHONE = "5551999990000"
 OTHER_PHONE = "5551888880000"
 CLINIC_INFO = {
@@ -525,6 +952,7 @@ def test_webhook_terminal_replay_reads_no_sql_or_session_and_mutates_no_state(
                 ingress_runtime.store.stage_agent_result(command, claim.attempt, result, ingress_runtime.clock.now(), lease)
                 ingress_runtime.coordinator.apply_agent_result(db, PHONE, result, claim.attempt.processing_id,
                     claim.attempt.operation_id, ingress_runtime.clock.now(), lease)
+                ingress_runtime.store.record_outbound_attempt(command, claim.attempt, ingress_runtime.clock.now(), lease)
                 ingress_runtime.store.complete_batch(command, claim.attempt, ingress_runtime.clock.now(), lease)
     receipts = [item for item in ingress_runtime.details() if item.entry.kind == "dedupe"]
     assert len(receipts) == 1 and receipts[0].body["disposition"] == disposition and receipts[0].terminal
