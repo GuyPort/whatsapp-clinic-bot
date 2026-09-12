@@ -169,3 +169,12 @@ def scheduler_module(main_module, admin_runtime):
     spec.loader.exec_module(module)
     module.get_db = admin_runtime.session_factory
     return module
+
+
+@pytest.fixture
+def scheduler_application_log_records(scheduler_module, caplog):
+    """Observe application logs and the exact name of this injected scheduler."""
+    def observed():
+        return [record for record in caplog.records
+                if record.name.startswith("app.") or record.name == scheduler_module.logger.name]
+    return observed

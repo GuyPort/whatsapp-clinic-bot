@@ -134,7 +134,8 @@ def test_dashboard_simulator_reset_missing_or_failed_readiness_is_503(admin_clie
 
 
 @pytest.mark.parametrize("failure", ["database", "readiness", "lease_loss"])
-def test_scheduler_failure_is_sanitized_and_preserves_context(scheduler_module, admin_runtime, session_factory, caplog, monkeypatch, failure):
+def test_scheduler_failure_is_sanitized_and_preserves_context(scheduler_module, admin_runtime, session_factory, caplog, monkeypatch, failure,
+                                                            scheduler_application_log_records):
     from tests.test_conversation_flow import ADMIN_PHONE
     from app.models import ConversationContext
     from app.conversation_redis import contact_keys
@@ -152,11 +153,37 @@ def test_scheduler_failure_is_sanitized_and_preserves_context(scheduler_module, 
     with caplog.at_level(logging.INFO):
         asyncio.run(scheduler_module.check_inactive_contexts(rt))
         logging.getLogger("unaffected_control").info("unaffected_control")
-    application_logs = "\n".join(record.getMessage() for record in caplog.records if record.name.startswith("app."))
+    application_records = scheduler_application_log_records()
+    assert any(record.name == scheduler_module.logger.name for record in application_records), "scheduler logger is outside the observed privacy set"
+    application_logs = "\n".join(record.getMessage() for record in application_records)
     assert sentinel not in application_logs and ADMIN_PHONE not in application_logs
     assert "unaffected_control" in caplog.text
     with session_factory() as db:
         assert db.get(ConversationContext, ADMIN_PHONE) is not None
+
+
+def test_scheduler_privacy_capture_observes_injected_sentinel_and_excludes_library_logs(
+        scheduler_module, scheduler_application_log_records, caplog, monkeypatch):
+    sentinel = "PRIVATE_EXCEPTION patient=synthetic token=synthetic"
+    original_warning = scheduler_module.logger.warning
+    def leaking_warning(*args, **kwargs):
+        original_warning(sentinel)
+    monkeypatch.setattr(scheduler_module.logger, "warning", leaking_warning)
+    with caplog.at_level(logging.INFO):
+        asyncio.run(scheduler_module.check_inactive_contexts())
+        logging.getLogger("app.synthetic_privacy_control").info("application_control")
+        logging.getLogger("httpx").info("httpx_out_of_scope")
+        logging.getLogger(scheduler_module.logger.name + ".unrelated").info("other_scheduler_out_of_scope")
+        logging.getLogger("unaffected_control").info("unaffected_control")
+    application_records = scheduler_application_log_records()
+    assert any(record.name == scheduler_module.logger.name and record.getMessage() == sentinel
+               for record in application_records)
+    assert any(record.name == "app.synthetic_privacy_control" for record in application_records)
+    assert all(record.name not in ("httpx", scheduler_module.logger.name + ".unrelated", "unaffected_control")
+               for record in application_records)
+    assert "httpx_out_of_scope" in caplog.text
+    assert "other_scheduler_out_of_scope" in caplog.text
+    assert "unaffected_control" in caplog.text
 
 
 def call_webhook(main, payload=None, **kwargs):
