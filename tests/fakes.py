@@ -414,3 +414,66 @@ class ScriptedBroker:
         if self.on_enqueue:
             self.on_enqueue(command)
         return self.next_result or EnqueueResult.CONFIRMED
+
+
+class ScriptedClaude:
+    """Complete SDK-shaped responses without constructing an HTTP client."""
+
+    def __init__(self):
+        self.messages = self
+        self.calls = []
+        self.responses = []
+        self.on_create = None
+
+    def respond(self, *blocks, stop_reason=None):
+        from anthropic.types import Message, Usage
+
+        self.responses.append(Message(
+            id="msg_synthetic",
+            type="message",
+            role="assistant",
+            model="claude-sonnet-4-6",
+            content=list(blocks),
+            stop_reason=stop_reason or (
+                "tool_use" if any(block.type == "tool_use" for block in blocks) else "end_turn"
+            ),
+            stop_sequence=None,
+            usage=Usage(input_tokens=1, output_tokens=1),
+        ))
+
+    def respond_with_text(self, text):
+        from anthropic.types import TextBlock
+
+        self.respond(TextBlock(type="text", text=text))
+
+    def respond_with_tool(self, name, tool_input=None, tool_id="tool_synthetic"):
+        from anthropic.types import ToolUseBlock
+
+        self.respond(ToolUseBlock(
+            type="tool_use", id=tool_id, name=name,
+            input={} if tool_input is None else tool_input,
+        ))
+
+    def create(self, **kwargs):
+        self.calls.append(deepcopy(kwargs))
+        if self.on_create is not None:
+            self.on_create(kwargs)
+        if not self.responses:
+            raise AssertionError("unexpected Claude invocation")
+        response = self.responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+
+class ForbiddenAgentEffects:
+    """Tripwire for effects outside the pure agent's injected model boundary."""
+
+    def __init__(self):
+        self.calls = []
+
+    def boundary(self, name):
+        def forbidden(*args, **kwargs):
+            self.calls.append(name)
+            raise AssertionError("forbidden agent effect")
+        return forbidden

@@ -134,6 +134,11 @@ class FailureReason(str, Enum):
     CONDITION_CHANGED = "mutation_condition_changed"
     BROKER_UNAVAILABLE = "broker_unavailable"
     INVALID_TASK_COMMAND = "invalid_task_command"
+    AGENT_UNAVAILABLE = "agent_unavailable"
+    INVALID_AGENT_RESPONSE = "invalid_agent_response"
+    INVALID_AGENT_SNAPSHOT = "invalid_agent_snapshot"
+    TOOL_UNAVAILABLE = "tool_unavailable"
+    TOOL_ITERATION_LIMIT = "tool_iteration_limit"
 
 
 class ConfigurationIssue(str, Enum):
@@ -214,6 +219,18 @@ class ReadinessUnavailable(ConversationDomainError):
 
 class BrokerUnavailable(ConversationDomainError):
     pass
+
+
+class AgentUnavailable(ConversationDomainError):
+    """The agent produced no result; callers must not create patient output."""
+
+
+class AgentResponseInvalid(AgentUnavailable):
+    """The model response cannot safely be converted into an agent result."""
+
+
+class AgentToolUnavailable(AgentUnavailable):
+    """A pure tool could not produce a valid outcome."""
 
 
 @dataclass(frozen=True)
@@ -395,6 +412,12 @@ class AgentResult:
     current_flow: str | None
     flow_data: dict
     intent: AgentIntent
+
+
+@dataclass(frozen=True)
+class ToolOutcome:
+    content: str
+    intent: AgentIntent | None = None
 
 
 @dataclass(frozen=True, repr=False)
