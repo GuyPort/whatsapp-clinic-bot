@@ -713,6 +713,12 @@ class RedisConversationStore:
                         raise ValueError
                     if attempt.phase in (ProcessingPhase.RESULT_READY, ProcessingPhase.APPLYING, ProcessingPhase.DONE) and not staging.body.get("result"):
                         raise ValueError
+                    if "outbound_attempted" in processing.body or "outbound_attempt_id" in processing.body:
+                        receipt = processing.body.get("outbound_reservation")
+                        if (processing.body.get("outbound_attempted") is not True
+                                or not isinstance(receipt, dict)
+                                or processing.body.get("outbound_attempt_id") != receipt.get("reservation_id")):
+                            raise ValueError
             for item in details:
                 if item.entry.kind == "dedupe" and item.body.get("schema") == "batch_v1" and item.body.get("disposition") == "BUFFERED":
                     if self._find(details, "batch", item.body["batch_id"]) is None:
@@ -766,13 +772,27 @@ class RedisConversationStore:
 
     def _transition(self, lease, expected, details, generation=None, operation="cas", extra=(),
                     *, cycle=None, operational=False, deadline=None, mutation_fence=...,
-                    deadline_transition=None, _plan_only=False, require_ready=None, acknowledged=False):
+                    deadline_transition=None, _plan_only=False, require_ready=None, acknowledged=False,
+                    acknowledgement=None):
         with self._lock:
             anchor, previous, checks = self._snapshot(lease, operational=operational, require_ready=require_ready,
                                                      read_only=acknowledged)
             if (anchor.contact_revision != expected.contact_revision
                     or anchor.manifest_fingerprint != expected.manifest_fingerprint):
                 raise ConversationStateUnavailable(FailureReason.STATE_UNAVAILABLE)
+            if acknowledged:
+                # Bind the exemption to freshly read evidence covered by these
+                # same atomic snapshot checks, never to a carried boolean.
+                if isinstance(acknowledgement, OutboundReservation):
+                    batch = self._find(previous, "batch", acknowledgement.batch_id)
+                    self._require_outbound_ack(anchor, previous, batch, acknowledgement)
+                elif isinstance(acknowledgement, BufferDispatch):
+                    batch = self._find(previous, "batch", acknowledgement.batch_id)
+                    if (batch is None or self._dispatch_load(batch) != acknowledgement
+                            or acknowledgement.enqueue_attempt_id is None):
+                        raise ConversationMutationPending(FailureReason.MUTATION_PENDING)
+                else:
+                    raise ConversationMutationPending(FailureReason.MUTATION_PENDING)
             generation = generation or anchor.last_generation
             if not isinstance(generation, UUID):
                 raise ConversationStateUnavailable(FailureReason.INVALID_VALUE)
@@ -846,7 +866,10 @@ class RedisConversationStore:
             if _plan_only:
                 return writes
             deadline_writes = ()
-            if deadline_transition is not None:
+            # A recognized ACK authorizes its record, never expiry cleanup.
+            # The server clock can reject the record at the deadline without
+            # writing; a later ready recovery pass owns terminalization.
+            if deadline_transition is not None and not acknowledged:
                 deadline_writes = self._transition(lease, expected, operation=operation,
                                                    _plan_only=True, require_ready=require_ready,
                                                    acknowledged=acknowledged, **deadline_transition)
@@ -1135,8 +1158,9 @@ class RedisConversationStore:
                 body["next_enqueue_at"] = (self._now() + timedelta(seconds=self.config.enqueue_backoff_seconds)).timestamp()
             self._transition(lease, anchor, self._replace_details(details, self._changed(current, body=body)),
                              operation="finish_enqueue", deadline=None if durable else deadline,
-                             deadline_transition=None if durable else self._terminal_plan(anchor, details, current),
-                             require_ready=require_ready, acknowledged=acknowledged)
+                             deadline_transition=None if durable or acknowledged else self._terminal_plan(anchor, details, current),
+                             require_ready=require_ready, acknowledged=acknowledged,
+                             acknowledgement=self._dispatch_load(reserved) if acknowledged else None)
         if outcome is EnqueueResult.DEFINITIVE_FAILURE:
             raise BrokerUnavailable(FailureReason.BROKER_UNAVAILABLE)
         return EnsureConsumerResult.SCHEDULED
@@ -1186,10 +1210,12 @@ class RedisConversationStore:
             self._transition(lease, anchor, operation="exhaust_batch", require_ready=require_ready,
                              **self._terminal_plan(anchor, details, batch))
 
-    def claim_or_resume_batch(self, command, now, lease, *, require_ready=None, acknowledged=False):
+    def claim_or_resume_batch(self, command, now, lease, *, require_ready=None, acknowledged=False, reservation=None):
         with self._lock:
             anchor, details, batch, _ = self._batch_snapshot(command, lease, require_ready=require_ready,
                                                            read_only=acknowledged)
+            if acknowledged:
+                self._require_outbound_ack(anchor, details, batch, reservation)
             dispatch = self._dispatch_load(batch)
             if dispatch.phase in (DispatchPhase.EXHAUSTED, DispatchPhase.PROCESSED):
                 return BatchClaim(ClaimOutcome.TERMINAL)
@@ -1245,7 +1271,7 @@ class RedisConversationStore:
                 self._transition(lease, anchor, self._replace_details(details, processing), operation="claim_or_resume_batch",
                                  deadline=None if durable else deadline,
                                  deadline_transition=None if durable else self._terminal_plan(anchor, details, batch),
-                                 require_ready=require_ready, acknowledged=acknowledged)
+                                 require_ready=require_ready, acknowledged=acknowledged, acknowledgement=reservation)
             envelopes = tuple(InboundEnvelope(e["kind"], e["content"], datetime.fromisoformat(e["received_at"]),
                                               e["generation"], e["message_id"]) for e in staging.body["envelopes"])
             result = staging.body.get("result")
@@ -1404,6 +1430,15 @@ class RedisConversationStore:
                 or self._outbound_reservation(anchor, details, batch) != reservation):
             raise ConversationMutationPending(FailureReason.MUTATION_PENDING)
 
+    def _require_outbound_ack(self, anchor, details, batch, reservation):
+        if batch is None:
+            raise ConversationMutationPending(FailureReason.MUTATION_PENDING)
+        self._require_outbound_reservation(anchor, details, batch, reservation)
+        processing = self._find(details, "processing", reservation.processing_id)
+        if (processing is None or processing.body.get("outbound_attempted") is not True
+                or processing.body.get("outbound_attempt_id") != reservation.reservation_id):
+            raise ConversationMutationPending(FailureReason.MUTATION_PENDING)
+
     def record_outbound_attempt(self, command, attempt, now, lease, *, reservation=None):
         """Caller has crossed the local broker boundary; this is not delivery proof."""
         with self._lock:
@@ -1442,7 +1477,8 @@ class RedisConversationStore:
                     or processing.body.get("outbound_attempt_id") != reservation.reservation_id):
                 raise ConversationMutationPending(FailureReason.MUTATION_PENDING)
             self._transition(lease, anchor, operation="complete_batch", require_ready=require_ready,
-                             acknowledged=acknowledged, **self._terminal_plan(anchor, details, batch, processed=True))
+                             acknowledged=acknowledged, acknowledgement=reservation,
+                             **self._terminal_plan(anchor, details, batch, processed=True))
 
     @staticmethod
     def _recovery_cursor(state):
@@ -1740,7 +1776,8 @@ class RedisConversationStore:
         reservation = self._outbound_reservation(anchor, details, batch)
         if (reservation is not None and processing.body.get("outbound_attempted") is True
                 and processing.body.get("outbound_attempt_id") == reservation.reservation_id):
-            claim = self.claim_or_resume_batch(command, now, lease, require_ready=require_ready, acknowledged=True)
+            claim = self.claim_or_resume_batch(command, now, lease, require_ready=require_ready,
+                                              acknowledged=True, reservation=reservation)
             self.complete_batch(command, claim.attempt, now, lease, reservation=reservation,
                                 require_ready=require_ready, acknowledged=True)
             return "completed"

@@ -714,12 +714,13 @@ class RecoveryWriteAudit:
     read. Only an explicitly witnessed broker ACK or persisted outbound receipt
     can exempt its identity-bound record. Lease maintenance is not recovery DML.
     """
-    def __init__(self, runtime, monkeypatch, *, acknowledged=()):
+    def __init__(self, runtime, monkeypatch):
         import sys
         from app.conversation_redis import ATOMIC_SCRIPT, RECOVERY_CHECKPOINT_SCRIPT
         self.observed, self.violations, self.opcodes = set(), [], set()
         self.checks = 0
-        self.acknowledged = set(acknowledged)
+        self.witnesses = []
+        self.client = runtime.store.client
         readiness = runtime.readiness_status
         def probe():
             result = readiness()
@@ -752,6 +753,10 @@ class RecoveryWriteAudit:
                 keys, plan = args[:count], json.loads(args[count])
                 operation = plan["operation"]
                 self.observed.add(operation)
+                failed = [check for check in plan["checks"] if
+                    (original_get(keys[check["key"] - 1]) if check["op"] == "get" else
+                     client.sismember(keys[check["key"] - 1], check["member"])) != check["value"]]
+                blocked = bool(failed and failed[0].get("failure") != "generation")
                 writes = plan["writes"] + plan.get("deadline_writes", [])
                 repair = plan["quarantine"] or any(check.get("failure") == "generation" and
                     (original_get(keys[check["key"] - 1]) if check["op"] == "get" else
@@ -762,14 +767,122 @@ class RecoveryWriteAudit:
                     self.opcodes.update(("SET", "SADD"))  # Corruption-quarantine anchor/index.
                 self.opcodes.update(write["op"] for write in writes)
                 lease_only = operation in ("acquire", "assert", "renew", "release")
-                acknowledged_record = operation in self.acknowledged and not repair
-                if (writes or repair) and not lease_only and not acknowledged_record and not self.checks:
+                acknowledged_record = (not repair and not plan.get("deadline_writes")
+                                       and self._identity_bound_plan(keys, plan))
+                if (writes or repair) and not blocked and not lease_only and not acknowledged_record and not self.checks:
                     self.violations.append(operation)
                 if acknowledged_record and (plan["quarantine"] or plan.get("quarantine_writes") or
                         any(check.get("failure") == "generation" for check in plan["checks"])):
                     self.violations.append("ack_can_destroy_evidence")
             return original_eval(script, count, *args)
         monkeypatch.setattr(client, "eval", evaluate)
+
+    def witness_processing(self, command):
+        """Called only by the fake broker when it actually recognizes the ACK."""
+        from app.conversation_redis import contact_keys
+        key = contact_keys(command.phone).batch_prefix + command.batch_id
+        record = json.loads(self.client.values[key])
+        assert record["body"]["enqueue_attempt_id"]
+        self.witnesses.append(("processing", command.phone, record))
+
+    def witness_outbound(self, command):
+        """Independently observe a previously persisted exact outbound receipt."""
+        from app.conversation_redis import contact_keys
+        records = [json.loads(value) for key, value in self.client.values.items()
+                   if key.startswith(contact_keys(command.phone).processing_prefix)]
+        record = next(record for record in records if record["body"]["batch_id"] == command.batch_id)
+        receipt = record["body"]["outbound_reservation"]
+        assert record["body"]["outbound_attempted"] is True
+        assert record["body"]["outbound_attempt_id"] == receipt["reservation_id"]
+        self.witnesses.append(("outbound", command.phone, deepcopy(receipt)))
+
+    def _identity_bound_plan(self, keys, plan):
+        """Project the real opcodes and compare effects, without operation names.
+
+        SET-over-DEL of unchanged manifest details is not evidence loss. Only
+        one witnessed batch's ACK delta, or its proven outbound completion, is
+        allowed; expiry/quarantine and unrelated receipt/index changes are not.
+        """
+        from app.conversation_redis import contact_keys, contact_digest, INDEX_KEYS
+        values, indexes = dict(self.client.values), deepcopy(self.client.sets)
+        for write in plan["writes"]:
+            key, op = keys[write["key"] - 1], write["op"]
+            if op == "SET":
+                values[key] = write["value"]
+            elif op == "DEL":
+                values.pop(key, None)
+                indexes.pop(key, None)
+            elif op in ("SADD", "SREM"):
+                members = indexes.setdefault(key, set())
+                (members.add if op == "SADD" else members.discard)(write["value"])
+            else:
+                return False
+        old_values = self.client.values
+        changed = {key for key in old_values.keys() | values.keys() if old_values.get(key) != values.get(key)}
+        checks = {keys[c["key"] - 1]: c["value"] for c in plan["checks"]
+                  if c["op"] == "get" and c.get("failure") == "stale"}
+        for kind, phone, witness in self.witnesses:
+            contact = contact_keys(phone)
+            batch_id = witness["entry"]["id"] if kind == "processing" else witness["batch_id"]
+            batch_key = contact.batch_prefix + batch_id
+            try:
+                batch = json.loads(old_values[batch_key])
+                updated_batch = json.loads(values[batch_key])
+                old_anchor, new_anchor = json.loads(old_values[contact.anchor]), json.loads(values[contact.anchor])
+                if (checks.get(batch_key) != old_values[batch_key]
+                        or checks.get(contact.anchor) != old_values[contact.anchor]
+                        or new_anchor["contact_revision"] != old_anchor["contact_revision"] + 1
+                        or any(new_anchor.get(field) != old_anchor.get(field) for field in
+                               ("cycle", "last_generation", "generation_history", "mutation_fence"))):
+                    continue
+                allowed = {batch_key, contact.anchor, contact.generation}
+                expected_indexes = deepcopy(self.client.sets)
+                if kind == "processing":
+                    expected_body = {**witness["body"], "phase": "STAGED" if witness["body"]["phase"] == "STAGED" else "SCHEDULED",
+                                     "scheduled_at": updated_batch["body"]["scheduled_at"]}
+                    if (batch != witness or updated_batch["body"] != expected_body
+                            or updated_batch["terminal"] or updated_batch["body"]["scheduled_at"] is None):
+                        continue
+                else:
+                    processing_key = contact.processing_prefix + witness["processing_id"]
+                    processing = json.loads(old_values[processing_key])
+                    updated_processing = json.loads(values[processing_key])
+                    body, after = processing["body"], updated_processing["body"]
+                    if (checks.get(processing_key) != old_values[processing_key]
+                            or body.get("outbound_reservation") != witness or body.get("outbound_attempted") is not True
+                            or body.get("outbound_attempt_id") != witness["reservation_id"]
+                            or body["claim_token"] != witness["claim_token"] or body["phase"] != "APPLYING"
+                            or batch["body"]["phase"] != "STAGED"):
+                        continue
+                    allowed.add(processing_key)
+                    completed = updated_batch["body"]["phase"] == "PROCESSED"
+                    expected_body = {**body, "phase": "DONE"} if completed else {
+                        **body, "owner_token_hash": after["owner_token_hash"]}
+                    if (after != expected_body or updated_batch["body"] != {
+                            **batch["body"], "phase": "PROCESSED" if completed else "STAGED"}
+                            or updated_processing["terminal"] is not completed
+                            or updated_batch["terminal"] is not completed):
+                        continue
+                    if completed:
+                        allowed.update((contact.staging_prefix + batch_id, contact.buffer_prefix + batch_id))
+                        for key, value in old_values.items():
+                            if not key.startswith(contact.dedupe):
+                                continue
+                            receipt = json.loads(value)
+                            if receipt["body"].get("batch_id") == batch_id:
+                                terminal = json.loads(values[key])
+                                if terminal["body"] != {**receipt["body"], "disposition": "PROCESSED"} or not terminal["terminal"]:
+                                    break
+                                allowed.add(key)
+                        for flag in batch["entry"]["index_flags"]:
+                            member = f"{contact_digest(phone)}:batch:{batch_id}"
+                            expected_indexes.setdefault(INDEX_KEYS[flag], set()).discard(member)
+                if changed <= allowed and {key: value for key, value in indexes.items() if value} == {
+                        key: value for key, value in expected_indexes.items() if value}:
+                    return True
+            except (KeyError, TypeError, ValueError):
+                continue
+        return False
 
 
 class RetryTask:
