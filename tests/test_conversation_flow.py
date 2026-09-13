@@ -200,6 +200,103 @@ def test_ready_race_recovery_stops_broker_and_checkpoint(admin_runtime, monkeypa
         assert rt.store.client.get(RECOVERY_CHECKPOINT_KEY) is None
 
 
+@pytest.mark.parametrize("path", ["mutation", "batch"])
+@pytest.mark.parametrize("dependency,offset,composed,close_at", [
+    (name, 1, False, "anchor") for name in (domain.DependencyName.SECRET, domain.DependencyName.SQL,
+        domain.DependencyName.REDIS, domain.DependencyName.BROKER)] + [
+    (name, offset, True, "anchor") for name in domain.DependencyName for offset in (-1, 0, 1)] + [
+    (domain.DependencyName.SQL, 1, True, "cas_scan")])
+def test_recovery_snapshot_quarantine_rechecks_ready_after_anchor_read(processing_runtime, task_api, monkeypatch,
+                                                                      path, dependency, offset, composed, close_at):
+    from app.conversation_redis import contact_keys
+    rt = processing_runtime
+    command = rt.buffer()
+    rt.store.fail_next_atomic("finalize_committed")
+    with pytest.raises(task_api.RetryRequested):
+        task_api.process_batch(command, rt)
+    client = rt.store.client
+    runtime = rt
+    settings = SimpleNamespace(webhook_secret="synthetic-webhook-secret")
+    if composed:
+        monkeypatch.setattr(client, "ping", lambda: rt.dependencies[domain.DependencyName.REDIS])
+        monkeypatch.setattr(rt.processing_broker, "probe", lambda: rt.dependencies[domain.DependencyName.BROKER])
+        runtime = recovery_api().compose_runtime(settings=settings, client=client,
+            config=rt.store.config, session_factory=rt.session_factory,
+            sql_probe=lambda: rt.dependencies[domain.DependencyName.SQL], agent=rt.agent,
+            processing_broker=rt.processing_broker, outbound_broker=rt.outbound_broker,
+            transport=rt.transport, clock=rt.clock)
+        # Inject a failed epoch probe, not a different lease/store or runtime.
+        probes = runtime.readiness_status.__self__._probes
+        epoch_probe = probes[domain.DependencyName.EPOCH]
+        monkeypatch.setitem(probes, domain.DependencyName.EPOCH,
+                            lambda: rt.dependencies[domain.DependencyName.EPOCH] and epoch_probe())
+        assert runtime.readiness_status().ready
+    rt.store.save_recovery_checkpoint(None, (0 if path == "mutation" else 1, None, None))
+    rt.clock.advance(timedelta(seconds=600 + offset))
+    keys = contact_keys(command.phone)
+    retained = {key: value for key, value in client.values.items()
+                if key == keys.anchor or key == keys.generation or key.startswith(keys.staging_prefix)
+                or key.startswith(keys.processing_prefix) or key.startswith(keys.mutation_prefix)}
+    assert any(key.startswith(keys.staging_prefix) for key in retained)
+    indexes = deepcopy(client.sets)
+    original = client.get
+    closed = []
+    def close_dependency():
+        closed.append(True)
+        rt.dependencies[dependency] = False
+        if dependency is domain.DependencyName.SECRET:
+            settings.webhook_secret = ""
+    def get(key):
+        result = original(key)
+        if (close_at == "anchor" and key == keys.anchor and not closed
+                and sys._getframe(2).f_code.co_name == "_snapshot"):
+            close_dependency()
+        return result
+    monkeypatch.setattr(client, "get", get)
+    if close_at == "cas_scan":
+        original_scan = client.scan_iter
+        def scan(*args, **kwargs):
+            result = original_scan(*args, **kwargs)
+            if not closed and sys._getframe(3).f_code.co_name == "_compact_mutation_fence":
+                close_dependency()
+            return result
+        monkeypatch.setattr(client, "scan_iter", scan)
+    # An ahead scan timestamp is only a hint, including the just-before case.
+    report = recovery_api().RecoveryService(runtime, max_pages=1).run_once(rt.clock.now() + timedelta(seconds=2))
+    assert closed == [True]
+    assert report.quarantined == 0
+    assert command.phone not in repr(report) and command.coordination_epoch not in repr(report)
+    assert client.operation_calls.get("quarantine_mutation", 0) == 0
+    assert {key: client.values.get(key) for key in retained} == retained
+    assert client.sets == indexes
+    rt.dependencies[dependency] = True
+    settings.webhook_secret = "synthetic-webhook-secret"
+    if composed and dependency is domain.DependencyName.REDIS:
+        # Actual Redis unavailability also prevents lease release. Recovery must
+        # respect the surviving owner until its bounded TTL, never force unlock.
+        assert client.get(keys.lease) is not None
+        held = recovery_api().RecoveryService(runtime).run_once(rt.clock.now() + timedelta(seconds=2))
+        assert held.quarantined == 0 and held.failed > 0
+        assert {key: client.values.get(key) for key in retained} == retained
+        assert client.sets == indexes
+        rt.clock.advance(timedelta(seconds=rt.store.config.contact_lease_ttl_seconds + 1))
+    elif offset < 0:
+        healthy = recovery_api().RecoveryService(runtime).run_once(rt.clock.now() + timedelta(seconds=2))
+        assert (healthy.quarantined, healthy.failed) == (0, 0)
+        assert {key: client.values.get(key) for key in retained} == retained
+        assert client.sets == indexes
+        rt.clock.advance(timedelta(seconds=1))
+    resumed = recovery_api().RecoveryService(runtime).run_once(rt.clock.now())
+    assert (resumed.quarantined, resumed.failed) == (1, 0)
+    assert client.operation_calls.get("quarantine_mutation", 0) == 1
+    assert not any(key.startswith(keys.staging_prefix) for key in client.values)
+    again = recovery_api().RecoveryService(runtime).run_once(rt.clock.now())
+    assert (again.quarantined, again.failed, again.rescheduled) == (0, 0, 0)
+    assert client.operation_calls.get("quarantine_mutation", 0) == 1
+    assert len(rt.agent.calls) == len(rt.processing_broker.calls) == 1
+    assert rt.outbound_broker.calls == rt.transport.calls == []
+
+
 @pytest.mark.parametrize("offset", [-1, 0, 1])
 def test_recovery_stale_discovery_preserves_fresh_committing_until_actual_deadline(processing_runtime, task_api, monkeypatch, offset):
     rt = processing_runtime
