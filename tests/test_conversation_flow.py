@@ -662,6 +662,119 @@ def test_recovery_ack_audit_rejects_real_regression_plans(processing_runtime, ta
         assert "claim_or_resume_batch" in audit.violations
 
 
+def exercise_malformed_ack_recovery(rt, task_api, monkeypatch, request, boundary, composed, dependency, corruption):
+    from app.conversation_redis import ATOMIC_SCRIPT, contact_keys, RECOVERY_CHECKPOINT_KEY
+    from tests.fakes import compose_recovery_fixture, RecoveryWriteAudit
+    command = rt.buffer()
+    rt.store.fail_next_atomic("complete_batch")
+    with pytest.raises(task_api.RetryRequested):
+        task_api.process_batch(command, rt)
+    rt.clock.advance(timedelta(seconds=61))
+    runtime = compose_recovery_fixture(rt, monkeypatch) if composed else rt
+    store, client, keys = runtime.store, rt.store.client, contact_keys(command.phone)
+    audit = RecoveryWriteAudit(runtime, monkeypatch)
+    audit.witness_outbound(command)
+    sql = observe_recovery_sql(rt, request)
+    effects = (len(rt.agent.calls), len(rt.processing_broker.calls), len(rt.outbound_broker.calls), len(rt.transport.calls))
+    evidence, closed_writes, quarantines = [], [], []
+    evaluate = client.eval
+    def observe_plan(script, count, *args):
+        if script == ATOMIC_SCRIPT:
+            plan = json.loads(args[count])
+            if plan["quarantine"]:
+                quarantines.append(plan["operation"])
+            if (not rt.dependencies[dependency] and plan["operation"] not in ("acquire", "assert", "renew", "release")
+                    and (plan["writes"] or plan["deadline_writes"] or plan["quarantine"])):
+                closed_writes.append(plan["operation"])
+        return evaluate(script, count, *args)
+    monkeypatch.setattr(client, "eval", observe_plan)
+    method = "claim_or_resume_batch" if boundary == "claim" else "complete_batch"
+    original = getattr(store, method)
+    def close_with_malformed_receipt(*args, **kwargs):
+        rt.dependencies[dependency] = False
+        key = next(key for key in client.values if key.startswith(keys.processing_prefix))
+        record = json.loads(client.values[key])
+        body, receipt = record["body"], record["body"]["outbound_reservation"]
+        if corruption.startswith("both_"):
+            malformed = {"both_null": None, "both_empty": "", "both_invalid": "not-a-uuid",
+                         "both_number": 7, "both_bool": False, "both_list": [], "both_dict": {},
+                         "both_uppercase": "00000000-0000-4000-8000-0000000000AB"}[corruption]
+            body["outbound_attempt_id"] = receipt["reservation_id"] = malformed
+        elif corruption == "missing_ids":
+            body.pop("outbound_attempt_id")
+            receipt.pop("reservation_id")
+        elif corruption == "missing_reservation":
+            body.pop("outbound_reservation")
+        elif corruption == "missing_attempted":
+            body.pop("outbound_attempted")
+        elif corruption == "attempt_null":
+            body["outbound_attempt_id"] = None
+        elif corruption == "reservation_null":
+            receipt["reservation_id"] = None
+        elif corruption == "asymmetric_equal_types":
+            body["outbound_attempt_id"], receipt["reservation_id"] = 0, False
+        elif corruption == "wrong_reservation_type":
+            body["outbound_reservation"] = []
+        elif corruption == "missing_typed_field":
+            receipt.pop("claim_token")
+        elif corruption == "invalid_typed_field":
+            receipt["result_fingerprint"] = None
+        elif corruption == "extra_typed_field":
+            receipt["unexpected"] = "synthetic"
+        else:
+            pytest.fail("unsupported synthetic corruption")
+        client.values[key] = json.dumps(record)
+        evidence.append(({key: value for key, value in client.values.items()
+                          if key not in (keys.lease, RECOVERY_CHECKPOINT_KEY)}, deepcopy(client.sets)))
+        return original(*args, **kwargs)
+    monkeypatch.setattr(store, method, close_with_malformed_receipt)
+    closed = recovery_api().RecoveryService(runtime).run_once(rt.clock.now())
+    assert len(evidence) == 1
+    values, indexes = evidence[0]
+    assert {key: value for key, value in client.values.items()
+            if key not in (keys.lease, RECOVERY_CHECKPOINT_KEY)} == values
+    assert client.sets == indexes
+    assert closed.completed == closed.quarantined == closed.rescheduled == closed.exhausted == 0
+    assert closed_writes == quarantines == sql == audit.violations == []
+    assert effects == (len(rt.agent.calls), len(rt.processing_broker.calls), len(rt.outbound_broker.calls), len(rt.transport.calls))
+    monkeypatch.setattr(store, method, original)
+    rt.dependencies[dependency] = True
+    resumed = recovery_api().RecoveryService(runtime).run_once(rt.clock.now())
+    writes = dict(client.operation_calls)
+    again = recovery_api().RecoveryService(runtime).run_once(rt.clock.now())
+    # Collect both ready passes before asserting: the reviewed defect reported
+    # failed twice, never making the canonical quarantine transition.
+    assert (resumed.quarantined, resumed.failed, again.quarantined, again.failed) == (1, 0, 0, 0)
+    assert resumed.completed == resumed.rescheduled == resumed.exhausted == 0
+    assert again.completed == again.rescheduled == again.exhausted == 0
+    assert quarantines == ["validate"]
+    for operation in ("claim_or_resume_batch", "complete_batch", "reserve_enqueue", "validate"):
+        assert client.operation_calls.get(operation, 0) == writes.get(operation, 0)
+    assert effects == (len(rt.agent.calls), len(rt.processing_broker.calls), len(rt.outbound_broker.calls), len(rt.transport.calls))
+    assert sql == closed_writes == audit.violations == []
+
+
+@pytest.mark.parametrize("boundary", ["claim", "completion"])
+@pytest.mark.parametrize("composed", [False, True])
+@pytest.mark.parametrize("dependency", list(domain.DependencyName))
+@pytest.mark.parametrize("corruption", ["both_null", "both_empty", "both_invalid"])
+def test_recovery_malformed_ack_receipts_converge(processing_runtime, task_api, monkeypatch, request,
+                                                boundary, composed, dependency, corruption):
+    exercise_malformed_ack_recovery(processing_runtime, task_api, monkeypatch, request,
+                                   boundary, composed, dependency, corruption)
+
+
+@pytest.mark.parametrize("boundary", ["claim", "completion"])
+@pytest.mark.parametrize("composed", [False, True])
+@pytest.mark.parametrize("corruption", ["both_number", "both_bool", "both_list", "both_dict", "both_uppercase",
+    "missing_ids", "missing_reservation", "missing_attempted", "attempt_null", "reservation_null",
+    "asymmetric_equal_types", "wrong_reservation_type", "missing_typed_field", "invalid_typed_field", "extra_typed_field"])
+def test_recovery_malformed_ack_type_and_asymmetry_controls(processing_runtime, task_api, monkeypatch, request,
+                                                          boundary, composed, corruption):
+    exercise_malformed_ack_recovery(processing_runtime, task_api, monkeypatch, request,
+                                   boundary, composed, domain.DependencyName.SECRET, corruption)
+
+
 @pytest.mark.parametrize("ack_path", ["processing_broker", "persisted_outbound"])
 @pytest.mark.parametrize("corrupt", [False, True])
 def test_recovery_ack_records_only_identity_bound_effect_without_destructive_repair(processing_runtime, task_api,

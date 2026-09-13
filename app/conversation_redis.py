@@ -714,16 +714,18 @@ class RedisConversationStore:
                     if attempt.phase in (ProcessingPhase.RESULT_READY, ProcessingPhase.APPLYING, ProcessingPhase.DONE) and not staging.body.get("result"):
                         raise ValueError
                     if "outbound_attempted" in processing.body or "outbound_attempt_id" in processing.body:
-                        receipt = processing.body.get("outbound_reservation")
+                        receipt = OutboundReservation.from_payload(processing.body.get("outbound_reservation"))
+                        attempt_id = processing.body.get("outbound_attempt_id")
                         if (processing.body.get("outbound_attempted") is not True
-                                or not isinstance(receipt, dict)
-                                or processing.body.get("outbound_attempt_id") != receipt.get("reservation_id")):
+                                or not isinstance(attempt_id, str)
+                                or str(UUID(attempt_id)) != attempt_id
+                                or attempt_id != receipt.reservation_id):
                             raise ValueError
             for item in details:
                 if item.entry.kind == "dedupe" and item.body.get("schema") == "batch_v1" and item.body.get("disposition") == "BUFFERED":
                     if self._find(details, "batch", item.body["batch_id"]) is None:
                         raise ValueError
-        except (ValueError, KeyError, TypeError, ConversationGenerationUnavailable):
+        except (ValueError, KeyError, TypeError, ConversationGenerationUnavailable, ConversationMutationPending):
             self._atomic(lease.phone, "validate", checks, quarantine=True, require_ready=require_ready,
                          preserve_evidence=read_only)
 
