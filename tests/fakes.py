@@ -693,6 +693,85 @@ class ProcessingRuntime(IngressRuntime):
                     self.clock.now(), lease, str(uuid4()))
 
 
+def compose_recovery_fixture(runtime, monkeypatch):
+    """Real composition with controlled probe outcomes, without parallel types."""
+    from types import SimpleNamespace
+    from app.conversation_recovery import compose_runtime
+    composed = compose_runtime(settings=SimpleNamespace(webhook_secret="synthetic-webhook-secret"),
+        client=runtime.store.client, config=runtime.store.config, session_factory=runtime.session_factory,
+        sql_probe=lambda: True, agent=runtime.agent, processing_broker=runtime.processing_broker,
+        outbound_broker=runtime.outbound_broker, transport=runtime.transport, clock=runtime.clock)
+    probes = composed.readiness_status.__self__._probes
+    for name, probe in tuple(probes.items()):
+        monkeypatch.setitem(probes, name, lambda name=name, probe=probe: runtime.dependencies[name] and probe())
+    return composed
+
+
+class RecoveryWriteAudit:
+    """Observe every executed Redis plan, not a mirrored transition implementation.
+
+    Readiness must have been observed after the last plan-building dependency
+    read. Only an explicitly witnessed broker ACK or persisted outbound receipt
+    can exempt its identity-bound record. Lease maintenance is not recovery DML.
+    """
+    def __init__(self, runtime, monkeypatch, *, acknowledged=()):
+        import sys
+        from app.conversation_redis import ATOMIC_SCRIPT, RECOVERY_CHECKPOINT_SCRIPT
+        self.observed, self.violations, self.opcodes = set(), [], set()
+        self.checks = 0
+        self.acknowledged = set(acknowledged)
+        readiness = runtime.readiness_status
+        def probe():
+            result = readiness()
+            self.checks += int(result.ready)
+            return result
+        monkeypatch.setattr(runtime, "readiness_status", probe)
+        client = runtime.store.client
+        original_scan, original_eval, original_get = client.scan_iter, client.eval, client.get
+        def get(*args, **kwargs):
+            result = original_get(*args, **kwargs)
+            self.checks = 0
+            return result
+        monkeypatch.setattr(client, "get", get)
+        def scan(*args, **kwargs):
+            result = original_scan(*args, **kwargs)
+            frame = sys._getframe(1)
+            while frame is not None and frame.f_code.co_name != "_atomic":
+                frame = frame.f_back
+            if frame is not None:
+                self.checks = 0
+            return result
+        monkeypatch.setattr(client, "scan_iter", scan)
+        def evaluate(script, count, *args):
+            if script == RECOVERY_CHECKPOINT_SCRIPT:
+                if not self.checks:
+                    self.violations.append("checkpoint")
+                self.observed.add("checkpoint")
+                self.opcodes.add("SET")
+            if script == ATOMIC_SCRIPT:
+                keys, plan = args[:count], json.loads(args[count])
+                operation = plan["operation"]
+                self.observed.add(operation)
+                writes = plan["writes"] + plan.get("deadline_writes", [])
+                repair = plan["quarantine"] or any(check.get("failure") == "generation" and
+                    (original_get(keys[check["key"] - 1]) if check["op"] == "get" else
+                     client.sismember(keys[check["key"] - 1], check["member"])) != check["value"]
+                    for check in plan["checks"])
+                if repair:
+                    writes += plan.get("quarantine_writes", [])
+                    self.opcodes.update(("SET", "SADD"))  # Corruption-quarantine anchor/index.
+                self.opcodes.update(write["op"] for write in writes)
+                lease_only = operation in ("acquire", "assert", "renew", "release")
+                acknowledged_record = operation in self.acknowledged and not repair
+                if (writes or repair) and not lease_only and not acknowledged_record and not self.checks:
+                    self.violations.append(operation)
+                if acknowledged_record and (plan["quarantine"] or plan.get("quarantine_writes") or
+                        any(check.get("failure") == "generation" for check in plan["checks"])):
+                    self.violations.append("ack_can_destroy_evidence")
+            return original_eval(script, count, *args)
+        monkeypatch.setattr(client, "eval", evaluate)
+
+
 class RetryTask:
     """Celery Retry must escape the wrapper exactly once."""
     def __init__(self):

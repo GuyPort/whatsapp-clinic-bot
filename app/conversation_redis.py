@@ -415,7 +415,14 @@ class RedisConversationStore:
             raise ReadinessUnavailable(FailureReason.READINESS_UNAVAILABLE)
 
     def _atomic(self, phone, operation, checks=(), writes=(), quarantine=False, *, deadline=None,
-                deadline_writes=(), require_ready=None):
+                deadline_writes=(), require_ready=None, preserve_evidence=False):
+        if preserve_evidence:
+            if quarantine:
+                raise ConversationStateUnavailable(FailureReason.STATE_UNAVAILABLE)
+            # A recognized-effect receipt must never fall back to destructive
+            # repair if a read/CAS races with corruption or changed generation.
+            checks = [{**check, "failure": "stale"} if check.get("failure") == "generation" else check
+                      for check in checks]
         self._ready()
         keys = contact_keys(phone)
         key_list = [GLOBAL_EPOCH_KEY, keys.anchor, QUARANTINE_INDEX_KEY]
@@ -436,7 +443,8 @@ class RedisConversationStore:
                 "checks": [{**c, "key": index(c["key"])} for c in checks],
                 "writes": [{**w, "key": index(w["key"])} for w in writes],
                 "deadline_writes": [{**w, "key": index(w["key"])} for w in deadline_writes],
-                "quarantine_writes": [{"op": "DEL", "key": index(key)} for key in content_keys]}
+                "quarantine_writes": [] if preserve_evidence else
+                    [{"op": "DEL", "key": index(key)} for key in content_keys]}
         if deadline is not None:
             plan["deadline_us"] = int(deadline.timestamp() * 1000000)
         if require_ready is not None:
@@ -584,7 +592,11 @@ class RedisConversationStore:
         self._atomic(lease.phone, "trim_quarantine_receipts", checks, writes, require_ready=require_ready)
         return True
 
-    def _snapshot(self, lease, *, operational=False, require_ready=None):
+    def _snapshot(self, lease, *, operational=False, require_ready=None, read_only=False):
+        # Post-ACK validation may read while aggregate readiness is closed, but
+        # it must not quarantine, compact, trim or perform conflict cleanup.
+        if read_only:
+            require_ready = None
         self.assert_owned(lease)
         keys = contact_keys(lease.phone)
         raw = self._get(keys.anchor)
@@ -592,7 +604,8 @@ class RedisConversationStore:
         if raw is None:
             if not self._has_remnants(lease.phone):
                 raise ConversationCoordinationAbsent(FailureReason.GENERATION_UNAVAILABLE)
-            self._atomic(lease.phone, "validate", checks, quarantine=True, require_ready=require_ready)
+            self._atomic(lease.phone, "validate", checks, quarantine=True, require_ready=require_ready,
+                         preserve_evidence=read_only)
             raise ConversationGenerationUnavailable(FailureReason.GENERATION_UNAVAILABLE)
         try:
             value = json.loads(raw)
@@ -613,7 +626,8 @@ class RedisConversationStore:
                     or manifest_fingerprint(entries) != anchor.manifest_fingerprint):
                 raise ValueError("invalid_value")
         except (KeyError, TypeError, ValueError, OverflowError, ConversationGenerationUnavailable):
-            self._atomic(lease.phone, "validate", checks, quarantine=True, require_ready=require_ready)
+            self._atomic(lease.phone, "validate", checks, quarantine=True, require_ready=require_ready,
+                         preserve_evidence=read_only)
             raise AssertionError("unreachable")
         checks.append(self._check(keys.generation, _generation_control(anchor), "generation"))
         fence = anchor.mutation_fence
@@ -625,15 +639,18 @@ class RedisConversationStore:
                 if attempt.phase not in (MutationPhase.PREPARED, MutationPhase.COMMITTING, MutationPhase.QUARANTINED):
                     raise ValueError("invalid_value")
             except (KeyError, TypeError, StopIteration, ValueError, ConversationStateUnavailable):
-                self._atomic(lease.phone, "validate", checks, quarantine=True, require_ready=require_ready)
+                self._atomic(lease.phone, "validate", checks, quarantine=True, require_ready=require_ready,
+                             preserve_evidence=read_only)
                 raise AssertionError("unreachable")
             if attempt.phase is MutationPhase.COMMITTING and self._now() >= attempt.processing_deadline:
+                if read_only:
+                    raise ConversationStateUnavailable(FailureReason.STATE_UNAVAILABLE)
                 self._compact_mutation_fence(lease, anchor, checks, require_ready=require_ready)
         if anchor.cycle is ConversationCycle.QUARANTINED:
             if not operational:
-                self._atomic(lease.phone, "validate", checks, require_ready=require_ready)
+                self._atomic(lease.phone, "validate", checks, require_ready=require_ready, preserve_evidence=read_only)
                 raise ConversationMutationPending(FailureReason.MUTATION_PENDING)
-            if fence is not None and self._trim_quarantine_receipts(lease, anchor, checks, require_ready=require_ready):
+            if not read_only and fence is not None and self._trim_quarantine_receipts(lease, anchor, checks, require_ready=require_ready):
                 return self._snapshot(lease, operational=True, require_ready=require_ready)
         details = []
         for entry in entries:
@@ -654,6 +671,8 @@ class RedisConversationStore:
                         raise ValueError("invalid_value")
                 details.append(detail)
             except (TypeError, KeyError, ValueError, ConversationStateUnavailable):
+                if read_only:
+                    raise ConversationStateUnavailable(FailureReason.STATE_UNAVAILABLE) from None
                 if fence is not None and fence["phase"] == MutationPhase.COMMITTING.value:
                     self._compact_mutation_fence(lease, anchor, checks, require_ready=require_ready)
                 self._atomic(lease.phone, "validate", checks, quarantine=True, require_ready=require_ready)
@@ -662,13 +681,13 @@ class RedisConversationStore:
                 checks.append({"op": "member", "key": INDEX_KEYS[flag],
                                "member": self._member(lease.phone, entry), "value": 1,
                                "failure": "generation"})
-        self._atomic(lease.phone, "validate", checks, require_ready=require_ready)
-        self._validate_batch_details(lease, details, checks)
+        self._atomic(lease.phone, "validate", checks, require_ready=require_ready, preserve_evidence=read_only)
+        self._validate_batch_details(lease, details, checks, require_ready=require_ready, read_only=read_only)
         if anchor.cycle is ConversationCycle.QUARANTINED and not operational:
             raise ConversationMutationPending(FailureReason.MUTATION_PENDING)
         return anchor, tuple(details), checks
 
-    def _validate_batch_details(self, lease, details, checks):
+    def _validate_batch_details(self, lease, details, checks, *, require_ready=None, read_only=False):
         """Manifest integrity also includes mandatory batch/claim relationships."""
         try:
             for batch in details:
@@ -699,7 +718,8 @@ class RedisConversationStore:
                     if self._find(details, "batch", item.body["batch_id"]) is None:
                         raise ValueError
         except (ValueError, KeyError, TypeError, ConversationGenerationUnavailable):
-            self._atomic(lease.phone, "validate", checks, quarantine=True)
+            self._atomic(lease.phone, "validate", checks, quarantine=True, require_ready=require_ready,
+                         preserve_evidence=read_only)
 
     def initialize_contact(self, phone: str, lease: ContactLease | None = None,
                            *, db_state_present: bool | None = None) -> ContactAnchor:
@@ -746,9 +766,10 @@ class RedisConversationStore:
 
     def _transition(self, lease, expected, details, generation=None, operation="cas", extra=(),
                     *, cycle=None, operational=False, deadline=None, mutation_fence=...,
-                    deadline_transition=None, _plan_only=False):
+                    deadline_transition=None, _plan_only=False, require_ready=None, acknowledged=False):
         with self._lock:
-            anchor, previous, checks = self._snapshot(lease, operational=operational)
+            anchor, previous, checks = self._snapshot(lease, operational=operational, require_ready=require_ready,
+                                                     read_only=acknowledged)
             if (anchor.contact_revision != expected.contact_revision
                     or anchor.manifest_fingerprint != expected.manifest_fingerprint):
                 raise ConversationStateUnavailable(FailureReason.STATE_UNAVAILABLE)
@@ -756,13 +777,15 @@ class RedisConversationStore:
             if not isinstance(generation, UUID):
                 raise ConversationStateUnavailable(FailureReason.INVALID_VALUE)
             if generation != anchor.last_generation and generation in anchor.generation_history:
-                self._atomic(lease.phone, operation, checks, quarantine=True)
+                self._atomic(lease.phone, operation, checks, quarantine=True, require_ready=require_ready,
+                             preserve_evidence=acknowledged)
             previous_by_id = {(item.entry.kind, item.entry.id): item for item in previous}
             for item in details:
                 old = previous_by_id.get((item.entry.kind, item.entry.id))
                 if old is not None and (item.entry.version < old.entry.version or (
                         item != old and item.entry.version == old.entry.version)):
-                    self._atomic(lease.phone, operation, checks, quarantine=True)
+                    self._atomic(lease.phone, operation, checks, quarantine=True, require_ready=require_ready,
+                                 preserve_evidence=acknowledged)
             entries = tuple(sorted((item.entry for item in details), key=lambda e: (e.kind, e.id)))
             if len({(e.kind, e.id) for e in entries}) != len(entries):
                 raise ConversationStateUnavailable(FailureReason.INVALID_VALUE)
@@ -825,9 +848,11 @@ class RedisConversationStore:
             deadline_writes = ()
             if deadline_transition is not None:
                 deadline_writes = self._transition(lease, expected, operation=operation,
-                                                   _plan_only=True, **deadline_transition)
+                                                   _plan_only=True, require_ready=require_ready,
+                                                   acknowledged=acknowledged, **deadline_transition)
             self._atomic(lease.phone, operation, checks, writes, deadline=deadline,
-                         deadline_writes=deadline_writes)
+                         deadline_writes=deadline_writes, require_ready=None if acknowledged else require_ready,
+                         preserve_evidence=acknowledged)
             return updated
 
     def compare_and_set(self, lease: ContactLease, expected: ContactAnchor,
@@ -908,12 +933,12 @@ class RedisConversationStore:
                                   batch.body["processing_id"], batch.body["operation_id"],
                                   batch.entry.id if batch.body["processing_id"] else None)
 
-    def _batch_snapshot(self, command, lease, *, require_ready=None):
+    def _batch_snapshot(self, command, lease, *, require_ready=None, read_only=False):
         if lease.phone != command.phone:
             raise ContactLeaseLost(FailureReason.CONTACT_LEASE_LOST)
         if command.coordination_epoch != str(self.config.coordination_epoch):
             raise ConversationGenerationUnavailable(FailureReason.GENERATION_UNAVAILABLE)
-        anchor, details, checks = self._snapshot(lease, require_ready=require_ready)
+        anchor, details, checks = self._snapshot(lease, require_ready=require_ready, read_only=read_only)
         item = self._find(details, "batch", command.batch_id)
         if item is None:
             raise ConversationGenerationUnavailable(FailureReason.GENERATION_UNAVAILABLE)
@@ -924,8 +949,8 @@ class RedisConversationStore:
             raise ConversationGenerationUnavailable(FailureReason.GENERATION_UNAVAILABLE)
         return anchor, details, item, checks
 
-    def dispatch(self, command: ProcessingCommand, lease: ContactLease) -> BufferDispatch:
-        return self._dispatch_load(self._batch_snapshot(command, lease)[2])
+    def dispatch(self, command: ProcessingCommand, lease: ContactLease, *, require_ready=None) -> BufferDispatch:
+        return self._dispatch_load(self._batch_snapshot(command, lease, require_ready=require_ready)[2])
 
     def _compatible_generation(self, anchor, details, batch):
         if str(anchor.last_generation) == batch.body["generation"]:
@@ -1059,8 +1084,9 @@ class RedisConversationStore:
         require_ready = require_ready or (lambda: None)
         require_ready()
         with self._lock:
-            anchor, details, batch, _ = self._batch_snapshot(command, lease)
-            self.assert_mutation_available(lease, self._now(), operation_id=batch.body["operation_id"])
+            anchor, details, batch, _ = self._batch_snapshot(command, lease, require_ready=require_ready)
+            self.assert_mutation_available(lease, self._now(), operation_id=batch.body["operation_id"],
+                                           require_ready=require_ready)
             dispatch = self._dispatch_load(batch)
             if dispatch.phase in (DispatchPhase.PROCESSED, DispatchPhase.EXHAUSTED):
                 return EnsureConsumerResult.NOT_DUE
@@ -1069,7 +1095,7 @@ class RedisConversationStore:
             committed = mutation is not None and self._attempt_load(mutation).phase is MutationPhase.COMMITTED
             durable = committed or self._outbound_reservation(anchor, details, batch) is not None
             if not self._compatible_generation(anchor, details, batch) or (self._now() >= deadline and not durable):
-                self.exhaust_batch(command, self._now(), lease)
+                self.exhaust_batch(command, self._now(), lease, require_ready=require_ready)
                 return EnsureConsumerResult.NOT_DUE
             if dispatch.phase is DispatchPhase.STAGED:
                 processing = self._find(details, "processing", dispatch.processing_id)
@@ -1083,7 +1109,8 @@ class RedisConversationStore:
             require_ready()
             self._transition(lease, anchor, self._replace_details(details, reserved), operation="reserve_enqueue",
                              deadline=None if durable else deadline,
-                             deadline_transition=None if durable else self._terminal_plan(anchor, details, batch))
+                             deadline_transition=None if durable else self._terminal_plan(anchor, details, batch),
+                             require_ready=require_ready)
         lease.assert_owned()
         require_ready()
         try:
@@ -1092,8 +1119,10 @@ class RedisConversationStore:
             raise BrokerUnavailable(FailureReason.BROKER_UNAVAILABLE) from None
         if not isinstance(outcome, EnqueueResult) or outcome is EnqueueResult.AMBIGUOUS:
             raise BrokerUnavailable(FailureReason.BROKER_UNAVAILABLE)
+        acknowledged = outcome is EnqueueResult.CONFIRMED
         with self._lock:
-            anchor, details, current, _ = self._batch_snapshot(command, lease)
+            anchor, details, current, _ = self._batch_snapshot(command, lease, require_ready=require_ready,
+                                                             read_only=acknowledged)
             if (current.body["enqueue_attempt_id"] != reserved.body["enqueue_attempt_id"]
                     or current.body["phase"] != reserved.body["phase"]):
                 raise ConversationMutationPending(FailureReason.MUTATION_PENDING)
@@ -1106,7 +1135,8 @@ class RedisConversationStore:
                 body["next_enqueue_at"] = (self._now() + timedelta(seconds=self.config.enqueue_backoff_seconds)).timestamp()
             self._transition(lease, anchor, self._replace_details(details, self._changed(current, body=body)),
                              operation="finish_enqueue", deadline=None if durable else deadline,
-                             deadline_transition=None if durable else self._terminal_plan(anchor, details, current))
+                             deadline_transition=None if durable else self._terminal_plan(anchor, details, current),
+                             require_ready=require_ready, acknowledged=acknowledged)
         if outcome is EnqueueResult.DEFINITIVE_FAILURE:
             raise BrokerUnavailable(FailureReason.BROKER_UNAVAILABLE)
         return EnsureConsumerResult.SCHEDULED
@@ -1134,16 +1164,16 @@ class RedisConversationStore:
                 remove=(("buffer", batch.entry.id), ("staging", batch.entry.id))),
                 "cycle": cycle, "mutation_fence": fence}
 
-    def exhaust_batch(self, command, now, lease):
+    def exhaust_batch(self, command, now, lease, *, require_ready=None):
         with self._lock:
-            anchor, details, batch, _ = self._batch_snapshot(command, lease)
+            anchor, details, batch, _ = self._batch_snapshot(command, lease, require_ready=require_ready)
             dispatch = self._dispatch_load(batch)
             if dispatch.phase in (DispatchPhase.PROCESSED, DispatchPhase.EXHAUSTED):
                 return
             operation = batch.body["operation_id"]
             mutation = self._find(details, "mutation", self._attempt_id(operation)) if operation else None
             if mutation and self._attempt_load(mutation).phase is MutationPhase.COMMITTING:
-                self.quarantine_ambiguous_commit(command.phone, operation, lease, now)
+                self.quarantine_ambiguous_commit(command.phone, operation, lease, now, require_ready=require_ready)
                 raise ConversationMutationPending(FailureReason.MUTATION_PENDING)
             if ((mutation and self._attempt_load(mutation).phase is MutationPhase.COMMITTED
                     or self._outbound_reservation(anchor, details, batch) is not None)
@@ -1153,21 +1183,26 @@ class RedisConversationStore:
             deadline = dispatch.processing_deadline if dispatch.phase is DispatchPhase.STAGED else dispatch.dispatch_deadline
             if self._now() < deadline and self._compatible_generation(anchor, details, batch):
                 return
-            self._transition(lease, anchor, operation="exhaust_batch", **self._terminal_plan(anchor, details, batch))
+            self._transition(lease, anchor, operation="exhaust_batch", require_ready=require_ready,
+                             **self._terminal_plan(anchor, details, batch))
 
-    def claim_or_resume_batch(self, command, now, lease):
+    def claim_or_resume_batch(self, command, now, lease, *, require_ready=None, acknowledged=False):
         with self._lock:
-            anchor, details, batch, _ = self._batch_snapshot(command, lease)
+            anchor, details, batch, _ = self._batch_snapshot(command, lease, require_ready=require_ready,
+                                                           read_only=acknowledged)
             dispatch = self._dispatch_load(batch)
             if dispatch.phase in (DispatchPhase.EXHAUSTED, DispatchPhase.PROCESSED):
                 return BatchClaim(ClaimOutcome.TERMINAL)
-            self.assert_mutation_available(lease, now, operation_id=dispatch.operation_id)
+            self.assert_mutation_available(lease, now, operation_id=dispatch.operation_id,
+                                           require_ready=require_ready, read_only=acknowledged)
             mutation = self._find(details, "mutation", self._attempt_id(dispatch.operation_id)) if dispatch.operation_id else None
             committed = mutation is not None and self._attempt_load(mutation).phase is MutationPhase.COMMITTED
             durable = committed or self._outbound_reservation(anchor, details, batch) is not None
             deadline = dispatch.processing_deadline if dispatch.phase is DispatchPhase.STAGED else dispatch.dispatch_deadline
             if not self._compatible_generation(anchor, details, batch) or (self._now() >= deadline and not durable):
-                self.exhaust_batch(command, now, lease)
+                if acknowledged:
+                    raise ConversationStateUnavailable(FailureReason.STATE_UNAVAILABLE)
+                self.exhaust_batch(command, now, lease, require_ready=require_ready)
                 return BatchClaim(ClaimOutcome.TERMINAL)
             if dispatch.phase is not DispatchPhase.STAGED:
                 if any(item.entry.kind == "processing" and not item.terminal for item in details):
@@ -1189,7 +1224,8 @@ class RedisConversationStore:
                 self._transition(lease, anchor, self._replace_details(details, updated, processing, staging, *receipts,
                                    remove=(("buffer", batch.entry.id),)), operation="claim_or_resume_batch",
                                    deadline=dispatch.dispatch_deadline,
-                                   deadline_transition=self._terminal_plan(anchor, details, batch))
+                                   deadline_transition=self._terminal_plan(anchor, details, batch),
+                                   require_ready=require_ready, acknowledged=acknowledged)
                 outcome = ClaimOutcome.CLAIMED
             else:
                 processing = self._find(details, "processing", dispatch.processing_id)
@@ -1208,7 +1244,8 @@ class RedisConversationStore:
                     outcome = ClaimOutcome.RESULT_READY if phase is ProcessingPhase.RESULT_READY else ClaimOutcome.APPLYING
                 self._transition(lease, anchor, self._replace_details(details, processing), operation="claim_or_resume_batch",
                                  deadline=None if durable else deadline,
-                                 deadline_transition=None if durable else self._terminal_plan(anchor, details, batch))
+                                 deadline_transition=None if durable else self._terminal_plan(anchor, details, batch),
+                                 require_ready=require_ready, acknowledged=acknowledged)
             envelopes = tuple(InboundEnvelope(e["kind"], e["content"], datetime.fromisoformat(e["received_at"]),
                                               e["generation"], e["message_id"]) for e in staging.body["envelopes"])
             result = staging.body.get("result")
@@ -1252,13 +1289,13 @@ class RedisConversationStore:
             self._transition(lease, anchor, self._replace_details(details, changed, ready), operation="stage_agent_result",
                              deadline=deadline, deadline_transition=self._terminal_plan(anchor, details, batch))
 
-    def validate_agent_application(self, phone, processing_id, operation_id, result, lease):
+    def validate_agent_application(self, phone, processing_id, operation_id, result, lease, *, require_ready=None, read_only=False):
         if phone != lease.phone:
             raise ContactLeaseLost(FailureReason.CONTACT_LEASE_LOST)
         # Tasks 1-3 also expose a direct coordinator contract, before a batch exists.
         if self._get(contact_keys(phone).anchor) is None:
             return
-        anchor, details, _ = self._snapshot(lease)
+        anchor, details, _ = self._snapshot(lease, require_ready=require_ready, read_only=read_only)
         processing = self._find(details, "processing", processing_id)
         if processing is None:
             if any(item.entry.kind == "processing" and item.body.get("schema") == "batch_v1" and not item.terminal for item in details):
@@ -1289,11 +1326,13 @@ class RedisConversationStore:
         committed = mutation and self._attempt_load(mutation).phase is MutationPhase.COMMITTED
         durable = committed or self._outbound_reservation(anchor, details, batch) is not None
         if self._now() >= self._date(processing.body["processing_deadline"]) and not durable:
-            self.exhaust_batch(self._command_for(phone, batch), self._now(), lease)
+            if read_only:
+                raise ConversationStateUnavailable(FailureReason.STATE_UNAVAILABLE)
+            self.exhaust_batch(self._command_for(phone, batch), self._now(), lease, require_ready=require_ready)
             raise ConversationMutationPending(FailureReason.MUTATION_PENDING)
 
-    def _owned_result(self, command, attempt, lease):
-        anchor, details, batch, _ = self._batch_snapshot(command, lease)
+    def _owned_result(self, command, attempt, lease, *, require_ready=None, read_only=False):
+        anchor, details, batch, _ = self._batch_snapshot(command, lease, require_ready=require_ready, read_only=read_only)
         processing = self._find(details, "processing", attempt.processing_id)
         staging = self._find(details, "staging", command.batch_id)
         if (batch.body["phase"] != "STAGED" or processing is None or staging is None
@@ -1306,7 +1345,8 @@ class RedisConversationStore:
                 or staging.body.get("result") is None):
             raise ConversationMutationPending(FailureReason.MUTATION_PENDING)
         result = self._result_load(staging.body["result"])
-        self.validate_agent_application(command.phone, attempt.processing_id, attempt.operation_id, result, lease)
+        self.validate_agent_application(command.phone, attempt.processing_id, attempt.operation_id, result, lease,
+                                        require_ready=require_ready, read_only=read_only)
         return anchor, details, batch, processing, staging, result
 
     def _fixed_staging_result(self, staging):
@@ -1330,8 +1370,9 @@ class RedisConversationStore:
                 deadline=self._date(processing.body["processing_deadline"]),
                 deadline_transition=self._terminal_plan(anchor, details, batch))
 
-    def _applied_result(self, command, attempt, lease):
-        anchor, details, batch, processing, staging, result = self._owned_result(command, attempt, lease)
+    def _applied_result(self, command, attempt, lease, *, require_ready=None, read_only=False):
+        anchor, details, batch, processing, staging, result = self._owned_result(command, attempt, lease,
+                                                                            require_ready=require_ready, read_only=read_only)
         mutation = self._find(details, "mutation", self._attempt_id(attempt.operation_id))
         no_sql = (processing.body.get("application") == ResultApplication.NO_SQL.value
                   and processing.body["phase"] == "APPLYING" and mutation is None
@@ -1372,9 +1413,10 @@ class RedisConversationStore:
                 "outbound_attempt_id": reservation.reservation_id})
             self._transition(lease, anchor, self._replace_details(details, updated), operation="record_outbound_attempt")
 
-    def complete_batch(self, command, attempt, now, lease, *, reservation=None):
+    def complete_batch(self, command, attempt, now, lease, *, reservation=None, require_ready=None, acknowledged=False):
         with self._lock:
-            anchor, details, batch, _ = self._batch_snapshot(command, lease)
+            anchor, details, batch, _ = self._batch_snapshot(command, lease, require_ready=require_ready,
+                                                           read_only=acknowledged)
             if batch.body["phase"] in ("EXHAUSTED", "PROCESSED"):
                 processing = self._find(details, "processing", batch.body["processing_id"])
                 if (batch.body["phase"] != "PROCESSED" or processing is None
@@ -1393,12 +1435,14 @@ class RedisConversationStore:
                         or processing.body.get("outbound_attempt_id") != reservation.reservation_id):
                     raise ConversationMutationPending(FailureReason.MUTATION_PENDING)
                 return
-            anchor, details, batch, processing, committed = self._applied_result(command, attempt, lease)
+            anchor, details, batch, processing, committed = self._applied_result(command, attempt, lease,
+                                                                               require_ready=require_ready, read_only=acknowledged)
             self._require_outbound_reservation(anchor, details, batch, reservation)
             if (processing.body.get("outbound_attempted") is not True
                     or processing.body.get("outbound_attempt_id") != reservation.reservation_id):
                 raise ConversationMutationPending(FailureReason.MUTATION_PENDING)
-            self._transition(lease, anchor, operation="complete_batch", **self._terminal_plan(anchor, details, batch, processed=True))
+            self._transition(lease, anchor, operation="complete_batch", require_ready=require_ready,
+                             acknowledged=acknowledged, **self._terminal_plan(anchor, details, batch, processed=True))
 
     @staticmethod
     def _recovery_cursor(state):
@@ -1623,32 +1667,58 @@ class RedisConversationStore:
         except Exception:
             raise ConversationStateUnavailable(FailureReason.STATE_UNAVAILABLE) from None
 
+    def _recovery_quarantined(self, phone, lease):
+        """Read the canonical terminal marker under the current contact fence."""
+        if lease.phone != phone:
+            raise ContactLeaseLost(FailureReason.CONTACT_LEASE_LOST)
+        self.assert_owned(lease)
+        try:
+            value = self.client.sismember(QUARANTINE_INDEX_KEY, contact_digest(phone))
+            if value not in (0, 1):
+                raise ValueError
+            return bool(value)
+        except Exception:
+            raise ConversationStateUnavailable(FailureReason.STATE_UNAVAILABLE) from None
+
     def recover_mutation(self, phone, operation_id, now, lease, *, require_ready=None):
         require_ready = require_ready or (lambda: None)
         require_ready()
+        if self._recovery_quarantined(phone, lease):
+            return "skipped"
         try:
             attempt = self.inspect_mutation(phone, operation_id, lease, require_ready=require_ready)
-        except ConversationMutationPending:
+        except (ConversationMutationPending, ConversationGenerationUnavailable):
+            if self._recovery_quarantined(phone, lease):
+                return "quarantined"
             attempt = self.inspect_mutation(phone, operation_id, lease, operational=True, require_ready=require_ready)
             return "quarantined" if attempt and attempt.phase is MutationPhase.QUARANTINED else "skipped"
         if attempt is None or self._now() < attempt.processing_deadline:
             return "skipped"
         if attempt.phase is MutationPhase.PREPARED:
             require_ready()
-            self.abort_prepared(phone, operation_id, lease, now, request_fingerprint=attempt.request_fingerprint)
+            self.abort_prepared(phone, operation_id, lease, now, request_fingerprint=attempt.request_fingerprint,
+                                require_ready=require_ready)
             return "aborted"
         if attempt.phase is MutationPhase.COMMITTING:
             require_ready()
-            self.quarantine_ambiguous_commit(phone, operation_id, lease, now)
+            try:
+                self.quarantine_ambiguous_commit(phone, operation_id, lease, now, require_ready=require_ready)
+            except (ConversationMutationPending, ConversationGenerationUnavailable):
+                if not self._recovery_quarantined(phone, lease):
+                    raise
             return "quarantined"
         return "skipped"
 
     def recover_batch(self, command, broker, now, lease, *, require_ready=None):
         require_ready = require_ready or (lambda: None)
         require_ready()
+        if self._recovery_quarantined(command.phone, lease):
+            return "skipped"
         try:
             anchor, details, batch, _ = self._batch_snapshot(command, lease, require_ready=require_ready)
-        except ConversationMutationPending:
+        except (ConversationMutationPending, ConversationGenerationUnavailable):
+            if self._recovery_quarantined(command.phone, lease):
+                return "quarantined"
             anchor, _, _ = self._snapshot(lease, operational=True, require_ready=require_ready)
             return "quarantined" if anchor.cycle is ConversationCycle.QUARANTINED else "skipped"
         dispatch = self._dispatch_load(batch)
@@ -1670,21 +1740,29 @@ class RedisConversationStore:
         reservation = self._outbound_reservation(anchor, details, batch)
         if (reservation is not None and processing.body.get("outbound_attempted") is True
                 and processing.body.get("outbound_attempt_id") == reservation.reservation_id):
-            claim = self.claim_or_resume_batch(command, now, lease)
-            self.complete_batch(command, claim.attempt, now, lease, reservation=reservation)
+            claim = self.claim_or_resume_batch(command, now, lease, require_ready=require_ready, acknowledged=True)
+            self.complete_batch(command, claim.attempt, now, lease, reservation=reservation,
+                                require_ready=require_ready, acknowledged=True)
             return "completed"
         require_ready()
         try:
-            self.exhaust_batch(command, now, lease)
-        except ConversationMutationPending:
+            self.exhaust_batch(command, now, lease, require_ready=require_ready)
+        except (ConversationMutationPending, ConversationGenerationUnavailable):
+            if self._recovery_quarantined(command.phone, lease):
+                return "quarantined"
             current, _, _ = self._snapshot(lease, operational=True, require_ready=require_ready)
             if current.cycle is ConversationCycle.QUARANTINED:
                 return "quarantined"
             raise
-        if self.dispatch(command, lease).phase is DispatchPhase.EXHAUSTED:
+        if self.dispatch(command, lease, require_ready=require_ready).phase is DispatchPhase.EXHAUSTED:
             return "exhausted"
         require_ready()
-        outcome = self.ensure_consumer(broker, command, now, lease, require_ready=require_ready)
+        try:
+            outcome = self.ensure_consumer(broker, command, now, lease, require_ready=require_ready)
+        except (ConversationMutationPending, ConversationGenerationUnavailable):
+            if self._recovery_quarantined(command.phone, lease):
+                return "quarantined"
+            raise
         return "rescheduled" if outcome is EnsureConsumerResult.SCHEDULED else "skipped"
 
     @staticmethod
@@ -1738,7 +1816,7 @@ class RedisConversationStore:
                                        require_ready=require_ready)[3]
 
     def _write_attempt(self, lease, anchor, details, previous, attempt, operation,
-                       *, cycle=None, compact=False, operational=False, deadline=None):
+                       *, cycle=None, compact=False, operational=False, deadline=None, require_ready=None):
         entry = ManifestEntry("mutation", self._attempt_id(attempt.operation_id),
                               previous.entry.version + 1 if previous else 1, attempt.expected_until)
         updated = ContactDetail(entry, self._attempt_data(attempt),
@@ -1773,7 +1851,8 @@ class RedisConversationStore:
             MutationPhase.PREPARED, MutationPhase.COMMITTING, MutationPhase.QUARANTINED) else None
         self._transition(lease, anchor, (*retained, updated), attempt.generation,
                          operation=operation, cycle=cycle, operational=operational,
-                         deadline=deadline, mutation_fence=fence, deadline_transition=deadline_transition)
+                         deadline=deadline, mutation_fence=fence, deadline_transition=deadline_transition,
+                         require_ready=require_ready)
         return attempt
 
     def _mutation_receipt(self, attempt: MutationAttempt) -> dict:
@@ -1799,8 +1878,8 @@ class RedisConversationStore:
         return item if self._is_replay_receipt(item) else None
 
     def assert_mutation_available(self, lease: ContactLease, now: datetime,
-                                  *, operation_id: str | None = None) -> None:
-        _, details, _ = self._snapshot(lease)
+                                  *, operation_id: str | None = None, require_ready=None, read_only=False) -> None:
+        _, details, _ = self._snapshot(lease, require_ready=require_ready, read_only=read_only)
         for item in details:
             if item.entry.kind != "mutation":
                 continue
@@ -1808,7 +1887,10 @@ class RedisConversationStore:
             if attempt.phase is MutationPhase.PREPARED and attempt.operation_id == operation_id:
                 continue
             if attempt.phase is MutationPhase.COMMITTING and self._now() >= attempt.processing_deadline:
-                self.quarantine_ambiguous_commit(lease.phone, attempt.operation_id, lease, now)
+                if read_only:
+                    raise ConversationStateUnavailable(FailureReason.STATE_UNAVAILABLE)
+                self.quarantine_ambiguous_commit(lease.phone, attempt.operation_id, lease, now,
+                                                require_ready=require_ready)
             if attempt.phase in (MutationPhase.PREPARED, MutationPhase.COMMITTING, MutationPhase.QUARANTINED):
                 raise ConversationMutationPending(FailureReason.MUTATION_PENDING)
 
@@ -1896,16 +1978,16 @@ class RedisConversationStore:
                                 "abort_prepared", cycle=attempt.prior_cycle)
 
     def abort_prepared(self, phone: str, operation_id: str, lease: ContactLease, now: datetime,
-                       *, request_fingerprint: str) -> MutationAttempt:
+                       *, request_fingerprint: str, require_ready=None) -> MutationAttempt:
         """A current lease may terminalize only the identical never-committing operation."""
         with self._lock:
-            anchor, details, item, attempt = self._mutation_snapshot(phone, operation_id, lease)
+            anchor, details, item, attempt = self._mutation_snapshot(phone, operation_id, lease, require_ready=require_ready)
             if attempt is None or attempt.phase is not MutationPhase.PREPARED:
                 raise ConversationMutationPending(FailureReason.MUTATION_PENDING)
             if attempt.request_fingerprint != request_fingerprint:
                 raise ConversationStateUnavailable(FailureReason.INVALID_VALUE)
             return self._write_attempt(lease, anchor, details, item, replace(attempt, phase=MutationPhase.ABORTED),
-                                       "abort_prepared", cycle=attempt.prior_cycle)
+                                       "abort_prepared", cycle=attempt.prior_cycle, require_ready=require_ready)
 
     def restore_prepared_after_rollback(self, phone: str, operation_id: str, lease: ContactLease,
                                         now: datetime, *, proof: DefinitiveRollbackProof) -> None:
@@ -1924,14 +2006,15 @@ class RedisConversationStore:
                                 "restore_prepared", cycle=ConversationCycle.MUTATING)
 
     def quarantine_ambiguous_commit(self, phone: str, operation_id: str,
-                                    lease: ContactLease, now: datetime) -> MutationAttempt:
+                                    lease: ContactLease, now: datetime, *, require_ready=None) -> MutationAttempt:
         with self._lock:
-            anchor, details, item, attempt = self._mutation_snapshot(phone, operation_id, lease)
+            anchor, details, item, attempt = self._mutation_snapshot(phone, operation_id, lease, require_ready=require_ready)
             if attempt is None or attempt.phase is not MutationPhase.COMMITTING:
                 raise ConversationMutationPending(FailureReason.MUTATION_PENDING)
             compact = replace(attempt, phase=MutationPhase.QUARANTINED)
             return self._write_attempt(lease, anchor, details, item, compact,
-                                       "quarantine_mutation", cycle=ConversationCycle.QUARANTINED, compact=True)
+                                       "quarantine_mutation", cycle=ConversationCycle.QUARANTINED, compact=True,
+                                       require_ready=require_ready)
 
     def finalize_committed(self, phone: str, operation_id: str, lease: ContactLease,
                            now: datetime) -> MutationAttempt:

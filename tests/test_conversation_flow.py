@@ -297,6 +297,291 @@ def test_recovery_snapshot_quarantine_rechecks_ready_after_anchor_read(processin
     assert rt.outbound_broker.calls == rt.transport.calls == []
 
 
+@pytest.mark.parametrize("branch,dependency,composed,offset_us,skew_days", [
+    (branch, dependency, composed, offset, skew)
+    for branch in ("nested_mutation", "nested_batch") for dependency in domain.DependencyName
+    for composed in (False, True) for offset in (-1, 0, 1) for skew in (-1, 1)] + [
+    (branch, dependency, composed, 0, 1)
+    for branch in ("invalid_details", "prepared_abort", "claimed_exhaust", "scheduled_exhaust", "reserve_enqueue")
+    for dependency in domain.DependencyName for composed in (False, True)])
+def test_recovery_destructive_transitions_keep_evidence_when_gate_closes(processing_runtime, task_api, monkeypatch, request,
+                                                                       branch, dependency, composed, offset_us, skew_days):
+    from app.conversation_redis import contact_keys, RECOVERY_CHECKPOINT_KEY
+    from tests.fakes import compose_recovery_fixture, RecoveryWriteAudit
+    rt = processing_runtime
+    command = rt.buffer()
+    if branch.startswith("nested") or branch == "prepared_abort":
+        rt.store.fail_next_atomic("enter_committing" if branch == "prepared_abort" else "finalize_committed")
+        with pytest.raises(task_api.RetryRequested):
+            task_api.process_batch(command, rt)
+    elif branch in ("claimed_exhaust", "invalid_details"):
+        with rt.store.contact_lease(command.phone) as lease:
+            rt.store.claim_or_resume_batch(command, rt.clock.now(), lease)
+    client, keys = rt.store.client, contact_keys(command.phone)
+    runtime = compose_recovery_fixture(rt, monkeypatch) if composed else rt
+    store = runtime.store
+    if branch == "invalid_details":
+        processing_key = next(key for key in client.values if key.startswith(keys.processing_prefix))
+        data = json.loads(client.values[processing_key])
+        data["body"]["claim_token"] = ""
+        client.values[processing_key] = json.dumps(data)
+    start = rt.clock.now()
+    if branch.startswith("nested"):
+        rt.clock.advance(timedelta(seconds=600, microseconds=-1))
+    else:
+        rt.clock.advance(timedelta(seconds=901 if branch == "scheduled_exhaust" else 61 if branch == "reserve_enqueue" else 601))
+    mutation_page = branch in ("nested_mutation", "prepared_abort")
+    store.save_recovery_checkpoint(None, (0 if mutation_page else 1, None, None))
+    scanner_name = "recoverable_mutations" if mutation_page else "recoverable_batches"
+    scanner = getattr(store, scanner_name)
+    page = (scanner(start + timedelta(days=1)) if mutation_page else scanner(now=start + timedelta(days=1)))
+    # Hold an actual discovered page across caller skew; only the leased clock
+    # and current state can authorize a transition after this stale hint.
+    monkeypatch.setattr(store, scanner_name, lambda *args, **kwargs: page)
+    retained = {key: value for key, value in client.values.items() if key not in (keys.lease, RECOVERY_CHECKPOINT_KEY)}
+    indexes = deepcopy(client.sets)
+    before = (len(rt.agent.calls), len(rt.processing_broker.calls), len(rt.outbound_broker.calls),
+              len(rt.transport.calls), sum(s.events.count("commit_entered") for s in rt.sessions))
+    from sqlalchemy import event
+    engine = rt._factory.kw["bind"]
+    assert engine.url.database in (None, "", ":memory:")
+    sql_effects = []
+    def observe_sql(connection, cursor, statement, parameters, context, executemany):
+        if not statement.lstrip().upper().startswith("SELECT "):
+            sql_effects.append("non_select")
+    event.listen(engine, "before_cursor_execute", observe_sql)
+    request.addfinalizer(lambda: event.remove(engine, "before_cursor_execute", observe_sql))
+    closed, snapshots = [], []
+    audit = RecoveryWriteAudit(runtime, monkeypatch)
+    def close():
+        if not closed:
+            closed.append(True)
+            rt.dependencies[dependency] = False
+    original_snapshot = store._snapshot
+    def snapshot(*args, **kwargs):
+        snapshots.append(True)
+        result = original_snapshot(*args, **kwargs)
+        if branch.startswith("nested") and len(snapshots) == 1:
+            rt.clock.advance(timedelta(microseconds=1 + offset_us))
+        return result
+    monkeypatch.setattr(store, "_snapshot", snapshot)
+    original_get = client.get
+    def get(key):
+        value = original_get(key)
+        if branch.startswith("nested") and key == keys.anchor and len(snapshots) == 2:
+            close()
+        return value
+    monkeypatch.setattr(client, "get", get)
+    if branch == "invalid_details":
+        original_load = store._processing_load
+        def load(*args, **kwargs):
+            result = original_load(*args, **kwargs)
+            close()
+            return result
+        monkeypatch.setattr(store, "_processing_load", load)
+    target = {"prepared_abort": "abort_prepared", "claimed_exhaust": "exhaust_batch",
+              "scheduled_exhaust": "exhaust_batch", "reserve_enqueue": "reserve_enqueue"}.get(branch)
+    original_scan = client.scan_iter
+    def scan(*args, **kwargs):
+        result = original_scan(*args, **kwargs)
+        frame = sys._getframe(1)
+        while frame is not None and frame.f_code.co_name != "_atomic":
+            frame = frame.f_back
+        if target is not None and frame is not None and frame.f_locals["operation"] == target:
+            close()
+        return result
+    monkeypatch.setattr(client, "scan_iter", scan)
+    report = recovery_api().RecoveryService(runtime, max_pages=1).run_once(start + timedelta(days=skew_days))
+    assert closed == ([] if branch.startswith("nested") and offset_us < 0 else [True])
+    assert report.quarantined == report.aborted == report.exhausted == report.rescheduled == 0
+    assert {key: client.values.get(key) for key in retained} == retained
+    assert client.sets == indexes
+    assert before == (len(rt.agent.calls), len(rt.processing_broker.calls), len(rt.outbound_broker.calls),
+                      len(rt.transport.calls), sum(s.events.count("commit_entered") for s in rt.sessions))
+    assert sql_effects == []
+    assert audit.violations == []
+    monkeypatch.setattr(store, scanner_name, scanner)
+    monkeypatch.setattr(store, "_snapshot", original_snapshot)
+    monkeypatch.setattr(client, "get", original_get)
+    monkeypatch.setattr(client, "scan_iter", original_scan)
+    if branch == "invalid_details":
+        monkeypatch.setattr(store, "_processing_load", original_load)
+    rt.dependencies[dependency] = True
+    if branch.startswith("nested") and offset_us < 0:
+        rt.clock.advance(timedelta(microseconds=1))
+    # The known processing broker response allows only its post-effect record.
+    rt.processing_broker.on_enqueue = lambda command: audit.acknowledged.add("finish_enqueue")
+    resumed = recovery_api().RecoveryService(runtime, max_pages=2).run_once(rt.clock.now())
+    expected = "quarantined" if branch.startswith("nested") or branch == "invalid_details" else (
+        "aborted" if branch == "prepared_abort" else "rescheduled" if branch == "reserve_enqueue" else "exhausted")
+    assert getattr(resumed, expected) == 1 and resumed.failed == 0
+    writes_after = dict(client.operation_calls)
+    again = recovery_api().RecoveryService(runtime, max_pages=1).run_once(rt.clock.now())
+    assert again.quarantined == again.aborted == again.exhausted == again.rescheduled == again.failed == 0
+    for operation in ("quarantine_mutation", "abort_prepared", "exhaust_batch", "reserve_enqueue"):
+        assert client.operation_calls.get(operation, 0) == writes_after.get(operation, 0)
+    assert audit.violations == []
+    assert audit.opcodes <= {"SET", "DEL", "SADD", "SREM", "ACQUIRE", "PEXPIRE"}
+    assert sql_effects == []
+
+
+@pytest.mark.parametrize("ack_path", ["processing_broker", "persisted_outbound"])
+@pytest.mark.parametrize("corrupt", [False, True])
+def test_recovery_ack_records_only_identity_bound_effect_without_destructive_repair(processing_runtime, task_api,
+                                                                                 monkeypatch, ack_path, corrupt):
+    from app.conversation_redis import contact_keys, RECOVERY_CHECKPOINT_KEY
+    from tests.fakes import RecoveryWriteAudit
+    rt = processing_runtime
+    command = rt.buffer()
+    rt.store.fail_next_atomic("reserve_outbound_enqueue" if ack_path == "processing_broker" else "complete_batch")
+    with pytest.raises(task_api.RetryRequested):
+        task_api.process_batch(command, rt)
+    rt.clock.advance(timedelta(seconds=61))
+    client, keys = rt.store.client, contact_keys(command.phone)
+    before = len(rt.processing_broker.calls), len(rt.outbound_broker.calls), len(rt.agent.calls), len(rt.transport.calls)
+    audit = RecoveryWriteAudit(rt, monkeypatch, acknowledged=(
+        ("claim_or_resume_batch", "complete_batch") if ack_path == "persisted_outbound" else ()))
+    evidence = []
+    def close_and_capture():
+        if evidence:
+            return
+        close_ready(rt)
+        if corrupt:
+            key = next(key for key in client.values if key.startswith(keys.processing_prefix))
+            data = json.loads(client.values[key])
+            data["body"]["claim_token"] = ""
+            client.values[key] = json.dumps(data)
+        evidence.append(({key: value for key, value in client.values.items()
+                          if key not in (keys.lease, RECOVERY_CHECKPOINT_KEY)}, deepcopy(client.sets)))
+    if ack_path == "processing_broker":
+        def broker_ack(command):
+            audit.acknowledged.add("finish_enqueue")
+            close_and_capture()
+        rt.processing_broker.on_enqueue = broker_ack
+    else:
+        original_scan = client.scan_iter
+        def scan(*args, **kwargs):
+            result = original_scan(*args, **kwargs)
+            frame = sys._getframe(1)
+            while frame is not None and frame.f_code.co_name != "_atomic":
+                frame = frame.f_back
+            if frame is not None and frame.f_locals["operation"] == "claim_or_resume_batch":
+                close_and_capture()
+            return result
+        monkeypatch.setattr(client, "scan_iter", scan)
+    report = recovery_api().RecoveryService(rt).run_once(rt.clock.now())
+    assert len(evidence) == 1
+    assert report.quarantined == 0
+    if corrupt:
+        values, indexes = evidence[0]
+        assert {key: client.values.get(key) for key in values} == values
+        assert client.sets == indexes
+        assert report.completed == report.rescheduled == 0
+    else:
+        assert (report.rescheduled, report.completed) == ((1, 0) if ack_path == "processing_broker" else (0, 1))
+    assert (len(rt.processing_broker.calls), len(rt.outbound_broker.calls), len(rt.agent.calls), len(rt.transport.calls)) == (
+        before[0] + (ack_path == "processing_broker"), *before[1:])
+    assert audit.violations == []
+    rt.dependencies[domain.DependencyName.SECRET] = True
+    if corrupt and ack_path == "processing_broker":
+        rt.clock.advance(timedelta(seconds=61))  # Respect the existing visibility reservation.
+    resumed = recovery_api().RecoveryService(rt).run_once(rt.clock.now())
+    assert (resumed.quarantined, resumed.failed) == ((1, 0) if corrupt else (0, 0))
+    writes_after = dict(client.operation_calls)
+    again = recovery_api().RecoveryService(rt).run_once(rt.clock.now())
+    assert again.quarantined == again.failed == again.rescheduled == again.completed == 0
+    for operation in ("finish_enqueue", "claim_or_resume_batch", "complete_batch", "quarantine_mutation"):
+        assert client.operation_calls.get(operation, 0) == writes_after.get(operation, 0)
+    assert audit.violations == []
+
+
+@pytest.mark.parametrize("operation", ["quarantine_mutation", "abort_prepared", "exhaust_batch", "reserve_enqueue",
+                                      "validate", "checkpoint"])
+def test_recovery_opcode_audit_detects_removed_adjacent_guard(processing_runtime, task_api, monkeypatch, operation):
+    from tests.fakes import RecoveryWriteAudit
+    from app.conversation_redis import contact_keys
+    rt = processing_runtime
+    command = rt.buffer()
+    if operation in ("quarantine_mutation", "abort_prepared"):
+        rt.store.fail_next_atomic("finalize_committed" if operation == "quarantine_mutation" else "enter_committing")
+        with pytest.raises(task_api.RetryRequested):
+            task_api.process_batch(command, rt)
+    elif operation == "validate":
+        with rt.store.contact_lease(command.phone) as lease:
+            rt.store.claim_or_resume_batch(command, rt.clock.now(), lease)
+        prefix = contact_keys(command.phone).processing_prefix
+        key = next(key for key in rt.store.client.values if key.startswith(prefix))
+        detail = json.loads(rt.store.client.values[key])
+        detail["body"]["claim_token"] = ""
+        rt.store.client.values[key] = json.dumps(detail)
+    rt.clock.advance(timedelta(seconds=61 if operation == "reserve_enqueue" else 901))
+    audit = RecoveryWriteAudit(rt, monkeypatch)
+    rt.processing_broker.on_enqueue = lambda command: audit.acknowledged.add("finish_enqueue")
+    original = rt.store._atomic
+    def atomic(phone, name, *args, **kwargs):
+        if name == operation:
+            kwargs["require_ready"] = None  # Deliberate synthetic regression.
+        return original(phone, name, *args, **kwargs)
+    monkeypatch.setattr(rt.store, "_atomic", atomic)
+    if operation == "checkpoint":
+        original_checkpoint = rt.store.save_recovery_checkpoint
+        def checkpoint(*args, **kwargs):
+            kwargs["require_ready"] = None
+            return original_checkpoint(*args, **kwargs)
+        monkeypatch.setattr(rt.store, "save_recovery_checkpoint", checkpoint)
+    recovery_api().RecoveryService(rt).run_once(rt.clock.now())
+    assert operation in audit.observed
+    assert operation in audit.violations
+
+
+def test_recovery_operational_trim_is_guarded_and_idempotent(processing_runtime, monkeypatch):
+    from tests.fakes import RecoveryWriteAudit
+    from app.conversation_redis import QUARANTINE_INDEX_KEY, RECOVERY_CHECKPOINT_KEY, contact_digest, contact_keys
+    rt = processing_runtime
+    phone = "5551999990000"
+    with rt.store.contact_lease(phone) as lease, rt.session_factory() as db:
+        rt.coordinator.pause_for_secretary(db, phone, "secretary_manual_pause", rt.clock.now(), lease, "old-receipt")
+        def ambiguous():
+            raise RuntimeError("synthetic ambiguous commit")
+        db.hooks["commit_entered"] = ambiguous
+        with pytest.raises(domain.ConversationMutationAmbiguous):
+            rt.coordinator.unpause(db, phone, rt.clock.now(), lease, "uncertain-operation")
+    rt.clock.advance(timedelta(days=8))
+    client, keys = rt.store.client, contact_keys(phone)
+    # A stale discovery plus missing secondary marker exercises the operational
+    # fallback; the durable primary fence still proves quarantine, not a commit.
+    client.sets[QUARANTINE_INDEX_KEY].discard(contact_digest(phone))
+    page = domain.RecoveryPage((), None, ((phone, "uncertain-operation"),), 1, 0)
+    monkeypatch.setattr(rt.store, "recoverable_mutations", lambda *args, **kwargs: page)
+    audit = RecoveryWriteAudit(rt, monkeypatch)
+    original_scan = client.scan_iter
+    closed = []
+    def scan(*args, **kwargs):
+        result = original_scan(*args, **kwargs)
+        frame = sys._getframe(1)
+        while frame is not None and frame.f_code.co_name != "_atomic":
+            frame = frame.f_back
+        if not closed and frame is not None and frame.f_locals["operation"] == "trim_quarantine_receipts":
+            closed.append(True)
+            close_ready(rt)
+        return result
+    monkeypatch.setattr(client, "scan_iter", scan)
+    retained = {key: value for key, value in client.values.items() if key not in (keys.lease, RECOVERY_CHECKPOINT_KEY)}
+    indexes = deepcopy(client.sets)
+    report = recovery_api().RecoveryService(rt, max_pages=1).run_once(rt.clock.now())
+    assert closed == [True] and report.quarantined == 0
+    assert client.operation_calls.get("trim_quarantine_receipts", 0) == 0
+    assert {key: client.values.get(key) for key in retained} == retained
+    assert client.sets == indexes and audit.violations == []
+    rt.dependencies[domain.DependencyName.SECRET] = True
+    recovery_api().RecoveryService(rt, max_pages=1).run_once(rt.clock.now())
+    assert client.operation_calls.get("trim_quarantine_receipts", 0) == 1
+    recovery_api().RecoveryService(rt).run_once(rt.clock.now())
+    assert client.operation_calls.get("trim_quarantine_receipts", 0) == 1
+    assert "trim_quarantine_receipts" in audit.observed and audit.violations == []
+    assert rt.agent.calls == rt.processing_broker.calls == rt.outbound_broker.calls == rt.transport.calls == []
+
+
 @pytest.mark.parametrize("offset", [-1, 0, 1])
 def test_recovery_stale_discovery_preserves_fresh_committing_until_actual_deadline(processing_runtime, task_api, monkeypatch, offset):
     rt = processing_runtime
