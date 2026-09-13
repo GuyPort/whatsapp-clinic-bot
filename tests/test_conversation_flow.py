@@ -32,6 +32,223 @@ def recovery_api():
     return importlib.import_module("app.conversation_recovery")
 
 
+def close_ready(runtime):
+    runtime.dependencies[domain.DependencyName.SECRET] = False
+
+
+@pytest.mark.parametrize("boundary", ["json", "acquire", "finalize_ingress_once", "reserve_enqueue"])
+def test_ready_race_ingress_stops_before_next_effect(main_module, ingress_runtime, monkeypatch, boundary):
+    import asyncio
+    rt = ingress_runtime
+    request = WebhookRequest(main_module.app, webhook_payload())
+    if boundary == "json":
+        original = request.json
+        async def body():
+            result = await original()
+            close_ready(rt)
+            return result
+        monkeypatch.setattr(request, "json", body)
+    else:
+        rt.store.client.after_operation[boundary] = lambda: close_ready(rt)
+    response = asyncio.run(main_module.whatsapp_webhook(request))
+    assert response.status_code == 503
+    assert rt.processing_broker.calls == []
+    if boundary == "json":
+        assert rt.lease_calls == rt.session_calls == 0
+    elif boundary == "acquire":
+        assert rt.session_calls == 0
+
+
+@pytest.mark.parametrize("boundary", ["acquire", "claim_or_resume_batch", "snapshot", "agent",
+    "stage_agent_result", "prepare_mutation", "flush", "enter_committing", "commit_returned", "reserve_outbound_enqueue"])
+def test_ready_race_processing_rechecks_before_agent_sql_and_outbound(processing_runtime, task_api, monkeypatch, boundary):
+    rt = processing_runtime
+    command = rt.buffer()
+    if boundary == "snapshot":
+        original = rt.coordinator.processing_snapshot
+        def snapshot(*args, **kwargs):
+            result = original(*args, **kwargs)
+            close_ready(rt)
+            return result
+        monkeypatch.setattr(rt.coordinator, "processing_snapshot", snapshot)
+    elif boundary == "agent":
+        rt.agent.on_prepare = lambda: close_ready(rt)
+    elif boundary in ("flush", "commit_returned"):
+        rt.persistent_session_hooks[boundary] = lambda: close_ready(rt)
+    else:
+        rt.store.client.after_operation[boundary] = lambda: close_ready(rt)
+    with pytest.raises(task_api.RetryRequested):
+        task_api.process_batch(command, rt)
+    assert rt.outbound_broker.calls == rt.transport.calls == []
+    if boundary in ("acquire", "claim_or_resume_batch", "snapshot"):
+        assert rt.agent.calls == []
+    with rt._factory() as db:
+        from app.models import ConversationContext
+        assert db.bind.url.database in (None, "", ":memory:")
+        row = db.get(ConversationContext, command.phone)
+        assert (row is not None) is (boundary in ("commit_returned", "reserve_outbound_enqueue"))
+
+
+def test_ready_race_outbound_ack_still_records_and_completes(processing_runtime, task_api):
+    rt = processing_runtime
+    command = rt.buffer()
+    rt.outbound_broker.on_enqueue = lambda outbound: close_ready(rt)
+    assert task_api.process_batch(command, rt) is task_api.ProcessingOutcome.PROCESSED
+    assert len(rt.outbound_broker.calls) == 1
+    processing = next(d for d in rt.details() if d.entry.kind == "processing")
+    assert processing.body["phase"] == "DONE"
+    assert processing.body["outbound_attempted"] is True
+
+
+def test_ready_race_processing_ack_is_preserved_when_ingress_readiness_closes(main_module, ingress_runtime):
+    rt = ingress_runtime
+    rt.processing_broker.on_enqueue = lambda command: close_ready(rt)
+    response = webhook(main_module)
+    assert response.status_code == 200
+    assert len(rt.processing_broker.calls) == 1
+    assert next(d for d in rt.details() if d.entry.kind == "batch").body["phase"] == "SCHEDULED"
+
+
+def test_ready_race_agent_result_is_staged_before_retry_without_model_reentry(processing_runtime, task_api):
+    rt = processing_runtime
+    command = rt.buffer()
+    rt.agent.on_prepare = lambda: close_ready(rt)
+    with pytest.raises(task_api.RetryRequested) as raised:
+        task_api.process_batch(command, rt)
+    assert next(d for d in rt.details() if d.entry.kind == "processing").body["phase"] == "RESULT_READY"
+    rt.dependencies[domain.DependencyName.SECRET] = True
+    rt.agent.on_prepare = None
+    assert task_api.process_batch(raised.value.command, rt) is task_api.ProcessingOutcome.PROCESSED
+    assert len(rt.agent.calls) == 1
+
+
+def test_ready_race_provider_ack_is_not_reclassified_as_retry(processing_runtime, task_api):
+    rt = processing_runtime
+    command = rt.buffer()
+    task_api.process_batch(command, rt)
+    rt.transport.on_send = lambda: close_ready(rt)
+    assert task_api.send_outbound(rt.outbound_broker.calls[-1], rt) is task_api.SendOutcome.SENT
+    assert len(rt.transport.calls) == 1
+
+
+@pytest.mark.parametrize("boundary", ["session", "acquire", "authorization", "last_lease_assert"])
+def test_ready_race_sender_stops_before_provider(processing_runtime, task_api, monkeypatch, boundary):
+    from contextlib import contextmanager
+    rt = processing_runtime
+    command = rt.buffer()
+    task_api.process_batch(command, rt)
+    outbound = rt.outbound_broker.calls[-1]
+    before = rt.lease_calls
+    if boundary == "session":
+        original = rt.session_factory
+        @contextmanager
+        def session():
+            with original() as db:
+                close_ready(rt)
+                yield db
+        monkeypatch.setattr(rt, "session_factory", session)
+    elif boundary == "acquire":
+        rt.store.client.after_operation["acquire"] = lambda: close_ready(rt)
+    else:
+        original = rt.coordinator.may_send
+        def may_send(*args, **kwargs):
+            result = original(*args, **kwargs)
+            if boundary == "authorization":
+                close_ready(rt)
+            else:
+                rt.store.client.after_operation["assert"] = lambda: close_ready(rt)
+            return result
+        monkeypatch.setattr(rt.coordinator, "may_send", may_send)
+    with pytest.raises(task_api.RetryRequested):
+        task_api.send_outbound(outbound, rt)
+    assert rt.transport.calls == []
+    if boundary == "session":
+        assert rt.lease_calls == before
+
+
+@pytest.mark.parametrize("boundary", ["acquire", "prepare_mutation"])
+def test_ready_race_cleanup_stops_before_delete(admin_runtime, scheduler_module, boundary):
+    import asyncio
+    from app.models import ConversationContext
+    rt = admin_runtime
+    rt.seed_contact(ADMIN_PHONE, age_minutes=120)
+    rt.store.client.after_operation[boundary] = lambda: close_ready(rt)
+    asyncio.run(scheduler_module.check_inactive_contexts(rt))
+    with rt._factory() as db:
+        assert db.get(ConversationContext, ADMIN_PHONE) is not None
+
+
+@pytest.mark.parametrize("boundary", ["reserve_enqueue", "checkpoint"])
+def test_ready_race_recovery_stops_broker_and_checkpoint(admin_runtime, monkeypatch, boundary):
+    from app.conversation_redis import RECOVERY_CHECKPOINT_KEY
+    rt = admin_runtime
+    rt.buffer()
+    rt.clock.advance(timedelta(seconds=61))
+    if boundary == "reserve_enqueue":
+        rt.store.client.after_operation["reserve_enqueue"] = lambda: close_ready(rt)
+    else:
+        original = rt.store._ready
+        def ready():
+            original()
+            if sys._getframe(1).f_code.co_name == "save_recovery_checkpoint":
+                close_ready(rt)
+        monkeypatch.setattr(rt.store, "_ready", ready)
+    before = len(rt.processing_broker.calls)
+    recovery_api().RecoveryService(rt).run_once(rt.clock.now())
+    assert len(rt.processing_broker.calls) == before
+    if boundary == "checkpoint":
+        assert rt.store.client.get(RECOVERY_CHECKPOINT_KEY) is None
+
+
+@pytest.mark.parametrize("offset", [-1, 0, 1])
+def test_recovery_stale_discovery_preserves_fresh_committing_until_actual_deadline(processing_runtime, task_api, monkeypatch, offset):
+    rt = processing_runtime
+    command = rt.buffer()
+    rt.clock.advance(timedelta(seconds=61))
+    original = rt.store.recoverable_batches
+    invoked = []
+    def discover(*args, **kwargs):
+        page = original(*args, **kwargs)
+        if not invoked:
+            invoked.append(True)
+            rt.store.fail_next_atomic("finalize_committed")
+            with pytest.raises(task_api.RetryRequested):
+                task_api.process_batch(command, rt)
+            rt.clock.advance(timedelta(seconds=600 + offset))
+        return page
+    monkeypatch.setattr(rt.store, "recoverable_batches", discover)
+    report = recovery_api().RecoveryService(rt).run_once(rt.clock.now())
+    assert report.failed == 0
+    assert report.quarantined == (0 if offset < 0 else 1)
+    assert bool(rt.store.is_quarantined(command.phone)) is (offset >= 0)
+    assert len(rt.agent.calls) == 1
+    assert rt.transport.calls == rt.outbound_broker.calls == []
+    assert len(rt.processing_broker.calls) == 1
+    if offset < 0:
+        assert rt.envelopes()
+    again = recovery_api().RecoveryService(rt).run_once(rt.clock.now())
+    assert again.quarantined == again.failed == again.rescheduled == 0
+
+
+@pytest.mark.parametrize("start_result", [False, True, "exception"])
+def test_ready_scheduler_shutdown_only_after_affirmative_start(main_module, admin_runtime, monkeypatch, start_result):
+    import asyncio
+    calls = []
+    monkeypatch.setattr(main_module, "init_db", lambda: None)
+    def start(runtime):
+        calls.append("start")
+        if start_result == "exception":
+            raise RuntimeError("private-token")
+        return start_result
+    monkeypatch.setattr(main_module, "start_scheduler", start)
+    monkeypatch.setattr(main_module, "stop_scheduler", lambda: calls.append("stop"))
+    async def run():
+        async with main_module.lifespan(main_module.app):
+            assert (await main_module.health_check())["status"] == "healthy"
+    asyncio.run(run())
+    assert calls == (["start", "stop"] if start_result is True else ["start"])
+
+
 @pytest.mark.parametrize("ready", [False, True])
 def test_ready_lifespan_preserves_schema_initialization_only_after_gate(main_module, admin_runtime, monkeypatch, ready):
     import asyncio
@@ -39,7 +256,7 @@ def test_ready_lifespan_preserves_schema_initialization_only_after_gate(main_mod
     admin_runtime.dependencies[domain.DependencyName.SQL] = ready
     started, stopped, initialized = [], [], []
     monkeypatch.setattr(main_module, "init_db", lambda: initialized.append(True))
-    monkeypatch.setattr(main_module, "start_scheduler", lambda rt=None: started.append(rt))
+    monkeypatch.setattr(main_module, "start_scheduler", lambda rt=None: started.append(rt) or True)
     monkeypatch.setattr(main_module, "stop_scheduler", lambda: stopped.append(True))
     async def run():
         async with main_module.lifespan(main_module.app):
@@ -381,6 +598,7 @@ def test_ready_build_runtime_constructs_bounded_clients_and_canonical_contract(m
     created = []
     def from_url(url, **options):
         created.append(options)
+        admin_runtime.store.client.connection_pool = SimpleNamespace(connection_kwargs=options)
         return admin_runtime.store.client
     monkeypatch.setattr(redis.Redis, "from_url", from_url)
     monkeypatch.setattr(api, "bounded_sql_dependencies", lambda url: (admin_runtime.session_factory, lambda: True))
@@ -402,8 +620,11 @@ def test_ready_build_runtime_constructs_bounded_clients_and_canonical_contract(m
     assert runtime.coordinator.store is runtime.store
     assert runtime.store.client is admin_runtime.store.client
     assert runtime.readiness_status().ready is True
-    assert created == [{"socket_connect_timeout": 2, "socket_timeout": 2,
-                        "retry_on_timeout": False, "decode_responses": True}]
+    assert len(created) == 1
+    options = created[0]
+    assert options["socket_connect_timeout"] == options["socket_timeout"] == 2
+    assert options["retry_on_timeout"] is False and options["retry_on_error"] == []
+    assert options["retry"]._retries == 0 and options["decode_responses"] is True
     assert admin_runtime.lease_calls == admin_runtime.session_calls == 0
 
 

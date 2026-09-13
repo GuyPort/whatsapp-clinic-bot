@@ -963,8 +963,9 @@ class ConversationCoordinator:
     _TERMINAL_INGRESS = frozenset({IngressDisposition.PROCESSED, IngressDisposition.DROPPED,
         IngressDisposition.APPLIED, IngressDisposition.IGNORED, IngressDisposition.FAILED})
 
-    def __init__(self, store: ConversationStore, clock):
+    def __init__(self, store: ConversationStore, clock, *, require_ready: Callable[[], None] | None = None):
         self.store, self.clock = store, clock
+        self.require_ready = require_ready or (lambda: None)
 
     @_reason_codes_only
     def processing_snapshot(self, db: Session, phone: str, now: datetime,
@@ -1037,12 +1038,14 @@ class ConversationCoordinator:
         Only this method decides pause precedence; adapters never send a reply.
         """
         phone, message_id = identity.phone, identity.message_id
+        self.require_ready()
         previous = self._retained_ingress_receipt(identity, now, lease)
         if previous is not None and previous.disposition in self._TERMINAL_INGRESS:
             return IngressReceipt(IngressDisposition.DUPLICATE)
         anchor = self._ensure(db, phone, lease)
         secretary_command = identity.from_me and kind == "text" and content.strip().lower() in {"/pause", "/pausar"}
         if previous is not None:
+            self.require_ready()
             receipt = self.store.finalize_ingress_once(
                 phone, None, message_id, str(anchor.last_generation), lease)
             if receipt.disposition is None:
@@ -1056,6 +1059,7 @@ class ConversationCoordinator:
 
         if identity.from_me:
             disposition = IngressDisposition.APPLIED if secretary_command else IngressDisposition.IGNORED
+            self.require_ready()
             receipt = self.store.finalize_ingress_once(
                 phone, None, message_id, str(anchor.last_generation), lease, disposition=disposition)
             if secretary_command:
@@ -1064,6 +1068,7 @@ class ConversationCoordinator:
             return receipt
 
         resolution = self.resolve_ingress(db, phone, now, lease)
+        self.require_ready()
         if resolution.state is ConversationState.SECRETARY_ATTENDANCE:
             return self.store.finalize_ingress_once(
                 phone, None, message_id, resolution.generation, lease,
@@ -1074,6 +1079,7 @@ class ConversationCoordinator:
         if kind == "text" and content.strip().lower() in {"/pause", "/pausar"}:
             kind, content = "pause_help", "Para falar com a Beatriz, envie ATENDIMENTO."
         envelope = InboundEnvelope(kind, content, now, resolution.generation, message_id)
+        self.require_ready()
         receipt = self.store.finalize_ingress_once(phone, envelope, message_id, resolution.generation, lease)
         return self._dispatch_ingress(phone, receipt, now, lease, broker)
 
@@ -1089,7 +1095,8 @@ class ConversationCoordinator:
         dispatch = self.store.dispatch(command, lease)
         if dispatch.phase in (DispatchPhase.PROCESSED, DispatchPhase.EXHAUSTED):
             return IngressReceipt(IngressDisposition.DUPLICATE)
-        self.store.ensure_consumer(broker, command, now, lease)
+        self.require_ready()
+        self.store.ensure_consumer(broker, command, now, lease, require_ready=self.require_ready)
         dispatch = self.store.dispatch(command, lease)
         if dispatch.phase is DispatchPhase.PENDING:
             # An earlier failed/ambiguous reservation is not an existing consumer.
@@ -1107,6 +1114,7 @@ class ConversationCoordinator:
         with db.no_autoflush:
             present = (db.get(PausedContact, phone) is not None
                        or db.get(ConversationContext, phone) is not None)
+        self.require_ready()
         return self.store.initialize_contact(phone, lease, db_state_present=present)
 
     def _db_hash(self, db: Session, phone: str, *, appointments: bool = False) -> str:
@@ -1147,19 +1155,25 @@ class ConversationCoordinator:
     def _run_mutation(self, db: Session, phone: str, kind: str, target: MutationTarget,
                       lease: ContactLease, operation_id: str, now: datetime,
                       apply_dml: Callable[[Session, MutationAttempt], Any]) -> MutationAttempt:
+        self.require_ready()
         attempt = self.store.prepare_mutation(phone, kind, target.fingerprint, lease,
                                                operation_id, now, target=target)
         if attempt.phase is MutationPhase.COMMITTED:
             return attempt
         try:
             lease.assert_owned()
+            self.require_ready()
             with db.no_autoflush:
                 apply_dml(db, attempt)
             lease.assert_owned()
+            self.require_ready()
             db.flush()
             lease.assert_owned()
+            self.require_ready()
             self.store.enter_committing(phone, operation_id, lease, self.clock.now(),
                                         attempt.processing_deadline)
+            lease.assert_owned()
+            self.require_ready()  # Pre-commit failure still has a rollback proof.
         except Exception as exc:
             try:
                 db.rollback()
@@ -1201,9 +1215,9 @@ class ConversationCoordinator:
         if self._db_hash(db, phone, appointments=appointments) != target.expected_hash:
             raise ConversationStateUnavailable(FailureReason.CONDITION_CHANGED)
 
-    @staticmethod
-    def _execute_dml(db: Session, lease: ContactLease, statement):
+    def _execute_dml(self, db: Session, lease: ContactLease, statement):
         lease.assert_owned()
+        self.require_ready()
         return db.execute(statement)
 
     @staticmethod

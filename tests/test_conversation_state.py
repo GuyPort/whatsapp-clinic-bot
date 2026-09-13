@@ -50,6 +50,21 @@ def recovery_api():
     return importlib.import_module("app.conversation_recovery")
 
 
+def test_ready_coordinator_keeps_legacy_constructor_and_explicit_gate(transition_env):
+    from app.conversation_state import ConversationCoordinator, ReadinessUnavailable
+    from app.models import PausedContact
+    coordinator, db, store, clock = transition_env
+    def closed():
+        raise ReadinessUnavailable(FailureReason.READINESS_UNAVAILABLE)
+    gated = ConversationCoordinator(store, clock, require_ready=closed)
+    with store.contact_lease(PHONE) as lease:
+        assert coordinator.resolve_ingress(db, PHONE, clock.now(), lease).cycle is ConversationCycle.OPEN
+        with pytest.raises(ReadinessUnavailable):
+            gated.pause_manual(db, PHONE, 1, "secretary_dashboard_pause", clock.now(), lease, "synthetic-operation")
+        assert db.get(PausedContact, PHONE) is None
+        assert store.read_details(lease) == ()
+
+
 @pytest.mark.parametrize("failed", [(), ("secret",), ("sql",), ("redis",), ("epoch",),
                                   ("broker",), ("sql", "epoch", "broker")])
 def test_ready_dependency_matrix_is_allowlisted_and_fail_closed(failed):

@@ -383,6 +383,11 @@ Redis, `CONVERSATION_REDIS_EXPECTED_RUN_ID` igual ao servidor e as atestações
 Readiness nunca cria ou corrige o epoch. Os clientes de sondagem usam limites
 de conexão e socket de 2 segundos; SQL PostgreSQL também limita cada statement
 e espera por lock a 2 segundos. Falhas mantêm os fluxos da conversa fechados.
+O cliente Redis de coordenação é construído pelo mesmo helper no runtime e na
+CLI. Na query da URL aceita-se somente um `db` numérico; opções de timeout,
+retry ou outras opções são rejeitadas antes da construção, incluindo variantes
+duplicadas, codificadas ou com caixa diferente. A configuração efetiva do pool
+é conferida depois da construção: timeout de até 2 segundos e zero retries.
 O startup preserva a inicialização SQL e o cleanup de 20 minutos somente depois
 de readiness passar. Se o processo iniciou indisponível, reinicie-o após corrigir
 as dependências para iniciar também esse cleanup.
@@ -403,6 +408,13 @@ simular uma recuperação bem-sucedida.
 
 A recuperação readquire a lease, relê SQL e Redis e pode republicar apenas
 comandos internos canônicos. Nunca chama Claude ou o transporte do provedor.
+Páginas antigas são apenas candidatos: tentativas criadas depois da leitura
+da página são reavaliadas com o relógio atual sob lease e preservadas enquanto
+saudáveis. Readiness é rechecado junto às fronteiras seguintes de DML, agente,
+broker, transporte e checkpoint, inclusive depois de operações demoradas.
+Essas observações não são uma transação atômica com as dependências externas.
+Resultados, commits e enqueues já reconhecidos mantêm seu registro canônico
+mesmo se readiness fechar; o próximo efeito externo é bloqueado.
 Uma confirmação local de enqueue já persistida permite concluir o lote sem
 reenviar; `DONE` não é reproduzido. Sem confirmação, resultados compatíveis já
 confirmados no SQL ou com reserva válida permanecem recuperáveis. Preparações

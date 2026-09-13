@@ -51,6 +51,70 @@ def epoch_cli():
     return module
 
 
+@pytest.mark.parametrize("query", ["socket_timeout=60", "socket_connect_timeout=60", "retry_on_timeout=true",
+    "retry=private-token", "retry_on_error=TimeoutError", "SOCKET_TIMEOUT=60", "Socket_Timeout=60",
+    "socket_timeout=2&socket_timeout=60", "%73ocket_timeout=60", "%2573ocket_timeout=60",
+    "socket%5ftimeout=60", "db=0&retry_on_timeout=true", "db=0%26socket_timeout%3D60",
+    "db=0;socket_timeout=60", "db=0&db=1", "ssl_connection_timeout=60", "health_check_interval=999"])
+def test_ready_redis_url_options_cannot_override_timeout_or_retry(query, monkeypatch, caplog):
+    from app import conversation_recovery as api
+    assert hasattr(api, "bounded_redis_client"), "central bounded Redis construction missing"
+    def factory(*args, **kwargs):
+        pytest.fail("unsafe URL reached client construction")
+    with pytest.raises(ValueError, match="invalid Redis configuration") as raised:
+        api.bounded_redis_client("rediss://synthetic:private-token@synthetic.invalid/0?" + query, client_factory=factory)
+    assert query not in str(raised.value)
+    assert "private-token" not in str(raised.value) + caplog.text
+
+
+@pytest.mark.parametrize("override", ["socket_timeout", "socket_connect_timeout", "retry_on_timeout", "retry", "retry_on_error"])
+def test_ready_redis_effective_options_are_validated_after_factory(override):
+    from types import SimpleNamespace
+    from redis.retry import Retry
+    from redis.backoff import NoBackoff
+    from app import conversation_recovery as api
+    assert hasattr(api, "bounded_redis_client"), "central bounded Redis construction missing"
+    def factory(url, **options):
+        options[override] = {"socket_timeout": 60, "socket_connect_timeout": None, "retry_on_timeout": True,
+                             "retry": Retry(NoBackoff(), 1), "retry_on_error": [TimeoutError]}[override]
+        return SimpleNamespace(connection_pool=SimpleNamespace(connection_kwargs=options))
+    with pytest.raises(ValueError, match="invalid Redis configuration"):
+        api.bounded_redis_client("redis://synthetic.invalid/0", client_factory=factory)
+
+
+@pytest.mark.parametrize("scheme", ["redis", "rediss"])
+def test_ready_redis_safe_credentials_are_not_exposed_and_effective_retry_is_zero(scheme, monkeypatch, caplog):
+    import socket
+    from app import conversation_recovery as api
+    assert hasattr(api, "bounded_redis_client"), "central bounded Redis construction missing"
+    def forbidden(*args, **kwargs):
+        raise AssertionError("network forbidden")
+    monkeypatch.setattr(socket.socket, "connect", forbidden)
+    client = api.bounded_redis_client(scheme + "://synthetic:private-token@synthetic.invalid/0?db=1")
+    options = client.connection_pool.connection_kwargs
+    assert options["socket_timeout"] == options["socket_connect_timeout"] == 2
+    assert options["retry_on_timeout"] is False
+    assert options["retry_on_error"] == []
+    assert options["retry"]._retries == 0
+    assert options["db"] == 1
+    assert "private-token" not in caplog.text
+    client.close()
+
+
+def test_epoch_cli_rejects_unsafe_redis_url_with_fixed_class_before_probe(monkeypatch, capsys):
+    from app import conversation_recovery as api
+    cli = epoch_cli()
+    monkeypatch.setenv("REDIS_URL", "redis://synthetic:private-token@synthetic.invalid/0?socket_timeout=60")
+    monkeypatch.setenv("CONVERSATION_COORDINATION_EPOCH", "00000000-0000-4000-8000-000000000002")
+    touched = []
+    monkeypatch.setattr(api, "bounded_sql_dependencies", lambda url: touched.append(True) or (_ for _ in ()).throw(RuntimeError("private-token")))
+    code = cli.main(["--expected-current-epoch", "00000000-0000-4000-8000-000000000001",
+                     "--new-epoch", "00000000-0000-4000-8000-000000000002", "--confirm-quiescent"])
+    assert code == 2
+    assert touched == []
+    assert capsys.readouterr() == ("epoch_rotation_rejected\n", "")
+
+
 def test_epoch_cli_import_and_rejected_args_never_construct_dependencies(monkeypatch, capsys):
     import builtins
     original = builtins.__import__

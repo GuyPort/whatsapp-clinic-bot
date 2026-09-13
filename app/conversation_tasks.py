@@ -92,6 +92,7 @@ def _require_ready(runtime):
 
 def _enqueue(outbound, runtime, lease):
     lease.assert_owned()
+    _require_ready(runtime)
     try:
         result = runtime.outbound_broker.enqueue_outbound(outbound)
     except CeleryRetry:
@@ -104,6 +105,7 @@ def _enqueue(outbound, runtime, lease):
 
 @contextmanager
 def _session(runtime):
+    _require_ready(runtime)
     try:
         session = runtime.session_factory()
     except CeleryRetry:
@@ -112,6 +114,7 @@ def _session(runtime):
         raise ConversationStateUnavailable(FailureReason.STATE_UNAVAILABLE) from None
     try:
         with session as db:
+            _require_ready(runtime)
             yield db
     except SQLAlchemyError:
         raise ConversationStateUnavailable(FailureReason.STATE_UNAVAILABLE) from None
@@ -123,6 +126,7 @@ def process_batch(command: ProcessingCommand, runtime: ConversationRuntime) -> P
     try:
         _require_ready(runtime)
         with runtime.store.contact_lease(command.phone) as lease:
+            _require_ready(runtime)
             try:
                 claim = runtime.store.claim_or_resume_batch(command, runtime.clock.now(), lease)
             except RETRYABLE_ERRORS:
@@ -143,6 +147,7 @@ def process_batch(command: ProcessingCommand, runtime: ConversationRuntime) -> P
             attempt = claim.attempt
             command = replace(command, processing_id=attempt.processing_id,
                 operation_id=attempt.operation_id, staging_id=command.batch_id)
+            _require_ready(runtime)
             result = claim.result
             fixed = tuple(e for e in claim.envelopes if e.kind != "text")
             texts = tuple(e for e in claim.envelopes if e.kind == "text")
@@ -151,23 +156,29 @@ def process_batch(command: ProcessingCommand, runtime: ConversationRuntime) -> P
                     snapshot = runtime.coordinator.processing_snapshot(db, command.phone, runtime.clock.now(), lease)
                     if texts:
                         lease.assert_owned()
+                        _require_ready(runtime)
                         result = runtime.agent.prepare_result("\n".join(e.content for e in texts), command.phone, snapshot)
                         if fixed:
                             result = replace(result, text=fixed_reply_result(fixed).text + "\n\n" + result.text)
                     else:
                         result = fixed_reply_result(fixed)
+                    # Preserve the acknowledged result before stopping later effects.
                     runtime.store.stage_agent_result(command, attempt, result, runtime.clock.now(), lease)
+                _require_ready(runtime)
                 if texts:
                     outbound = runtime.coordinator.apply_agent_result(db, command.phone, result,
                         attempt.processing_id, attempt.operation_id, runtime.clock.now(), lease)
                 else:
                     # A staged fixed result has no context delta or SQL transition.
                     runtime.coordinator.processing_snapshot(db, command.phone, runtime.clock.now(), lease)
+                    _require_ready(runtime)
                     runtime.store.prepare_fixed_response(command, attempt, runtime.clock.now(), lease)
                     outbound = OutboundEnvelope(command.phone, result.text, OutboundKind.NORMAL,
                         command.generation, attempt.processing_id, attempt.operation_id)
+                _require_ready(runtime)  # SQL commit may have outlived readiness.
                 reservation = runtime.store.reserve_outbound_enqueue(command, attempt, runtime.clock.now(), lease)
                 _enqueue(outbound, runtime, lease)
+                # A local acknowledgement must survive readiness closing in enqueue.
                 runtime.store.record_outbound_attempt(command, attempt, runtime.clock.now(), lease, reservation=reservation)
                 runtime.store.complete_batch(command, attempt, runtime.clock.now(), lease, reservation=reservation)
             return ProcessingOutcome.PROCESSED
@@ -206,6 +217,7 @@ def simulate_message(message: str, runtime: ConversationRuntime) -> str:
         runtime.agent, capture, capture, None, runtime.clock, runtime.readiness_status)
     phone = ConversationCoordinator.TEST_PHONE
     with local.store.contact_lease(phone) as lease, _session(local) as db:
+        _require_ready(local)
         receipt = local.coordinator.accept_ingress(db,
             SenderIdentity(phone, False, str(uuid4()), "pn"), "text", message,
             local.clock.now(), lease, capture)
@@ -225,9 +237,11 @@ def send_outbound(outbound: OutboundEnvelope, runtime: ConversationRuntime) -> S
     try:
         _require_ready(runtime)
         with _session(runtime) as db, runtime.store.contact_lease(outbound.phone) as lease:
+            _require_ready(runtime)
             if not runtime.coordinator.may_send(db, outbound, runtime.clock.now(), lease):
                 return SendOutcome.DISCARDED
-            lease.assert_owned()  # Last operation before entering the transport.
+            lease.assert_owned()  # Fence check before final readiness/transport boundary.
+            _require_ready(runtime)
             try:
                 result = runtime.transport.send_message(outbound.phone, outbound.text)
                 if inspect.isawaitable(result):

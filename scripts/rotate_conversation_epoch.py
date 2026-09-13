@@ -16,15 +16,13 @@ def _dependencies():
     from app.simple_config import Settings
     from app.conversation_state import ConversationConfig
     from app.conversation_redis import EpochStore
-    from app.conversation_recovery import bounded_sql_dependencies
+    from app.conversation_recovery import bounded_sql_dependencies, bounded_redis_client
     from kombu import Connection
-    import redis
     settings = Settings()
     config = ConversationConfig.from_settings(settings)
     if config.issues:
         raise ValueError("invalid configuration")
-    client = redis.Redis.from_url(settings.redis_url, socket_connect_timeout=2,
-        socket_timeout=2, retry_on_timeout=False, decode_responses=True)
+    client = bounded_redis_client(settings.redis_url)
     _, sql_probe = bounded_sql_dependencies(settings.database_url)
     def probe():
         if sql_probe() is not True or client.ping() is not True:

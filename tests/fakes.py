@@ -560,7 +560,8 @@ class IngressRuntime:
         from app.conversation_state import ConversationCoordinator, DependencyName
         self.store = InMemoryConversationStore(config)
         self.clock = self.store.clock
-        self.coordinator = ConversationCoordinator(self.store, self.clock)
+        from app.conversation_tasks import _require_ready
+        self.coordinator = ConversationCoordinator(self.store, self.clock, require_ready=lambda: _require_ready(self))
         self.processing_broker = ScriptedBroker()
         self._factory = factory
         self.dependencies = {name: True for name in DependencyName}

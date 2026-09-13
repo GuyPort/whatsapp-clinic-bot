@@ -62,8 +62,7 @@ async def lifespan(app: FastAPI):
     try:
         _require_ready(runtime)
         init_db()
-        start_scheduler(runtime)
-        started = True
+        started = start_scheduler(runtime) is True
     except Exception:
         logger.warning("conversation_startup_not_ready")
     try:
@@ -332,10 +331,14 @@ async def whatsapp_webhook(request: Request):
         return JSONResponse({"status": "ignored"})
     kind, content = useful_message
     try:
+        _require_ready(runtime)
         with runtime.store.contact_lease(identity.phone) as lease:
+            _require_ready(runtime)
             if runtime.coordinator.is_terminal_ingress(identity, runtime.clock.now(), lease):
                 return JSONResponse({"status": "ignored"})
+            _require_ready(runtime)
             with runtime.session_factory() as db:
+                _require_ready(runtime)
                 receipt = runtime.coordinator.accept_ingress(
                     db, identity, kind, content, runtime.clock.now(), lease, runtime.processing_broker)
     except Exception:

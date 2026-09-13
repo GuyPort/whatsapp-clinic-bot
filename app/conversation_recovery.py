@@ -128,18 +128,22 @@ class RecoveryService:
                                     db.execute(select(PausedContact.phone).where(PausedContact.phone == phone)).first()
                                 _require_ready(runtime)
                                 lease.assert_owned()
+                                _require_ready(runtime)
                                 if isinstance(item, tuple):
-                                    outcome = runtime.store.recover_mutation(phone, item[1], now, lease)
+                                    outcome = runtime.store.recover_mutation(phone, item[1], runtime.clock.now(), lease,
+                                        require_ready=lambda: _require_ready(runtime))
                                 else:
                                     broker = (_SimulatorCapture() if phone == ConversationCoordinator.TEST_PHONE
                                               else runtime.processing_broker)
-                                    outcome = runtime.store.recover_batch(item, broker, now, lease)
+                                    outcome = runtime.store.recover_batch(item, broker, runtime.clock.now(), lease,
+                                        require_ready=lambda: _require_ready(runtime))
                         counts[outcome if outcome in counts and outcome != "scanned" else "failed"] += 1
                     except Exception:
                         counts["failed"] += 1
                 try:
                     _require_ready(runtime)
-                    runtime.store.save_recovery_checkpoint(expected, (1 - turn, *cursors))
+                    runtime.store.save_recovery_checkpoint(expected, (1 - turn, *cursors),
+                        require_ready=lambda: _require_ready(runtime))
                 except Exception:
                     counts["failed"] += 1
             return RecoveryReport(**counts)
@@ -160,7 +164,8 @@ def compose_runtime(*, settings, client, session_factory, sql_probe, agent,
     store = RedisConversationStore(client, config or ConversationConfig.from_settings(settings), clock)
     readiness = DependencyReadiness.for_dependencies(secret=lambda: settings.webhook_secret,
         sql_probe=sql_probe, store=store, broker=processing_broker)
-    runtime = ConversationRuntime(ConversationCoordinator(store, clock), store, session_factory,
+    coordinator = ConversationCoordinator(store, clock, require_ready=lambda: _require_ready(runtime))
+    runtime = ConversationRuntime(coordinator, store, session_factory,
         agent, processing_broker, outbound_broker, transport, clock, readiness.check)
     return runtime
 
@@ -187,10 +192,41 @@ def bounded_sql_dependencies(database_url, *, engine_factory=None):
     return sessionmaker(bind=engine, autoflush=False, expire_on_commit=False), probe
 
 
+def bounded_redis_client(url, *, client_factory=None):
+    """Reject URL policy overrides and verify effective bounds without connecting."""
+    from urllib.parse import urlsplit, parse_qsl
+    import re
+    import redis
+    from redis.backoff import NoBackoff
+    from redis.retry import Retry
+    try:
+        parts = urlsplit(url)
+        # An explicit allowlist also closes case/encoding/duplicate-key variants
+        # independently of redis-py's URL/keyword precedence in any version.
+        if parts.scheme not in ("redis", "rediss") or not parts.hostname or parts.fragment:
+            raise ValueError
+        query = parse_qsl(parts.query, keep_blank_values=True, strict_parsing=True)
+        if query and (len(query) != 1 or query[0][0] != "db" or not re.fullmatch(r"[0-9]+", query[0][1])):
+            raise ValueError
+        client = (client_factory or redis.Redis.from_url)(url,
+            socket_connect_timeout=2, socket_timeout=2, retry_on_timeout=False,
+            retry_on_error=[], retry=Retry(NoBackoff(), 0), decode_responses=True)
+        effective = client.connection_pool.connection_kwargs
+        if (any(type(effective.get(name)) not in (int, float) or not 0 < effective[name] <= 2
+                for name in ("socket_connect_timeout", "socket_timeout"))
+                or effective.get("retry_on_timeout") is not False
+                or effective.get("retry_on_error") != []
+                or not isinstance(effective.get("retry"), Retry)
+                or getattr(effective["retry"], "_retries", None) != 0):
+            raise ValueError
+        return client
+    except Exception:
+        raise ValueError("invalid Redis configuration") from None
+
+
 def build_runtime(*, settings, processing_task, outbound_task, celery):
     """Lazy client construction only; no SQL initialization or dependency writes."""
     import os
-    import redis
     from app.ai_agent import ai_agent
     from app.whatsapp_service import whatsapp_service
     from app.celery_app import CeleryProcessingBroker, CeleryOutboundBroker, probe_broker
@@ -200,8 +236,7 @@ def build_runtime(*, settings, processing_task, outbound_task, celery):
         recovery_max_pages=int(os.environ.get("BATCH_RECOVERY_MAX_PAGES", "2")))
     if not (1 <= config.recovery_page_size <= 1000 and 1 <= config.recovery_max_pages <= 100):
         raise ValueError("invalid recovery limits")
-    client = redis.Redis.from_url(settings.redis_url, socket_connect_timeout=2,
-        socket_timeout=2, retry_on_timeout=False, decode_responses=True)
+    client = bounded_redis_client(settings.redis_url)
     sessions, sql_probe = bounded_sql_dependencies(settings.database_url)
     return compose_runtime(settings=settings, config=config, client=client,
         session_factory=sessions, sql_probe=sql_probe, agent=ai_agent,

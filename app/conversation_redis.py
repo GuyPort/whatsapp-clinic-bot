@@ -1053,7 +1053,9 @@ class RedisConversationStore:
                 self._transition(lease, anchor, self._replace_details(details, *updates), operation="finalize_ingress_once")
             return IngressReceipt(None if disposition is IngressDisposition.APPLIED else disposition, batch_id, operation_id)
 
-    def ensure_consumer(self, broker, command, now, lease):
+    def ensure_consumer(self, broker, command, now, lease, *, require_ready=None):
+        require_ready = require_ready or (lambda: None)
+        require_ready()
         with self._lock:
             anchor, details, batch, _ = self._batch_snapshot(command, lease)
             self.assert_mutation_available(lease, self._now(), operation_id=batch.body["operation_id"])
@@ -1076,10 +1078,12 @@ class RedisConversationStore:
             started = self._now()
             reserved = self._changed(batch, body={**batch.body, "enqueue_attempt_id": str(uuid4()),
                 "next_enqueue_at": (started + timedelta(seconds=self.config.enqueue_visibility_seconds)).timestamp()})
+            require_ready()
             self._transition(lease, anchor, self._replace_details(details, reserved), operation="reserve_enqueue",
                              deadline=None if durable else deadline,
                              deadline_transition=None if durable else self._terminal_plan(anchor, details, batch))
         lease.assert_owned()
+        require_ready()
         try:
             outcome = broker.enqueue_processing(command)
         except Exception:
@@ -1567,11 +1571,13 @@ class RedisConversationStore:
         except Exception:
             raise ConversationStateUnavailable(FailureReason.STATE_UNAVAILABLE) from None
 
-    def save_recovery_checkpoint(self, expected, position):
+    def save_recovery_checkpoint(self, expected, position, *, require_ready=None):
         self._ready()
         try:
             position = self._validate_recovery_position(position)
             value = _json({"epoch": str(self.config.coordination_epoch), "position": position})
+            if require_ready is not None:
+                require_ready()
             result = self.client.eval(RECOVERY_CHECKPOINT_SCRIPT, 2, GLOBAL_EPOCH_KEY,
                 RECOVERY_CHECKPOINT_KEY, str(self.config.coordination_epoch), self.config.redis_expected_run_id,
                 expected or "", value)
@@ -1615,7 +1621,9 @@ class RedisConversationStore:
         except Exception:
             raise ConversationStateUnavailable(FailureReason.STATE_UNAVAILABLE) from None
 
-    def recover_mutation(self, phone, operation_id, now, lease):
+    def recover_mutation(self, phone, operation_id, now, lease, *, require_ready=None):
+        require_ready = require_ready or (lambda: None)
+        require_ready()
         try:
             attempt = self.inspect_mutation(phone, operation_id, lease)
         except ConversationMutationPending:
@@ -1624,14 +1632,18 @@ class RedisConversationStore:
         if attempt is None or self._now() < attempt.processing_deadline:
             return "skipped"
         if attempt.phase is MutationPhase.PREPARED:
+            require_ready()
             self.abort_prepared(phone, operation_id, lease, now, request_fingerprint=attempt.request_fingerprint)
             return "aborted"
         if attempt.phase is MutationPhase.COMMITTING:
+            require_ready()
             self.quarantine_ambiguous_commit(phone, operation_id, lease, now)
             return "quarantined"
         return "skipped"
 
-    def recover_batch(self, command, broker, now, lease):
+    def recover_batch(self, command, broker, now, lease, *, require_ready=None):
+        require_ready = require_ready or (lambda: None)
+        require_ready()
         try:
             anchor, details, batch, _ = self._batch_snapshot(command, lease)
         except ConversationMutationPending:
@@ -1640,17 +1652,37 @@ class RedisConversationStore:
         dispatch = self._dispatch_load(batch)
         if dispatch.phase in (DispatchPhase.PROCESSED, DispatchPhase.EXHAUSTED):
             return "skipped"
+        # Discovery is only a hint. A worker may have staged a fresh attempt
+        # after the page was read; only current state/time under this lease wins.
+        now = self._now()
         processing = self._find(details, "processing", dispatch.processing_id)
+        mutation = (self._find(details, "mutation", self._attempt_id(dispatch.operation_id))
+                    if dispatch.operation_id else None)
+        if mutation is not None:
+            attempt = self._attempt_load(mutation)
+            if attempt.phase in (MutationPhase.PREPARED, MutationPhase.COMMITTING) and now < attempt.processing_deadline:
+                return "skipped"
+        if (processing is not None and processing.body["phase"] == "CLAIMED"
+                and now < self._date(processing.body["claim_deadline"])):
+            return "skipped"
         reservation = self._outbound_reservation(anchor, details, batch)
         if (reservation is not None and processing.body.get("outbound_attempted") is True
                 and processing.body.get("outbound_attempt_id") == reservation.reservation_id):
             claim = self.claim_or_resume_batch(command, now, lease)
             self.complete_batch(command, claim.attempt, now, lease, reservation=reservation)
             return "completed"
-        self.exhaust_batch(command, now, lease)
+        require_ready()
+        try:
+            self.exhaust_batch(command, now, lease)
+        except ConversationMutationPending:
+            current, _, _ = self._snapshot(lease, operational=True)
+            if current.cycle is ConversationCycle.QUARANTINED:
+                return "quarantined"
+            raise
         if self.dispatch(command, lease).phase is DispatchPhase.EXHAUSTED:
             return "exhausted"
-        outcome = self.ensure_consumer(broker, command, now, lease)
+        require_ready()
+        outcome = self.ensure_consumer(broker, command, now, lease, require_ready=require_ready)
         return "rescheduled" if outcome is EnsureConsumerResult.SCHEDULED else "skipped"
 
     @staticmethod

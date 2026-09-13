@@ -34,6 +34,7 @@ async def check_inactive_contexts(runtime=None):
             return
         try:
             with runtime.store.contact_lease(phone) as lease, runtime.session_factory() as db:
+                _require_ready(runtime)
                 runtime.coordinator.close_inactive_context(db, phone, cutoff,
                     runtime.clock.now(), lease, str(uuid4()))
         except Exception:
