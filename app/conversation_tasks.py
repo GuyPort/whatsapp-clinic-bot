@@ -112,8 +112,7 @@ def _require_ready(runtime):
 
 
 def _enqueue(outbound, runtime, lease):
-    lease.assert_owned()
-    _require_ready(runtime)
+    _authorize_provider(runtime, lease)
     try:
         result = runtime.outbound_broker.enqueue_outbound(outbound)
     except CeleryRetry:

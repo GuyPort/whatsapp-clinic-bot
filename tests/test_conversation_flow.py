@@ -27,6 +27,63 @@ ADMIN_PHONE = "5551999990011"
 SIMULATOR_PHONE = "5500000000000"
 
 
+@pytest.mark.parametrize("slow_readiness", [True, False], ids=["lease_lost", "current_owner"])
+def test_final_broker_publication_rechecks_lease_after_readiness(
+        main_module, processing_runtime, task_api, monkeypatch, slow_readiness):
+    from dataclasses import replace
+    from pathlib import Path
+    from app.models import PausedContact
+
+    # Real Celery module/adapter; only the final task publication is captured.
+    spec = importlib.util.spec_from_file_location(
+        "app.synthetic_final_broker", Path(__file__).parents[1] / "app" / "celery_app.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    rt = processing_runtime
+    rt.store.config = replace(rt.store.config, contact_lease_ttl_seconds=6,
+                              contact_lease_heartbeat_seconds=2)
+    publications, pauses = [], []
+    monkeypatch.setattr(main_module.send_message_task, "apply_async",
+                        lambda **kwargs: publications.append(kwargs))
+    rt.outbound_broker = module.CeleryOutboundBroker(main_module.send_message_task)
+    command = rt.buffer("imagem", kind="media")
+    previous_readiness = rt.readiness_status
+
+    def arm_slow_readiness():
+        def delayed_readiness():
+            rt.readiness_status = previous_readiness
+            rt.clock.advance(timedelta(seconds=7))
+            pauses.append(rt.pause())
+            return previous_readiness()
+        rt.readiness_status = delayed_readiness
+
+    if slow_readiness:
+        rt.store.client.after_operation["reserve_outbound_enqueue"] = arm_slow_readiness
+    try:
+        if slow_readiness:
+            with pytest.raises(task_api.RetryRequested) as raised:
+                task_api.process_batch(command, rt)
+            assert raised.value.reason_code is domain.FailureReason.CONTACT_LEASE_LOST
+            assert raised.value.command.batch_id == command.batch_id
+            assert len(pauses) == 1
+            with rt._factory() as db:
+                assert db.bind.url.database in (None, "", ":memory:")
+                row = db.get(PausedContact, PHONE)
+                assert row.paused_until == pauses[0].paused_until.replace(tzinfo=None)
+            assert publications == []
+        else:
+            assert task_api.process_batch(command, rt) is task_api.ProcessingOutcome.PROCESSED
+            assert len(publications) == 1
+            payload = publications[0]["args"][0]
+            outbound = domain.OutboundEnvelope.from_payload(payload)
+            assert outbound.generation == command.generation
+            assert outbound.coordination_epoch == command.coordination_epoch
+            assert task_api.send_outbound(outbound, rt) is task_api.SendOutcome.SENT
+            assert len(rt.transport.calls) == 1
+    finally:
+        module.celery_app.close()
+
+
 @pytest.fixture
 def final_provider_adapters(monkeypatch):
     """Import actual adapters with only SDK construction and HTTP replaced."""
