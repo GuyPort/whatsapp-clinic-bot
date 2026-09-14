@@ -11,6 +11,7 @@ from contextlib import contextmanager
 from enum import Enum
 import asyncio
 import inspect
+import logging
 from typing import Callable, Protocol, TYPE_CHECKING
 from uuid import uuid4
 
@@ -28,6 +29,26 @@ from app.conversation_state import (
     OutboundKind, TransportUnavailable, fixed_reply_result,
     IngressDisposition, SenderIdentity,
 )
+from app.utils import AuditEvent, ConversationAuditLogger, new_audit_correlation_id
+
+
+logger = logging.getLogger(__name__)
+conversation_audit = ConversationAuditLogger(logger)
+
+
+def _emit_audit(event: AuditEvent, **fields: object) -> None:
+    conversation_audit.emit(event, correlation_id=new_audit_correlation_id(), **fields)
+
+
+def _retry_outcome(error: BaseException) -> str:
+    """Map internal failures to fixed operator classes without rendering errors."""
+    if isinstance(error, (ReadinessUnavailable, BrokerUnavailable, AgentUnavailable)):
+        return "dependency_unavailable"
+    if isinstance(error, ConversationStateUnavailable):
+        return "persistence_failed"
+    if isinstance(error, TransportUnavailable):
+        return "transport_failed"
+    return "coordination_failed"
 
 if TYPE_CHECKING:
     from app.ai_agent import ClaudeToolAgent
@@ -123,6 +144,7 @@ def _session(runtime):
 def process_batch(command: ProcessingCommand, runtime: ConversationRuntime) -> ProcessingOutcome:
     """Claim, stage, commit, enqueue and complete under one renewable lease."""
     command = ProcessingCommand.from_payload(command.to_payload())
+    _emit_audit(AuditEvent.PROCESSING, outcome="started", attempt_state="claiming")
     try:
         _require_ready(runtime)
         with runtime.store.contact_lease(command.phone) as lease:
@@ -141,8 +163,10 @@ def process_batch(command: ProcessingCommand, runtime: ConversationRuntime) -> P
                     pass  # Coordination may still be unavailable; batch ID survives.
                 raise
             if claim.outcome is ClaimOutcome.TERMINAL:
+                _emit_audit(AuditEvent.PROCESSING, outcome="terminal", attempt_state="terminal")
                 return ProcessingOutcome.TERMINAL
             if claim.outcome is ClaimOutcome.DUPLICATE:
+                _emit_audit(AuditEvent.PROCESSING, outcome="duplicate", attempt_state="duplicate")
                 return ProcessingOutcome.DUPLICATE
             attempt = claim.attempt
             command = replace(command, processing_id=attempt.processing_id,
@@ -181,10 +205,13 @@ def process_batch(command: ProcessingCommand, runtime: ConversationRuntime) -> P
                 # A local acknowledgement must survive readiness closing in enqueue.
                 runtime.store.record_outbound_attempt(command, attempt, runtime.clock.now(), lease, reservation=reservation)
                 runtime.store.complete_batch(command, attempt, runtime.clock.now(), lease, reservation=reservation)
+            _emit_audit(AuditEvent.PROCESSING, outcome="processed", attempt_state="completed")
             return ProcessingOutcome.PROCESSED
     except ConversationMutationAborted:
+        _emit_audit(AuditEvent.PROCESSING, outcome="terminal", attempt_state="aborted")
         return ProcessingOutcome.TERMINAL
     except RETRYABLE_ERRORS as exc:
+        _emit_audit(AuditEvent.PROCESSING, outcome=_retry_outcome(exc), attempt_state="retryable")
         raise RetryRequested(exc.reason_code, command) from None
 
 
@@ -222,23 +249,28 @@ def simulate_message(message: str, runtime: ConversationRuntime) -> str:
             SenderIdentity(phone, False, str(uuid4()), "pn"), "text", message,
             local.clock.now(), lease, capture)
     if receipt.disposition is IngressDisposition.DROPPED:
+        _emit_audit(AuditEvent.PROCESSING, outcome="paused", cycle="paused")
         return "[Bot pausado para este número - aguardando atendimento humano]"
     if receipt.disposition is not IngressDisposition.BUFFERED or not capture.commands:
         raise BrokerUnavailable(FailureReason.BROKER_UNAVAILABLE)
     for command in capture.commands:
         if process_batch(command, local) is not ProcessingOutcome.PROCESSED:
             raise BrokerUnavailable(FailureReason.BROKER_UNAVAILABLE)
-    return "\n\n".join(outbound.text for outbound in capture.outbound)
+    response = "\n\n".join(outbound.text for outbound in capture.outbound)
+    _emit_audit(AuditEvent.PROCESSING, outcome="simulated", attempt_state="captured")
+    return response
 
 
 def send_outbound(outbound: OutboundEnvelope, runtime: ConversationRuntime) -> SendOutcome:
     """Authorize using fresh SQL and keep the lease across the provider call."""
     outbound = OutboundEnvelope.from_payload(outbound.to_payload())
+    _emit_audit(AuditEvent.OUTBOUND, outcome="started", attempt_state="authorizing")
     try:
         _require_ready(runtime)
         with _session(runtime) as db, runtime.store.contact_lease(outbound.phone) as lease:
             _require_ready(runtime)
             if not runtime.coordinator.may_send(db, outbound, runtime.clock.now(), lease):
+                _emit_audit(AuditEvent.OUTBOUND, outcome="discarded", attempt_state="terminal")
                 return SendOutcome.DISCARDED
             lease.assert_owned()  # Fence check before final readiness/transport boundary.
             _require_ready(runtime)
@@ -252,6 +284,8 @@ def send_outbound(outbound: OutboundEnvelope, runtime: ConversationRuntime) -> S
                 raise TransportUnavailable(FailureReason.TRANSPORT_UNAVAILABLE) from None
             if result is not True:
                 raise TransportUnavailable(FailureReason.TRANSPORT_UNAVAILABLE)
+            _emit_audit(AuditEvent.OUTBOUND, outcome="sent", attempt_state="completed")
             return SendOutcome.SENT
     except RETRYABLE_ERRORS as exc:
+        _emit_audit(AuditEvent.OUTBOUND, outcome=_retry_outcome(exc), attempt_state="retryable")
         raise RetryRequested(exc.reason_code) from None

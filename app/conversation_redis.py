@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import base64
 import json
+import logging
 import re
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
@@ -33,7 +34,17 @@ from app.conversation_state import (
     EnsureConsumerResult, BrokerUnavailable,
     ResultApplication, OutboundReservation, fixed_reply_result,
 )
-from app.utils import normalize_phone
+from app.utils import (
+    AuditEvent, ConversationAuditLogger, new_audit_correlation_id, normalize_phone,
+)
+
+
+logger = logging.getLogger(__name__)
+conversation_audit = ConversationAuditLogger(logger)
+
+
+def _emit_audit(event: AuditEvent, **fields: object) -> None:
+    conversation_audit.emit(event, correlation_id=new_audit_correlation_id(), **fields)
 
 GLOBAL_EPOCH_KEY = "conversation:coordination:epoch"
 DISPATCH_INDEX_KEY = "conversation:index:dispatch"
@@ -407,8 +418,11 @@ class RedisConversationStore:
             )
         except Exception:
             pass
-        return ReadinessReport((DependencyStatus(DependencyName.REDIS, ready),
-                                DependencyStatus(DependencyName.EPOCH, ready)))
+        report = ReadinessReport((DependencyStatus(DependencyName.REDIS, ready),
+                                  DependencyStatus(DependencyName.EPOCH, ready)))
+        _emit_audit(AuditEvent.READINESS, outcome="ready" if ready else "dependency_unavailable",
+                    count=2 if ready else 0)
+        return report
 
     def _ready(self) -> None:
         if not self.readiness().ready:

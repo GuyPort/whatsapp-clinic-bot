@@ -1,10 +1,231 @@
 """Authenticated ingress tests; only synthetic headers, identities and stores."""
 import asyncio
 import hashlib
+import importlib.util
 import json
 import logging
+from pathlib import Path
+from uuid import UUID
 
 import pytest
+
+
+def _serialized_application_records(records):
+    """Inspect both rendered messages and every structured application field."""
+    serialized = []
+    for record in records:
+        fields = {name: value for name, value in record.__dict__.items()
+                  if name not in {"msg", "args", "message"}}
+        serialized.append(record.getMessage())
+        serialized.append(json.dumps(fields, default=str, sort_keys=True))
+    return " ".join(serialized)
+
+
+def test_conversation_audit_rejects_unknown_field_before_emitting_record(
+        caplog, conversation_security_boundaries):
+    from app import utils
+    assert hasattr(utils, "AuditEvent"), "closed conversation audit event enum missing"
+    assert hasattr(utils, "ConversationAuditLogger"), "closed conversation audit logger missing"
+    audit = utils.ConversationAuditLogger(logging.getLogger("app.audit_contract"))
+    with caplog.at_level(logging.INFO), pytest.raises(ValueError, match="invalid conversation audit field"):
+        audit.emit(utils.AuditEvent.INGRESS, phone="5551976543210")
+    assert not any(record.name == "app.audit_contract" for record in caplog.records)
+
+
+@pytest.mark.parametrize("field,value", [
+    ("outcome", "5551976543210"),
+    ("cycle", "PRIVATE-INBOUND-TEXT-91"),
+    ("attempt_state", "PRIVATE-MESSAGE-ID-92"),
+    ("count", -1),
+    ("count", 1_000_001),
+    ("latency_bucket", "redis://PRIVATE-TOKEN-93@audit.invalid/0"),
+    ("correlation_id", "PRIVATE-CORRELATION-94"),
+])
+def test_conversation_audit_rejects_non_allowlisted_values_before_log(
+        caplog, conversation_security_boundaries, field, value):
+    from app.utils import AuditEvent, ConversationAuditLogger
+    audit = ConversationAuditLogger(logging.getLogger("app.audit_value_contract"))
+    with caplog.at_level(logging.INFO), pytest.raises(ValueError, match="invalid conversation audit value"):
+        audit.emit(AuditEvent.INGRESS, **{field: value})
+    assert not any(record.name == "app.audit_value_contract" for record in caplog.records)
+
+
+def test_conversation_audit_allowlist_has_fresh_opaque_uuid_and_keeps_unrelated_logs(
+        caplog, conversation_security_boundaries):
+    from app import utils
+    assert hasattr(utils, "new_audit_correlation_id"), "opaque audit correlation factory missing"
+    first = utils.new_audit_correlation_id()
+    second = utils.new_audit_correlation_id()
+    assert first != second
+    assert UUID(first).version == UUID(second).version == 4
+    protected = ("5551976543210", "private-message-id")
+    for value in (first, second):
+        assert all(fragment not in value for fragment in protected)
+        assert all(hashlib.sha256(fragment.encode()).hexdigest() not in value for fragment in protected)
+
+    audit = utils.ConversationAuditLogger(logging.getLogger("app.audit_contract"))
+    with caplog.at_level(logging.INFO):
+        audit.emit(utils.AuditEvent.INGRESS, outcome="accepted", cycle="open",
+                   attempt_state="claimed", count=2, latency_bucket="under_1s",
+                   correlation_id=first)
+        logging.getLogger("unaffected_control").info("unaffected_control")
+    record = next(record for record in caplog.records if record.name == "app.audit_contract")
+    assert record.getMessage() == "conversation_audit"
+    assert record.audit == {"event": "ingress", "outcome": "accepted", "cycle": "open",
+                            "attempt_state": "claimed", "count": 2,
+                            "latency_bucket": "under_1s", "correlation_id": first}
+    assert "unaffected_control" in caplog.text
+
+
+@pytest.mark.parametrize("transport_failure", ["vendor_body", "exception"])
+def test_whatsapp_audit_sentinel_capture_covers_configuration_vendor_and_exception(
+        monkeypatch, caplog, conversation_security_boundaries, transport_failure):
+    """A real service logger must never serialize credentials, URLs or provider data."""
+    from app.simple_config import settings
+    import redis
+
+    sentinels = {
+        "phone": "5551976543210",
+        "text": "PRIVATE-INBOUND-TEXT-71",
+        "redis": "redis://audit-user:REDIS-TOKEN-72@audit.invalid/9",
+        "sql": "postgresql://audit-user:SQL-TOKEN-73@audit.invalid/private",
+        "bearer": "BEARER-TOKEN-74",
+        "vendor": "VENDOR-BODY-75",
+        "exception": "PRIVATE-EXCEPTION-76",
+    }
+    monkeypatch.setattr(settings, "evolution_api_url", "https://audit.invalid/" + sentinels["bearer"])
+    monkeypatch.setattr(settings, "evolution_api_key", sentinels["bearer"])
+    monkeypatch.setattr(settings, "evolution_instance_name", "INSTANCE-PRIVATE-77")
+    monkeypatch.setattr(settings, "redis_url", sentinels["redis"])
+    monkeypatch.setattr(settings, "database_url", sentinels["sql"])
+    def redis_factory(url, **kwargs):
+        assert url == sentinels["redis"]
+        raise RuntimeError(sentinels["exception"])
+    monkeypatch.setattr(redis, "from_url", redis_factory)
+
+    class Response:
+        status_code = 500
+        text = sentinels["vendor"]
+
+    class Client:
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *args):
+            return False
+        async def post(self, *args, **kwargs):
+            if transport_failure == "exception":
+                raise RuntimeError(sentinels["exception"])
+            return Response()
+
+    with caplog.at_level(logging.INFO):
+        from app.conversation_recovery import bounded_sql_dependencies
+        def sql_factory(url, **kwargs):
+            assert url == sentinels["sql"]
+            raise RuntimeError(sentinels["exception"])
+        with pytest.raises(RuntimeError, match=sentinels["exception"]):
+            bounded_sql_dependencies(sentinels["sql"], engine_factory=sql_factory)
+        spec = importlib.util.spec_from_file_location(
+            "app.synthetic_whatsapp_audit", Path(__file__).parents[1] / "app" / "whatsapp_service.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        monkeypatch.setattr(module.httpx, "AsyncClient", lambda **kwargs: Client())
+        asyncio.run(module.whatsapp_service._send_message_internal(sentinels["phone"], sentinels["text"]))
+        logging.getLogger("unaffected_control").info("unaffected_control")
+
+    captured = _serialized_application_records(
+        record for record in caplog.records if record.name.startswith("app."))
+    for sentinel in (*sentinels.values(), "INSTANCE-PRIVATE-77"):
+        normalized = "".join(character for character in sentinel.lower() if character.isalnum())
+        assert sentinel not in captured
+        assert normalized not in "".join(character for character in captured.lower() if character.isalnum())
+        assert hashlib.sha256(sentinel.encode()).hexdigest() not in captured
+    assert "unaffected_control" in caplog.text
+    assert any(record.name == "app.synthetic_whatsapp_audit" for record in caplog.records)
+
+
+def test_conversation_audit_sentinel_capture_covers_all_operational_paths(
+        main_module, admin_runtime, admin_client, scheduler_module, monkeypatch, caplog,
+        conversation_security_boundaries):
+    """Accepted/replayed/closed/failing paths expose only the closed audit payload."""
+    from app import conversation_tasks
+    from app.conversation_recovery import RecoveryService
+    from app.conversation_state import AgentIntent, AgentResult
+
+    rt = admin_runtime
+    phone = "5551976543210"
+    sentinels = (
+        phone, "PRIVATE-INBOUND-TEXT-81", "PRIVATE-MESSAGE-ID-82",
+        "synthetic-media-url", "PRIVATE-MEDIA-ID-83", "PRIVATE-SIGNATURE-84",
+        "PRIVATE-BASIC-USER-85", "PRIVATE-BASIC-PASSWORD-86",
+        "PRIVATE-PROMPT-OUTPUT-87", "PRIVATE-BOUNDARY-EXCEPTION-88",
+    )
+
+    def agent_result(message, contact, snapshot):
+        return AgentResult(sentinels[8], snapshot.messages, snapshot.current_flow,
+                           snapshot.flow_data, AgentIntent.SAVE_CONTEXT)
+
+    with caplog.at_level(logging.INFO):
+        # Header rejection, accepted ingress and retained duplicate.
+        payload = webhook_payload(jid=phone + "@s.whatsapp.net", text=sentinels[1],
+                                  message_id=sentinels[2])
+        assert call_webhook(main_module, payload, signature=sentinels[5])[0].status_code == 401
+        assert call_webhook(main_module, payload)[0].status_code == 200
+        assert call_webhook(main_module, payload)[0].status_code == 200
+
+        # Paused media, lease failure and SQL/session failure.
+        paused_phone = "5551976543211"
+        rt.pause(paused_phone)
+        assert call_webhook(main_module, webhook_payload(
+            jid=paused_phone + "@s.whatsapp.net", media="imageMessage",
+            message_id=sentinels[4]))[0].status_code == 200
+        rt.store.fail_next_atomic("acquire")
+        assert call_webhook(main_module, webhook_payload(
+            jid="5551976543212@s.whatsapp.net", text=sentinels[1]))[0].status_code == 503
+        original_sessions = rt.session_factory
+        monkeypatch.setattr(rt, "session_factory", lambda: (_ for _ in ()).throw(
+            RuntimeError(sentinels[9])))
+        assert call_webhook(main_module, webhook_payload(
+            jid="5551976543213@s.whatsapp.net", text=sentinels[1]))[0].status_code == 503
+        monkeypatch.setattr(rt, "session_factory", original_sessions)
+
+        # Canonical processing, provider failure and authenticated simulator.
+        monkeypatch.setattr(rt.agent, "prepare_result", agent_result)
+        command = rt.buffer(sentinels[1], phone="5551976543214", message_id=sentinels[2] + "-task")
+        assert conversation_tasks.process_batch(command, rt) is conversation_tasks.ProcessingOutcome.PROCESSED
+        rt.transport.on_send = lambda: (_ for _ in ()).throw(RuntimeError(sentinels[9]))
+        with pytest.raises(conversation_tasks.RetryRequested):
+            conversation_tasks.send_outbound(rt.outbound_broker.calls[-1], rt)
+        assert admin_client.get("/test/chat", auth=(sentinels[6], sentinels[7])).status_code == 401
+        assert admin_client.post("/test/chat", json={"message": sentinels[1]}).status_code == 200
+
+        # Recovery/readiness and the real dynamically loaded scheduler logger.
+        original_checkpoint = rt.store.recovery_checkpoint
+        monkeypatch.setattr(rt.store, "recovery_checkpoint", lambda: (_ for _ in ()).throw(
+            RuntimeError(sentinels[9])))
+        assert RecoveryService(rt, max_pages=1).run_once(rt.clock.now()).failed == 1
+        monkeypatch.setattr(rt.store, "recovery_checkpoint", original_checkpoint)
+        assert admin_client.get("/ready").status_code == 200
+        asyncio.run(scheduler_module.check_inactive_contexts(None))
+        logging.getLogger("unaffected_control").info("unaffected_control")
+
+    application_records = [record for record in caplog.records
+                           if record.name.startswith("app.") or record.name == scheduler_module.logger.name]
+    captured = _serialized_application_records(application_records)
+    for sentinel in sentinels:
+        normalized = "".join(character for character in sentinel.lower() if character.isalnum())
+        assert sentinel not in captured
+        assert sentinel.lower() not in captured.lower()
+        assert normalized not in "".join(character for character in captured.lower() if character.isalnum())
+        assert hashlib.sha256(sentinel.encode()).hexdigest() not in captured
+    audit_records = [record for record in application_records if record.getMessage() == "conversation_audit"]
+    assert {record.audit["event"] for record in audit_records} == {
+        "ingress", "transition", "processing", "outbound", "recovery", "readiness"}
+    allowed = {"event", "outcome", "cycle", "attempt_state", "count",
+               "latency_bucket", "correlation_id"}
+    for record in audit_records:
+        assert set(record.audit) <= allowed
+        assert UUID(record.audit["correlation_id"]).version == 4
+    assert "unaffected_control" in caplog.text
 
 
 @pytest.mark.parametrize("failed", [None, "secret", "sql", "redis", "epoch", "broker"])
@@ -388,10 +609,10 @@ def test_scheduler_failure_is_sanitized_and_preserves_context(scheduler_module, 
 def test_scheduler_privacy_capture_observes_injected_sentinel_and_excludes_library_logs(
         scheduler_module, scheduler_application_log_records, caplog, monkeypatch):
     sentinel = "PRIVATE_EXCEPTION patient=synthetic token=synthetic"
-    original_warning = scheduler_module.logger.warning
-    def leaking_warning(*args, **kwargs):
-        original_warning(sentinel)
-    monkeypatch.setattr(scheduler_module.logger, "warning", leaking_warning)
+    original_info = scheduler_module.logger.info
+    def leaking_info(*args, **kwargs):
+        original_info(sentinel)
+    monkeypatch.setattr(scheduler_module.logger, "info", leaking_info)
     with caplog.at_level(logging.INFO):
         asyncio.run(scheduler_module.check_inactive_contexts())
         logging.getLogger("app.synthetic_privacy_control").info("application_control")

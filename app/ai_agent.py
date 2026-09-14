@@ -16,9 +16,17 @@ from app.conversation_state import (
     AgentUnavailable, ConversationDomainError, ConversationSnapshot,
     FailureReason, InvalidCanonicalContact, ToolOutcome,
 )
-from app.utils import load_clinic_info, get_brazil_timezone
+from app.utils import (
+    AuditEvent, ConversationAuditLogger, get_brazil_timezone, load_clinic_info,
+    new_audit_correlation_id,
+)
 
 logger = logging.getLogger(__name__)
+conversation_audit = ConversationAuditLogger(logger)
+
+
+def _emit_audit(event: AuditEvent, **fields: object) -> None:
+    conversation_audit.emit(event, correlation_id=new_audit_correlation_id(), **fields)
 
 
 def format_closed_days(dias_fechados: List[str]) -> str:
@@ -357,8 +365,9 @@ Após responder qualquer dúvida ou enviar um link:
 
     def _call_claude(self, messages: list, system_prompt: str):
         """Mantém a mesma configuração e os links canônicos em cada rodada."""
+        _emit_audit(AuditEvent.PROCESSING, outcome="agent_started", attempt_state="provider_call")
         try:
-            return self.client.messages.create(
+            response = self.client.messages.create(
                 model="claude-sonnet-4-6",
                 max_tokens=1500,
                 temperature=0.3,
@@ -373,9 +382,15 @@ Após responder qualquer dúvida ou enviar um link:
                 tools=deepcopy(self.tools),
             )
         except ConversationDomainError:
+            _emit_audit(AuditEvent.PROCESSING, outcome="dependency_unavailable",
+                        attempt_state="provider_failed")
             raise
         except Exception:
+            _emit_audit(AuditEvent.PROCESSING, outcome="dependency_unavailable",
+                        attempt_state="provider_failed")
             raise AgentUnavailable(FailureReason.AGENT_UNAVAILABLE) from None
+        _emit_audit(AuditEvent.PROCESSING, outcome="agent_completed", attempt_state="provider_returned")
+        return response
 
     def _process_claude_response(self, response, claude_messages: list, phone: str,
                                  system_prompt: str) -> ToolOutcome:

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import datetime, timezone
+import logging
 from threading import Lock
 from typing import Callable, Mapping
 
@@ -14,6 +15,15 @@ from app.conversation_state import (
 )
 from app.conversation_tasks import ConversationRuntime, _require_ready, _SimulatorCapture
 from app.models import ConversationContext, PausedContact
+from app.utils import AuditEvent, ConversationAuditLogger, new_audit_correlation_id
+
+
+logger = logging.getLogger(__name__)
+conversation_audit = ConversationAuditLogger(logger)
+
+
+def _emit_audit(event: AuditEvent, **fields: object) -> None:
+    conversation_audit.emit(event, correlation_id=new_audit_correlation_id(), **fields)
 
 
 class DependencyNotReady(RuntimeError):
@@ -34,7 +44,10 @@ class DependencyReadiness:
             except Exception:
                 ready = False
             states.append(DependencyStatus(name, ready))
-        return ReadinessReport(tuple(states))
+        report = ReadinessReport(tuple(states))
+        _emit_audit(AuditEvent.READINESS, outcome="ready" if report.ready else "dependency_unavailable",
+                    count=sum(1 for state in states if state.ready))
+        return report
 
     def require_ready(self) -> None:
         if not self.check().ready:
@@ -64,6 +77,8 @@ def public_readiness(runtime):
     except Exception:
         pass
     ready = all(value == "ready" for value in states.values())
+    _emit_audit(AuditEvent.READINESS, outcome="ready" if ready else "dependency_unavailable",
+                count=sum(1 for value in states.values() if value == "ready"))
     return {"status": "ready" if ready else "not_ready", "dependencies": states}, 200 if ready else 503
 
 
@@ -84,16 +99,20 @@ class RecoveryService:
         self._lock = Lock()
 
     def run_once(self, now: datetime) -> RecoveryReport:
+        _emit_audit(AuditEvent.RECOVERY, outcome="started", attempt_state="scanning")
         try:
             _require_ready(self.runtime)
         except Exception:
+            _emit_audit(AuditEvent.RECOVERY, outcome="dependency_unavailable", attempt_state="closed")
             return RecoveryReport()
         if not self._lock.acquire(blocking=False):
+            _emit_audit(AuditEvent.RECOVERY, outcome="coordination_failed", attempt_state="busy")
             return RecoveryReport()
         counts = {name: 0 for name in RecoveryReport.__dataclass_fields__}
         runtime = self.runtime
         try:
             if not isinstance(now, datetime) or now.tzinfo is None:
+                _emit_audit(AuditEvent.RECOVERY, outcome="invalid_request", attempt_state="terminal")
                 return RecoveryReport(failed=1)
             for _ in range(self.max_pages):
                 try:
@@ -115,6 +134,8 @@ class RecoveryService:
                     try:
                         _require_ready(runtime)
                     except Exception:
+                        _emit_audit(AuditEvent.RECOVERY, outcome="dependency_unavailable",
+                                    attempt_state="closed", count=sum(counts.values()))
                         return RecoveryReport(**counts)
                     phone = item[0] if isinstance(item, tuple) else item.phone
                     try:
@@ -146,7 +167,11 @@ class RecoveryService:
                         require_ready=lambda: _require_ready(runtime))
                 except Exception:
                     counts["failed"] += 1
-            return RecoveryReport(**counts)
+            report = RecoveryReport(**counts)
+            _emit_audit(AuditEvent.RECOVERY,
+                        outcome="recovered" if report.failed == 0 else "coordination_failed",
+                        attempt_state="completed", count=sum(counts.values()))
+            return report
         finally:
             self._lock.release()
 

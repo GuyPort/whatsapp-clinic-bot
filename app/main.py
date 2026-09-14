@@ -19,7 +19,9 @@ from app.database import init_db, get_db
 from sqlalchemy.orm import Session
 from app.ai_agent import ai_agent
 from app.whatsapp_service import whatsapp_service
-from app.utils import normalize_phone
+from app.utils import (
+    AuditEvent, ConversationAuditLogger, new_audit_correlation_id, normalize_phone,
+)
 from app.conversation_state import (
     IngressDisposition, SenderIdentity, ConversationDomainError, OutboundEnvelope, ProcessingCommand,
     ConversationCoordinator, InvalidManualPauseDuration, PauseReason, manual_pause_deadline,
@@ -36,7 +38,12 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+conversation_audit = ConversationAuditLogger(logger)
 _runtime_lock = Lock()
+
+
+def _emit_conversation_audit(event: AuditEvent, **fields: object) -> None:
+    conversation_audit.emit(event, correlation_id=new_audit_correlation_id(), **fields)
 
 
 def get_conversation_runtime():
@@ -50,7 +57,7 @@ def get_conversation_runtime():
                     outbound_task=send_message_task, celery=celery_app)
                 app.state.conversation_runtime = runtime
             except Exception:
-                logger.warning("conversation_runtime_unavailable")
+                _emit_conversation_audit(AuditEvent.READINESS, outcome="dependency_unavailable")
         return runtime
 
 
@@ -64,7 +71,7 @@ async def lifespan(app: FastAPI):
         init_db()
         started = start_scheduler(runtime) is True
     except Exception:
-        logger.warning("conversation_startup_not_ready")
+        _emit_conversation_audit(AuditEvent.READINESS, outcome="dependency_unavailable")
     try:
         yield
     finally:
@@ -309,42 +316,54 @@ async def whatsapp_webhook(request: Request):
     secret = settings.webhook_secret
     signature = request.headers.get("X-Webhook-Signature")
     if secret is None:
+        _emit_conversation_audit(AuditEvent.INGRESS, outcome="dependency_unavailable")
         return JSONResponse({"status": "temporarily_unavailable"}, status_code=503)
     if signature is None or not secrets.compare_digest(signature.encode("utf-8"), secret.encode("utf-8")):
+        _emit_conversation_audit(AuditEvent.INGRESS, outcome="unauthorized")
         return JSONResponse({"status": "unauthorized"}, status_code=401)
     # Task 9 owns production composition. Absence is closed, never legacy fallback.
     runtime = getattr(request.app.state, "conversation_runtime", None)
     try:
         if runtime is None or not runtime.readiness_status().ready:
+            _emit_conversation_audit(AuditEvent.READINESS, outcome="dependency_unavailable")
             return JSONResponse({"status": "temporarily_unavailable"}, status_code=503)
     except Exception:
+        _emit_conversation_audit(AuditEvent.READINESS, outcome="dependency_unavailable")
         return JSONResponse({"status": "temporarily_unavailable"}, status_code=503)
     try:
         payload = await request.json()
     except (ValueError, UnicodeError):
+        _emit_conversation_audit(AuditEvent.INGRESS, outcome="invalid_request")
         return JSONResponse({"status": "invalid_request"}, status_code=400)
     identity = resolve_sender_identity(payload)
     if identity is None:
+        _emit_conversation_audit(AuditEvent.INGRESS, outcome="ignored")
         return JSONResponse({"status": "ignored"})
     useful_message = _ingress_content(payload)
     if useful_message is None:
+        _emit_conversation_audit(AuditEvent.INGRESS, outcome="ignored")
         return JSONResponse({"status": "ignored"})
     kind, content = useful_message
+    failure_outcome = "coordination_failed"
     try:
         _require_ready(runtime)
         with runtime.store.contact_lease(identity.phone) as lease:
             _require_ready(runtime)
             if runtime.coordinator.is_terminal_ingress(identity, runtime.clock.now(), lease):
+                _emit_conversation_audit(AuditEvent.INGRESS, outcome="duplicate")
                 return JSONResponse({"status": "ignored"})
             _require_ready(runtime)
+            failure_outcome = "persistence_failed"
             with runtime.session_factory() as db:
                 _require_ready(runtime)
+                failure_outcome = "coordination_failed"
                 receipt = runtime.coordinator.accept_ingress(
                     db, identity, kind, content, runtime.clock.now(), lease, runtime.processing_broker)
     except Exception:
-        logger.warning("conversation_ingress_unavailable")
+        _emit_conversation_audit(AuditEvent.INGRESS, outcome=failure_outcome)
         return JSONResponse({"status": "temporarily_unavailable"}, status_code=503)
-    logger.info("conversation_ingress_accepted")
+    _emit_conversation_audit(AuditEvent.INGRESS,
+        outcome="accepted" if receipt.disposition is IngressDisposition.BUFFERED else "ignored")
     return JSONResponse({"status": "buffered" if receipt.disposition is IngressDisposition.BUFFERED else "ignored"})
 
 
@@ -408,7 +427,7 @@ async def status():
             "database": "connected"
         }
     except Exception as e:
-        logger.error(f"Erro ao verificar status: {str(e)}")
+        logger.error("instance_status_check_failed")
         return {
             "status": "degraded",
             "error": str(e)
@@ -425,7 +444,7 @@ async def reload_config(admin: str = Depends(verify_admin_credentials)):
         ai_agent.reload_clinic_info()
         return {"status": "success", "message": "Configurações recarregadas"}
     except Exception as e:
-        logger.error(f"Erro ao recarregar config: {str(e)}")
+        logger.error("configuration_reload_failed")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -464,7 +483,7 @@ async def get_patients(admin: str = Depends(verify_admin_credentials)):
                 "patients": patients
             }
     except Exception as e:
-        logger.error(f"Erro ao buscar pacientes: {str(e)}")
+        logger.error("patient_search_failed")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -508,7 +527,7 @@ async def get_appointments(admin: str = Depends(verify_admin_credentials)):
                 ]
             }
     except Exception as e:
-        logger.error(f"Erro ao buscar consultas: {str(e)}")
+        logger.error("appointment_search_failed")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -585,7 +604,7 @@ async def get_scheduled_appointments():
             }
             
     except Exception as e:
-        logger.error(f"Erro ao buscar consultas agendadas: {str(e)}")
+        logger.error("scheduled_appointment_search_failed")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -644,7 +663,7 @@ async def get_appointments_history():
             }
 
     except Exception as e:
-        logger.error(f"Erro ao buscar histórico de consultas: {str(e)}")
+        logger.error("appointment_history_search_failed")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -657,7 +676,7 @@ async def init_database(admin: str = Depends(verify_admin_credentials)):
         init_db()
         return {"message": "✅ Banco de dados inicializado com sucesso!", "status": "success"}
     except Exception as e:
-        logger.error(f"Erro ao inicializar banco: {str(e)}")
+        logger.error("database_initialization_failed")
         return {"message": f"❌ Erro ao inicializar banco: {str(e)}", "status": "error"}
 
 
@@ -680,7 +699,7 @@ async def clean_database(admin: str = Depends(verify_admin_credentials)):
             "status": "success"
         }
     except Exception as e:
-        logger.error(f"Erro ao limpar banco: {str(e)}")
+        logger.error("database_cleanup_failed")
         return {"message": f"❌ Erro ao limpar banco: {str(e)}", "status": "error"}
 
 
@@ -751,7 +770,7 @@ async def get_dashboard(admin: str = Depends(verify_admin_credentials)):
                 "appointments_by_status": appointments_by_status
             }
     except Exception as e:
-        logger.error(f"Erro ao buscar dashboard: {str(e)}")
+        logger.error("dashboard_query_failed")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -771,7 +790,7 @@ async def delete_appointment_admin(
                 raise HTTPException(status_code=404, detail="Consulta não encontrada")
 
             # Log do cancelamento
-            logger.info(f"Admin {admin} cancelou consulta #{appointment_id}: {appointment.patient_name} - {appointment.appointment_date} {appointment.appointment_time}")
+            logger.info("appointment_cancelled")
 
             # Marcar como cancelada em vez de deletar
             appointment.status = AppointmentStatus.CANCELADA
@@ -790,7 +809,7 @@ async def delete_appointment_admin(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Erro ao cancelar consulta: {str(e)}")
+        logger.error("appointment_cancellation_failed")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -817,7 +836,7 @@ async def mark_attended_appointment_admin(
             appointment._skip_time_validation = True
             db.commit()
 
-            logger.info(f"Admin {admin} marcou consulta #{appointment_id} como compareceu: {appointment.patient_name}")
+            logger.info("appointment_attendance_recorded")
 
             return {
                 "success": True,
@@ -832,7 +851,7 @@ async def mark_attended_appointment_admin(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Erro ao marcar presença: {str(e)}")
+        logger.error("appointment_attendance_failed")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -859,7 +878,7 @@ async def mark_missed_appointment_admin(
             appointment._skip_time_validation = True
             db.commit()
 
-            logger.info(f"Admin {admin} marcou consulta #{appointment_id} como não compareceu (falta): {appointment.patient_name}")
+            logger.info("appointment_absence_recorded")
 
             return {
                 "success": True,
@@ -874,7 +893,7 @@ async def mark_missed_appointment_admin(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Erro ao marcar falta: {str(e)}")
+        logger.error("appointment_absence_failed")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -943,7 +962,7 @@ async def reschedule_appointment_admin(
 
             db.commit()
 
-            logger.info(f"Admin {admin} remarcou consulta #{appointment_id} para {new_date} {new_time}")
+            logger.info("appointment_rescheduled")
 
             return {
                 "success": True,
@@ -960,7 +979,7 @@ async def reschedule_appointment_admin(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Erro ao remarcar consulta: {str(e)}")
+        logger.error("appointment_reschedule_failed")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -998,7 +1017,7 @@ async def update_appointment_admin(
 
             db.commit()
 
-            logger.info(f"Admin {admin} atualizou consulta #{appointment_id}")
+            logger.info("appointment_updated")
 
             return {
                 "success": True,
@@ -1015,7 +1034,7 @@ async def update_appointment_admin(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Erro ao atualizar consulta: {str(e)}")
+        logger.error("appointment_update_failed")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -1093,7 +1112,7 @@ async def create_appointment_admin(
             db.commit()
             db.refresh(new_appointment)
 
-            logger.info(f"Admin {admin} criou nova consulta #{new_appointment.id}: {new_appointment.patient_name} - {appointment_date} {appointment_time}")
+            logger.info("appointment_created")
 
             return {
                 "success": True,
@@ -1113,7 +1132,7 @@ async def create_appointment_admin(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Erro ao criar consulta: {str(e)}")
+        logger.error("appointment_creation_failed")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -1141,7 +1160,7 @@ async def migrate_appointment_status(admin: str = Depends(verify_admin_credentia
             if "already exists" in str(e).lower():
                 logger.info("ℹ️  Valor 'compareceu' já existe")
             else:
-                logger.warning(f"Aviso ao adicionar 'compareceu': {str(e)}")
+                logger.warning("migration_compareceu_value_failed")
 
         # ETAPA 2: Adicionar 'nao_compareceu' ao enum (transação separada)
         try:
@@ -1154,7 +1173,7 @@ async def migrate_appointment_status(admin: str = Depends(verify_admin_credentia
             if "already exists" in str(e).lower():
                 logger.info("ℹ️  Valor 'nao_compareceu' já existe")
             else:
-                logger.warning(f"Aviso ao adicionar 'nao_compareceu': {str(e)}")
+                logger.warning("migration_nao_compareceu_value_failed")
 
         # ETAPA 3: Migrar dados (nova transação limpa)
         with get_db() as db:
@@ -1169,7 +1188,7 @@ async def migrate_appointment_status(admin: str = Depends(verify_admin_credentia
                 result = db.execute(text("SELECT COUNT(*) FROM appointments WHERE status::text = 'cancelada'"))
                 canceled_count = result.scalar() or 0
             except Exception as e:
-                logger.warning(f"Não conseguiu contar canceladas: {str(e)}")
+                logger.warning("migration_cancelled_count_failed")
 
             # Contar realizadas (usar cast para text)
             realizada_count = 0
@@ -1177,7 +1196,7 @@ async def migrate_appointment_status(admin: str = Depends(verify_admin_credentia
                 result = db.execute(text("SELECT COUNT(*) FROM appointments WHERE status::text = 'realizada'"))
                 realizada_count = result.scalar() or 0
             except Exception as e:
-                logger.warning(f"Não conseguiu contar realizadas: {str(e)}")
+                logger.warning("migration_completed_count_failed")
 
             # Deletar canceladas
             if canceled_count > 0:
@@ -1213,7 +1232,7 @@ async def migrate_appointment_status(admin: str = Depends(verify_admin_credentia
             }
 
     except Exception as e:
-        logger.error(f"❌ Erro na migração: {str(e)}")
+        logger.error("status_migration_failed")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -1250,7 +1269,7 @@ async def fix_enum_values(admin: str = Depends(verify_admin_credentials)):
                 results["diagnostico"]["valores_atuais"] = current_values
                 logger.info(f"Valores atuais do enum: {current_values}")
             except Exception as e:
-                logger.error(f"Erro ao consultar valores do enum: {str(e)}")
+                logger.error("enum_value_query_failed")
                 results["diagnostico"]["erro"] = str(e)
 
         # ETAPA 2: Adicionar 'agendada' se não existir
@@ -1267,7 +1286,7 @@ async def fix_enum_values(admin: str = Depends(verify_admin_credentials)):
                     logger.info("ℹ️ Valor 'agendada' já existe")
                     results["acoes"].append("ℹ️ Valor 'agendada' já existia")
                 else:
-                    logger.error(f"Erro ao adicionar 'agendada': {str(e)}")
+                    logger.error("enum_agendada_value_failed")
                     results["acoes"].append(f"❌ Erro ao adicionar 'agendada': {str(e)}")
                     results["success"] = False
         else:
@@ -1287,7 +1306,7 @@ async def fix_enum_values(admin: str = Depends(verify_admin_credentials)):
                     logger.info("ℹ️ Valor 'cancelada' já existe")
                     results["acoes"].append("ℹ️ Valor 'cancelada' já existia")
                 else:
-                    logger.error(f"Erro ao adicionar 'cancelada': {str(e)}")
+                    logger.error("enum_cancelada_value_failed")
                     results["acoes"].append(f"❌ Erro ao adicionar 'cancelada': {str(e)}")
                     results["success"] = False
         else:
@@ -1322,7 +1341,7 @@ async def fix_enum_values(admin: str = Depends(verify_admin_credentials)):
                 results["diagnostico"]["contagem_por_status"] = status_counts
                 logger.info(f"Contagem por status: {status_counts}")
             except Exception as e:
-                logger.error(f"Erro ao contar status: {str(e)}")
+                logger.error("status_count_failed")
                 results["diagnostico"]["erro_contagem"] = str(e)
 
         return {
@@ -1342,7 +1361,7 @@ async def fix_enum_values(admin: str = Depends(verify_admin_credentials)):
         }
 
     except Exception as e:
-        logger.error(f"❌ Erro no diagnóstico/correção: {str(e)}")
+        logger.error("status_diagnostic_failed")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -3018,7 +3037,7 @@ def _administrative_session(runtime, phone):
     except HTTPException:
         raise
     except Exception:
-        logger.warning("conversation_administration_unavailable")
+        _emit_conversation_audit(AuditEvent.TRANSITION, outcome="coordination_failed")
         raise HTTPException(status_code=503, detail="temporarily_unavailable") from None
 
 
@@ -4471,8 +4490,9 @@ async def test_chat_send(request: Request, admin: str = Depends(verify_admin_cre
     try:
         response = simulate_message(message.strip(), runtime)
     except Exception:
-        logger.warning("conversation_simulator_unavailable")
+        _emit_conversation_audit(AuditEvent.PROCESSING, outcome="processing_failed")
         raise HTTPException(status_code=503, detail="temporarily_unavailable") from None
+    _emit_conversation_audit(AuditEvent.PROCESSING, outcome="processed")
     return {"response": response or "[Sem resposta]", "phone": TEST_PHONE}
 
 

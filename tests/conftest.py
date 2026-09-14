@@ -178,3 +178,40 @@ def scheduler_application_log_records(scheduler_module, caplog):
         return [record for record in caplog.records
                 if record.name.startswith("app.") or record.name == scheduler_module.logger.name]
     return observed
+
+
+@pytest.fixture
+def conversation_security_boundaries(monkeypatch):
+    """Fail closed if audit tests cross a forbidden external/write boundary."""
+    import builtins
+    import io
+    import subprocess
+    from pathlib import Path
+
+    workspace = Path(__file__).parents[1].resolve()
+    original_open = builtins.open
+
+    def guarded_open(file, mode="r", *args, **kwargs):
+        if any(flag in mode for flag in ("w", "a", "x", "+")):
+            try:
+                target = Path(file).resolve()
+            except (TypeError, OSError):
+                target = None
+            if target is not None and (target == workspace or workspace in target.parents):
+                pytest.fail("repository write forbidden in conversation security test")
+        return original_open(file, mode, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", guarded_open)
+    monkeypatch.setattr(io, "open", guarded_open)
+    for name in ("Popen", "run", "call", "check_call", "check_output"):
+        monkeypatch.setattr(subprocess, name,
+            lambda *args, _name=name, **kwargs: pytest.fail(
+                f"subprocess {_name} forbidden in conversation security test"))
+    try:
+        import dotenv
+        monkeypatch.setattr(dotenv, "load_dotenv",
+                            lambda *args, **kwargs: pytest.fail("dotenv forbidden in security test"))
+    except ImportError:
+        pass
+    monkeypatch.setenv("APP_SKIP_DOTENV", "1")
+    monkeypatch.setenv("DATABASE_URL", "sqlite://")

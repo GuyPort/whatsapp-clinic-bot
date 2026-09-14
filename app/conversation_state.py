@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import hashlib
 import json
+import logging
 from copy import deepcopy
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
@@ -19,6 +20,15 @@ from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
 from app.models import Appointment, ConversationContext, PausedContact
+from app.utils import AuditEvent, ConversationAuditLogger, new_audit_correlation_id
+
+
+logger = logging.getLogger(__name__)
+conversation_audit = ConversationAuditLogger(logger)
+
+
+def _emit_audit(event: AuditEvent, **fields: object) -> None:
+    conversation_audit.emit(event, correlation_id=new_audit_correlation_id(), **fields)
 
 
 class ConversationState(str, Enum):
@@ -1232,6 +1242,8 @@ class ConversationCoordinator:
             parameters["agent"] = agent_request
         request_hash, previous = self._request(db, phone, lease, operation_id, now, kind, parameters)
         if previous is not None and previous.phase is MutationPhase.COMMITTED:
+            _emit_audit(AuditEvent.TRANSITION, outcome="duplicate", cycle="paused",
+                        attempt_state="committed")
             return self._pause_ref(previous)
         if agent_request is not None and previous is None:
             self._assert_open(db, phone, lease)
@@ -1261,7 +1273,10 @@ class ConversationCoordinator:
             row.paused_until, row.reason = _sql_time(deadline), reason
             if kind != "EXTEND_PAUSE":
                 row.paused_at = _sql_time(attempt.started_at or now)
-        return self._pause_ref(self._run_mutation(db, phone, kind, target, lease, operation_id, now, dml))
+        result = self._pause_ref(self._run_mutation(db, phone, kind, target, lease, operation_id, now, dml))
+        _emit_audit(AuditEvent.TRANSITION, outcome="applied", cycle="paused",
+                    attempt_state="committed")
+        return result
 
     @_reason_codes_only
     def pause_for_secretary(self, db: Session, phone: str, reason: str, now: datetime,
@@ -1287,6 +1302,8 @@ class ConversationCoordinator:
         request_hash, previous = self._request(db, phone, lease, operation_id, now, kind,
                                                parameters)
         if previous is not None and previous.phase is MutationPhase.COMMITTED:
+            _emit_audit(AuditEvent.TRANSITION, outcome="duplicate",
+                        cycle=previous.target_cycle.value.lower(), attempt_state="committed")
             return previous
         if previous is None and (agent_request is not None or kind == "CLOSE_CONTEXT"):
             self._assert_open(db, phone, lease)
@@ -1321,7 +1338,11 @@ class ConversationCoordinator:
                     raise ConversationStateUnavailable(FailureReason.CONDITION_CHANGED)
             if kind == "RESET_TEST":
                 self._execute_dml(session, lease, delete(Appointment).where(Appointment.patient_phone == phone))
-        return self._run_mutation(db, phone, kind, target, lease, operation_id, now, dml)
+        result = self._run_mutation(db, phone, kind, target, lease, operation_id, now, dml)
+        if result is not None:
+            _emit_audit(AuditEvent.TRANSITION, outcome="applied", cycle=cycle.value.lower(),
+                        attempt_state="committed")
+        return result
 
     @_reason_codes_only
     def unpause(self, db: Session, phone: str, now: datetime, lease: ContactLease, operation_id: str) -> None:
