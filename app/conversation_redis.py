@@ -331,6 +331,7 @@ def manifest_fingerprint(entries: tuple[ManifestEntry, ...]) -> str:
 
 def _anchor_data(anchor: ContactAnchor) -> dict:
     data = {"contact_revision": anchor.contact_revision,
+            "coordination_epoch": str(anchor.coordination_epoch),
             "last_generation": str(anchor.last_generation),
             "manifest": [_entry_data(entry) for entry in anchor.manifest],
             "manifest_fingerprint": anchor.manifest_fingerprint,
@@ -344,6 +345,7 @@ def _anchor_data(anchor: ContactAnchor) -> dict:
 def _generation_control(anchor: ContactAnchor) -> str:
     """A durable second fence, cross-checked even when the manifest is empty."""
     data = {"last_generation": str(anchor.last_generation),
+                  "coordination_epoch": str(anchor.coordination_epoch),
                   "contact_revision": anchor.contact_revision,
                   "manifest_fingerprint": anchor.manifest_fingerprint}
     if anchor.mutation_fence is not None:
@@ -624,6 +626,8 @@ class RedisConversationStore:
         try:
             value = json.loads(raw)
             if (not isinstance(value, dict)
+                    or not isinstance(value["coordination_epoch"], str)
+                    or value["coordination_epoch"] != str(self.config.coordination_epoch)
                     or not isinstance(value["last_generation"], str)
                     or not isinstance(value["generation_history"], list)
                     or not all(isinstance(g, str) for g in value["generation_history"])):
@@ -632,7 +636,8 @@ class RedisConversationStore:
             anchor = ContactAnchor(value["contact_revision"], UUID(value["last_generation"]),
                                    entries, value["manifest_fingerprint"],
                                    tuple(UUID(g) for g in value["generation_history"]),
-                                   ConversationCycle(value["cycle"]), value.get("mutation_fence"))
+                                   ConversationCycle(value["cycle"]), value.get("mutation_fence"),
+                                   coordination_epoch=UUID(value["coordination_epoch"]))
             if (type(anchor.contact_revision) is not int or anchor.contact_revision < 0
                     or anchor.last_generation not in anchor.generation_history
                     or len(set(anchor.generation_history)) != len(anchor.generation_history)
@@ -656,6 +661,20 @@ class RedisConversationStore:
                 self._atomic(lease.phone, "validate", checks, quarantine=True, require_ready=require_ready,
                              preserve_evidence=read_only)
                 raise AssertionError("unreachable")
+            # The durable fence binds recovery membership and its exact detail,
+            # including when a COMMITTING detail expired and needs compaction.
+            # These expectations enter every later Lua CAS, never a repair write.
+            if attempt.phase in (MutationPhase.PREPARED, MutationPhase.COMMITTING):
+                member = self._mutation_member(lease.phone, fence)
+                checks.extend([
+                    {"op": "member", "key": MUTATION_INDEX_KEY, "member": member,
+                     "value": 1, "failure": "generation"},
+                    self._check(self._mutation_recovery_key(member),
+                        _json([lease.phone, attempt.operation_id, str(attempt.epoch),
+                               attempt.processing_deadline.isoformat()]), "generation"),
+                ])
+                self._atomic(lease.phone, "validate", checks, require_ready=require_ready,
+                             preserve_evidence=read_only)
             if attempt.phase is MutationPhase.COMMITTING and self._now() >= attempt.processing_deadline:
                 if read_only:
                     raise ConversationStateUnavailable(FailureReason.STATE_UNAVAILABLE)
@@ -762,7 +781,8 @@ class RedisConversationStore:
             self._atomic(phone, "initialize", [self._lease_check(lease), self._check(keys.anchor, None)],
                          quarantine=True)
         generation = uuid4()
-        anchor = ContactAnchor(0, generation, (), manifest_fingerprint(()), (generation,))
+        anchor = ContactAnchor(0, generation, (), manifest_fingerprint(()), (generation,),
+                               coordination_epoch=self.config.coordination_epoch)
         self._atomic(phone, "initialize", [self._lease_check(lease),
                      self._check(keys.anchor, None), self._check(keys.generation, None, "generation")],
                      [{"op": "SET", "key": keys.anchor, "value": _json(_anchor_data(anchor))},

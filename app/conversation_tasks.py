@@ -124,6 +124,12 @@ def _enqueue(outbound, runtime, lease):
         raise BrokerUnavailable(FailureReason.BROKER_UNAVAILABLE)
 
 
+def _authorize_provider(runtime, lease):
+    lease.assert_owned()
+    _require_ready(runtime)
+    lease.assert_owned()  # Dependency probes may themselves outlive this owner.
+
+
 @contextmanager
 def _session(runtime):
     _require_ready(runtime)
@@ -181,7 +187,8 @@ def process_batch(command: ProcessingCommand, runtime: ConversationRuntime) -> P
                     if texts:
                         lease.assert_owned()
                         _require_ready(runtime)
-                        result = runtime.agent.prepare_result("\n".join(e.content for e in texts), command.phone, snapshot)
+                        result = runtime.agent.prepare_result("\n".join(e.content for e in texts), command.phone, snapshot,
+                            authorize=lambda: _authorize_provider(runtime, lease))
                         if fixed:
                             result = replace(result, text=fixed_reply_result(fixed).text + "\n\n" + result.text)
                     else:
@@ -198,7 +205,8 @@ def process_batch(command: ProcessingCommand, runtime: ConversationRuntime) -> P
                     _require_ready(runtime)
                     runtime.store.prepare_fixed_response(command, attempt, runtime.clock.now(), lease)
                     outbound = OutboundEnvelope(command.phone, result.text, OutboundKind.NORMAL,
-                        command.generation, attempt.processing_id, attempt.operation_id)
+                        command.generation, attempt.processing_id, attempt.operation_id,
+                        coordination_epoch=command.coordination_epoch)
                 _require_ready(runtime)  # SQL commit may have outlived readiness.
                 reservation = runtime.store.reserve_outbound_enqueue(command, attempt, runtime.clock.now(), lease)
                 _enqueue(outbound, runtime, lease)
@@ -275,10 +283,11 @@ def send_outbound(outbound: OutboundEnvelope, runtime: ConversationRuntime) -> S
             lease.assert_owned()  # Fence check before final readiness/transport boundary.
             _require_ready(runtime)
             try:
-                result = runtime.transport.send_message(outbound.phone, outbound.text)
+                result = runtime.transport.send_message(outbound.phone, outbound.text,
+                    authorize=lambda: _authorize_provider(runtime, lease))
                 if inspect.isawaitable(result):
                     result = asyncio.run(result)
-            except CeleryRetry:
+            except (CeleryRetry, ConversationDomainError):
                 raise
             except Exception:
                 raise TransportUnavailable(FailureReason.TRANSPORT_UNAVAILABLE) from None

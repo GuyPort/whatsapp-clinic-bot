@@ -709,8 +709,10 @@ class ScriptedAgent:
         self.on_prepare = None
         self.intent = None
 
-    def prepare_result(self, message, phone, snapshot):
+    def prepare_result(self, message, phone, snapshot, *, authorize=None):
         from app.conversation_state import AgentResult, AgentIntent
+        if authorize is not None:
+            authorize()
         self.calls.append((message, phone, deepcopy(snapshot)))
         if self.on_prepare:
             self.on_prepare()
@@ -727,7 +729,8 @@ class ScriptedOutboundBroker:
         self.next_result = None
 
     def enqueue_outbound(self, outbound):
-        from app.conversation_state import EnqueueResult
+        from app.conversation_state import EnqueueResult, OutboundEnvelope
+        outbound = OutboundEnvelope.from_payload(outbound.to_payload())
         self.calls.append(outbound)
         if self.on_enqueue:
             self.on_enqueue(outbound)
@@ -740,7 +743,9 @@ class ScriptedTransport:
         self.on_send = None
         self.result = True
 
-    def send_message(self, phone, text):
+    def send_message(self, phone, text, *, authorize=None):
+        if authorize is not None:
+            authorize()
         self.calls.append((phone, text))
         if self.on_send:
             self.on_send()

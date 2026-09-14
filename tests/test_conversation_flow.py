@@ -27,6 +27,255 @@ ADMIN_PHONE = "5551999990011"
 SIMULATOR_PHONE = "5500000000000"
 
 
+@pytest.fixture
+def final_provider_adapters(monkeypatch):
+    """Import actual adapters with only SDK construction and HTTP replaced."""
+    from pathlib import Path
+    import redis
+    monkeypatch.setattr(redis, "from_url", lambda *args, **kwargs: object())
+    monkeypatch.setattr(anthropic, "Anthropic", lambda **kwargs: ScriptedClaude())
+    monkeypatch.setattr(utils, "load_clinic_info", lambda: deepcopy(CLINIC_INFO))
+    modules = []
+    for filename in ("ai_agent", "whatsapp_service"):
+        spec = importlib.util.spec_from_file_location(
+            "app.synthetic_final_" + filename, Path(__file__).parents[1] / "app" / (filename + ".py"))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        modules.append(module)
+    return modules
+
+
+@pytest.mark.parametrize("boundary", ["rate_wait", "http_enter", "retry", "ready_retry", "ready_enter", "slow_readiness", "valid"])
+def test_final_provider_post_guard_after_wait_and_between_retries(
+        processing_runtime, task_api, final_provider_adapters, monkeypatch, boundary):
+    from dataclasses import replace
+    import asyncio
+    rt = processing_runtime
+    rt.store.config = replace(rt.store.config, contact_lease_ttl_seconds=6, contact_lease_heartbeat_seconds=2)
+    command = rt.buffer("imagem", kind="media")
+    assert task_api.process_batch(command, rt) is task_api.ProcessingOutcome.PROCESSED
+    outbound = rt.outbound_broker.calls[-1]
+    module = final_provider_adapters[1]
+    rt.transport = module.whatsapp_service
+    posts, pauses = [], []
+
+    def lose_authority():
+        # Seven synthetic seconds inside the real adapter's 30-second lock wait.
+        # Heartbeat renewal cannot save a suspended/crashed lease owner.
+        rt.clock.advance(timedelta(seconds=7))
+        pauses.append(rt.pause())
+
+    class RateLock:
+        def __init__(self, client, key, *, timeout, blocking_timeout):
+            assert timeout == 5 and blocking_timeout == 30
+        def acquire(self, **kwargs):
+            if boundary == "rate_wait":
+                lose_authority()
+            return True
+        def owned(self):
+            return True
+        def release(self):
+            pass
+
+    class Provider:
+        async def __aenter__(self):
+            if boundary == "http_enter":
+                lose_authority()
+            elif boundary == "ready_enter":
+                close_ready(rt)
+            elif boundary == "slow_readiness":
+                previous = rt.readiness_status
+                def delayed_readiness():
+                    rt.readiness_status = previous
+                    lose_authority()
+                    return previous()
+                rt.readiness_status = delayed_readiness
+            return self
+        async def __aexit__(self, *args):
+            return False
+        async def post(self, *args, **kwargs):
+            posts.append(kwargs)
+            if boundary == "retry":
+                lose_authority()
+            elif boundary == "ready_retry":
+                close_ready(rt)
+            return SimpleNamespace(status_code=429 if "retry" in boundary else 201,
+                                   json=lambda: {"retry_after": 1})
+
+    async def no_sleep(seconds):
+        pass
+    monkeypatch.setattr(module, "Lock", RateLock)
+    monkeypatch.setattr(module.httpx, "AsyncClient", lambda **kwargs: Provider())
+    monkeypatch.setattr(module.asyncio, "sleep", no_sleep)
+    if boundary == "valid":
+        assert task_api.send_outbound(outbound, rt) is task_api.SendOutcome.SENT
+        assert len(posts) == 1
+    else:
+        with pytest.raises(task_api.RetryRequested) as raised:
+            task_api.send_outbound(outbound, rt)
+        assert raised.value.reason_code == (
+            domain.FailureReason.READINESS_UNAVAILABLE if boundary.startswith("ready")
+            else domain.FailureReason.CONTACT_LEASE_LOST)
+        assert len(posts) == (1 if "retry" in boundary else 0)
+        assert len(pauses) == (0 if boundary.startswith("ready") else 1)
+
+
+@pytest.mark.parametrize("loss", ["lease", "readiness", "valid"])
+def test_final_claude_tool_round_revalidates_authority(
+        processing_runtime, task_api, final_provider_adapters, loss, conversation_resources):
+    from app.conversation_redis import contact_keys
+    rt = processing_runtime
+    command = rt.buffer()
+    provider = ScriptedClaude()
+    provider.respond_with_tool("get_clinic_info")
+    provider.respond_with_text("synthetic response")
+    rt.agent = make_agent(final_provider_adapters[0], rt.clock, provider)
+    pauses = []
+    def after_first_call(kwargs):
+        provider.on_create = None
+        if loss == "lease":
+            rt.clock.advance(timedelta(seconds=61))
+            pauses.append(rt.pause())
+        elif loss == "readiness":
+            close_ready(rt)
+    provider.on_create = after_first_call
+    if loss == "valid":
+        assert task_api.process_batch(command, rt) is task_api.ProcessingOutcome.PROCESSED
+        assert len(provider.calls) == 2
+    else:
+        with pytest.raises(task_api.RetryRequested) as raised:
+            task_api.process_batch(command, rt)
+        assert raised.value.reason_code == (domain.FailureReason.CONTACT_LEASE_LOST if loss == "lease"
+                                           else domain.FailureReason.READINESS_UNAVAILABLE)
+        assert len(provider.calls) == 1
+        assert len(pauses) == (1 if loss == "lease" else 0)
+        assert rt.outbound_broker.calls == rt.transport.calls == []
+        if loss == "readiness":
+            conversation_resources.expect_crashed_claim(rt.store, command,
+                reason="readiness lost after first provider call before RESULT_READY")
+
+
+def test_final_old_media_outbound_rejected_after_cleanup_and_epoch_rotation(processing_runtime, task_api):
+    from dataclasses import replace
+    from app.conversation_redis import EpochStore, contact_keys
+    rt = processing_runtime
+    assert task_api.process_batch(rt.buffer("imagem", kind="media"), rt) is task_api.ProcessingOutcome.PROCESSED
+    outbound = rt.outbound_broker.calls[-1]
+    assert task_api.send_outbound(outbound, rt) is task_api.SendOutcome.SENT
+    rt.transport.calls.clear()
+    rt.clock.advance(timedelta(days=8))
+    with rt.store.contact_lease(PHONE) as lease:
+        rt.store.cleanup(lease, rt.store.read_anchor(lease))
+        assert rt.store.read_details(lease) == ()
+    new_config = replace(rt.store.config, coordination_epoch=uuid4())
+    EpochStore(rt.store.client, new_config).rotate(rt.store.config.coordination_epoch, new_config.coordination_epoch)
+    rt.store.config = new_config
+    assert rt.store.readiness().ready
+    assert task_api.send_outbound(outbound, rt) is task_api.SendOutcome.DISCARDED
+    assert rt.transport.calls == []
+    # The durable contact must also reject reuse of its old epoch/generation.
+    with rt.store.contact_lease(PHONE) as lease, pytest.raises(domain.ConversationGenerationUnavailable):
+        rt.store.read_anchor(lease)
+    assert rt.store.is_quarantined(PHONE)
+
+
+@pytest.mark.parametrize("epoch", ["missing", None, 1, "", "old-not-a-uuid"])
+def test_final_outbound_requires_canonical_epoch(processing_runtime, task_api, epoch):
+    rt = processing_runtime
+    task_api.process_batch(rt.buffer("imagem", kind="media"), rt)
+    payload = rt.outbound_broker.calls[-1].to_payload()
+    if epoch == "missing":
+        payload.pop("coordination_epoch", None)
+    else:
+        payload["coordination_epoch"] = epoch
+    with pytest.raises(domain.ConversationStateUnavailable):
+        domain.OutboundEnvelope.from_payload(payload)
+    assert rt.transport.calls == []
+
+
+def test_final_lifespan_installs_one_inert_job_and_recovers_without_restart(
+        main_module, admin_runtime, scheduler_module, monkeypatch, session_factory):
+    import asyncio
+    from app.models import ConversationContext
+    rt = admin_runtime
+    rt.seed_contact(PHONE, age_minutes=61)
+    rt.dependencies[domain.DependencyName.SQL] = False
+    jobs, starts, stops = {}, [], []
+    class Scheduler:
+        running = False
+        def add_job(self, function, trigger, **kwargs):
+            if kwargs["id"] in jobs and not kwargs.get("replace_existing"):
+                raise AssertionError("duplicate installed job")
+            jobs[kwargs["id"]] = (function, kwargs["kwargs"])
+        def start(self):
+            assert not self.running
+            self.running = True
+            starts.append(True)
+        def shutdown(self):
+            assert self.running
+            self.running = False
+            stops.append(True)
+    scheduler = Scheduler()
+    monkeypatch.setattr(scheduler_module, "scheduler", scheduler)
+    monkeypatch.setattr(main_module, "start_scheduler", scheduler_module.start_scheduler)
+    monkeypatch.setattr(main_module, "stop_scheduler", scheduler_module.stop_scheduler)
+    monkeypatch.setattr(main_module, "init_db", lambda: pytest.fail("SQL initialization while unready"))
+    async def run():
+        async with main_module.lifespan(main_module.app):
+            assert len(jobs) == 1
+            before = rt.store.snapshot(), rt.session_calls, rt.lease_calls
+            # Exercise the actual installed synchronous callback off this event loop.
+            function, kwargs = next(iter(jobs.values()))
+            await asyncio.to_thread(function, **kwargs)
+            assert (rt.store.snapshot(), rt.session_calls, rt.lease_calls) == before
+            rt.dependencies[domain.DependencyName.SQL] = True
+            assert scheduler_module.start_scheduler(rt) is True
+            await asyncio.to_thread(function, **kwargs)
+            with session_factory() as db:
+                assert db.get(ConversationContext, PHONE) is None
+            rt.dependencies[domain.DependencyName.SQL] = False
+            assert scheduler_module.start_scheduler(rt) is True
+            assert len(jobs) == 1 and starts == [True]
+    asyncio.run(run())
+    scheduler_module.stop_scheduler()  # repeated/inert shutdown is harmless
+    assert stops == [True]
+
+
+@pytest.mark.parametrize("result", ["failed", "stale", "closed"])
+def test_final_scheduler_audit_counts_only_closed_contacts(
+        admin_runtime, scheduler_module, monkeypatch, caplog, result):
+    import asyncio
+    rt = admin_runtime
+    rt.seed_contact(PHONE, age_minutes=61)
+    if result == "failed":
+        rt.store.fail_next_atomic("acquire")
+    elif result == "stale":
+        from app.models import ConversationContext
+        def refresh():
+            with rt._factory() as db:
+                assert db.bind.url.database in (None, "", ":memory:")
+                db.get(ConversationContext, PHONE).last_activity = rt.clock.now().replace(tzinfo=None)
+                db.commit()
+        rt.store.client.before_operation["acquire"] = refresh
+    with caplog.at_level(logging.INFO):
+        asyncio.run(scheduler_module.check_inactive_contexts(rt))
+    records = [record.audit for record in caplog.records
+               if record.name == scheduler_module.logger.name]
+    assert any(row.get("attempt_state") == "scanning" and row.get("count") == 1 for row in records)
+    recovered = [row for row in records if row.get("outcome") == "recovered"]
+    assert [row["count"] for row in recovered] == ([1] if result == "closed" else [])
+    if result == "failed":
+        assert any(row.get("attempt_state") == "failed" and row.get("count") == 1 for row in records)
+    if result == "stale":
+        assert any(row.get("outcome") == "ignored" and row.get("count") == 1 for row in records)
+
+
+def test_final_health_is_dependency_free_alive(main_module, monkeypatch):
+    import asyncio
+    monkeypatch.setattr(main_module, "get_conversation_runtime", lambda: pytest.fail("liveness probed dependencies"))
+    assert asyncio.run(main_module.health_check())["status"] == "alive"
+
+
 def recovery_api():
     assert importlib.util.find_spec("app.conversation_recovery") is not None, "recovery service missing"
     return importlib.import_module("app.conversation_recovery")
@@ -1495,7 +1744,7 @@ def test_ready_scheduler_shutdown_only_after_affirmative_start(main_module, admi
     monkeypatch.setattr(main_module, "stop_scheduler", lambda: calls.append("stop"))
     async def run():
         async with main_module.lifespan(main_module.app):
-            assert (await main_module.health_check())["status"] == "healthy"
+            assert (await main_module.health_check())["status"] == "alive"
     asyncio.run(run())
     assert calls == (["start", "stop"] if start_result is True else ["start"])
 
@@ -1514,8 +1763,8 @@ def test_ready_lifespan_preserves_schema_initialization_only_after_gate(main_mod
             assert main_module.app.state.conversation_runtime is admin_runtime
     asyncio.run(run())
     assert initialized == ([True] if ready else [])
-    assert started == ([admin_runtime] if ready else [])
-    assert stopped == ([True] if ready else [])
+    assert started == [admin_runtime]
+    assert stopped == [True]
 
 
 def test_ready_worker_and_recovery_share_one_composed_runtime(main_module, admin_runtime, monkeypatch):
@@ -2762,7 +3011,7 @@ def test_outbound_reservation_fault_precedes_broker_and_preserves_recoverable_re
 def test_outbound_command_rejects_invalid_json_payload_without_exposing_values(task_api, fault):
     from uuid import uuid4
     payload = domain.OutboundEnvelope(PHONE, "synthetic-private-text", domain.OutboundKind.NORMAL,
-        str(uuid4()), str(uuid4()), str(uuid4())).to_dict()
+        str(uuid4()), str(uuid4()), str(uuid4()), coordination_epoch=str(uuid4())).to_dict()
     if fault == "missing":
         del payload["text"]
     elif fault == "extra":
@@ -2788,7 +3037,7 @@ def test_outbound_command_roundtrip_uses_canonical_processing_type(task_api):
     generation, operation = str(uuid4()), str(uuid4())
     ref = domain.PauseTransitionRef(generation, datetime(2026, 9, 13, tzinfo=timezone.utc), "user_requested_human_assistance")
     outbound = domain.OutboundEnvelope(PHONE, "Resposta", domain.OutboundKind.TRANSFER_CONFIRMATION,
-        generation, str(uuid4()), operation, pause_ref=ref)
+        generation, str(uuid4()), operation, pause_ref=ref, coordination_epoch=str(uuid4()))
     assert domain.OutboundEnvelope.from_payload(json.loads(json.dumps(outbound.to_payload()))) == outbound
 
 
@@ -2997,10 +3246,10 @@ def test_sender_runs_async_transport_inside_live_lease_and_fresh_session(_case, 
     outbound = rt.outbound_broker.calls[-1]
     sessions = rt.session_calls
     original = rt.transport.send_message
-    async def send(phone, text):
+    async def send(phone, text, *, authorize=None):
         with pytest.raises(domain.ContactLockUnavailable):
             rt.pause()
-        return original(phone, text)
+        return original(phone, text, authorize=authorize)
     rt.transport.send_message = send
     assert task_api.send_outbound(outbound, rt) is task_api.SendOutcome.SENT
     assert rt.session_calls == sessions + 1
@@ -3027,7 +3276,8 @@ def test_task_celery_broker_exception_is_ambiguous_without_sensitive_error(main_
     else:
         from uuid import uuid4
         result = module.CeleryOutboundBroker(task).enqueue_outbound(domain.OutboundEnvelope(
-            PHONE, "synthetic", domain.OutboundKind.NORMAL, command.generation, str(uuid4()), str(uuid4())))
+            PHONE, "synthetic", domain.OutboundKind.NORMAL, command.generation, str(uuid4()), str(uuid4()),
+            coordination_epoch=command.coordination_epoch))
     assert result is domain.EnqueueResult.AMBIGUOUS
 
 

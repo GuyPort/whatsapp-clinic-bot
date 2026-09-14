@@ -318,7 +318,8 @@ Após responder qualquer dúvida ou enviar um link:
                 items.append(f"• {dados.get('nome', cod)}")
         return "\n".join(items) if items else "Convênios não informados."
 
-    def prepare_result(self, message: str, phone: str, snapshot: ConversationSnapshot) -> AgentResult:
+    def prepare_result(self, message: str, phone: str, snapshot: ConversationSnapshot,
+                       *, authorize: Callable[[], None] | None = None) -> AgentResult:
         """Produz texto e intenção sem consultar ou alterar estado persistente."""
         if not isinstance(phone, str) or re.fullmatch(r"[1-9][0-9]{9,14}", phone) is None:
             raise InvalidCanonicalContact(FailureReason.INVALID_CANONICAL_CONTACT)
@@ -346,8 +347,9 @@ Após responder qualquer dúvida ou enviar um link:
                 for item in history
             ]
             system_prompt = self._get_system_prompt_for(phone)
-            response = self._call_claude(claude_messages, system_prompt)
-            outcome = self._process_claude_response(response, claude_messages, phone, system_prompt)
+            response = self._call_claude(claude_messages, system_prompt, authorize=authorize)
+            outcome = self._process_claude_response(response, claude_messages, phone, system_prompt,
+                                                    authorize=authorize)
             if outcome.intent is not None:
                 return AgentResult(outcome.content, [], None, {}, outcome.intent)
 
@@ -363,10 +365,12 @@ Após responder qualquer dúvida ou enviar um link:
         except Exception:
             raise AgentUnavailable(FailureReason.AGENT_UNAVAILABLE) from None
 
-    def _call_claude(self, messages: list, system_prompt: str):
+    def _call_claude(self, messages: list, system_prompt: str, *, authorize=None):
         """Mantém a mesma configuração e os links canônicos em cada rodada."""
         _emit_audit(AuditEvent.PROCESSING, outcome="agent_started", attempt_state="provider_call")
         try:
+            if authorize is not None:
+                authorize()  # Optional only for isolated, authority-free adapter callers.
             response = self.client.messages.create(
                 model="claude-sonnet-4-6",
                 max_tokens=1500,
@@ -393,7 +397,7 @@ Após responder qualquer dúvida ou enviar um link:
         return response
 
     def _process_claude_response(self, response, claude_messages: list, phone: str,
-                                 system_prompt: str) -> ToolOutcome:
+                                 system_prompt: str, *, authorize=None) -> ToolOutcome:
         """Resolve até três rodadas de tools, sempre conservando a intenção."""
         for iteration in range(4):
             blocks = getattr(response, "content", None)
@@ -442,7 +446,7 @@ Após responder qualquer dúvida ou enviar um link:
                     for block, outcome in zip(tool_blocks, outcomes)
                 ]},
             ])
-            response = self._call_claude(claude_messages, system_prompt)
+            response = self._call_claude(claude_messages, system_prompt, authorize=authorize)
 
         raise AgentResponseInvalid(FailureReason.TOOL_ITERATION_LIMIT)
 

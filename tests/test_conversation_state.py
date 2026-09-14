@@ -50,6 +50,84 @@ def recovery_api():
     return importlib.import_module("app.conversation_recovery")
 
 
+def final_prepared_mutation(store, lease):
+    from app.conversation_state import MutationTarget
+    target = MutationTarget("CLOSE_CONTEXT", "request", "empty", ConversationCycle.CLOSED)
+    return store.prepare_mutation(lease.phone, target.kind, target.fingerprint, lease,
+                                  "final-operation", store.clock.now(), target=target)
+
+
+@pytest.mark.parametrize("phase", ["PREPARED", "COMMITTING", "expired_committing"])
+@pytest.mark.parametrize("fault", ["index", "detail", "altered_detail", "cas_index", "cas_detail"])
+def test_final_mutation_recovery_metadata_is_manifest_fenced(transition_env, phase, fault):
+    from app.conversation_redis import MUTATION_INDEX_KEY
+    coordinator, db, store, clock = transition_env
+    with store.contact_lease(PHONE) as lease:
+        store.initialize_contact(PHONE, lease, db_state_present=False)
+        attempt = final_prepared_mutation(store, lease)
+        if phase != "PREPARED":
+            store.enter_committing(PHONE, attempt.operation_id, lease, clock.now(), attempt.processing_deadline)
+    if phase == "expired_committing":
+        clock.set(attempt.processing_deadline)
+    member = store._mutation_member(PHONE, {"operation_id": attempt.operation_id})
+    key = store._mutation_recovery_key(member)
+    assert store.client.sismember(MUTATION_INDEX_KEY, member) == 1
+    assert store.client.get(key) is not None
+    def corrupt():
+        if fault.endswith("index"):
+            store.client.sets[MUTATION_INDEX_KEY].remove(member)
+        elif fault == "altered_detail":
+            value = json.loads(store.client.values[key])
+            value[1] = "different-operation"
+            store.client.values[key] = json.dumps(value)
+        else:
+            store.client.values.pop(key)
+    with store.contact_lease(PHONE) as lease:
+        if fault.startswith("cas_"):
+            store.client.before_operation["validate"] = corrupt
+        else:
+            corrupt()
+        with pytest.raises(ConversationGenerationUnavailable):
+            store.read_anchor(lease)
+        assert store.is_quarantined(PHONE)
+        assert db.events == []
+
+
+@pytest.mark.parametrize("fault", ["revision", "fingerprint", "atomic", "valid"])
+def test_final_mutation_recovery_terminal_cleanup_is_atomic(transition_env, fault):
+    from dataclasses import replace
+    from app.conversation_redis import MUTATION_INDEX_KEY
+    coordinator, db, store, clock = transition_env
+    with store.contact_lease(PHONE) as lease:
+        store.initialize_contact(PHONE, lease, db_state_present=False)
+        attempt = final_prepared_mutation(store, lease)
+        anchor = store.read_anchor(lease)
+        before = store.snapshot()
+        if fault in ("revision", "fingerprint"):
+            stale = replace(anchor, **({"contact_revision": anchor.contact_revision - 1} if fault == "revision"
+                                     else {"manifest_fingerprint": "stale"}))
+            with pytest.raises(ConversationStateUnavailable):
+                store.compare_and_set(lease, stale, store.read_details(lease))
+            assert store.snapshot() == before
+        elif fault == "atomic":
+            store.fail_next_atomic("abort_prepared")
+            with pytest.raises(ConversationStateUnavailable):
+                store.abort_prepared(PHONE, attempt.operation_id, lease, clock.now(),
+                                     request_fingerprint=attempt.request_fingerprint)
+            assert store.snapshot() == before
+        store.abort_prepared(PHONE, attempt.operation_id, lease, clock.now(),
+                             request_fingerprint=attempt.request_fingerprint)
+        member = store._mutation_member(PHONE, {"operation_id": attempt.operation_id})
+        assert not store.client.sismember(MUTATION_INDEX_KEY, member)
+        assert store.client.get(store._mutation_recovery_key(member)) is None
+        assert store.inspect_mutation(PHONE, attempt.operation_id, lease).phase is MutationPhase.ABORTED
+    clock.advance(timedelta(days=8))
+    with store.contact_lease(PHONE) as lease:
+        store.cleanup(lease, store.read_anchor(lease))
+        assert store.read_details(lease) == ()
+    assert db.events == []
+
+
 def test_ready_coordinator_keeps_legacy_constructor_and_explicit_gate(transition_env):
     from app.conversation_state import ConversationCoordinator, ReadinessUnavailable
     from app.models import PausedContact
@@ -417,6 +495,7 @@ def test_domain_enums_serialize_to_the_cross_task_wire_values():
 def test_outbound_envelope_serializes_nested_refs_to_json_primitives():
     """Catches enum/datetime objects leaking into the broker payload."""
     envelope = OutboundEnvelope(
+        coordination_epoch="00000000-0000-4000-8000-000000000001",
         phone="5551999990000",
         text="synthetic response",
         kind=OutboundKind.TRANSFER_CONFIRMATION,
@@ -433,6 +512,7 @@ def test_outbound_envelope_serializes_nested_refs_to_json_primitives():
     payload = envelope.to_dict()
 
     assert payload == {
+        "coordination_epoch": "00000000-0000-4000-8000-000000000001",
         "phone": "5551999990000",
         "text": "synthetic response",
         "kind": "TRANSFER_CONFIRMATION",
@@ -539,7 +619,7 @@ def test_manual_clock_advances_monotonically_and_returns_new_time():
 def test_anchor_domain_rejects_invalid_revision_or_generation_lineage(revision, generation, history):
     """Catches invalid anchor fences entering adapters through typed domain construction."""
     with pytest.raises(ConversationGenerationUnavailable) as raised:
-        ContactAnchor(revision, generation, (), "unused", history)
+        ContactAnchor(revision, generation, (), "unused", history, coordination_epoch=UUID(int=1))
     assert raised.value.reason_code is FailureReason.GENERATION_UNAVAILABLE
 
 
@@ -615,7 +695,8 @@ def test_state_transfer_reference_rejects_every_stale_binding(transition_env, ch
         reference = coordinator.pause_for_secretary(db, PHONE, "user_requested_human_assistance",
                                                    clock.now(), lease, "transfer")
         outbound = OutboundEnvelope(PHONE, "synthetic", OutboundKind.TRANSFER_CONFIRMATION,
-                                    reference.generation, "processing", "transfer", pause_ref=reference)
+                                    reference.generation, "processing", "transfer", pause_ref=reference,
+                                    coordination_epoch=str(store.config.coordination_epoch))
         if change == "missing":
             outbound = replace(outbound, pause_ref=None)
         elif change == "old_generation":
@@ -847,7 +928,8 @@ def test_closed_new_ingress_rotates_generation_and_invalidates_closure_send(_cas
         assert db.get(ConversationContext, PHONE) is None
         assert store.read_anchor(lease).cycle is ConversationCycle.CLOSED
         envelope = OutboundEnvelope(PHONE, "synthetic", OutboundKind.CLOSURE_CONFIRMATION,
-                                    ref.generation, None, "close-1", closure_ref=ref)
+                                    ref.generation, None, "close-1", closure_ref=ref,
+                                    coordination_epoch=str(store.config.coordination_epoch))
         assert coordinator.may_send(db, envelope, clock.now(), lease)
         reopened = coordinator.resolve_ingress(db, PHONE, clock.now(), lease)
         assert reopened.cycle is ConversationCycle.OPEN
@@ -861,11 +943,13 @@ def test_send_exact_pause_reference_and_current_open_generation_only(_case, tran
     coordinator, db, store, clock = transition_env
     with store.contact_lease(PHONE) as lease:
         opened = coordinator.resolve_ingress(db, PHONE, clock.now(), lease)
-        normal = OutboundEnvelope(PHONE, "synthetic", OutboundKind.NORMAL, opened.generation, "p-1", "op-1")
+        normal = OutboundEnvelope(PHONE, "synthetic", OutboundKind.NORMAL, opened.generation, "p-1", "op-1",
+                                  coordination_epoch=str(store.config.coordination_epoch))
         assert coordinator.may_send(db, normal, clock.now(), lease)
         ref = coordinator.pause_for_secretary(db, PHONE, "user_requested_human_assistance", clock.now(), lease, "pause-1")
         transfer = OutboundEnvelope(PHONE, "synthetic", OutboundKind.TRANSFER_CONFIRMATION,
-                                    ref.generation, "p-1", "pause-1", pause_ref=ref)
+                                    ref.generation, "p-1", "pause-1", pause_ref=ref,
+                                    coordination_epoch=str(store.config.coordination_epoch))
         assert coordinator.may_send(db, transfer, clock.now(), lease)
         assert not coordinator.may_send(db, normal, clock.now(), lease)
         for bad_ref in (replace(ref, reason="wrong"), replace(ref, paused_until=ref.paused_until + timedelta(microseconds=1))):
@@ -881,7 +965,8 @@ def test_send_missing_coordination_never_initializes_contact(_case, transition_e
     from app.models import ConversationContext, PausedContact
     coordinator, db, store, clock = transition_env
     outbound = OutboundEnvelope(PHONE, "synthetic", kind,
-                                "00000000-0000-4000-8000-000000000002", "p-1", "op-1")
+                                "00000000-0000-4000-8000-000000000002", "p-1", "op-1",
+                                coordination_epoch=str(store.config.coordination_epoch))
     with store.contact_lease(PHONE) as lease:
         before = store.snapshot()
         with pytest.raises(ConversationGenerationUnavailable) as raised:
@@ -1048,7 +1133,8 @@ def test_send_transfer_requires_patient_requested_reason(transition_env, reason,
     with store.contact_lease(PHONE) as lease:
         ref = coordinator.pause_for_secretary(db, PHONE, reason, clock.now(), lease, "pause-1")
         outbound = OutboundEnvelope(PHONE, "synthetic", OutboundKind.TRANSFER_CONFIRMATION,
-                                    ref.generation, "p-1", "pause-1", pause_ref=ref)
+                                    ref.generation, "p-1", "pause-1", pause_ref=ref,
+                                    coordination_epoch=str(store.config.coordination_epoch))
         assert coordinator.may_send(db, outbound, clock.now(), lease) is allowed
 
 

@@ -63,13 +63,16 @@ def get_conversation_runtime():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Compose dependencies and preserve existing startup only after readiness."""
+    """Install the inert scheduler even when dependency startup is unavailable."""
     runtime = get_conversation_runtime()
     started = False
     try:
+        started = start_scheduler(runtime) is True
+    except Exception:
+        _emit_conversation_audit(AuditEvent.READINESS, outcome="dependency_unavailable")
+    try:
         _require_ready(runtime)
         init_db()
-        started = start_scheduler(runtime) is True
     except Exception:
         _emit_conversation_audit(AuditEvent.READINESS, outcome="dependency_unavailable")
     try:
@@ -228,7 +231,7 @@ async def root():
 async def health_check():
     """Health check endpoint"""
     return {
-        "status": "healthy",
+        "status": "alive",
         "service": "whatsapp-clinic-bot",
         "version": "1.0.0"
     }

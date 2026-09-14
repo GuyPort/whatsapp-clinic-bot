@@ -1266,6 +1266,7 @@ def test_quarantine_resolution_rotates_generation_and_rejects_old_outbound(trans
         kind = {"SAVE_CONTEXT": OutboundKind.NORMAL, "PAUSE_FOR_SECRETARY": OutboundKind.TRANSFER_CONFIRMATION,
                 "CLOSE_CONTEXT": OutboundKind.CLOSURE_CONFIRMATION}[intent]
         envelope = OutboundEnvelope(PHONE, "synthetic", kind, str(old.generation), "p-1", "op-1",
+            coordination_epoch=str(store.config.coordination_epoch),
             pause_ref=PauseTransitionRef(str(old.generation), clock.now() + timedelta(hours=24), "user_requested_human_assistance")
                 if intent == "PAUSE_FOR_SECRETARY" else None,
             closure_ref=ClosureTransitionRef(str(old.generation), "op-1") if intent == "CLOSE_CONTEXT" else None)
@@ -1638,7 +1639,8 @@ def test_quarantine_committed_pause_replay_returns_fresh_typed_reference_without
         assert db.get(PausedContact, PHONE).paused_until == expected_deadline.replace(tzinfo=None)
         assert db.events.count("commit_entered") == 1
         old_outbound = OutboundEnvelope(PHONE, "synthetic", OutboundKind.TRANSFER_CONFIRMATION,
-                                       original[0].generation, "p-1", "pause-1", pause_ref=original[0])
+                                       original[0].generation, "p-1", "pause-1", pause_ref=original[0],
+                                       coordination_epoch=str(store.config.coordination_epoch))
         assert not coordinator.may_send(db, old_outbound, clock.now(), lease)
 
 
@@ -2256,7 +2258,7 @@ def test_sender_missing_entire_coordination_never_initializes_old_generation(tas
     from uuid import uuid4
     rt = processing_runtime
     outbound = domain.OutboundEnvelope(PHONE, "synthetic", domain.OutboundKind.NORMAL,
-        str(uuid4()), str(uuid4()), str(uuid4()))
+        str(uuid4()), str(uuid4()), str(uuid4()), coordination_epoch=str(rt.store.config.coordination_epoch))
     with pytest.raises(task_api.RetryRequested):
         task_api.send_outbound(outbound, rt)
     assert rt.store.contact_snapshot(PHONE)["values"] == {}

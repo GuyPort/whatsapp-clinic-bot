@@ -400,11 +400,13 @@ class ContactAnchor:
     manifest: tuple[ManifestEntry, ...]
     manifest_fingerprint: str
     generation_history: tuple[UUID, ...]
+    coordination_epoch: UUID = field(kw_only=True)
     cycle: ConversationCycle = ConversationCycle.OPEN
     mutation_fence: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
         if (type(self.contact_revision) is not int or self.contact_revision < 0
+                or not isinstance(self.coordination_epoch, UUID)
                 or not isinstance(self.last_generation, UUID)
                 or not isinstance(self.generation_history, tuple)
                 or not all(isinstance(value, UUID) for value in self.generation_history)
@@ -621,6 +623,7 @@ class OutboundEnvelope:
     generation: str
     processing_id: str | None
     operation_id: str | None
+    coordination_epoch: str = field(kw_only=True)
     pause_ref: PauseTransitionRef | None = None
     closure_ref: ClosureTransitionRef | None = None
 
@@ -645,6 +648,7 @@ class OutboundEnvelope:
             "generation": self.generation,
             "processing_id": self.processing_id,
             "operation_id": self.operation_id,
+            "coordination_epoch": self.coordination_epoch,
             "pause_ref": pause_ref,
             "closure_ref": closure_ref,
         }
@@ -674,6 +678,7 @@ class OutboundEnvelope:
             if not isinstance(payload["text"], str) or not payload["text"]:
                 raise ValueError
             identifier(payload["generation"])
+            identifier(payload["coordination_epoch"])
             identifier(payload["processing_id"], optional=True)
             identifier(payload["operation_id"], optional=True)
             if type(payload["kind"]) is not str:
@@ -698,7 +703,7 @@ class OutboundEnvelope:
                 identifier(closure["operation_id"])
                 closure = ClosureTransitionRef(closure["generation"], closure["operation_id"])
             return cls(phone, payload["text"], kind, payload["generation"], payload["processing_id"],
-                payload["operation_id"], pause, closure)
+                payload["operation_id"], pause, closure, coordination_epoch=payload["coordination_epoch"])
         except (ValueError, TypeError, AttributeError, KeyError, OverflowError):
             raise ConversationStateUnavailable(FailureReason.INVALID_TASK_COMMAND) from None
 
@@ -1416,12 +1421,14 @@ class ConversationCoordinator:
             ref = self._pause(db, phone, "user_requested_human_assistance", now, lease, operation_id,
                               kind="PAUSE_FOR_SECRETARY", agent_request=agent_request)
             return OutboundEnvelope(phone, result.text, OutboundKind.TRANSFER_CONFIRMATION,
-                                    ref.generation, processing_id, operation_id, pause_ref=ref)
+                                    ref.generation, processing_id, operation_id, pause_ref=ref,
+                                    coordination_epoch=str(self.store.read_anchor(lease).coordination_epoch))
         if result.intent is AgentIntent.CLOSE_CONTEXT:
             attempt = self._remove(db, phone, now, lease, operation_id, "CLOSE_CONTEXT", agent_request=agent_request)
             ref = ClosureTransitionRef(str(attempt.generation), attempt.operation_id)
             return OutboundEnvelope(phone, result.text, OutboundKind.CLOSURE_CONFIRMATION,
-                                    ref.generation, processing_id, operation_id, closure_ref=ref)
+                                    ref.generation, processing_id, operation_id, closure_ref=ref,
+                                    coordination_epoch=str(attempt.epoch))
         if result.intent is not AgentIntent.SAVE_CONTEXT:
             raise ConversationStateUnavailable(FailureReason.INVALID_VALUE)
         payload = {"messages": result.messages, "flow": result.current_flow, "data": result.flow_data}
@@ -1444,7 +1451,8 @@ class ConversationCoordinator:
                 row.messages, row.current_flow, row.flow_data = deepcopy(result.messages), result.current_flow, deepcopy(result.flow_data)
                 row.status, row.last_activity = "active", _sql_time(attempt.started_at or now)
             previous = self._run_mutation(db, phone, "SAVE_CONTEXT", target, lease, operation_id, now, dml)
-        return OutboundEnvelope(phone, result.text, OutboundKind.NORMAL, str(previous.generation), processing_id, operation_id)
+        return OutboundEnvelope(phone, result.text, OutboundKind.NORMAL, str(previous.generation), processing_id, operation_id,
+                                coordination_epoch=str(previous.epoch))
 
     def _assert_open(self, db, phone, lease):
         if (self.store.read_anchor(lease).cycle is not ConversationCycle.OPEN
@@ -1458,9 +1466,13 @@ class ConversationCoordinator:
         lease.assert_owned()
         if db.new or db.dirty or db.deleted:
             raise ConversationStateUnavailable(FailureReason.INVALID_VALUE)
+        # Reject old broker work before loading a contact from the prior epoch.
+        if outbound.coordination_epoch != str(self.store.config.coordination_epoch):
+            return False
         anchor = self.store.read_anchor(lease)
         self.store.assert_mutation_available(lease, now)
-        if outbound.generation != str(anchor.last_generation):
+        if (outbound.coordination_epoch != str(anchor.coordination_epoch)
+                or outbound.generation != str(anchor.last_generation)):
             return False
         pause = db.get(PausedContact, outbound.phone, populate_existing=True)
         if outbound.kind is OutboundKind.NORMAL:

@@ -2,13 +2,14 @@
 Serviço de integração com Evolution API para WhatsApp.
 """
 import httpx
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Callable
 import logging
 import asyncio
 import redis
 from redis.lock import Lock
 
 from app.simple_config import settings
+from app.conversation_state import ConversationDomainError
 from app.utils import AuditEvent, ConversationAuditLogger, new_audit_correlation_id
 
 logger = logging.getLogger(__name__)
@@ -40,7 +41,8 @@ class WhatsAppService:
             self.redis_client = None
         
     
-    async def send_message(self, phone: str, message: str) -> bool:
+    async def send_message(self, phone: str, message: str,
+                           *, authorize: Callable[[], None] | None = None) -> bool:
         """
         Envia uma mensagem de texto para um número de WhatsApp.
         Usa Redis Lock para garantir rate limiting de 1 mensagem a cada 5 segundos.
@@ -56,7 +58,7 @@ class WhatsAppService:
         if not self.redis_client:
             _emit_audit(AuditEvent.OUTBOUND, outcome="dependency_unavailable",
                         attempt_state="without_rate_limit")
-            return await self._send_message_internal(phone, message)
+            return await self._send_message_internal(phone, message, authorize=authorize)
         
         lock_key = "whatsapp:send_message:lock"
         lock = Lock(
@@ -81,7 +83,7 @@ class WhatsAppService:
             # Tentar enviar mensagem (com retry automático para 429)
             max_retries = 3
             for attempt in range(max_retries):
-                success = await self._send_message_internal(phone, message)
+                success = await self._send_message_internal(phone, message, authorize=authorize)
                 
                 if success:
                     # Manter lock por 5 segundos para garantir intervalo mínimo
@@ -103,6 +105,8 @@ class WhatsAppService:
                         attempt_state="exhausted", count=max_retries)
             return False
             
+        except ConversationDomainError:
+            raise
         except Exception:
             _emit_audit(AuditEvent.OUTBOUND, outcome="transport_failed", attempt_state="failed")
             return False
@@ -116,7 +120,7 @@ class WhatsAppService:
                 _emit_audit(AuditEvent.OUTBOUND, outcome="coordination_failed",
                             attempt_state="release_failed")
     
-    async def _send_message_internal(self, phone: str, message: str) -> bool:
+    async def _send_message_internal(self, phone: str, message: str, *, authorize=None) -> bool:
         """
         Método interno para enviar mensagem sem lock.
         Trata erros 429 automaticamente.
@@ -135,6 +139,8 @@ class WhatsAppService:
             }
             
             async with httpx.AsyncClient(timeout=30.0) as client:
+                if authorize is not None:
+                    authorize()  # After client entry/rate waits, before every HTTP attempt.
                 response = await client.post(url, json=payload, headers=self.headers)
                 
                 # Tratar erro 429 (rate limit)
@@ -160,6 +166,8 @@ class WhatsAppService:
                                 attempt_state="provider_rejected")
                     return False
                     
+        except ConversationDomainError:
+            raise
         except Exception:
             _emit_audit(AuditEvent.OUTBOUND, outcome="transport_failed", attempt_state="provider_failed")
             return False

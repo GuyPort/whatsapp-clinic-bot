@@ -580,7 +580,9 @@ def test_conversation_audit_sentinel_capture_covers_all_operational_paths(
 
     monkeypatch.setattr(rt.coordinator, "accept_ingress", observe_ingress)
 
-    def agent_result(message, contact, snapshot):
+    def agent_result(message, contact, snapshot, *, authorize=None):
+        if authorize is not None:
+            authorize()
         observed_phones.add(contact)
         observed_values.update((message, contact))
         return AgentResult(sentinels[8], snapshot.messages, snapshot.current_flow,

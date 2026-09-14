@@ -5,6 +5,7 @@ Lembretes de consulta agora são enviados pelo MedSystem (Django).
 from apscheduler.schedulers.background import BackgroundScheduler
 from datetime import timedelta, timezone
 from uuid import uuid4
+from threading import RLock
 from app.conversation_tasks import _require_ready
 from app.models import ConversationContext
 from app.utils import AuditEvent, ConversationAuditLogger, new_audit_correlation_id
@@ -34,21 +35,35 @@ async def check_inactive_contexts(runtime=None):
         _emit_audit(AuditEvent.RECOVERY, outcome=failure_outcome, attempt_state="closed")
         return
 
+    _emit_audit(AuditEvent.RECOVERY, outcome="started", attempt_state="scanning",
+                count=min(len(phones), 1_000_000))
+    closed = failed = skipped = 0
     for (phone,) in phones:
         try:
             _require_ready(runtime)
         except Exception:
             _emit_audit(AuditEvent.RECOVERY, outcome="dependency_unavailable", attempt_state="closed")
-            return
+            break
         try:
             with runtime.store.contact_lease(phone) as lease, runtime.session_factory() as db:
                 _require_ready(runtime)
-                runtime.coordinator.close_inactive_context(db, phone, cutoff,
+                did_close = runtime.coordinator.close_inactive_context(db, phone, cutoff,
                     runtime.clock.now(), lease, str(uuid4()))
+                if did_close:
+                    closed += 1
+                else:
+                    skipped += 1
         except Exception:
-            _emit_audit(AuditEvent.RECOVERY, outcome="coordination_failed", attempt_state="failed")
-    _emit_audit(AuditEvent.RECOVERY, outcome="recovered", attempt_state="completed",
-                count=min(len(phones), 1_000_000))
+            failed += 1
+    if closed:
+        _emit_audit(AuditEvent.RECOVERY, outcome="recovered", attempt_state="completed",
+                    count=min(closed, 1_000_000))
+    if failed:
+        _emit_audit(AuditEvent.RECOVERY, outcome="coordination_failed", attempt_state="failed",
+                    count=min(failed, 1_000_000))
+    if skipped:
+        _emit_audit(AuditEvent.RECOVERY, outcome="ignored", attempt_state="terminal",
+                    count=min(skipped, 1_000_000))
 
 
 def run_check(runtime=None):
@@ -58,28 +73,30 @@ def run_check(runtime=None):
 
 # Criar scheduler
 scheduler = BackgroundScheduler()
+_scheduler_lock = RLock()
 
 
 def start_scheduler(runtime=None):
     """Use the composed runtime and remain inert while dependencies are closed."""
-    try:
-        _require_ready(runtime)
-    except Exception:
-        _emit_audit(AuditEvent.READINESS, outcome="dependency_unavailable")
-        return False
-    scheduler.add_job(
-        run_check,
-        'interval',
-        minutes=20,
-        id='check_inactive_contexts',
-        kwargs={"runtime": runtime}
-    )
-    scheduler.start()
+    with _scheduler_lock:
+        scheduler.add_job(
+            run_check,
+            'interval',
+            minutes=20,
+            id='check_inactive_contexts',
+            kwargs={"runtime": runtime},
+            replace_existing=True,
+        )
+        if not scheduler.running:
+            scheduler.start()
     _emit_audit(AuditEvent.RECOVERY, outcome="started", attempt_state="scheduled")
     return True
 
 
 def stop_scheduler():
     """Para o scheduler"""
-    scheduler.shutdown()
+    with _scheduler_lock:
+        if not scheduler.running:
+            return
+        scheduler.shutdown()
     _emit_audit(AuditEvent.RECOVERY, outcome="stopped", attempt_state="terminal")

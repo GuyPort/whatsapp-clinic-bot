@@ -418,14 +418,14 @@ executáveis da spec aprovada; eles podem ser selecionados com `pytest -k` ou
 pelo node ID completo. Os testes usam barreiras e snapshots SQL sintéticos;
 não comprovam isolamento ou entrega em serviços hospedados.
 
-Verificação local da Task 11 após a revisão: estado **166**, fluxo **908**, segurança **274**,
-concorrência **212** e suíte completa **1560 testes aprovados**. Os cinco comandos
-acima terminaram com exit `0`. A suíte completa registrou 414 avisos do escape
-preexistente em `app/main.py:2318`; nenhum serviço externo foi acessado.
+Verificação local após a correção final: estado **185**, fluxo **929**, segurança **274**,
+concorrência **212** e suíte completa **1600 testes aprovados**. Os cinco comandos
+acima terminaram com exit `0`. A suíte completa registrou 419 avisos do escape
+preexistente em `app/main.py:2321`; nenhum serviço externo foi acessado.
 
 ### Sinais de disponibilidade e proprietários das falhas
 
-`GET /health` é apenas liveness: responde 200 quando o processo HTTP está vivo,
+`GET /health` é apenas liveness: responde 200 com `status: alive` quando o processo HTTP está vivo,
 sem sondar SQL, Redis ou broker. `GET /ready` responde 200 somente quando todas
 as dependências obrigatórias estão disponíveis; caso contrário, responde 503.
 O corpo contém somente `status` (`ready`/`not_ready`) e `dependencies`, com as
@@ -446,9 +446,17 @@ CLI. Na query da URL aceita-se somente um `db` numérico; opções de timeout,
 retry ou outras opções são rejeitadas antes da construção, incluindo variantes
 duplicadas, codificadas ou com caixa diferente. A configuração efetiva do pool
 é conferida depois da construção: timeout de até 2 segundos e zero retries.
-O startup preserva a inicialização SQL e o cleanup de 20 minutos somente depois
-de readiness passar. Se o processo iniciou indisponível, reinicie-o após corrigir
-as dependências para iniciar também esse cleanup.
+O startup instala uma única tarefa de cleanup de 20 minutos mesmo quando as
+dependências estão indisponíveis; a inicialização SQL continua exigindo readiness.
+Cada execução do cleanup permanece inerte enquanto readiness estiver fechada.
+Quando as dependências se recuperam, o próximo ciclo retoma a limpeza sem reinício.
+
+O epoch fica gravado na âncora durável do contato e no controle de geração, e é
+obrigatório no envelope de saída. Trabalho de um epoch anterior é rejeitado mesmo
+depois da remoção dos recibos temporários por expiração e cleanup. As referências
+de recuperação de mutações pendentes (membership global e detalhe canônico) são
+validadas a partir da barreira durável da âncora em cada CAS, inclusive antes de
+compactação: perda ou divergência bloqueia o contato, sem reconstrução automática.
 
 HTTP, workers e cleanup usam o mesmo contrato `ConversationRuntime`. O Celery
 beat registra `app.main.recover_conversations_task`, no intervalo
@@ -470,6 +478,10 @@ Páginas antigas são apenas candidatos: tentativas criadas depois da leitura
 da página são reavaliadas com o relógio atual sob lease e preservadas enquanto
 saudáveis. Readiness é rechecado junto às fronteiras seguintes de DML, agente,
 broker, transporte e checkpoint, inclusive depois de operações demoradas.
+O agente e o transporte recebem a autorização da lease/readiness e a revalidam
+imediatamente antes de cada chamada ao Claude e de cada POST, após a espera pelo
+rate limit, entre retries e entre rodadas de ferramentas. Falhas de autorização
+preservam o tipo de coordenação ou readiness até o proprietário do retry.
 Essas observações não são uma transação atômica com as dependências externas.
 Resultados, commits e enqueues já reconhecidos mantêm seu registro canônico
 mesmo se readiness fechar; o próximo efeito externo é bloqueado.
@@ -501,9 +513,10 @@ de recovery/rotação continuam **NÃO VERIFICADOS** por testes locais simulados
 
 Os eventos usam classes fixas como `dependency_unavailable`, `coordination_failed`,
 `persistence_failed` e `transport_failed`, sem detalhes sensíveis da exceção.
-O resumo final do scheduler conta candidatos examinados e ainda pode registrar
-`recovered/completed` mesmo quando houve falhas por contato; consulte também os
-eventos individuais. Esse limite conhecido não é uma prova de limpeza concluída.
+O scheduler registra separadamente a quantidade de candidatos (`started/scanning`),
+contextos efetivamente encerrados (`recovered/completed`), falhas
+(`coordination_failed/failed`) e candidatos já atualizados (`ignored/terminal`).
+Sem encerramento confirmado, não registra `recovered/completed`.
 
 Entrega exatamente uma vez sem outbox permanece **NÃO VERIFICADA**. Persistência
 e failover de Redis, ambiguidade do broker, Wasender e Claude reais permanecem
