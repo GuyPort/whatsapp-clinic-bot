@@ -4,14 +4,11 @@ Aplicação FastAPI principal com webhooks do WhatsApp.
 from fastapi import FastAPI, Request, HTTPException, Depends
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
-from contextlib import asynccontextmanager, contextmanager
+from contextlib import asynccontextmanager
 import logging
 import secrets
-import re
 from typing import Dict, Any, List
 from datetime import datetime, date
-from uuid import uuid4
-from threading import Lock
 
 from app.simple_config import settings
 
@@ -19,14 +16,7 @@ from app.database import init_db, get_db
 from sqlalchemy.orm import Session
 from app.ai_agent import ai_agent
 from app.whatsapp_service import whatsapp_service
-from app.utils import (
-    AuditEvent, ConversationAuditLogger, new_audit_correlation_id, normalize_phone,
-)
-from app.conversation_state import (
-    IngressDisposition, SenderIdentity, ConversationDomainError, OutboundEnvelope, ProcessingCommand,
-    ConversationCoordinator, InvalidManualPauseDuration, PauseReason, manual_pause_deadline,
-)
-from app.conversation_tasks import process_batch, send_outbound, RetryRequested, simulate_message, _require_ready
+from app.utils import normalize_phone
 from app.models import Appointment, ConversationContext, PausedContact, AppointmentStatus
 from app.scheduler import start_scheduler, stop_scheduler
 from app.celery_app import celery_app
@@ -38,48 +28,22 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
-conversation_audit = ConversationAuditLogger(logger)
-_runtime_lock = Lock()
-
-
-def _emit_conversation_audit(event: AuditEvent, **fields: object) -> None:
-    conversation_audit.emit(event, correlation_id=new_audit_correlation_id(), **fields)
-
-
-def get_conversation_runtime():
-    """One process-local composition shared by HTTP, workers and cleanup."""
-    with _runtime_lock:
-        runtime = getattr(app.state, "conversation_runtime", None)
-        if runtime is None:
-            try:
-                from app.conversation_recovery import build_runtime
-                runtime = build_runtime(settings=settings, processing_task=process_message_task,
-                    outbound_task=send_message_task, celery=celery_app)
-                app.state.conversation_runtime = runtime
-            except Exception:
-                _emit_conversation_audit(AuditEvent.READINESS, outcome="dependency_unavailable")
-        return runtime
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Install the inert scheduler even when dependency startup is unavailable."""
-    runtime = get_conversation_runtime()
-    started = False
-    try:
-        started = start_scheduler(runtime) is True
-    except Exception:
-        _emit_conversation_audit(AuditEvent.READINESS, outcome="dependency_unavailable")
-    try:
-        _require_ready(runtime)
-        init_db()
-    except Exception:
-        _emit_conversation_audit(AuditEvent.READINESS, outcome="dependency_unavailable")
-    try:
-        yield
-    finally:
-        if started:
-            stop_scheduler()
+    """Lifecycle da aplicação"""
+    # Startup
+    logger.info("🚀 Iniciando bot da clínica...")
+    init_db()
+    start_scheduler()  # Iniciar scheduler de timeout proativo
+    logger.info("✅ Bot iniciado com sucesso!")
+    
+    yield
+    
+    # Shutdown
+    stop_scheduler()  # Parar scheduler
+    logger.info("👋 Encerrando bot da clínica...")
 
 
 # Criar aplicação FastAPI
@@ -231,190 +195,358 @@ async def root():
 async def health_check():
     """Health check endpoint"""
     return {
-        "status": "alive",
+        "status": "healthy",
         "service": "whatsapp-clinic-bot",
         "version": "1.0.0"
     }
 
 
-@app.get("/ready")
-def readiness_check():
-    from app.conversation_recovery import public_readiness
-    body, status = public_readiness(getattr(app.state, "conversation_runtime", None))
-    return JSONResponse(body, status_code=status)
-
-
-def _message_event(payload):
-    if not isinstance(payload, dict) or payload.get("event") not in ("messages.upsert", "messages.received"):
-        return None
-    data = payload.get("data")
-    if not isinstance(data, dict):
-        return None
-    message = data.get("messages", data)
-    if not isinstance(message, dict) or not isinstance(message.get("key"), dict):
-        return None
-    return message
-
-
-def resolve_sender_identity(payload) -> SenderIdentity | None:
-    """Resolve authenticated individual identity before inspecting origin/text."""
-    event = _message_event(payload)
-    if event is None:
-        return None
-    key = event["key"]
-    raw = key.get("remoteJid")
-    if not isinstance(raw, str) or not raw:
-        return None
-    if "@g.us" in raw or "@newsletter" in raw:
-        return None
-    raw_kind = "pn"
-    if raw.endswith("@lid"):
-        raw_kind = "lid"
-        cleaned = key.get("cleanedSenderPn")
-        raw = cleaned if isinstance(cleaned, str) and re.fullmatch(r"[1-9][0-9]{9,14}", cleaned) else key.get("senderPn")
-        if not isinstance(raw, str) or not raw or (
-                "@" in raw and not raw.endswith(("@s.whatsapp.net", "@c.us"))):
-            return None
-    elif "@" in raw:
-        if not raw.endswith(("@s.whatsapp.net", "@c.us")):
-            return None
-        raw_kind = "jid"
-    phone = normalize_phone(raw)
-    if not phone:
-        return None
-    from_me = key.get("fromMe", False)
-    message_id = key.get("id")
-    if not isinstance(from_me, bool):
-        return None
-    if message_id is not None and (not isinstance(message_id, str) or not message_id):
-        return None
-    return SenderIdentity(phone, from_me, message_id, raw_kind)
-
-
-def _ingress_content(payload) -> tuple[str, str] | None:
-    message = _message_event(payload).get("message")
-    if not isinstance(message, dict):
-        return None
-    text = message.get("conversation")
-    if isinstance(text, str) and text.strip():
-        return "text", text
-    extended = message.get("extendedTextMessage")
-    if isinstance(extended, dict) and isinstance(extended.get("text"), str) and extended["text"].strip():
-        return "text", extended["text"]
-    image = message.get("imageMessage")
-    if isinstance(image, dict) and isinstance(image.get("caption"), str) and image["caption"].strip():
-        return "text", image["caption"]
-    for field, label in (
-        ("imageMessage", "imagem"), ("audioMessage", "áudio"), ("videoMessage", "vídeo"),
-        ("documentMessage", "documento"), ("stickerMessage", "figurinha"),
-    ):
-        if isinstance(message.get(field), dict):
-            return "media", label
-    return None
-
-
 @app.post("/webhook/whatsapp")
 async def whatsapp_webhook(request: Request):
-    """Authenticate headers, require readiness and delegate canonical ingress."""
-    secret = settings.webhook_secret
-    signature = request.headers.get("X-Webhook-Signature")
-    if secret is None:
-        _emit_conversation_audit(AuditEvent.INGRESS, outcome="dependency_unavailable")
-        return JSONResponse({"status": "temporarily_unavailable"}, status_code=503)
-    if signature is None or not secrets.compare_digest(signature.encode("utf-8"), secret.encode("utf-8")):
-        _emit_conversation_audit(AuditEvent.INGRESS, outcome="unauthorized")
-        return JSONResponse({"status": "unauthorized"}, status_code=401)
-    # Task 9 owns production composition. Absence is closed, never legacy fallback.
-    runtime = getattr(request.app.state, "conversation_runtime", None)
-    try:
-        if runtime is None or not runtime.readiness_status().ready:
-            _emit_conversation_audit(AuditEvent.READINESS, outcome="dependency_unavailable")
-            return JSONResponse({"status": "temporarily_unavailable"}, status_code=503)
-    except Exception:
-        _emit_conversation_audit(AuditEvent.READINESS, outcome="dependency_unavailable")
-        return JSONResponse({"status": "temporarily_unavailable"}, status_code=503)
+    """
+    Webhook para receber mensagens do Evolution API.
+    
+    Evolution API envia payloads no formato:
+    {
+        "event": "messages.upsert",
+        "instance": "instance_name",
+        "data": {
+            "key": {
+                "remoteJid": "5511999999999@s.whatsapp.net",
+                "fromMe": false,
+                "id": "message_id"
+            },
+            "message": {
+                "conversation": "texto da mensagem",
+                "extendedTextMessage": {
+                    "text": "texto"
+                }
+            },
+            "messageTimestamp": "1234567890",
+            "pushName": "Nome do Usuário"
+        }
+    }
+    """
     try:
         payload = await request.json()
-    except (ValueError, UnicodeError):
-        _emit_conversation_audit(AuditEvent.INGRESS, outcome="invalid_request")
-        return JSONResponse({"status": "invalid_request"}, status_code=400)
-    identity = resolve_sender_identity(payload)
-    if identity is None:
-        _emit_conversation_audit(AuditEvent.INGRESS, outcome="ignored")
-        return JSONResponse({"status": "ignored"})
-    useful_message = _ingress_content(payload)
-    if useful_message is None:
-        _emit_conversation_audit(AuditEvent.INGRESS, outcome="ignored")
-        return JSONResponse({"status": "ignored"})
-    kind, content = useful_message
-    failure_outcome = "coordination_failed"
+        logger.info(f"Webhook recebido: {payload.get('event')}")
+        logger.info(f"Payload completo: {payload}")  # DEBUG: Ver payload completo
+        
+        # Verificar se é mensagem recebida (não enviada por nós)
+        event = payload.get('event', '')
+        if event not in ['messages.upsert', 'messages.received']:
+            return {"status": "ignored", "reason": "not a message event"}
+        
+        data = payload.get('data', {})
+        messages = data.get('messages', {})
+        key = messages.get('key', {})
+        message_data = messages.get('message', {})
+        remote_jid = key.get('remoteJid', '')
+        
+        # Extrair texto da mensagem (antes de tratar fromMe)
+        message_text = None
+        media_type = None  # Tipo de mídia não suportada
+        if 'conversation' in message_data:
+            message_text = message_data['conversation']
+        elif 'extendedTextMessage' in message_data:
+            message_text = message_data['extendedTextMessage'].get('text', '')
+        elif 'imageMessage' in message_data:
+            message_text = message_data['imageMessage'].get('caption', '')
+            if not message_text:
+                media_type = 'imagem'
+        elif 'audioMessage' in message_data:
+            media_type = 'áudio'
+        elif 'videoMessage' in message_data:
+            media_type = 'vídeo'
+        elif 'documentMessage' in message_data:
+            media_type = 'documento'
+        elif 'stickerMessage' in message_data:
+            media_type = 'figurinha'
+        
+        is_from_me = key.get('fromMe', False)
+        
+        # Tratar comando /pause da secretária (mensagens enviadas pelo número da clínica)
+        if is_from_me:
+            lowered = (message_text or '').strip().lower()
+            if lowered in {"/pausar", "/pause"} and remote_jid and '@newsletter' not in remote_jid and '@g.us' not in remote_jid:
+                patient_phone = remote_jid.replace('@s.whatsapp.net', '')
+                if patient_phone:
+                    logger.info(f"⏸️ Comando /pause recebido da secretária para {patient_phone}")
+                    with get_db() as db:
+                        ai_agent._handle_secretary_pause(db, patient_phone)
+                    return {"status": "processed", "action": "secretary_pause", "patient": patient_phone}
+            # Outras mensagens enviadas por nós devem ser ignoradas
+            return {"status": "ignored", "reason": "message from bot"}
+        
+        # Extrair informações
+        phone = remote_jid
+
+        # Ignorar mensagens de newsletter e grupos
+        if '@newsletter' in phone or '@g.us' in phone:
+            logger.info(f"Ignorando mensagem de newsletter/grupo: {phone}")
+            return {"status": "ignored", "reason": "newsletter or group message"}
+
+        # Tratar números @lid (Linked Device ID)
+        if '@lid' in phone:
+            # O número real vem no campo senderPn ou cleanedSenderPn do payload
+            cleaned_sender = key.get('cleanedSenderPn')
+            sender_pn = key.get('senderPn', '')
+
+            if cleaned_sender:
+                phone = cleaned_sender
+                logger.info(f"✅ LID detectado, usando cleanedSenderPn: {phone}")
+            elif sender_pn:
+                phone = sender_pn.replace('@s.whatsapp.net', '').replace('@c.us', '')
+                logger.info(f"✅ LID detectado, usando senderPn: {phone}")
+            else:
+                logger.warning(f"⚠️ LID detectado mas senderPn não disponível, ignorando")
+                return {"status": "ignored", "reason": "LID without senderPn"}
+        else:
+            phone = phone.replace('@s.whatsapp.net', '').replace('@c.us', '')
+        
+        if not phone:
+            logger.warning("Mensagem sem telefone")
+            return {"status": "ignored", "reason": "no phone"}
+
+        if not message_text:
+            if media_type:
+                # Responde que não processa mídia
+                logger.info(f"Mídia recebida de {phone}: {media_type}")
+                resposta = (
+                    f"Desculpe, não consigo receber {media_type}. "
+                    f"Se puder me explicar por texto, consigo te ajudar!\n\n"
+                    f"Caso prefira, posso te transferir para nossa secretária Beatriz."
+                )
+                send_message_task.delay(phone, resposta)
+                return {"status": "processed", "action": "media_response", "media_type": media_type}
+            logger.warning("Mensagem sem texto")
+            return {"status": "ignored", "reason": "no text"}
+
+        logger.info(f"Mensagem de {phone}: {message_text[:50]}...")
+
+        # Sistema de debounce: adicionar ao buffer e agendar task com delay
+        # Isso permite agrupar múltiplas mensagens enviadas em sequência
+        message_id = key.get('id')
+
+        # Adicionar mensagem ao buffer Redis
+        buffer_added = whatsapp_service.add_message_to_buffer(phone, message_text, message_id)
+
+        if buffer_added:
+            # Agendar task com delay de 7 segundos
+            # Se outra mensagem chegar, essa task vai verificar e ignorar se não passou o tempo
+            debounce_seconds = whatsapp_service.MESSAGE_DEBOUNCE_SECONDS
+            task = process_message_task.apply_async(
+                args=[phone, None, message_id],  # message_text=None pois vamos pegar do buffer
+                countdown=debounce_seconds
+            )
+            logger.info(f"[DEBOUNCE] Task agendada para {phone} em {debounce_seconds}s (task: {task.id})")
+            return {"status": "buffered", "task_id": task.id, "debounce_seconds": debounce_seconds}
+        else:
+            # Fallback: se Redis não disponível, processar imediatamente (comportamento antigo)
+            task = process_message_task.delay(phone, message_text, message_id)
+            logger.info(f"Task enfileirada (sem buffer): {task.id} para {phone}")
+            return {"status": "processing", "task_id": task.id}
+        
+    except Exception as e:
+        logger.error(f"Erro no webhook: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+def _send_message_sync(phone: str, message: str) -> bool:
+    """
+    Wrapper síncrono para whatsapp_service.send_message (async).
+    Usado dentro de tasks Celery que são síncronas.
+    """
     try:
-        _require_ready(runtime)
-        with runtime.store.contact_lease(identity.phone) as lease:
-            _require_ready(runtime)
-            if runtime.coordinator.is_terminal_ingress(identity, runtime.clock.now(), lease):
-                _emit_conversation_audit(AuditEvent.INGRESS, outcome="duplicate")
-                return JSONResponse({"status": "ignored"})
-            _require_ready(runtime)
-            failure_outcome = "persistence_failed"
-            with runtime.session_factory() as db:
-                _require_ready(runtime)
-                failure_outcome = "coordination_failed"
-                receipt = runtime.coordinator.accept_ingress(
-                    db, identity, kind, content, runtime.clock.now(), lease, runtime.processing_broker)
-    except Exception:
-        _emit_conversation_audit(AuditEvent.INGRESS, outcome=failure_outcome)
-        return JSONResponse({"status": "temporarily_unavailable"}, status_code=503)
-    _emit_conversation_audit(AuditEvent.INGRESS,
-        outcome="accepted" if receipt.disposition is IngressDisposition.BUFFERED else "ignored")
-    return JSONResponse({"status": "buffered" if receipt.disposition is IngressDisposition.BUFFERED else "ignored"})
+        return asyncio.run(whatsapp_service.send_message(phone, message))
+    except Exception as e:
+        logger.error(f"Erro ao enviar mensagem via wrapper síncrono: {str(e)}")
+        return False
 
 
-@celery_app.task(name="app.main.send_message_task", bind=True, max_retries=3, default_retry_delay=60)
-def send_message_task(self, payload):
-    """Parse a typed outbound and delegate all authorization to the sender."""
-    outbound = OutboundEnvelope.from_payload(payload)
+def _mark_message_as_read_sync(phone: str, message_id: str) -> bool:
+    """
+    Wrapper síncrono para whatsapp_service.mark_message_as_read (async).
+    Usado dentro de tasks Celery que são síncronas.
+    """
     try:
-        return send_outbound(outbound, get_conversation_runtime()).value
-    except RetryRequested as error:
-        raise self.retry(exc=ConversationDomainError(error.reason_code),
-            args=[outbound.to_payload()], kwargs={},
-            argsrepr="(<conversation_outbound>,)", kwargsrepr="{}") from None
+        return asyncio.run(whatsapp_service.mark_message_as_read(phone, message_id))
+    except Exception as e:
+        logger.error(f"Erro ao marcar mensagem como lida via wrapper síncrono: {str(e)}")
+        return False
 
 
-@celery_app.task(name="app.main.process_message_task", bind=True, max_retries=3, default_retry_delay=60)
-def process_message_task(self, payload):
-    """Retries carry the original batch and the persisted staging identities."""
-    command = ProcessingCommand.from_payload(payload)
+@celery_app.task(bind=True, max_retries=3, default_retry_delay=60)
+def send_message_task(self, phone: str, message: str):
+    """
+    Task Celery dedicada para envio de mensagens para WhatsApp API.
+    Esta task é roteada para a fila 'send_queue' e usa rate limiting de 5 segundos.
+    
+    Args:
+        phone: Número do telefone
+        message: Texto da mensagem a ser enviada
+    """
+    task_id = self.request.id
+    logger.info(f"📤 Task de envio {task_id} iniciada para {phone}")
+    
     try:
-        return process_batch(command, get_conversation_runtime()).value
-    except RetryRequested as error:
-        retry_command = error.command or command
-        raise self.retry(exc=ConversationDomainError(error.reason_code),
-            args=[retry_command.to_payload()], kwargs={}, countdown=60,
-            argsrepr="(<conversation_command>,)", kwargsrepr="{}") from None
+        # Normalizar telefone
+        phone = normalize_phone(phone)
+        
+        # Enviar mensagem usando wrapper síncrono (já tem rate limiting)
+        success = _send_message_sync(phone, message)
+        
+        if success:
+            logger.info(f"✅ Task de envio {task_id} concluída - Mensagem enviada para {phone}")
+        else:
+            logger.error(f"❌ Task de envio {task_id} - Falha ao enviar mensagem para {phone}")
+            # Retry automático se falhou
+            raise Exception("Falha ao enviar mensagem")
+            
+    except Exception as e:
+        logger.error(f"❌ Task de envio {task_id} - Erro: {str(e)}", exc_info=True)
+        # Retry automático do Celery
+        raise self.retry(exc=e)
 
 
-@celery_app.task(name="app.main.recover_conversations_task")
-def recover_conversations_task():
-    """Beat boundary; count-only result, never patient content or exceptions."""
-    from dataclasses import asdict
-    from app.conversation_recovery import RecoveryService
-    from app.conversation_state import RecoveryReport
-    runtime = get_conversation_runtime()
+@celery_app.task(bind=True, max_retries=3, default_retry_delay=60)
+def process_message_task(self, phone: str, message_text: str = None, message_id: str = None):
+    """
+    Processa mensagem em background usando Celery.
+    Suporta sistema de debounce: se message_text for None, busca do buffer Redis.
+
+    Args:
+        phone: Número do telefone
+        message_text: Texto da mensagem (None se usando buffer)
+        message_id: ID da mensagem (para marcar como lida)
+    """
+    task_id = self.request.id
+
+    # Normalizar telefone primeiro
+    phone = normalize_phone(phone)
+
+    # ==========================================================================
+    # SISTEMA DE DEBOUNCE: Verificar se deve processar agora
+    # ==========================================================================
+    if message_text is None:
+        # Task foi agendada com delay - verificar se deve processar
+        if not whatsapp_service.should_process_now(phone):
+            # Ainda não passou tempo suficiente - outra mensagem chegou
+            # Ignorar esta task, a próxima vai processar
+            logger.info(f"[DEBOUNCE] Task {task_id} ignorada para {phone} - aguardando mais mensagens")
+            return
+
+        # Passou o tempo de debounce - pegar mensagens concatenadas do buffer
+        message_text = whatsapp_service.get_concatenated_message(phone)
+
+        if not message_text:
+            logger.warning(f"[DEBOUNCE] Task {task_id} - Buffer vazio para {phone}")
+            return
+
+        logger.info(f"[DEBOUNCE] Task {task_id} processando {phone}: {message_text[:80]}...")
+    else:
+        # Modo antigo (fallback sem Redis) - processar diretamente
+        logger.info(f"Task {task_id} iniciada para {phone}: {message_text[:50]}...")
+
+    lock = None
+    lock_acquired = False
+
     try:
-        _require_ready(runtime)
-    except Exception:
-        return asdict(RecoveryReport())
-    try:
-        with _runtime_lock:
-            service = getattr(app.state, "conversation_recovery", None)
-            if service is None or service.runtime is not runtime:
-                service = RecoveryService(runtime)
-                app.state.conversation_recovery = service
-        return asdict(service.run_once(runtime.clock.now()))
-    except Exception:
-        return asdict(RecoveryReport(failed=1))
+        # Garantir processamento serializado por contato
+        lock = whatsapp_service.acquire_chat_lock(phone)
+        if lock:
+            try:
+                lock_acquired = lock.acquire(blocking=True)
+            except Exception as lock_error:
+                logger.warning(f"Nao foi possivel adquirir lock para {phone}: {lock_error}")
+                raise self.retry(exc=lock_error, countdown=2)
+
+            if not lock_acquired:
+                logger.warning(f"Lock ocupado para {phone}, reagendando task")
+                raise self.retry(exc=Exception("chat_lock_busy"), countdown=2)
+        else:
+            logger.warning(f"Processando {phone} sem lock - Redis indisponivel")
+
+        # Marcar como lida
+        if message_id:
+            _mark_message_as_read_sync(phone, message_id)
+
+        # Verificar comandos administrativos (/pausar)
+        lowered = message_text.strip().lower()
+
+        if lowered in {"/pausar", "/pause"}:
+            with get_db() as db:
+                logger.info(f"Comando /pausar recebido para {phone}")
+                response = ai_agent._handle_request_human_assistance({}, db, phone)
+                if response:
+                    send_message_task.delay(phone, response)
+                return
+
+        # Verificar se bot está pausado para este telefone
+        with get_db() as db:
+            paused_contact = db.query(PausedContact).filter_by(phone=phone).first()
+
+            if paused_contact:
+                if datetime.utcnow() < paused_contact.paused_until:
+                    # Ainda pausado - bot ignora mensagem
+                    logger.info(f"Bot pausado para {phone} ate {paused_contact.paused_until}")
+                    return
+                else:
+                    # Passou 2 horas - reativar silenciosamente
+                    logger.info(f"Bot reativado automaticamente para {phone}")
+                    db.delete(paused_contact)
+                    db.commit()
+
+        # Processar com IA
+        response = ai_agent.process_message(message_text, phone, db)
+        
+        # Enfileirar mensagem para envio na fila separada
+        if response:
+            send_task = send_message_task.delay(phone, response)
+            logger.info(f"✅ Task {task_id} concluída - Resposta enfileirada para envio (task: {send_task.id})")
+        else:
+            logger.warning(f"⚠️ Task {task_id} - Nenhuma resposta gerada para {phone}")
+        
+    except CeleryRetry:
+        raise
+    except Exception as e:
+        try:
+            from celery.exceptions import Retry as CeleryRetry  # type: ignore
+        except ImportError:
+            CeleryRetry = None
+        
+        if CeleryRetry and isinstance(e, CeleryRetry):
+            raise e
+        
+        logger.error(f"❌ Task {task_id} - Erro ao processar mensagem: {str(e)}", exc_info=True)
+        
+        error_text = str(e).lower()
+        concurrency_issue = any(
+            issue in error_text
+            for issue in ["database is locked", "chat_lock_busy", "deadlock", "could not obtain lock"]
+        )
+        
+        if concurrency_issue:
+            logger.warning(f"⚠️ Erro de concorrência detectado para {phone}; retry silencioso.")
+        else:
+            # Tentar enfileirar mensagem de erro ao usuário
+            try:
+                send_message_task.delay(
+                    phone,
+                    "Desculpe, ocorreu um erro ao processar sua mensagem. Por favor, tente novamente em instantes."
+                )
+                logger.info(f"📤 Mensagem de erro enfileirada para {phone}")
+            except Exception as send_error:
+                logger.error(f"❌ Task {task_id} - Erro ao enfileirar mensagem de erro: {str(send_error)}")
+        
+        # Retry automático do Celery se necessário
+        raise self.retry(exc=e, countdown=2 if concurrency_issue else 60)
+    finally:
+        if lock and lock_acquired:
+            try:
+                lock.release()
+            except Exception as release_error:
+                logger.warning(f"⚠️ Erro ao liberar lock de {phone}: {release_error}")
 
 
 @app.get("/status")
@@ -430,7 +562,7 @@ async def status():
             "database": "connected"
         }
     except Exception as e:
-        logger.error("instance_status_check_failed")
+        logger.error(f"Erro ao verificar status: {str(e)}")
         return {
             "status": "degraded",
             "error": str(e)
@@ -447,7 +579,7 @@ async def reload_config(admin: str = Depends(verify_admin_credentials)):
         ai_agent.reload_clinic_info()
         return {"status": "success", "message": "Configurações recarregadas"}
     except Exception as e:
-        logger.error("configuration_reload_failed")
+        logger.error(f"Erro ao recarregar config: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -486,7 +618,7 @@ async def get_patients(admin: str = Depends(verify_admin_credentials)):
                 "patients": patients
             }
     except Exception as e:
-        logger.error("patient_search_failed")
+        logger.error(f"Erro ao buscar pacientes: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -530,7 +662,7 @@ async def get_appointments(admin: str = Depends(verify_admin_credentials)):
                 ]
             }
     except Exception as e:
-        logger.error("appointment_search_failed")
+        logger.error(f"Erro ao buscar consultas: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -607,7 +739,7 @@ async def get_scheduled_appointments():
             }
             
     except Exception as e:
-        logger.error("scheduled_appointment_search_failed")
+        logger.error(f"Erro ao buscar consultas agendadas: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -666,7 +798,7 @@ async def get_appointments_history():
             }
 
     except Exception as e:
-        logger.error("appointment_history_search_failed")
+        logger.error(f"Erro ao buscar histórico de consultas: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -679,7 +811,7 @@ async def init_database(admin: str = Depends(verify_admin_credentials)):
         init_db()
         return {"message": "✅ Banco de dados inicializado com sucesso!", "status": "success"}
     except Exception as e:
-        logger.error("database_initialization_failed")
+        logger.error(f"Erro ao inicializar banco: {str(e)}")
         return {"message": f"❌ Erro ao inicializar banco: {str(e)}", "status": "error"}
 
 
@@ -702,7 +834,7 @@ async def clean_database(admin: str = Depends(verify_admin_credentials)):
             "status": "success"
         }
     except Exception as e:
-        logger.error("database_cleanup_failed")
+        logger.error(f"Erro ao limpar banco: {str(e)}")
         return {"message": f"❌ Erro ao limpar banco: {str(e)}", "status": "error"}
 
 
@@ -773,7 +905,7 @@ async def get_dashboard(admin: str = Depends(verify_admin_credentials)):
                 "appointments_by_status": appointments_by_status
             }
     except Exception as e:
-        logger.error("dashboard_query_failed")
+        logger.error(f"Erro ao buscar dashboard: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -793,7 +925,7 @@ async def delete_appointment_admin(
                 raise HTTPException(status_code=404, detail="Consulta não encontrada")
 
             # Log do cancelamento
-            logger.info("appointment_cancelled")
+            logger.info(f"Admin {admin} cancelou consulta #{appointment_id}: {appointment.patient_name} - {appointment.appointment_date} {appointment.appointment_time}")
 
             # Marcar como cancelada em vez de deletar
             appointment.status = AppointmentStatus.CANCELADA
@@ -812,7 +944,7 @@ async def delete_appointment_admin(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error("appointment_cancellation_failed")
+        logger.error(f"Erro ao cancelar consulta: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -839,7 +971,7 @@ async def mark_attended_appointment_admin(
             appointment._skip_time_validation = True
             db.commit()
 
-            logger.info("appointment_attendance_recorded")
+            logger.info(f"Admin {admin} marcou consulta #{appointment_id} como compareceu: {appointment.patient_name}")
 
             return {
                 "success": True,
@@ -854,7 +986,7 @@ async def mark_attended_appointment_admin(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error("appointment_attendance_failed")
+        logger.error(f"Erro ao marcar presença: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -881,7 +1013,7 @@ async def mark_missed_appointment_admin(
             appointment._skip_time_validation = True
             db.commit()
 
-            logger.info("appointment_absence_recorded")
+            logger.info(f"Admin {admin} marcou consulta #{appointment_id} como não compareceu (falta): {appointment.patient_name}")
 
             return {
                 "success": True,
@@ -896,7 +1028,7 @@ async def mark_missed_appointment_admin(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error("appointment_absence_failed")
+        logger.error(f"Erro ao marcar falta: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -965,7 +1097,7 @@ async def reschedule_appointment_admin(
 
             db.commit()
 
-            logger.info("appointment_rescheduled")
+            logger.info(f"Admin {admin} remarcou consulta #{appointment_id} para {new_date} {new_time}")
 
             return {
                 "success": True,
@@ -982,7 +1114,7 @@ async def reschedule_appointment_admin(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error("appointment_reschedule_failed")
+        logger.error(f"Erro ao remarcar consulta: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -1020,7 +1152,7 @@ async def update_appointment_admin(
 
             db.commit()
 
-            logger.info("appointment_updated")
+            logger.info(f"Admin {admin} atualizou consulta #{appointment_id}")
 
             return {
                 "success": True,
@@ -1037,7 +1169,7 @@ async def update_appointment_admin(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error("appointment_update_failed")
+        logger.error(f"Erro ao atualizar consulta: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -1115,7 +1247,7 @@ async def create_appointment_admin(
             db.commit()
             db.refresh(new_appointment)
 
-            logger.info("appointment_created")
+            logger.info(f"Admin {admin} criou nova consulta #{new_appointment.id}: {new_appointment.patient_name} - {appointment_date} {appointment_time}")
 
             return {
                 "success": True,
@@ -1135,7 +1267,7 @@ async def create_appointment_admin(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error("appointment_creation_failed")
+        logger.error(f"Erro ao criar consulta: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -1163,7 +1295,7 @@ async def migrate_appointment_status(admin: str = Depends(verify_admin_credentia
             if "already exists" in str(e).lower():
                 logger.info("ℹ️  Valor 'compareceu' já existe")
             else:
-                logger.warning("migration_compareceu_value_failed")
+                logger.warning(f"Aviso ao adicionar 'compareceu': {str(e)}")
 
         # ETAPA 2: Adicionar 'nao_compareceu' ao enum (transação separada)
         try:
@@ -1176,7 +1308,7 @@ async def migrate_appointment_status(admin: str = Depends(verify_admin_credentia
             if "already exists" in str(e).lower():
                 logger.info("ℹ️  Valor 'nao_compareceu' já existe")
             else:
-                logger.warning("migration_nao_compareceu_value_failed")
+                logger.warning(f"Aviso ao adicionar 'nao_compareceu': {str(e)}")
 
         # ETAPA 3: Migrar dados (nova transação limpa)
         with get_db() as db:
@@ -1191,7 +1323,7 @@ async def migrate_appointment_status(admin: str = Depends(verify_admin_credentia
                 result = db.execute(text("SELECT COUNT(*) FROM appointments WHERE status::text = 'cancelada'"))
                 canceled_count = result.scalar() or 0
             except Exception as e:
-                logger.warning("migration_cancelled_count_failed")
+                logger.warning(f"Não conseguiu contar canceladas: {str(e)}")
 
             # Contar realizadas (usar cast para text)
             realizada_count = 0
@@ -1199,7 +1331,7 @@ async def migrate_appointment_status(admin: str = Depends(verify_admin_credentia
                 result = db.execute(text("SELECT COUNT(*) FROM appointments WHERE status::text = 'realizada'"))
                 realizada_count = result.scalar() or 0
             except Exception as e:
-                logger.warning("migration_completed_count_failed")
+                logger.warning(f"Não conseguiu contar realizadas: {str(e)}")
 
             # Deletar canceladas
             if canceled_count > 0:
@@ -1235,7 +1367,7 @@ async def migrate_appointment_status(admin: str = Depends(verify_admin_credentia
             }
 
     except Exception as e:
-        logger.error("status_migration_failed")
+        logger.error(f"❌ Erro na migração: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -1272,7 +1404,7 @@ async def fix_enum_values(admin: str = Depends(verify_admin_credentials)):
                 results["diagnostico"]["valores_atuais"] = current_values
                 logger.info(f"Valores atuais do enum: {current_values}")
             except Exception as e:
-                logger.error("enum_value_query_failed")
+                logger.error(f"Erro ao consultar valores do enum: {str(e)}")
                 results["diagnostico"]["erro"] = str(e)
 
         # ETAPA 2: Adicionar 'agendada' se não existir
@@ -1289,7 +1421,7 @@ async def fix_enum_values(admin: str = Depends(verify_admin_credentials)):
                     logger.info("ℹ️ Valor 'agendada' já existe")
                     results["acoes"].append("ℹ️ Valor 'agendada' já existia")
                 else:
-                    logger.error("enum_agendada_value_failed")
+                    logger.error(f"Erro ao adicionar 'agendada': {str(e)}")
                     results["acoes"].append(f"❌ Erro ao adicionar 'agendada': {str(e)}")
                     results["success"] = False
         else:
@@ -1309,7 +1441,7 @@ async def fix_enum_values(admin: str = Depends(verify_admin_credentials)):
                     logger.info("ℹ️ Valor 'cancelada' já existe")
                     results["acoes"].append("ℹ️ Valor 'cancelada' já existia")
                 else:
-                    logger.error("enum_cancelada_value_failed")
+                    logger.error(f"Erro ao adicionar 'cancelada': {str(e)}")
                     results["acoes"].append(f"❌ Erro ao adicionar 'cancelada': {str(e)}")
                     results["success"] = False
         else:
@@ -1344,7 +1476,7 @@ async def fix_enum_values(admin: str = Depends(verify_admin_credentials)):
                 results["diagnostico"]["contagem_por_status"] = status_counts
                 logger.info(f"Contagem por status: {status_counts}")
             except Exception as e:
-                logger.error("status_count_failed")
+                logger.error(f"Erro ao contar status: {str(e)}")
                 results["diagnostico"]["erro_contagem"] = str(e)
 
         return {
@@ -1364,7 +1496,7 @@ async def fix_enum_values(admin: str = Depends(verify_admin_credentials)):
         }
 
     except Exception as e:
-        logger.error("status_diagnostic_failed")
+        logger.error(f"❌ Erro no diagnóstico/correção: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -2995,97 +3127,86 @@ async def get_paused_contacts(admin: str = Depends(verify_admin_credentials)):
         return {"paused_contacts": result, "count": len(result)}
 
 
-def _administrative_runtime(request: Request):
-    runtime = getattr(request.app.state, "conversation_runtime", None)
-    try:
-        _require_ready(runtime)
-    except Exception:
-        raise HTTPException(status_code=503, detail="temporarily_unavailable") from None
-    return runtime
-
-
-async def _administrative_payload(request: Request):
-    try:
-        data = await request.json()
-    except (ValueError, UnicodeError):
-        raise HTTPException(status_code=400, detail="invalid_request") from None
-    if not isinstance(data, dict):
-        raise HTTPException(status_code=400, detail="invalid_request")
-    return data
-
-
-def _administrative_phone(raw):
-    phone = normalize_phone(raw)
-    if not phone:
-        raise HTTPException(status_code=400, detail="invalid_phone")
-    return phone
-
-
-def _administrative_duration(data, now):
-    hours = data.get("hours", 24)
-    try:
-        manual_pause_deadline(now, hours)
-    except InvalidManualPauseDuration:
-        raise HTTPException(status_code=400, detail="invalid_pause_duration") from None
-    return hours
-
-
-@contextmanager
-def _administrative_session(runtime, phone):
-    try:
-        with runtime.store.contact_lease(phone) as lease, runtime.session_factory() as db:
-            yield db, lease
-    except InvalidManualPauseDuration:
-        raise HTTPException(status_code=400, detail="invalid_pause_duration") from None
-    except HTTPException:
-        raise
-    except Exception:
-        _emit_conversation_audit(AuditEvent.TRANSITION, outcome="coordination_failed")
-        raise HTTPException(status_code=503, detail="temporarily_unavailable") from None
-
-
 @app.post("/api/paused-contacts")
 async def pause_contact(request: Request, admin: str = Depends(verify_admin_credentials)):
-    """Create a fenced manual pause without deleting the conversation context."""
-    runtime = _administrative_runtime(request)
-    data = await _administrative_payload(request)
-    phone = _administrative_phone(data.get("phone"))
-    now = runtime.clock.now()
-    hours = _administrative_duration(data, now)
-    try:
-        reason = PauseReason(data.get("reason", PauseReason.DASHBOARD.value)).value
-    except (ValueError, TypeError):
-        raise HTTPException(status_code=400, detail="invalid_pause_reason") from None
-    with _administrative_session(runtime, phone) as (db, lease):
-        transition = runtime.coordinator.pause_manual(db, phone, hours, reason, now, lease, str(uuid4()))
-    return {"success": True, "phone": phone, "paused_until": transition.paused_until.isoformat()}
+    """Pausar um contato manualmente"""
+    from datetime import datetime, timedelta
+
+    data = await request.json()
+    phone = data.get("phone", "").strip()
+    hours = data.get("hours", 24)
+    reason = data.get("reason", "secretary_dashboard_pause")
+
+    if not phone:
+        raise HTTPException(status_code=400, detail="Telefone é obrigatório")
+
+    # Normalizar telefone
+    phone = normalize_phone(phone)
+
+    with get_db() as db:
+        # Verificar se já existe
+        existing = db.query(PausedContact).filter(PausedContact.phone == phone).first()
+
+        paused_until = datetime.utcnow() + timedelta(hours=hours)
+
+        if existing:
+            existing.paused_until = paused_until
+            existing.reason = reason
+            existing.paused_at = datetime.utcnow()
+        else:
+            new_pause = PausedContact(
+                phone=phone,
+                paused_until=paused_until,
+                reason=reason,
+                paused_at=datetime.utcnow()
+            )
+            db.add(new_pause)
+
+        db.commit()
+
+        logger.info(f"⏸️ Contato {phone} pausado via dashboard até {paused_until}")
+        return {"success": True, "phone": phone, "paused_until": paused_until.isoformat()}
 
 
 @app.delete("/api/paused-contacts/{phone}")
-async def unpause_contact(phone: str, request: Request, admin: str = Depends(verify_admin_credentials)):
+async def unpause_contact(phone: str, admin: str = Depends(verify_admin_credentials)):
     """Despausar um contato"""
-    runtime = _administrative_runtime(request)
-    phone = _administrative_phone(phone)
-    with _administrative_session(runtime, phone) as (db, lease):
-        if db.get(PausedContact, phone) is None:
+    phone = normalize_phone(phone)
+
+    with get_db() as db:
+        existing = db.query(PausedContact).filter(PausedContact.phone == phone).first()
+
+        if not existing:
             raise HTTPException(status_code=404, detail="Contato não encontrado na lista de pausados")
-        runtime.coordinator.unpause(db, phone, runtime.clock.now(), lease, str(uuid4()))
-    return {"success": True, "phone": phone}
+
+        db.delete(existing)
+        db.commit()
+
+        logger.info(f"▶️ Contato {phone} despausado via dashboard")
+        return {"success": True, "phone": phone}
 
 
 @app.put("/api/paused-contacts/{phone}/extend")
 async def extend_pause(phone: str, request: Request, admin: str = Depends(verify_admin_credentials)):
     """Estender pausa de um contato"""
-    runtime = _administrative_runtime(request)
-    data = await _administrative_payload(request)
-    phone = _administrative_phone(phone)
-    now = runtime.clock.now()
-    hours = _administrative_duration(data, now)
-    with _administrative_session(runtime, phone) as (db, lease):
-        if db.get(PausedContact, phone) is None:
+    from datetime import datetime, timedelta
+
+    data = await request.json()
+    hours = data.get("hours", 24)
+    phone = normalize_phone(phone)
+
+    with get_db() as db:
+        existing = db.query(PausedContact).filter(PausedContact.phone == phone).first()
+
+        if not existing:
             raise HTTPException(status_code=404, detail="Contato não encontrado na lista de pausados")
-        transition = runtime.coordinator.extend_pause(db, phone, hours, now, lease, str(uuid4()))
-    return {"success": True, "phone": phone, "paused_until": transition.paused_until.isoformat()}
+
+        # Adicionar horas ao tempo atual de pausa
+        existing.paused_until = existing.paused_until + timedelta(hours=hours)
+        db.commit()
+
+        logger.info(f"⏸️ Pausa do contato {phone} estendida por +{hours}h até {existing.paused_until}")
+        return {"success": True, "phone": phone, "paused_until": existing.paused_until.isoformat()}
 
 
 @app.get("/api/active-conversations")
@@ -4158,10 +4279,10 @@ async def domiciliares_dashboard(admin: str = Depends(verify_admin_credentials))
 # AMBIENTE DE TESTE - Simulador de Chat WhatsApp
 # =============================================================================
 
-TEST_PHONE = ConversationCoordinator.TEST_PHONE
+TEST_PHONE = "5500000000000"  # Número simulado para testes
 
 @app.get("/test/chat", response_class=HTMLResponse)
-async def test_chat_page(admin: str = Depends(verify_admin_credentials)):
+async def test_chat_page():
     """Página de teste com interface de chat estilo WhatsApp"""
     return """
     <!DOCTYPE html>
@@ -4483,29 +4604,82 @@ async def test_chat_page(admin: str = Depends(verify_admin_credentials)):
 
 
 @app.post("/test/chat")
-async def test_chat_send(request: Request, admin: str = Depends(verify_admin_credentials)):
-    """Authenticated synthetic patient ingress with capture-only processing."""
-    runtime = _administrative_runtime(request)
-    data = await _administrative_payload(request)
-    message = data.get("message")
-    if not isinstance(message, str) or not message.strip():
-        raise HTTPException(status_code=400, detail="invalid_message")
+async def test_chat_send(request: Request):
+    """
+    Endpoint de teste que processa mensagem e retorna resposta diretamente.
+    Simula exatamente o comportamento do bot no WhatsApp, mas sem:
+    - Celery (processamento síncrono)
+    - Evolution API (não envia para WhatsApp)
+    - Redis locks (não precisa)
+    """
     try:
-        response = simulate_message(message.strip(), runtime)
-    except Exception:
-        _emit_conversation_audit(AuditEvent.PROCESSING, outcome="processing_failed")
-        raise HTTPException(status_code=503, detail="temporarily_unavailable") from None
-    _emit_conversation_audit(AuditEvent.PROCESSING, outcome="processed")
-    return {"response": response or "[Sem resposta]", "phone": TEST_PHONE}
+        data = await request.json()
+        message_text = data.get("message", "").strip()
+
+        if not message_text:
+            return JSONResponse({"error": "Mensagem vazia"}, status_code=400)
+
+        phone = TEST_PHONE
+        logger.info(f"[TEST] Mensagem recebida: {message_text}")
+
+        # Verificar comandos administrativos
+        lowered = message_text.lower()
+        if lowered in {"/pausar", "/pause"}:
+            with get_db() as db:
+                response = ai_agent._handle_request_human_assistance({}, db, phone)
+                return {"response": response, "phone": phone}
+
+        # Verificar se bot está pausado
+        with get_db() as db:
+            paused = db.query(PausedContact).filter_by(phone=phone).first()
+            if paused:
+                from datetime import datetime
+                if datetime.utcnow() < paused.paused_until:
+                    return {"response": "[Bot pausado para este número - aguardando atendimento humano]", "phone": phone}
+                else:
+                    db.delete(paused)
+                    db.commit()
+
+            # Processar com IA (mesmo código do webhook real)
+            response = ai_agent.process_message(message_text, phone, db)
+
+            logger.info(f"[TEST] Resposta gerada: {response[:100] if response else 'None'}...")
+
+            return {"response": response or "[Sem resposta]", "phone": phone}
+
+    except Exception as e:
+        logger.error(f"[TEST] Erro: {str(e)}", exc_info=True)
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 
 @app.post("/test/reset")
-async def test_chat_reset(request: Request, admin: str = Depends(verify_admin_credentials)):
+async def test_chat_reset():
     """Reseta o contexto de conversa do número de teste"""
-    runtime = _administrative_runtime(request)
-    with _administrative_session(runtime, TEST_PHONE) as (db, lease):
-        runtime.coordinator.reset_test_state(db, TEST_PHONE, runtime.clock.now(), lease, str(uuid4()))
-    return {"message": "Conversa resetada com sucesso!", "phone": TEST_PHONE}
+    try:
+        with get_db() as db:
+            # Deletar contexto de conversa
+            context = db.query(ConversationContext).filter_by(phone=TEST_PHONE).first()
+            if context:
+                db.delete(context)
+
+            # Deletar pausa se existir
+            paused = db.query(PausedContact).filter_by(phone=TEST_PHONE).first()
+            if paused:
+                db.delete(paused)
+
+            # Deletar agendamentos de teste
+            appointments = db.query(Appointment).filter_by(patient_phone=TEST_PHONE).all()
+            for apt in appointments:
+                db.delete(apt)
+
+            db.commit()
+
+        logger.info(f"[TEST] Contexto resetado para {TEST_PHONE}")
+        return {"message": "Conversa resetada com sucesso!", "phone": TEST_PHONE}
+
+    except Exception as e:
+        logger.error(f"[TEST] Erro ao resetar: {str(e)}", exc_info=True)
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 
 if __name__ == "__main__":

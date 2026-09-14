@@ -3,100 +3,58 @@ Scheduler para verificação automática de contextos inativos.
 Lembretes de consulta agora são enviados pelo MedSystem (Django).
 """
 from apscheduler.schedulers.background import BackgroundScheduler
-from datetime import timedelta, timezone
-from uuid import uuid4
-from threading import RLock
-from app.conversation_tasks import _require_ready
+from datetime import datetime, timedelta
+from app.database import get_db
 from app.models import ConversationContext
-from app.utils import AuditEvent, ConversationAuditLogger, new_audit_correlation_id
 import asyncio
 import logging
 
 logger = logging.getLogger(__name__)
-conversation_audit = ConversationAuditLogger(logger)
 
 
-def _emit_audit(event: AuditEvent, **fields: object) -> None:
-    conversation_audit.emit(event, correlation_id=new_audit_correlation_id(), **fields)
-
-
-async def check_inactive_contexts(runtime=None):
-    """Scan phone IDs, then recheck/delete each context under its own lease."""
-    failure_outcome = "dependency_unavailable"
+async def check_inactive_contexts():
+    """Verifica e encerra contextos inativos"""
     try:
-        _require_ready(runtime)
-        failure_outcome = "persistence_failed"
-        cutoff = runtime.clock.now() - timedelta(hours=1)
-        with runtime.session_factory() as db:
-            phones = db.query(ConversationContext.phone).filter(
-                ConversationContext.last_activity < cutoff.astimezone(timezone.utc).replace(tzinfo=None)
+        with get_db() as db:
+            cutoff_time = datetime.utcnow() - timedelta(hours=1)
+            inactive_contexts = db.query(ConversationContext).filter(
+                ConversationContext.last_activity < cutoff_time
             ).all()
-    except Exception:
-        _emit_audit(AuditEvent.RECOVERY, outcome=failure_outcome, attempt_state="closed")
-        return
 
-    _emit_audit(AuditEvent.RECOVERY, outcome="started", attempt_state="scanning",
-                count=min(len(phones), 1_000_000))
-    closed = failed = skipped = 0
-    for (phone,) in phones:
-        try:
-            _require_ready(runtime)
-        except Exception:
-            _emit_audit(AuditEvent.RECOVERY, outcome="dependency_unavailable", attempt_state="closed")
-            break
-        try:
-            with runtime.store.contact_lease(phone) as lease, runtime.session_factory() as db:
-                _require_ready(runtime)
-                did_close = runtime.coordinator.close_inactive_context(db, phone, cutoff,
-                    runtime.clock.now(), lease, str(uuid4()))
-                if did_close:
-                    closed += 1
-                else:
-                    skipped += 1
-        except Exception:
-            failed += 1
-    if closed:
-        _emit_audit(AuditEvent.RECOVERY, outcome="recovered", attempt_state="completed",
-                    count=min(closed, 1_000_000))
-    if failed:
-        _emit_audit(AuditEvent.RECOVERY, outcome="coordination_failed", attempt_state="failed",
-                    count=min(failed, 1_000_000))
-    if skipped:
-        _emit_audit(AuditEvent.RECOVERY, outcome="ignored", attempt_state="terminal",
-                    count=min(skipped, 1_000_000))
+            logger.info(f"🔍 Verificando contextos inativos. Encontrados: {len(inactive_contexts)}")
+
+            for context in inactive_contexts:
+                logger.info(f"🕒 Encerrando contexto inativo para {context.phone}")
+                db.delete(context)
+                db.commit()
+                logger.info(f"✅ Contexto encerrado e deletado para {context.phone}")
+
+    except Exception as e:
+        logger.error(f"❌ Erro ao verificar contextos inativos: {str(e)}")
 
 
-def run_check(runtime=None):
+def run_check():
     """Wrapper síncrono para executar tarefa assíncrona"""
-    asyncio.run(check_inactive_contexts(runtime))
+    asyncio.run(check_inactive_contexts())
 
 
 # Criar scheduler
 scheduler = BackgroundScheduler()
-_scheduler_lock = RLock()
 
 
-def start_scheduler(runtime=None):
-    """Use the composed runtime and remain inert while dependencies are closed."""
-    with _scheduler_lock:
-        scheduler.add_job(
-            run_check,
-            'interval',
-            minutes=20,
-            id='check_inactive_contexts',
-            kwargs={"runtime": runtime},
-            replace_existing=True,
-        )
-        if not scheduler.running:
-            scheduler.start()
-    _emit_audit(AuditEvent.RECOVERY, outcome="started", attempt_state="scheduled")
-    return True
+def start_scheduler():
+    """Inicia o scheduler"""
+    scheduler.add_job(
+        run_check,
+        'interval',
+        minutes=20,
+        id='check_inactive_contexts'
+    )
+    scheduler.start()
+    logger.info("✅ Scheduler iniciado: timeout de contextos inativos (20 min)")
 
 
 def stop_scheduler():
     """Para o scheduler"""
-    with _scheduler_lock:
-        if not scheduler.running:
-            return
-        scheduler.shutdown()
-    _emit_audit(AuditEvent.RECOVERY, outcome="stopped", attempt_state="terminal")
+    scheduler.shutdown()
+    logger.info("🛑 Scheduler parado")

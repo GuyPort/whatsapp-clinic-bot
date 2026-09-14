@@ -2,22 +2,15 @@
 Serviço de integração com Evolution API para WhatsApp.
 """
 import httpx
-from typing import Optional, Dict, Any, Callable
+from typing import Optional, Dict, Any
 import logging
 import asyncio
 import redis
 from redis.lock import Lock
 
 from app.simple_config import settings
-from app.conversation_state import ConversationDomainError
-from app.utils import AuditEvent, ConversationAuditLogger, new_audit_correlation_id
 
 logger = logging.getLogger(__name__)
-conversation_audit = ConversationAuditLogger(logger)
-
-
-def _emit_audit(event: AuditEvent, **fields: object) -> None:
-    conversation_audit.emit(event, correlation_id=new_audit_correlation_id(), **fields)
 
 
 class WhatsAppService:
@@ -35,14 +28,17 @@ class WhatsAppService:
         # Cliente Redis para locks distribuídos
         try:
             self.redis_client = redis.from_url(settings.redis_url, decode_responses=False)
-            _emit_audit(AuditEvent.READINESS, outcome="ready")
-        except Exception:
-            _emit_audit(AuditEvent.READINESS, outcome="dependency_unavailable")
+            logger.info(f"✅ Cliente Redis conectado para rate limiting")
+        except Exception as e:
+            logger.error(f"❌ Erro ao conectar Redis: {str(e)}")
             self.redis_client = None
         
+        # Debug: Log das configurações
+        logger.info(f"WhatsAppService - base_url: {self.base_url}")
+        logger.info(f"WhatsAppService - instance_name: {self.instance_name}")
+        logger.info(f"WhatsAppService - api_key: {self.api_key[:10] if self.api_key else 'None'}...")
     
-    async def send_message(self, phone: str, message: str,
-                           *, authorize: Callable[[], None] | None = None) -> bool:
+    async def send_message(self, phone: str, message: str) -> bool:
         """
         Envia uma mensagem de texto para um número de WhatsApp.
         Usa Redis Lock para garantir rate limiting de 1 mensagem a cada 5 segundos.
@@ -56,9 +52,8 @@ class WhatsAppService:
         """
         # Se Redis não estiver disponível, tenta enviar sem lock (fallback)
         if not self.redis_client:
-            _emit_audit(AuditEvent.OUTBOUND, outcome="dependency_unavailable",
-                        attempt_state="without_rate_limit")
-            return await self._send_message_internal(phone, message, authorize=authorize)
+            logger.warning("⚠️ Redis não disponível, enviando sem rate limiting")
+            return await self._send_message_internal(phone, message)
         
         lock_key = "whatsapp:send_message:lock"
         lock = Lock(
@@ -70,25 +65,24 @@ class WhatsAppService:
         
         try:
             # Adquirir lock antes de enviar (aguarda até 30s)
-            _emit_audit(AuditEvent.OUTBOUND, outcome="started", attempt_state="locking")
+            logger.debug(f"🔒 Tentando adquirir lock para enviar mensagem para {phone}")
             acquired = lock.acquire(blocking=True)
             
             if not acquired:
-                _emit_audit(AuditEvent.OUTBOUND, outcome="coordination_failed",
-                            attempt_state="lock_timeout")
+                logger.error(f"❌ Timeout ao aguardar lock para enviar mensagem para {phone}")
                 return False
             
-            _emit_audit(AuditEvent.OUTBOUND, outcome="started", attempt_state="locked")
+            logger.debug(f"✅ Lock adquirido, enviando mensagem para {phone}")
             
             # Tentar enviar mensagem (com retry automático para 429)
             max_retries = 3
             for attempt in range(max_retries):
-                success = await self._send_message_internal(phone, message, authorize=authorize)
+                success = await self._send_message_internal(phone, message)
                 
                 if success:
                     # Manter lock por 5 segundos para garantir intervalo mínimo
                     # Isso previne que outro worker envie imediatamente após
-                    _emit_audit(AuditEvent.OUTBOUND, outcome="sent", attempt_state="rate_limited")
+                    logger.debug(f"✅ Mensagem enviada com sucesso, mantendo lock por 5s para rate limiting")
                     await asyncio.sleep(5)
                     # Lock será liberado no finally
                     return True
@@ -96,31 +90,25 @@ class WhatsAppService:
                 # Se erro 429, aguardar e tentar novamente
                 if attempt < max_retries - 1:
                     wait_time = 5  # Aguardar 5 segundos antes de retry
-                    _emit_audit(AuditEvent.OUTBOUND, outcome="transport_failed",
-                                attempt_state="retrying", count=attempt + 1,
-                                latency_bucket="retry_delay")
+                    logger.warning(f"⚠️ Erro ao enviar mensagem (tentativa {attempt + 1}/{max_retries}), aguardando {wait_time}s antes de retry")
                     await asyncio.sleep(wait_time)
             
-            _emit_audit(AuditEvent.OUTBOUND, outcome="transport_failed",
-                        attempt_state="exhausted", count=max_retries)
+            logger.error(f"❌ Falha ao enviar mensagem após {max_retries} tentativas")
             return False
             
-        except ConversationDomainError:
-            raise
-        except Exception:
-            _emit_audit(AuditEvent.OUTBOUND, outcome="transport_failed", attempt_state="failed")
+        except Exception as e:
+            logger.error(f"❌ Exceção ao enviar mensagem: {str(e)}")
             return False
         finally:
             # Sempre liberar lock se adquirido
             try:
                 if lock.owned():
                     lock.release()
-                    _emit_audit(AuditEvent.OUTBOUND, outcome="released", attempt_state="terminal")
-            except Exception:
-                _emit_audit(AuditEvent.OUTBOUND, outcome="coordination_failed",
-                            attempt_state="release_failed")
+                    logger.debug(f"🔓 Lock liberado")
+            except Exception as e:
+                logger.warning(f"⚠️ Erro ao liberar lock: {str(e)}")
     
-    async def _send_message_internal(self, phone: str, message: str, *, authorize=None) -> bool:
+    async def _send_message_internal(self, phone: str, message: str) -> bool:
         """
         Método interno para enviar mensagem sem lock.
         Trata erros 429 automaticamente.
@@ -139,8 +127,6 @@ class WhatsAppService:
             }
             
             async with httpx.AsyncClient(timeout=30.0) as client:
-                if authorize is not None:
-                    authorize()  # After client entry/rate waits, before every HTTP attempt.
                 response = await client.post(url, json=payload, headers=self.headers)
                 
                 # Tratar erro 429 (rate limit)
@@ -148,28 +134,23 @@ class WhatsAppService:
                     try:
                         error_data = response.json()
                         retry_after = error_data.get('retry_after', 5)
-                        _emit_audit(AuditEvent.OUTBOUND, outcome="transport_failed",
-                                    attempt_state="rate_limited", latency_bucket="vendor_delay")
+                        logger.warning(f"⚠️ Rate limit atingido (429), retry_after: {retry_after}s")
                         await asyncio.sleep(retry_after)
                         return False  # Retorna False para trigger retry no método principal
                     except Exception:
-                        _emit_audit(AuditEvent.OUTBOUND, outcome="transport_failed",
-                                    attempt_state="rate_limited", latency_bucket="retry_delay")
+                        logger.warning(f"⚠️ Rate limit atingido (429), aguardando 5s")
                         await asyncio.sleep(5)
                         return False
                 
                 if response.status_code == 200 or response.status_code == 201:
-                    _emit_audit(AuditEvent.OUTBOUND, outcome="sent", attempt_state="provider_accepted")
+                    logger.info(f"Mensagem enviada com sucesso para {phone}")
                     return True
                 else:
-                    _emit_audit(AuditEvent.OUTBOUND, outcome="transport_failed",
-                                attempt_state="provider_rejected")
+                    logger.error(f"Erro ao enviar mensagem: {response.status_code} - {response.text}")
                     return False
                     
-        except ConversationDomainError:
-            raise
-        except Exception:
-            _emit_audit(AuditEvent.OUTBOUND, outcome="transport_failed", attempt_state="provider_failed")
+        except Exception as e:
+            logger.error(f"Exceção ao enviar mensagem: {str(e)}")
             return False
     
 # send_message_with_buttons removido - não utilizado
@@ -193,7 +174,7 @@ class WhatsAppService:
                     return {"error": f"Status {response.status_code}"}
                     
         except Exception as e:
-            _emit_audit(AuditEvent.READINESS, outcome="dependency_unavailable")
+            logger.error(f"Erro ao verificar status: {str(e)}")
             return {"error": str(e)}
     
     def acquire_chat_lock(self, phone: str, timeout: int = 60, blocking_timeout: int = 10) -> Optional[Lock]:
@@ -202,7 +183,7 @@ class WhatsAppService:
         Quando Redis não estiver disponível, retorna None (seguimos sem lock).
         """
         if not self.redis_client:
-            _emit_audit(AuditEvent.READINESS, outcome="dependency_unavailable")
+            logger.warning("⚠️ Redis indisponível - processamento seguirá sem lock por contato")
             return None
         
         lock_key = f"whatsapp:chat-lock:{phone}"
@@ -227,7 +208,7 @@ class WhatsAppService:
         """
         # Por enquanto, sempre retorna True pois o Wasender pode não suportar
         # marcar mensagens como lidas
-        _emit_audit(AuditEvent.OUTBOUND, outcome="accepted", attempt_state="read_receipt")
+        logger.info(f"Marcando mensagem {message_id} como lida para {phone}")
         return True
 
     # =========================================================================
@@ -252,7 +233,7 @@ class WhatsAppService:
             True se adicionado com sucesso
         """
         if not self.redis_client:
-            _emit_audit(AuditEvent.READINESS, outcome="dependency_unavailable")
+            logger.warning("Redis indisponivel - buffer de mensagens desativado")
             return False
 
         try:
@@ -280,12 +261,12 @@ class WhatsAppService:
 
             # Contar mensagens no buffer
             count = self.redis_client.llen(buffer_key)
-            _emit_audit(AuditEvent.INGRESS, outcome="buffered", count=min(count, 1_000_000))
+            logger.info(f"[BUFFER] Mensagem adicionada para {phone} (total: {count})")
 
             return True
 
-        except Exception:
-            _emit_audit(AuditEvent.INGRESS, outcome="coordination_failed")
+        except Exception as e:
+            logger.error(f"[BUFFER] Erro ao adicionar mensagem: {str(e)}")
             return False
 
     def get_buffered_messages(self, phone: str) -> list:
@@ -325,12 +306,11 @@ class WhatsAppService:
                     # Se falhar ao decodificar, usar como string
                     messages.append({"text": raw.decode('utf-8') if isinstance(raw, bytes) else str(raw)})
 
-            _emit_audit(AuditEvent.PROCESSING, outcome="buffer_loaded",
-                        count=min(len(messages), 1_000_000))
+            logger.info(f"[BUFFER] {len(messages)} mensagens recuperadas para {phone}")
             return messages
 
-        except Exception:
-            _emit_audit(AuditEvent.PROCESSING, outcome="coordination_failed")
+        except Exception as e:
+            logger.error(f"[BUFFER] Erro ao obter mensagens: {str(e)}")
             return []
 
     def get_concatenated_message(self, phone: str) -> str:
@@ -353,8 +333,7 @@ class WhatsAppService:
         # Concatenar com quebra de linha
         concatenated = "\n".join(texts)
 
-        _emit_audit(AuditEvent.PROCESSING, outcome="buffer_combined",
-                    count=min(len(messages), 1_000_000))
+        logger.info(f"[BUFFER] Mensagens concatenadas para {phone}: {concatenated[:100]}...")
         return concatenated
 
     def should_process_now(self, phone: str) -> bool:
@@ -385,14 +364,12 @@ class WhatsAppService:
 
             should_process = elapsed >= self.MESSAGE_DEBOUNCE_SECONDS
 
-            _emit_audit(AuditEvent.PROCESSING,
-                        outcome="ready" if should_process else "waiting",
-                        latency_bucket="debounce_elapsed")
+            logger.info(f"[BUFFER] {phone} - elapsed: {elapsed:.1f}s, debounce: {self.MESSAGE_DEBOUNCE_SECONDS}s, should_process: {should_process}")
 
             return should_process
 
-        except Exception:
-            _emit_audit(AuditEvent.PROCESSING, outcome="coordination_failed")
+        except Exception as e:
+            logger.error(f"[BUFFER] Erro ao verificar tempo: {str(e)}")
             return True  # Em caso de erro, processa
 
     def has_pending_messages(self, phone: str) -> bool:

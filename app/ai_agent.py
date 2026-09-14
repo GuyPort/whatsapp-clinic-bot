@@ -2,31 +2,21 @@
 Agente de IA com Claude SDK para tirar dúvidas sobre a clínica.
 Versão simplificada: responde dúvidas e redireciona ações para páginas web.
 """
-from copy import deepcopy
-from datetime import datetime, timezone
-from typing import Callable, Dict, Any, List
+from datetime import datetime, timedelta
+from typing import Optional, Dict, Any, List
+import json
 import logging
-import re
+import pytz
 
 from anthropic import Anthropic
+from sqlalchemy.orm import Session
+from sqlalchemy.orm.attributes import flag_modified
 
 from app.simple_config import settings
-from app.conversation_state import (
-    AgentIntent, AgentResult, AgentResponseInvalid, AgentToolUnavailable,
-    AgentUnavailable, ConversationDomainError, ConversationSnapshot,
-    FailureReason, InvalidCanonicalContact, ToolOutcome,
-)
-from app.utils import (
-    AuditEvent, ConversationAuditLogger, get_brazil_timezone, load_clinic_info,
-    new_audit_correlation_id,
-)
+from app.models import Appointment, AppointmentStatus, ConversationContext, PausedContact
+from app.utils import load_clinic_info, normalize_phone, now_brazil, get_brazil_timezone
 
 logger = logging.getLogger(__name__)
-conversation_audit = ConversationAuditLogger(logger)
-
-
-def _emit_audit(event: AuditEvent, **fields: object) -> None:
-    conversation_audit.emit(event, correlation_id=new_audit_correlation_id(), **fields)
 
 
 def format_closed_days(dias_fechados: List[str]) -> str:
@@ -67,11 +57,9 @@ def format_closed_days(dias_fechados: List[str]) -> str:
 class ClaudeToolAgent:
     """Agente de IA para tirar dúvidas e redirecionar ações para páginas web"""
 
-    def __init__(self, client: Any = None, clinic_info: dict | None = None,
-                 clock: Callable[[], datetime] | None = None):
-        self.client = client if client is not None else Anthropic(api_key=settings.anthropic_api_key)
-        self.clinic_info = clinic_info if clinic_info is not None else load_clinic_info()
-        self.clock = clock if clock is not None else datetime.utcnow
+    def __init__(self):
+        self.client = Anthropic(api_key=settings.anthropic_api_key)
+        self.clinic_info = load_clinic_info()
         self.timezone = get_brazil_timezone()
         self.tools = self._define_tools()
         self.system_prompt = self._create_system_prompt()
@@ -249,13 +237,42 @@ Após responder qualquer dúvida ou enviar um link:
             }
         ]
 
+    def _handle_secretary_pause(self, db: Session, phone: Optional[str]) -> None:
+        """Pausa silenciosamente o contato por 24 horas quando secretária envia /pause"""
+        if not phone:
+            return
+
+        try:
+            logger.info(f"⏸️ Pausa manual da secretária aplicada para {phone}")
+
+            existing_context = db.query(ConversationContext).filter_by(phone=phone).first()
+            if existing_context:
+                db.delete(existing_context)
+                logger.info(f"🗑️ Contexto deletado para {phone} (pausa manual da secretária)")
+
+            existing_pause = db.query(PausedContact).filter_by(phone=phone).first()
+            if existing_pause:
+                db.delete(existing_pause)
+                logger.info(f"🗑️ Pausa anterior removida para {phone} (pausa manual da secretária)")
+
+            paused_until = datetime.utcnow() + timedelta(hours=24)
+            paused_contact = PausedContact(
+                phone=phone,
+                paused_until=paused_until,
+                reason="secretary_manual_pause"
+            )
+            db.add(paused_contact)
+            db.commit()
+
+            logger.info(f"⏸️ Contato {phone} pausado pela secretária até {paused_until}")
+        except Exception as exc:
+            logger.error(f"❌ Erro ao aplicar pausa manual da secretária: {exc}")
+            db.rollback()
+
     def _is_clinic_open_now(self) -> tuple:
         """Verifica se a clínica está aberta no momento atual"""
         try:
-            now = self.clock()
-            if now.tzinfo is None:
-                now = now.replace(tzinfo=timezone.utc)
-            now = now.astimezone(self.timezone)
+            now = now_brazil()
             weekday = now.weekday()
 
             dias_semana = ['segunda', 'terca', 'quarta', 'quinta', 'sexta', 'sabado', 'domingo']
@@ -280,10 +297,9 @@ Após responder qualquer dúvida ou enviar um link:
             except Exception:
                 return False, "Horário não determinado"
 
-        except ConversationDomainError:
-            raise
-        except Exception:
-            raise AgentToolUnavailable(FailureReason.TOOL_UNAVAILABLE) from None
+        except Exception as e:
+            logger.error(f"Erro ao verificar horário: {e}")
+            return False, "Erro ao verificar"
 
     def _format_clinic_hours(self) -> str:
         """Formata horários de funcionamento"""
@@ -318,59 +334,49 @@ Após responder qualquer dúvida ou enviar um link:
                 items.append(f"• {dados.get('nome', cod)}")
         return "\n".join(items) if items else "Convênios não informados."
 
-    def prepare_result(self, message: str, phone: str, snapshot: ConversationSnapshot,
-                       *, authorize: Callable[[], None] | None = None) -> AgentResult:
-        """Produz texto e intenção sem consultar ou alterar estado persistente."""
-        if not isinstance(phone, str) or re.fullmatch(r"[1-9][0-9]{9,14}", phone) is None:
-            raise InvalidCanonicalContact(FailureReason.INVALID_CANONICAL_CONTACT)
-        if not isinstance(snapshot, ConversationSnapshot):
-            raise AgentResponseInvalid(FailureReason.INVALID_AGENT_SNAPSHOT)
-        if snapshot.phone != phone:
-            raise InvalidCanonicalContact(FailureReason.INVALID_CANONICAL_CONTACT)
-
+    def process_message(self, message: str, phone: str, db: Session) -> str:
+        """Processa uma mensagem do usuário e retorna a resposta"""
         try:
-            # Neither the provider nor the returned delta shares mutable history
-            # with the snapshot owned by the conversation authority.
-            history = deepcopy(snapshot.messages)
-            flow_data = deepcopy(snapshot.flow_data)
-            if self._should_end_context(snapshot, message):
-                return AgentResult("Foi um prazer atender você! Até logo!", [], None, {},
-                                   AgentIntent.CLOSE_CONTEXT)
+            # 1. Carregar ou criar contexto
+            context = db.query(ConversationContext).filter_by(phone=phone).first()
+            if not context:
+                context = ConversationContext(
+                    phone=phone,
+                    messages=[],
+                    status="active"
+                )
+                db.add(context)
+                logger.info(f"🆕 Novo contexto criado para {phone}")
+            else:
+                logger.info(f"📱 Contexto carregado para {phone}: {len(context.messages)} mensagens")
 
-            history.append({
+            # 2. Verificar se deve encerrar contexto por despedida
+            normalized_phone = normalize_phone(phone)
+            if self._should_end_context(context, message):
+                logger.info(f"🔚 Encerrando contexto para {phone} por despedida")
+                db.delete(context)
+                db.commit()
+                return "Foi um prazer atender você! Até logo!"
+
+            # 4. Adicionar mensagem ao histórico
+            context.messages.append({
                 "role": "user",
                 "content": message,
-                "timestamp": self.clock().isoformat(),
+                "timestamp": datetime.utcnow().isoformat()
             })
-            claude_messages = [
-                {"role": item["role"], "content": deepcopy(item["content"])}
-                for item in history
-            ]
-            system_prompt = self._get_system_prompt_for(phone)
-            response = self._call_claude(claude_messages, system_prompt, authorize=authorize)
-            outcome = self._process_claude_response(response, claude_messages, phone, system_prompt,
-                                                    authorize=authorize)
-            if outcome.intent is not None:
-                return AgentResult(outcome.content, [], None, {}, outcome.intent)
+            flag_modified(context, 'messages')
 
-            history.append({
-                "role": "assistant",
-                "content": outcome.content,
-                "timestamp": self.clock().isoformat(),
-            })
-            return AgentResult(outcome.content, history, snapshot.current_flow, flow_data,
-                               AgentIntent.SAVE_CONTEXT)
-        except ConversationDomainError:
-            raise
-        except Exception:
-            raise AgentUnavailable(FailureReason.AGENT_UNAVAILABLE) from None
+            # 5. Preparar mensagens para Claude
+            claude_messages = []
+            for msg in context.messages:
+                claude_messages.append({
+                    "role": msg["role"],
+                    "content": msg["content"]
+                })
 
-    def _call_claude(self, messages: list, system_prompt: str, *, authorize=None):
-        """Mantém a mesma configuração e os links canônicos em cada rodada."""
-        _emit_audit(AuditEvent.PROCESSING, outcome="agent_started", attempt_state="provider_call")
-        try:
-            if authorize is not None:
-                authorize()  # Optional only for isolated, authority-free adapter callers.
+            # 6. Chamar Claude
+            logger.info(f"🤖 Enviando {len(claude_messages)} mensagens para Claude")
+            system_prompt = self._get_system_prompt_for(normalized_phone)
             response = self.client.messages.create(
                 model="claude-sonnet-4-6",
                 max_tokens=1500,
@@ -380,134 +386,207 @@ Após responder qualquer dúvida ou enviar um link:
                 system=[{
                     "type": "text",
                     "text": system_prompt,
-                    "cache_control": {"type": "ephemeral"},
+                    "cache_control": {"type": "ephemeral"}
                 }],
-                messages=deepcopy(messages),
-                tools=deepcopy(self.tools),
+                messages=claude_messages,
+                tools=self.tools
             )
-        except ConversationDomainError:
-            _emit_audit(AuditEvent.PROCESSING, outcome="dependency_unavailable",
-                        attempt_state="provider_failed")
-            raise
-        except Exception:
-            _emit_audit(AuditEvent.PROCESSING, outcome="dependency_unavailable",
-                        attempt_state="provider_failed")
-            raise AgentUnavailable(FailureReason.AGENT_UNAVAILABLE) from None
-        _emit_audit(AuditEvent.PROCESSING, outcome="agent_completed", attempt_state="provider_returned")
-        return response
 
-    def _process_claude_response(self, response, claude_messages: list, phone: str,
-                                 system_prompt: str, *, authorize=None) -> ToolOutcome:
-        """Resolve até três rodadas de tools, sempre conservando a intenção."""
-        for iteration in range(4):
-            blocks = getattr(response, "content", None)
-            if not isinstance(blocks, list) or not blocks:
-                raise AgentResponseInvalid(FailureReason.INVALID_AGENT_RESPONSE)
+            # 7. Processar resposta
+            bot_response = self._process_claude_response(response, claude_messages, db, phone)
 
-            texts = []
-            tool_blocks = []
-            assistant_blocks = []
-            for block in blocks:
-                if getattr(block, "type", None) == "text" and isinstance(block.text, str):
-                    texts.append(block.text)
-                    assistant_blocks.append({"type": "text", "text": block.text})
-                elif (getattr(block, "type", None) == "tool_use"
-                      and isinstance(block.id, str) and block.id
-                      and isinstance(block.name, str)):
-                    tool_blocks.append(block)
-                    assistant_blocks.append({
-                        "type": "tool_use", "id": block.id,
-                        "name": block.name, "input": deepcopy(block.input),
-                    })
+            # 8. Salvar resposta no histórico
+            context.messages.append({
+                "role": "assistant",
+                "content": bot_response,
+                "timestamp": datetime.utcnow().isoformat()
+            })
+            flag_modified(context, 'messages')
+            context.last_activity = datetime.utcnow()
+            db.commit()
+
+            logger.info(f"💾 Contexto salvo para {phone}: {len(context.messages)} mensagens")
+            return bot_response
+
+        except Exception as e:
+            logger.error(f"Erro ao processar mensagem: {str(e)}")
+            return "Desculpe, ocorreu um erro. Tente novamente em alguns instantes."
+
+    def _process_claude_response(self, response, claude_messages: list, db: Session, phone: str) -> str:
+        """Processa a resposta do Claude, incluindo chamadas de tools"""
+        if not response.content:
+            return "Desculpe, não consegui processar sua mensagem. Tente novamente."
+
+        content = response.content[0]
+
+        if content.type == "text":
+            return content.text
+
+        if content.type == "tool_use":
+            max_iterations = 3
+            current_response = response
+
+            for iteration in range(max_iterations):
+                if not current_response.content:
+                    break
+
+                content = current_response.content[0]
+
+                if content.type == "text":
+                    return content.text
+
+                if content.type == "tool_use":
+                    tool_result = self._execute_tool(content.name, content.input, db, phone)
+
+                    # end_conversation retorna imediatamente
+                    if content.name == "end_conversation":
+                        return tool_result
+
+                    # Continuar conversa com resultado da tool
+                    current_response = self.client.messages.create(
+                        model="claude-sonnet-4-6",
+                        max_tokens=1500,
+                        temperature=0.3,
+                        thinking={"type": "disabled"},
+                        extra_body={"output_config": {"effort": "low"}},
+                        system=[{
+                            "type": "text",
+                            "text": self.system_prompt,
+                            "cache_control": {"type": "ephemeral"}
+                        }],
+                        messages=claude_messages + [
+                            {"role": "assistant", "content": current_response.content},
+                            {
+                                "role": "user",
+                                "content": [
+                                    {
+                                        "type": "tool_result",
+                                        "tool_use_id": content.id,
+                                        "content": tool_result
+                                    }
+                                ]
+                            }
+                        ]
+                    )
                 else:
-                    raise AgentResponseInvalid(FailureReason.INVALID_AGENT_RESPONSE)
+                    break
 
-            if not tool_blocks:
-                text = "\n".join(texts)
-                if not text.strip():
-                    raise AgentResponseInvalid(FailureReason.INVALID_AGENT_RESPONSE)
-                return ToolOutcome(text)
-            if iteration == 3:
-                raise AgentResponseInvalid(FailureReason.TOOL_ITERATION_LIMIT)
-            if len({block.id for block in tool_blocks}) != len(tool_blocks):
-                raise AgentResponseInvalid(FailureReason.INVALID_AGENT_RESPONSE)
+            # Fallback: verificar última resposta
+            if current_response.content and current_response.content[0].type == "text":
+                return current_response.content[0].text
 
-            outcomes = [self._execute_tool(block.name, block.input, phone) for block in tool_blocks]
-            intents = {outcome.intent for outcome in outcomes if outcome.intent is not None}
-            if len(intents) > 1:
-                raise AgentResponseInvalid(FailureReason.INVALID_AGENT_RESPONSE)
-            if intents:
-                return next(outcome for outcome in outcomes if outcome.intent is not None)
+            return tool_result if 'tool_result' in dir() else "Desculpe, não consegui processar sua mensagem."
 
-            claude_messages.extend([
-                {"role": "assistant", "content": assistant_blocks},
-                {"role": "user", "content": [
-                    {"type": "tool_result", "tool_use_id": block.id, "content": outcome.content}
-                    for block, outcome in zip(tool_blocks, outcomes)
-                ]},
-            ])
-            response = self._call_claude(claude_messages, system_prompt, authorize=authorize)
+        return "Desculpe, não consegui processar sua mensagem. Tente novamente."
 
-        raise AgentResponseInvalid(FailureReason.TOOL_ITERATION_LIMIT)
-
-    def _execute_tool(self, tool_name: str, tool_input: Dict, phone: str) -> ToolOutcome:
-        """Executa somente cálculo local e retorna uma intenção tipada."""
+    def _execute_tool(self, tool_name: str, tool_input: Dict, db: Session, phone: str = None) -> str:
+        """Executa uma tool específica"""
         try:
-            if not isinstance(phone, str) or re.fullmatch(r"[1-9][0-9]{9,14}", phone) is None:
-                raise InvalidCanonicalContact(FailureReason.INVALID_CANONICAL_CONTACT)
-            if not isinstance(tool_input, dict) or tool_input:
-                raise AgentToolUnavailable(FailureReason.TOOL_UNAVAILABLE)
+            logger.info(f"🔧 Executando tool: {tool_name} com input: {tool_input}")
+
             if tool_name == "get_clinic_info":
-                return self._handle_get_clinic_info()
-            if tool_name == "request_human_assistance":
-                return self._handle_request_human_assistance()
-            if tool_name == "end_conversation":
-                return self._handle_end_conversation()
-            raise AgentToolUnavailable(FailureReason.TOOL_UNAVAILABLE)
-        except ConversationDomainError:
-            raise
-        except Exception:
-            raise AgentToolUnavailable(FailureReason.TOOL_UNAVAILABLE) from None
+                return self._handle_get_clinic_info(tool_input, db, phone)
+            elif tool_name == "request_human_assistance":
+                return self._handle_request_human_assistance(tool_input, db, phone)
+            elif tool_name == "end_conversation":
+                return self._handle_end_conversation(tool_input, db, phone)
 
-    def _handle_get_clinic_info(self) -> ToolOutcome:
-        """Tool: get_clinic_info — informações sem transição de estado."""
-        nome_clinica = self.clinic_info.get('nome_clinica', 'Clínica')
-        endereco = self.clinic_info.get('endereco', 'Não informado')
-        telefone = self.clinic_info.get('telefone', 'Não informado')
-        resposta = [
-            f"🏥 {nome_clinica}",
-            "",
-            f"📍 Endereço: {endereco}",
-            f"📞 Telefone: {telefone}",
-            "",
-            "🕒 Horários de funcionamento:",
-            self._format_clinic_hours(),
-        ]
-        dias_fechados = self.clinic_info.get('dias_fechados', [])
-        if dias_fechados:
-            resposta.extend([
-                "🚫 Dias especiais sem atendimento:",
-                self._format_closed_days(),
-            ])
-        return ToolOutcome("\n".join(resposta))
+            logger.warning(f"❌ Tool não reconhecida: {tool_name}")
+            return "Desculpe, ocorreu um problema técnico. Por favor, tente novamente."
+        except Exception as e:
+            logger.error(f"Erro ao executar tool {tool_name}: {str(e)}")
+            return "Desculpe, ocorreu um erro ao processar sua solicitação."
 
-    def _handle_request_human_assistance(self) -> ToolOutcome:
-        """Tool: request_human_assistance — solicita pausa à autoridade central."""
-        is_open, _ = self._is_clinic_open_now()
-        if is_open:
-            text = ("Vou transferir você para nossa secretária Beatriz agora! "
-                    "Para agilizar, já pode nos contar como podemos te ajudar.\n\n"
-                    "Em caso de emergência, ligue para a Dra. Rose: (51) 99954-6355")
-        else:
-            text = ("Vou transferir você para nossa secretária Beatriz. "
-                    "Neste momento estamos fora do horário de atendimento, "
-                    "mas ela vai te responder assim que possível.\n\n"
-                    "Em caso de emergência, ligue para a Dra. Rose: (51) 99954-6355")
-        return ToolOutcome(text, AgentIntent.PAUSE_FOR_SECRETARY)
+    def _handle_get_clinic_info(self, tool_input: Dict, db: Session, phone: Optional[str]) -> str:
+        """Tool: get_clinic_info - Retorna informações da clínica"""
+        try:
+            nome_clinica = self.clinic_info.get('nome_clinica', 'Clínica')
+            endereco = self.clinic_info.get('endereco', 'Não informado')
+            telefone = self.clinic_info.get('telefone', 'Não informado')
 
-    def _handle_end_conversation(self) -> ToolOutcome:
-        """Tool: end_conversation — solicita encerramento à autoridade central."""
-        return ToolOutcome("Foi um prazer atender você! Até logo!", AgentIntent.CLOSE_CONTEXT)
+            resposta = [
+                f"🏥 {nome_clinica}",
+                "",
+                f"📍 Endereço: {endereco}",
+                f"📞 Telefone: {telefone}",
+                "",
+                "🕒 Horários de funcionamento:",
+                self._format_clinic_hours(),
+            ]
+
+            dias_fechados = self.clinic_info.get('dias_fechados', [])
+            if dias_fechados:
+                resposta.extend([
+                    "🚫 Dias especiais sem atendimento:",
+                    self._format_closed_days()
+                ])
+
+            return "\n".join(resposta)
+
+        except Exception as e:
+            logger.error(f"Erro ao obter info da clínica: {str(e)}")
+            return f"Erro ao buscar informações: {str(e)}"
+
+    def _handle_request_human_assistance(self, tool_input: Dict, db: Session, phone: str) -> str:
+        """Tool: request_human_assistance - Pausar bot para atendimento humano"""
+        try:
+            logger.info(f"🛑 Tool request_human_assistance chamada para {phone}")
+
+            # Pausar sempre, independente do horário
+            existing_context = db.query(ConversationContext).filter_by(phone=phone).first()
+            if existing_context:
+                db.delete(existing_context)
+
+            existing_pause = db.query(PausedContact).filter_by(phone=phone).first()
+            if existing_pause:
+                db.delete(existing_pause)
+
+            paused_until = datetime.utcnow() + timedelta(hours=24)
+            paused_contact = PausedContact(
+                phone=phone,
+                paused_until=paused_until,
+                reason="user_requested_human_assistance"
+            )
+            db.add(paused_contact)
+            db.commit()
+
+            logger.info(f"⏸️ Bot pausado para {phone} até {paused_until}")
+
+            # Mensagem diferente conforme horário
+            is_open, message = self._is_clinic_open_now()
+
+            if is_open:
+                return ("Vou transferir você para nossa secretária Beatriz agora! "
+                        "Para agilizar, já pode nos contar como podemos te ajudar.\n\n"
+                        "Em caso de emergência, ligue para a Dra. Rose: (51) 99954-6355")
+            else:
+                return ("Vou transferir você para nossa secretária Beatriz. "
+                        "Neste momento estamos fora do horário de atendimento, "
+                        "mas ela vai te responder assim que possível.\n\n"
+                        "Em caso de emergência, ligue para a Dra. Rose: (51) 99954-6355")
+
+        except Exception as e:
+            logger.error(f"Erro ao pausar bot para humano: {str(e)}")
+            db.rollback()
+            return f"Erro ao transferir para humano: {str(e)}"
+
+    def _handle_end_conversation(self, tool_input: Dict, db: Session, phone: str) -> str:
+        """Tool: end_conversation - Encerrar conversa e limpar contexto"""
+        try:
+            logger.info(f"🔚 Tool end_conversation chamada para {phone}")
+
+            context = db.query(ConversationContext).filter_by(phone=phone).first()
+            if context:
+                db.delete(context)
+                db.commit()
+                logger.info(f"🗑️ Contexto deletado para {phone}")
+
+            return "Foi um prazer atender você! Até logo!"
+
+        except Exception as e:
+            logger.error(f"Erro ao encerrar conversa: {str(e)}")
+            db.rollback()
+            return f"Erro ao encerrar conversa: {str(e)}"
 
     def _detect_confirmation_intent(self, message: str) -> str:
         """Detecta intenção de confirmação (positive/negative/unclear)"""
@@ -537,7 +616,7 @@ Após responder qualquer dúvida ou enviar um link:
 
         return "unclear"
 
-    def _should_end_context(self, context: ConversationSnapshot, last_user_message: str) -> bool:
+    def _should_end_context(self, context: ConversationContext, last_user_message: str) -> bool:
         """Verifica se deve encerrar o contexto baseado na última mensagem"""
         if not context.messages:
             return False

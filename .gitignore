@@ -77,6 +77,3 @@ backup/
 *.tmp
 temp/
 tmp/
-
-# Local Git worktrees
-.worktrees/

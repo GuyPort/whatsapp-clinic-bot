@@ -2,99 +2,13 @@
 Funções utilitárias e helpers.
 """
 from datetime import datetime, timedelta, time
-from enum import Enum
 import logging
 import re
 import json
 import pytz
 from typing import Optional, Dict, Any, List, Mapping
-from uuid import UUID, uuid4
 
 from app.simple_config import settings
-
-
-class AuditEvent(str, Enum):
-    INGRESS = "ingress"
-    TRANSITION = "transition"
-    PROCESSING = "processing"
-    OUTBOUND = "outbound"
-    RECOVERY = "recovery"
-    READINESS = "readiness"
-
-
-ALLOWED_AUDIT_FIELDS = frozenset(
-    {
-        "outcome",
-        "cycle",
-        "attempt_state",
-        "count",
-        "latency_bucket",
-        "correlation_id",
-    }
-)
-
-_AUDIT_OUTCOMES = frozenset({
-    "accepted", "agent_completed", "agent_started", "applied", "buffer_combined",
-    "buffer_loaded", "buffered", "coordination_failed", "dependency_unavailable",
-    "discarded", "duplicate", "ignored", "invalid_request", "paused",
-    "persistence_failed", "processed", "processing_failed", "ready", "recovered",
-    "released", "reload_started", "sent", "simulated", "started", "stopped",
-    "terminal", "transport_failed", "unauthorized", "waiting",
-})
-_AUDIT_CYCLES = frozenset({"open", "paused", "closed", "mutating", "quarantined"})
-_AUDIT_ATTEMPT_STATES = frozenset({
-    "aborted", "authorizing", "busy", "captured", "claimed", "claiming", "closed", "committed", "completed",
-    "duplicate", "exhausted", "failed", "locking", "locked", "lock_timeout",
-    "provider_accepted", "provider_call", "provider_failed", "provider_rejected",
-    "provider_returned", "rate_limited", "read_receipt", "release_failed", "retryable",
-    "retrying", "scanning", "scheduled", "terminal", "without_rate_limit",
-})
-_AUDIT_LATENCY_BUCKETS = frozenset({
-    "under_1s", "one_to_five_seconds", "over_five_seconds", "debounce_elapsed",
-    "retry_delay", "vendor_delay",
-})
-_MAX_AUDIT_COUNT = 1_000_000
-
-
-def new_audit_correlation_id() -> str:
-    """Return a new opaque operation identifier unrelated to conversation data."""
-    return str(uuid4())
-
-
-class ConversationAuditLogger:
-    """Emit conversation telemetry through one closed structured schema."""
-    def __init__(self, logger: logging.Logger) -> None:
-        self._logger = logger
-
-    def emit(self, event: AuditEvent, **fields: object) -> None:
-        if not isinstance(event, AuditEvent):
-            raise ValueError("invalid conversation audit event")
-        invalid = set(fields).difference(ALLOWED_AUDIT_FIELDS)
-        if invalid:
-            raise ValueError("invalid conversation audit field")
-        validators = {
-            "outcome": lambda value: type(value) is str and value in _AUDIT_OUTCOMES,
-            "cycle": lambda value: type(value) is str and value in _AUDIT_CYCLES,
-            "attempt_state": lambda value: type(value) is str and value in _AUDIT_ATTEMPT_STATES,
-            "count": lambda value: type(value) is int and 0 <= value <= _MAX_AUDIT_COUNT,
-            "latency_bucket": lambda value: type(value) is str and value in _AUDIT_LATENCY_BUCKETS,
-            "correlation_id": _is_uuid4,
-        }
-        if any(not validators[name](value) for name, value in fields.items()):
-            raise ValueError("invalid conversation audit value")
-        payload = {"event": event.value, **fields}
-        rendered = json.dumps(payload, sort_keys=True, separators=(",", ":"))
-        self._logger.info(f"conversation_audit {rendered}", extra={"audit": payload})
-
-
-def _is_uuid4(value: object) -> bool:
-    if type(value) is not str:
-        return False
-    try:
-        parsed = UUID(value)
-    except (ValueError, AttributeError):
-        return False
-    return parsed.version == 4 and str(parsed) == value
 
 
 def get_brazil_timezone():
@@ -166,24 +80,17 @@ def normalize_phone(phone: str) -> str:
     if not phone or not isinstance(phone, str):
         return ""
     
-    candidate = phone.strip()
-    for suffix in ("@s.whatsapp.net", "@c.us"):
-        if candidate.endswith(suffix):
-            candidate = candidate[:-len(suffix)]
-            break
-
-    # Classificacao de outros tipos de JID pertence ao ingresso em main.py.
-    if "@" in candidate or not re.fullmatch(r"[0-9+().\s-]+", candidate):
-        return ""
-
-    clean = re.sub(r'\D', '', candidate)
+    clean = re.sub(r'\D', '', phone)
     
     # Validar tamanho (máximo 15 dígitos conforme padrão internacional)
-    if len(clean) in (10, 11):
-        clean = '55' + clean
+    if len(clean) > 15:
+        return ""
     
     # Garantir que tem código do país (55) para Brasil
-    return clean if re.fullmatch(r"[1-9][0-9]{9,14}", clean) else ""
+    if not clean.startswith('55') and len(clean) >= 10:
+        clean = '55' + clean
+    
+    return clean
 
 
 def load_clinic_info() -> Dict[str, Any]:
