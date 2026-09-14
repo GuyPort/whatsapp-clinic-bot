@@ -83,7 +83,8 @@ class ConversationAuditLogger:
         if any(not validators[name](value) for name, value in fields.items()):
             raise ValueError("invalid conversation audit value")
         payload = {"event": event.value, **fields}
-        self._logger.info("conversation_audit", extra={"audit": payload})
+        rendered = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        self._logger.info(f"conversation_audit {rendered}", extra={"audit": payload})
 
 
 def _is_uuid4(value: object) -> bool:

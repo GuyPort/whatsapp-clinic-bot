@@ -2,12 +2,72 @@
 import asyncio
 import hashlib
 import importlib.util
+import io
 import json
 import logging
 from pathlib import Path
+from types import SimpleNamespace
 from uuid import UUID
 
 import pytest
+
+
+pytestmark = pytest.mark.usefixtures("conversation_security_boundaries")
+DEPENDENCY_NAMES = ("secret", "sql", "redis", "epoch", "broker")
+
+
+class _RecordCapture(logging.Handler):
+    def __init__(self):
+        super().__init__()
+        self.records = []
+
+    def emit(self, record):
+        self.records.append(record)
+
+
+def test_conversation_audit_payload_is_visible_in_message_only_formatter_and_unrelated_unchanged(
+        conversation_security_boundaries):
+    from app.utils import AuditEvent, ConversationAuditLogger
+    correlation = "3c177a6b-8ba1-4aca-9966-3f35918dcd99"
+    stream = io.StringIO()
+    rendered = logging.StreamHandler(stream)
+    rendered.setFormatter(logging.Formatter("%(message)s"))
+    captured = _RecordCapture()
+    logger = logging.getLogger("app.audit_render_contract")
+    previous = logger.handlers[:], logger.level, logger.propagate
+    logger.handlers, logger.level, logger.propagate = [rendered, captured], logging.INFO, False
+    try:
+        ConversationAuditLogger(logger).emit(
+            AuditEvent.INGRESS, outcome="accepted", correlation_id=correlation)
+        logger.info("unaffected_control")
+    finally:
+        logger.handlers, logger.level, logger.propagate = previous
+    assert stream.getvalue().splitlines() == [
+        'conversation_audit {"correlation_id":"3c177a6b-8ba1-4aca-9966-3f35918dcd99",'
+        '"event":"ingress","outcome":"accepted"}',
+        "unaffected_control",
+    ]
+    assert captured.records[0].audit == {
+        "event": "ingress", "outcome": "accepted", "correlation_id": correlation}
+    assert not hasattr(captured.records[1], "audit")
+
+
+def test_conversation_security_guards_block_external_mutation_and_allow_memory_readonly(
+        conversation_security_boundaries):
+    guards = conversation_security_boundaries
+    assert guards is not None, "security guard fixture must expose positive probes"
+    for name, boundary in (
+            ("network", "network"),
+            ("persistent_sql", "persistent_sql"),
+            ("persistent_sqlite", "persistent_sql"),
+            ("mkdir", "mkdir"),
+            ("rename", "rename"),
+            ("remove", "remove"),
+            ("replace", "replace")):
+        with pytest.raises(AssertionError, match=f"{boundary} forbidden"):
+            getattr(guards, name)()
+    guards.memory_sql()
+    assert "conversation_security_boundaries" in guards.readonly_file()
 
 
 def _serialized_application_records(records):
@@ -19,6 +79,17 @@ def _serialized_application_records(records):
         serialized.append(record.getMessage())
         serialized.append(json.dumps(fields, default=str, sort_keys=True))
     return " ".join(serialized)
+
+
+def _assert_sensitive_fragments_absent(records, fragments):
+    captured = _serialized_application_records(records)
+    normalized_capture = "".join(character for character in captured.lower()
+                                 if character.isalnum())
+    for fragment in fragments:
+        assert fragment.lower() not in captured.lower(), fragment
+        normalized = "".join(character for character in fragment.lower()
+                             if character.isalnum())
+        assert normalized not in normalized_capture, fragment
 
 
 def test_conversation_audit_rejects_unknown_field_before_emitting_record(
@@ -70,7 +141,8 @@ def test_conversation_audit_allowlist_has_fresh_opaque_uuid_and_keeps_unrelated_
                    correlation_id=first)
         logging.getLogger("unaffected_control").info("unaffected_control")
     record = next(record for record in caplog.records if record.name == "app.audit_contract")
-    assert record.getMessage() == "conversation_audit"
+    assert record.getMessage() == "conversation_audit " + json.dumps(
+        record.audit, sort_keys=True, separators=(",", ":"))
     assert record.audit == {"event": "ingress", "outcome": "accepted", "cycle": "open",
                             "attempt_state": "claimed", "count": 2,
                             "latency_bucket": "under_1s", "correlation_id": first}
@@ -141,6 +213,169 @@ def test_whatsapp_audit_sentinel_capture_covers_configuration_vendor_and_excepti
         assert hashlib.sha256(sentinel.encode()).hexdigest() not in captured
     assert "unaffected_control" in caplog.text
     assert any(record.name == "app.synthetic_whatsapp_audit" for record in caplog.records)
+
+
+def test_debug_fragment_tripwire_covers_real_whatsapp_lock_buffer_and_agent_paths(
+        monkeypatch, caplog, conversation_security_boundaries):
+    """DEBUG and partial-value probes guard real paths with injected dependencies."""
+    import anthropic
+    import redis
+    from app import utils
+    from app.simple_config import settings
+    from app.conversation_state import ConversationSnapshot
+    from tests.fakes import ScriptedClaude
+    from datetime import datetime, timezone
+
+    phone = "5551976543987"
+    sentinels = {
+        "phone": phone,
+        "content": "PRIVATECONTENTFRAG501",
+        "media": "PRIVATEMEDIAFRAG502",
+        "bearer": "PREFIX10ZX-secret-tail",
+        "exception": "EXCFRAG503",
+        "vendor": "VENDORFRAG504",
+        "redis": "redis://audit-user:REDISFRAG505@audit.invalid/9",
+        "sql": "postgresql://audit-user:SQLFRAG506@audit.invalid/private",
+        "prompt": "PROMPTFRAG507",
+        "output": "OUTPUTFRAG508",
+    }
+    fragments = (
+        "76543987", "CONTENTFRAG501", "MEDIAFRAG502", "PREFIX10ZX",
+        "EXCFRAG503", "VENDORFRAG504", "REDISFRAG505", "SQLFRAG506",
+        "PROMPTFRAG507", "OUTPUTFRAG508",
+    )
+
+    # This positive mutation control must observe every class of leak at DEBUG.
+    with caplog.at_level(logging.DEBUG):
+        probe_logger = logging.getLogger("app.synthetic_debug_privacy_probe")
+        for fragment in fragments:
+            probe_logger.debug(fragment)
+    probe_records = [record for record in caplog.records
+                     if record.name == "app.synthetic_debug_privacy_probe"]
+    assert [record.getMessage() for record in probe_records] == list(fragments)
+    caplog.clear()
+
+    class MemoryRedis:
+        def __init__(self):
+            self.lists = {}
+            self.values = {}
+        def rpush(self, key, value):
+            self.lists.setdefault(key, []).append(value)
+        def expire(self, key, seconds):
+            return True
+        def set(self, key, value, **kwargs):
+            self.values[key] = value
+        def llen(self, key):
+            return len(self.lists.get(key, ()))
+        def lrange(self, key, start, end):
+            return list(self.lists.get(key, ()))
+        def delete(self, key):
+            self.lists.pop(key, None)
+        def get(self, key):
+            return self.values.get(key)
+
+    memory_redis = MemoryRedis()
+    monkeypatch.setattr(settings, "evolution_api_url", "https://audit.invalid")
+    monkeypatch.setattr(settings, "evolution_api_key", sentinels["bearer"])
+    monkeypatch.setattr(settings, "evolution_instance_name", "synthetic-instance")
+    monkeypatch.setattr(settings, "redis_url", sentinels["redis"])
+    monkeypatch.setattr(settings, "database_url", sentinels["sql"])
+    monkeypatch.setattr(redis, "from_url", lambda url, **kwargs: memory_redis)
+
+    provider_mode = {"value": "success"}
+    provider_calls = []
+    class ProviderClient:
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *args):
+            return False
+        async def post(self, url, **kwargs):
+            provider_calls.append((url, kwargs))
+            if provider_mode["value"] == "exception":
+                raise RuntimeError(sentinels["exception"])
+            return SimpleNamespace(
+                status_code=201 if provider_mode["value"] == "success" else 500,
+                text=sentinels["vendor"],
+            )
+
+    lock_keys = []
+    class MemoryLock:
+        def __init__(self, client, key, **kwargs):
+            assert client is memory_redis
+            lock_keys.append(key)
+            self.acquired = False
+        def acquire(self, **kwargs):
+            self.acquired = True
+            return True
+        def owned(self):
+            return self.acquired
+        def release(self):
+            self.acquired = False
+
+    async def no_sleep(_seconds):
+        return None
+
+    claude = ScriptedClaude()
+    claude.respond_with_text(sentinels["output"])
+    monkeypatch.setattr(anthropic, "Anthropic", lambda **kwargs: ScriptedClaude())
+    monkeypatch.setattr(utils, "load_clinic_info", lambda: {
+        "nome_clinica": sentinels["prompt"],
+        "horario_atendimento": {},
+    })
+
+    with caplog.at_level(logging.DEBUG):
+        service_spec = importlib.util.spec_from_file_location(
+            "app.synthetic_whatsapp_debug_audit",
+            Path(__file__).parents[1] / "app" / "whatsapp_service.py")
+        service_module = importlib.util.module_from_spec(service_spec)
+        service_spec.loader.exec_module(service_module)
+        monkeypatch.setattr(service_module, "Lock", MemoryLock)
+        monkeypatch.setattr(service_module.httpx, "AsyncClient",
+                            lambda **kwargs: ProviderClient())
+        monkeypatch.setattr(service_module.asyncio, "sleep", no_sleep)
+        service = service_module.whatsapp_service
+        assert asyncio.run(service.send_message(phone, sentinels["content"]))
+        assert service.acquire_chat_lock(phone) is not None
+        assert service.add_message_to_buffer(
+            phone, sentinels["prompt"], sentinels["media"])
+        assert service.get_concatenated_message(phone) == sentinels["prompt"]
+        provider_mode["value"] = "vendor"
+        assert not asyncio.run(service._send_message_internal(phone, sentinels["content"]))
+        provider_mode["value"] = "exception"
+        assert not asyncio.run(service._send_message_internal(phone, sentinels["content"]))
+
+        from app.conversation_recovery import bounded_sql_dependencies
+        with pytest.raises(RuntimeError, match=sentinels["exception"]):
+            bounded_sql_dependencies(
+                sentinels["sql"],
+                engine_factory=lambda url, **kwargs: (_ for _ in ()).throw(
+                    RuntimeError(sentinels["exception"])))
+
+        agent_spec = importlib.util.spec_from_file_location(
+            "app.synthetic_ai_debug_audit",
+            Path(__file__).parents[1] / "app" / "ai_agent.py")
+        agent_module = importlib.util.module_from_spec(agent_spec)
+        agent_spec.loader.exec_module(agent_module)
+        agent = agent_module.ClaudeToolAgent(
+            client=claude,
+            clinic_info={"nome_clinica": sentinels["prompt"],
+                         "horario_atendimento": {}},
+            clock=lambda: datetime(2026, 9, 14, 12, 0, tzinfo=timezone.utc),
+        )
+        snapshot = ConversationSnapshot(
+            phone=phone, messages=[], current_flow=None, flow_data={},
+            status="active", last_activity=None)
+        result = agent.prepare_result(sentinels["content"], phone, snapshot)
+        assert result.text == sentinels["output"]
+
+    assert provider_calls and any(phone in key for key in lock_keys)
+    application_records = [record for record in caplog.records
+                           if record.name.startswith("app.")]
+    assert any(record.name == "app.synthetic_whatsapp_debug_audit"
+               for record in application_records)
+    assert any(record.name == "app.synthetic_ai_debug_audit"
+               for record in application_records)
+    _assert_sensitive_fragments_absent(application_records, fragments)
 
 
 def test_conversation_audit_sentinel_capture_covers_all_operational_paths(
@@ -217,7 +452,8 @@ def test_conversation_audit_sentinel_capture_covers_all_operational_paths(
         assert sentinel.lower() not in captured.lower()
         assert normalized not in "".join(character for character in captured.lower() if character.isalnum())
         assert hashlib.sha256(sentinel.encode()).hexdigest() not in captured
-    audit_records = [record for record in application_records if record.getMessage() == "conversation_audit"]
+    audit_records = [record for record in application_records
+                     if record.getMessage().startswith("conversation_audit ")]
     assert {record.audit["event"] for record in audit_records} == {
         "ingress", "transition", "processing", "outbound", "recovery", "readiness"}
     allowed = {"event", "outcome", "cycle", "attempt_state", "count",
@@ -450,7 +686,6 @@ def test_epoch_rotation_cli_is_injected_guarded_cas_and_sanitized(fault, code, o
         assert cli.main(args, configured_epoch=new, epoch_store=epoch, dependency_probe=lambda: True) == 3
         assert store.global_epoch_writes == 1
 
-from app.conversation_state import DependencyName
 from tests.fakes import WebhookRequest, webhook_payload
 
 
@@ -467,10 +702,12 @@ def test_test_chat_reset_auth_precedes_state_agent_and_body(admin_client, admin_
 
 
 @pytest.mark.parametrize("route", ["create", "extend", "unpause", "test_chat", "reset"])
-@pytest.mark.parametrize("dependency", list(DependencyName))
+@pytest.mark.parametrize("dependency", DEPENDENCY_NAMES)
 def test_dashboard_test_chat_reset_readiness_precedes_content_lease_sql(admin_runtime, main_module, route, dependency):
     from tests.test_conversation_flow import ADMIN_PHONE
     from fastapi import HTTPException
+    from app.conversation_state import DependencyName
+    dependency = DependencyName(dependency)
     rt = admin_runtime
     rt.dependencies[dependency] = False
     request = WebhookRequest(main_module.app, json_error=AssertionError("body read before readiness"))
@@ -531,8 +768,10 @@ def test_dashboard_simulator_reset_failure_is_closed_and_sanitized(admin_client,
         assert db.query(Appointment).filter_by(patient_phone=phone).count() == 1
 
 
-@pytest.mark.parametrize("dependency", list(DependencyName))
+@pytest.mark.parametrize("dependency", DEPENDENCY_NAMES)
 def test_scheduler_readiness_closed_before_scan_or_lock(scheduler_module, admin_runtime, dependency):
+    from app.conversation_state import DependencyName
+    dependency = DependencyName(dependency)
     rt = admin_runtime
     rt.dependencies[dependency] = False
     asyncio.run(scheduler_module.check_inactive_contexts(rt))
@@ -652,8 +891,10 @@ def test_webhook_missing_secret_precedes_signature_and_body(main_module, ingress
     assert request.json_calls == ingress_runtime.readiness_calls == ingress_runtime.lease_calls == 0
 
 
-@pytest.mark.parametrize("dependency", list(DependencyName))
+@pytest.mark.parametrize("dependency", DEPENDENCY_NAMES)
 def test_webhook_readiness_precedes_json_lease_and_sql(main_module, ingress_runtime, dependency):
+    from app.conversation_state import DependencyName
+    dependency = DependencyName(dependency)
     ingress_runtime.dependencies[dependency] = False
     before = ingress_runtime.store.snapshot()
     response, request = call_webhook(main_module, json_error=AssertionError("body read"))

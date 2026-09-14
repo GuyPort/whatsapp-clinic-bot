@@ -34,7 +34,7 @@ def pytest_configure(config):
 
 
 @pytest.fixture
-def session_factory():
+def session_factory(conversation_security_boundaries):
     from app.database import Base
 
     engine = create_engine(
@@ -51,10 +51,9 @@ def session_factory():
 
 
 @pytest.fixture
-def main_module(monkeypatch):
+def main_module(monkeypatch, conversation_security_boundaries):
     """Import the actual routes with external construction/effects replaced."""
     import importlib.util
-    import socket
     import sys
     from pathlib import Path
     from types import SimpleNamespace
@@ -63,17 +62,6 @@ def main_module(monkeypatch):
     from tests.fakes import ForbiddenAgentEffects
 
     effects = ForbiddenAgentEffects()
-    original_connect = socket.socket.connect
-    def guarded_connect(sock, address):
-        # Windows implements asyncio's internal self-pipe with a socketpair.
-        # Only the stdlib socketpair frame may create its loopback connection.
-        caller = sys._getframe(1)
-        if (caller.f_code.co_name == "_fallback_socketpair"
-                and caller.f_globals.get("__name__") == "socket"
-                and address[0] in ("127.0.0.1", "::1")):
-            return original_connect(sock, address)
-        return effects.boundary("network")()
-    monkeypatch.setattr(socket.socket, "connect", guarded_connect)
     monkeypatch.setattr(database, "init_db", effects.boundary("init_db"))
     monkeypatch.setattr(database, "get_db", effects.boundary("implicit_session"))
     transport = SimpleNamespace(redis_client=None,
@@ -185,11 +173,92 @@ def conversation_security_boundaries(monkeypatch):
     """Fail closed if audit tests cross a forbidden external/write boundary."""
     import builtins
     import io
+    import os
+    import socket
+    import sqlite3
     import subprocess
+    import sys
     from pathlib import Path
+    from types import SimpleNamespace
+    import sqlalchemy
+    from sqlalchemy.pool import StaticPool
 
     workspace = Path(__file__).parents[1].resolve()
     original_open = builtins.open
+    original_socket_connect = socket.socket.connect
+    original_create_engine = sqlalchemy.create_engine
+    original_sqlite_connect = sqlite3.connect
+    original_path_methods = {name: getattr(Path, name) for name in
+                             ("mkdir", "rename", "replace", "unlink", "rmdir")}
+    original_os_methods = {name: getattr(os, name) for name in
+                           ("mkdir", "makedirs", "rename", "replace", "remove", "unlink", "rmdir")}
+
+    def in_workspace(value):
+        try:
+            target = Path(value).resolve()
+        except (TypeError, OSError):
+            return False
+        return target == workspace or workspace in target.parents
+
+    def guarded_connect(sock, address):
+        caller = sys._getframe(1)
+        while caller is not None:
+            if (caller.f_code.co_name == "_fallback_socketpair"
+                    and caller.f_globals.get("__name__") == "socket"
+                    and address[0] in ("127.0.0.1", "::1")):
+                return original_socket_connect(sock, address)
+            caller = caller.f_back
+        raise AssertionError("network forbidden")
+
+    def guarded_connect_ex(sock, address):
+        raise AssertionError("network forbidden")
+
+    def guarded_create_connection(*args, **kwargs):
+        raise AssertionError("network forbidden")
+
+    def safe_sqlite_database(database, *, uri=False):
+        value = str(database)
+        if value in ("", ":memory:"):
+            return True
+        return uri and value.startswith("file:") and "mode=memory" in value
+
+    def guarded_sqlite_connect(database, *args, **kwargs):
+        if not safe_sqlite_database(database, uri=kwargs.get("uri", False)):
+            raise AssertionError("persistent_sql forbidden")
+        return original_sqlite_connect(database, *args, **kwargs)
+
+    def guarded_create_engine(url, *args, **kwargs):
+        parsed = sqlalchemy.engine.make_url(url)
+        database = parsed.database
+        query = dict(parsed.query)
+        safe = (parsed.get_backend_name() == "sqlite"
+                and (database in (None, "", ":memory:")
+                     or query.get("mode") == "memory"))
+        if not safe:
+            raise AssertionError("persistent_sql forbidden")
+        return original_create_engine(url, *args, **kwargs)
+
+    def guarded_path_method(name):
+        original = original_path_methods[name]
+        def call(path, *args, **kwargs):
+            if name == "mkdir" and kwargs.get("exist_ok") and Path(path).is_dir():
+                return None
+            targets = (path, args[0]) if name in ("rename", "replace") and args else (path,)
+            if any(in_workspace(target) for target in targets):
+                raise AssertionError(f"{name if name != 'unlink' else 'remove'} forbidden")
+            return original(path, *args, **kwargs)
+        return call
+
+    def guarded_os_method(name):
+        original = original_os_methods[name]
+        def call(path, *args, **kwargs):
+            if name == "makedirs" and kwargs.get("exist_ok") and Path(path).is_dir():
+                return None
+            targets = (path, args[0]) if name in ("rename", "replace") and args else (path,)
+            if any(in_workspace(target) for target in targets):
+                raise AssertionError(f"{name if name != 'unlink' else 'remove'} forbidden")
+            return original(path, *args, **kwargs)
+        return call
 
     def guarded_open(file, mode="r", *args, **kwargs):
         if any(flag in mode for flag in ("w", "a", "x", "+")):
@@ -203,6 +272,16 @@ def conversation_security_boundaries(monkeypatch):
 
     monkeypatch.setattr(builtins, "open", guarded_open)
     monkeypatch.setattr(io, "open", guarded_open)
+    monkeypatch.setattr(socket.socket, "connect", guarded_connect)
+    monkeypatch.setattr(socket.socket, "connect_ex", guarded_connect_ex)
+    monkeypatch.setattr(socket, "create_connection", guarded_create_connection)
+    monkeypatch.setattr(sqlalchemy, "create_engine", guarded_create_engine)
+    monkeypatch.setattr(sqlite3, "connect", guarded_sqlite_connect)
+    monkeypatch.setattr(sqlite3.dbapi2, "connect", guarded_sqlite_connect)
+    for name in original_path_methods:
+        monkeypatch.setattr(Path, name, guarded_path_method(name))
+    for name in original_os_methods:
+        monkeypatch.setattr(os, name, guarded_os_method(name))
     for name in ("Popen", "run", "call", "check_call", "check_output"):
         monkeypatch.setattr(subprocess, name,
             lambda *args, _name=name, **kwargs: pytest.fail(
@@ -215,3 +294,33 @@ def conversation_security_boundaries(monkeypatch):
         pass
     monkeypatch.setenv("APP_SKIP_DOTENV", "1")
     monkeypatch.setenv("DATABASE_URL", "sqlite://")
+
+    def network_probe():
+        socket.create_connection(("192.0.2.1", 9), timeout=0.01)
+
+    def persistent_sql_probe():
+        sqlalchemy.create_engine(f"sqlite:///{workspace / 'forbidden-security.db'}")
+
+    def persistent_sqlite_probe():
+        sqlite3.connect(workspace / "forbidden-security.db")
+
+    def memory_sql_probe():
+        engine = sqlalchemy.create_engine("sqlite://", poolclass=StaticPool,
+                                          connect_args={"check_same_thread": False})
+        try:
+            with engine.connect() as connection:
+                assert connection.exec_driver_sql("SELECT 1").scalar() == 1
+        finally:
+            engine.dispose()
+
+    return SimpleNamespace(
+        network=network_probe,
+        persistent_sql=persistent_sql_probe,
+        persistent_sqlite=persistent_sqlite_probe,
+        mkdir=lambda: (workspace / "forbidden-security-dir").mkdir(),
+        rename=lambda: (workspace / "forbidden-source").rename(workspace / "forbidden-target"),
+        remove=lambda: (workspace / "forbidden-source").unlink(),
+        replace=lambda: (workspace / "forbidden-source").replace(workspace / "forbidden-target"),
+        memory_sql=memory_sql_probe,
+        readonly_file=lambda: (workspace / "tests" / "conftest.py").read_text(encoding="utf-8"),
+    )
