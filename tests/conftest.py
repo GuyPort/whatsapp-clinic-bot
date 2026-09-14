@@ -229,6 +229,13 @@ def conversation_resources(conversation_security_boundaries, monkeypatch):
         finally:
             ledger.active_leases -= 1
     monkeypatch.setattr(fakes.InMemoryConversationStore, "contact_lease", observed_lease)
+    original_claim = fakes.InMemoryConversationStore.claim_or_resume_batch
+    def observed_claim(store, command, *args, **kwargs):
+        result = original_claim(store, command, *args, **kwargs)
+        if result.outcome.value == "CLAIMED":
+            ledger.issued_claims[(id(store.client), command.batch_id)] = result.attempt
+        return result
+    monkeypatch.setattr(fakes.InMemoryConversationStore, "claim_or_resume_batch", observed_claim)
     for cls, method in (
             (fakes.ScriptedBroker, "enqueue_processing"),
             (fakes.ScriptedOutboundBroker, "enqueue_outbound"),
@@ -242,7 +249,6 @@ def conversation_resources(conversation_security_boundaries, monkeypatch):
                 return _method(instance, *args, **kwargs)
         monkeypatch.setattr(cls, method, guarded_call)
     yield ledger
-    ledger.settle_expiring_owners()
     ledger.dispose()
 
 

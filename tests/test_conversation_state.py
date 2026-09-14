@@ -676,7 +676,7 @@ def test_preparation_persists_complete_barrier_before_first_sql_effect(transitio
 
 @pytest.mark.parametrize("fault", ["epoch", "owner", "expired_lease", "phase"],
                          ids=lambda value: "state-24-" + value)
-def test_committing_cas_rechecks_every_authority_before_sql_commit(transition_env, fault):
+def test_committing_cas_rechecks_every_authority_before_sql_commit(transition_env, fault, conversation_resources):
     from app.conversation_redis import contact_keys
     from app.conversation_state import ConversationDomainError
     coordinator, db, store, clock = transition_env
@@ -706,6 +706,9 @@ def test_committing_cas_rechecks_every_authority_before_sql_commit(transition_en
         assert "flush" in db.events
         assert "commit_entered" not in db.events
         assert "rollback" in db.events
+    if fault in ("epoch", "owner"):
+        conversation_resources.expect_unreleased_lease(store, lease, reason="CAS fault prevents old-owner release",
+            owner_token="different-owner" if fault == "owner" else None)
 
 
 @pytest.mark.parametrize("checkpoint", ["commit_entered", "commit_returned"],
@@ -1228,7 +1231,7 @@ def test_enqueue_reserves_before_broker_and_obeys_inclusive_next_time(_case, out
 
 @pytest.mark.parametrize("delta,terminal", [(-1, False), (0, True), (1, True)])
 @pytest.mark.parametrize("_case", [None], ids=["state-42"])
-def test_batch_dispatch_deadline_exhausts_without_content_or_recreation(_case, delta, terminal):
+def test_batch_dispatch_deadline_exhausts_without_content_or_recreation(_case, delta, terminal, conversation_resources):
     from tests.test_conversation_concurrency import make_store
     domain, store = batch_api(), make_store()
     with store.contact_lease(PHONE) as lease:
@@ -1248,10 +1251,12 @@ def test_batch_dispatch_deadline_exhausts_without_content_or_recreation(_case, d
             assert append_batch(store, lease).disposition is domain.IngressDisposition.DUPLICATE
             assert store.claim_or_resume_batch(command, store.clock.now(), lease).outcome.value == "TERMINAL"
             assert store.recoverable_batches().commands == ()
+    if not terminal:
+        conversation_resources.expect_crashed_claim(store, command, claim.attempt, reason="worker stops after the last valid dispatch claim")
 
 
 @pytest.mark.parametrize("_case", [None], ids=["state-46"])
-def test_staged_ignores_old_dispatch_deadline_and_never_drains_new_buffer(_case, ):
+def test_staged_ignores_old_dispatch_deadline_and_never_drains_new_buffer(_case, conversation_resources):
     from tests.test_conversation_concurrency import make_store
     domain, store = batch_api(), make_store()
     with store.contact_lease(PHONE) as lease:
@@ -1274,6 +1279,7 @@ def test_staged_ignores_old_dispatch_deadline_and_never_drains_new_buffer(_case,
         assert [e.content for e in resumed.envelopes] == ["synthetic text"]
         assert batch_details(store, lease, "buffer")[0].body["envelopes"][0]["content"] == "new input"
         assert store.finalize_ingress_once(PHONE, None, "synthetic-id", command.generation, lease).disposition is domain.IngressDisposition.DUPLICATE
+    conversation_resources.expect_crashed_claim(store, command, resumed.attempt, reason="replacement worker stops before publishing RESULT_READY")
 
 
 @pytest.mark.parametrize("_case", [None], ids=["state-34"])

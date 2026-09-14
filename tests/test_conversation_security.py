@@ -87,6 +87,34 @@ def test_phase_one_guards_deny_dns_and_sqlite_attach_without_external_io():
         assert connection.execute("SELECT 1").fetchone() == (1,)
 
 
+@pytest.mark.parametrize("residue", ["lease", "claim"])
+def test_teardown_rejects_unexpected_owner_before_clock_or_store_cleanup(residue):
+    """A cleanup routine must not turn an abandoned live owner into a pass."""
+    from tests.fakes import ConversationResources
+    from tests.test_conversation_concurrency import make_store
+    from tests.test_conversation_state import append_batch, batch_command
+    store, ledger = make_store(), ConversationResources()
+    ledger.clients.append(store.client)
+    with store.contact_lease("5551999990000") as lease:
+        if residue == "claim":
+            store.initialize_contact("5551999990000", lease, db_state_present=False)
+            command = batch_command(store, lease, append_batch(store, lease))
+            claim = store.claim_or_resume_batch(command, store.clock.now(), lease)
+        else:
+            store.fail_next_atomic("release")
+    before, now = store.snapshot(), store.clock.now()
+    with pytest.raises(AssertionError, match="unexpected live " + residue):
+        ledger.dispose()
+    assert store.clock.now() == now
+    assert store.snapshot() == before
+    if residue == "claim":
+        ledger.expect_crashed_claim(store, command, claim.attempt, reason="negative control stops immediately after claim")
+    else:
+        ledger.expect_unreleased_lease(store, lease, reason="negative control injects release failure")
+    ledger.assert_idle()
+    ledger.dispose()
+
+
 def test_security_module_collection_has_no_pre_guard_application_imports(monkeypatch):
     import builtins
     import sys
@@ -518,7 +546,9 @@ def test_conversation_audit_sentinel_capture_covers_all_operational_paths(
     """Accepted/replayed/closed/failing paths expose only the closed audit payload."""
     from app import conversation_tasks
     from app.conversation_recovery import RecoveryService
-    from app.conversation_state import AgentIntent, AgentResult
+    from datetime import timedelta
+    from app.conversation_state import (AgentIntent, AgentResult, ConversationCycle,
+                                        ConversationMutationAmbiguous, MutationPhase)
 
     rt = admin_runtime
     phone = "5551976543210"
@@ -535,11 +565,28 @@ def test_conversation_audit_sentinel_capture_covers_all_operational_paths(
         "PRIVATE-SIGNATURE", "SIGNATURE-84", "PRIVATE-BASIC-PASSWORD", "PASSWORD-86",
     )
 
+    observed_values = set(sentinels) | set(coordination_sentinels) | {
+        "synthetic-webhook-secret", "synthetic-admin", "synthetic-admin-password",
+        "synthetic history", "synthetic-message-id",
+    }
+    observed_phones = {phone, "5551976543211", "5551976543212",
+                       "5551976543213", "5551976543214", "5551976543215"}
+    original_ingress = rt.coordinator.accept_ingress
+
+    def observe_ingress(db, identity, kind, content, now, lease, broker):
+        observed_phones.add(identity.phone)
+        observed_values.update((identity.phone, identity.message_id, content))
+        return original_ingress(db, identity, kind, content, now, lease, broker)
+
+    monkeypatch.setattr(rt.coordinator, "accept_ingress", observe_ingress)
+
     def agent_result(message, contact, snapshot):
+        observed_phones.add(contact)
+        observed_values.update((message, contact))
         return AgentResult(sentinels[8], snapshot.messages, snapshot.current_flow,
                            snapshot.flow_data, AgentIntent.SAVE_CONTEXT)
 
-    with caplog.at_level(logging.INFO):
+    with caplog.at_level(logging.DEBUG):
         # Header rejection, accepted ingress and retained duplicate.
         payload = webhook_payload(jid=phone + "@s.whatsapp.net", text=sentinels[1],
                                   message_id=sentinels[2])
@@ -579,21 +626,70 @@ def test_conversation_audit_sentinel_capture_covers_all_operational_paths(
             RuntimeError(sentinels[9])))
         assert RecoveryService(rt, max_pages=1).run_once(rt.clock.now()).failed == 1
         monkeypatch.setattr(rt.store, "recovery_checkpoint", original_checkpoint)
+        # Actual ambiguous SQL commit -> durable quarantine -> exact operational
+        # resolution, all in this private in-memory world (no real epoch action).
+        quarantine_phone = "5551976543215"
+        operation = "PRIVATE-QUARANTINE-OPERATION-95"
+        observed_values.add(operation)
+        rt.seed_contact(quarantine_phone)
+        rt.session_hooks["commit_returned"] = lambda: rt.store.fail_next_atomic("finalize_committed")
+        with rt.store.contact_lease(quarantine_phone) as lease, rt.session_factory() as db:
+            with pytest.raises(ConversationMutationAmbiguous):
+                rt.coordinator.pause_for_secretary(
+                    db, quarantine_phone, "secretary_manual_pause",
+                    rt.clock.now(), lease, operation)
+            pending = rt.store.inspect_mutation(quarantine_phone, operation, lease)
+            assert pending.phase is MutationPhase.COMMITTING
+            observed_values.add(str(pending.generation))
+        rt.clock.advance(timedelta(seconds=601))
+        report = RecoveryService(rt, max_pages=2).run_once(rt.clock.now())
+        assert report.quarantined == 1 and report.failed == 0
+        assert rt.store.is_quarantined(quarantine_phone)
+        with rt.store.contact_lease(quarantine_phone) as lease:
+            quarantined = rt.store.inspect_mutation(
+                quarantine_phone, operation, lease, operational=True)
+            assert quarantined.phase is MutationPhase.QUARANTINED
+            resolved = rt.store.resolve_quarantined_mutation(
+                quarantine_phone, operation, rt.store.config.coordination_epoch,
+                lease, rt.clock.now(), quiescent=True, outcome=MutationPhase.COMMITTED)
+            assert resolved.phase is MutationPhase.COMMITTED
+            anchor = rt.store.read_anchor(lease)
+            assert anchor.cycle is ConversationCycle.PAUSED
+            assert anchor.last_generation == resolved.generation != pending.generation
+            observed_values.add(str(resolved.generation))
+        assert not rt.store.is_quarantined(quarantine_phone)
         assert admin_client.get("/ready").status_code == 200
         asyncio.run(scheduler_module.check_inactive_contexts(None))
         logging.getLogger("unaffected_control").info("unaffected_control")
+        for actual_phone in observed_phones:
+            observed_values.update((actual_phone, actual_phone + "@s.whatsapp.net",
+                                    contact_digest(actual_phone)))
+        for item in (*rt.processing_broker.calls, *rt.outbound_broker.calls):
+            for field in ("batch_id", "staging_id", "operation_id", "processing_id",
+                          "generation", "phone", "text"):
+                value = getattr(item, field, None)
+                if value is not None:
+                    observed_values.add(str(value))
+        assert "5500000000000" in observed_phones  # actual authenticated simulator
+        private_values = tuple(sorted(value for value in observed_values if value))
+        probe_start = len(caplog.records)
+        for value in private_values:
+            logging.getLogger("app.synthetic_privacy_leak_probe").debug(value)
 
-    application_records = [record for record in caplog.records
+    leak_records = caplog.records[probe_start:]
+    assert [record.getMessage() for record in leak_records] == list(private_values), "capture must observe DEBUG leaks"
+    with pytest.raises(AssertionError):
+        _assert_sensitive_fragments_absent(leak_records, private_values)
+
+    application_records = [record for record in caplog.records[:probe_start]
                            if record.name.startswith("app.") or record.name == scheduler_module.logger.name]
-    captured = _serialized_application_records(application_records)
-    for sentinel in (*sentinels, *coordination_sentinels):
-        normalized = "".join(character for character in sentinel.lower() if character.isalnum())
-        assert sentinel not in captured
-        assert sentinel.lower() not in captured.lower()
-        assert normalized not in "".join(character for character in captured.lower() if character.isalnum())
-        assert hashlib.sha256(sentinel.encode()).hexdigest() not in captured
+    _assert_sensitive_fragments_absent(application_records, (
+        *private_values,
+        *(hashlib.sha256(value.encode()).hexdigest() for value in private_values),
+    ))
     audit_records = [record for record in application_records
                      if record.getMessage().startswith("conversation_audit ")]
+    assert application_records == audit_records, "operational logs must use the closed audit payload"
     assert {record.audit["event"] for record in audit_records} == {
         "ingress", "transition", "processing", "outbound", "recovery", "readiness"}
     allowed = {"event", "outcome", "cycle", "attempt_state", "count",
@@ -768,7 +864,7 @@ def test_epoch_cli_import_and_rejected_args_never_construct_dependencies(monkeyp
 
 @pytest.mark.parametrize("fault", ["owner", "cas_race", "acl", "acl_missing", "persistence", "same", "invalid"])
 @pytest.mark.parametrize("_case", [None], ids=["state-30"])
-def test_epoch_rotation_rejects_faults_before_any_write_and_invalidates_owner(_case, fault):
+def test_epoch_rotation_rejects_faults_before_any_write_and_invalidates_owner(_case, fault, conversation_resources):
     from dataclasses import replace
     from uuid import UUID
     from app.simple_config import settings
@@ -784,6 +880,7 @@ def test_epoch_rotation_rejects_faults_before_any_write_and_invalidates_owner(_c
             assert epoch.rotate(old, new) == new
             with pytest.raises(ConversationDomainError):
                 lease.assert_owned()
+            conversation_resources.expect_unreleased_lease(store, lease, reason="epoch rotation invalidates the former owner before release")
             return
         if fault == "cas_race":
             store.client.before_atomic = lambda: store.client.values.update({GLOBAL_EPOCH_KEY: str(new)})
@@ -797,6 +894,8 @@ def test_epoch_rotation_rejects_faults_before_any_write_and_invalidates_owner(_c
         with pytest.raises(ConversationDomainError):
             epoch.rotate(old, old if fault == "same" else "private-token" if fault == "invalid" else new)
         assert store.global_epoch_writes == before
+    if fault in ("cas_race", "acl_missing", "persistence"):
+        conversation_resources.expect_unreleased_lease(store, lease, reason="epoch/preflight failure prevents release of the exact old owner")
 
 
 def test_recovery_mutation_pages_only_expired_ids_and_terminal_index_is_empty(admin_runtime):

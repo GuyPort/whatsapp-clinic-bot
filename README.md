@@ -406,18 +406,21 @@ O harness fornece configuração sintética e SQLite estritamente em memória.
 Após o bootstrap dos plugins do pytest e antes da coleta dos testes, ele bloqueia
 rede, DNS, subprocessos, dotenv, leitura de `data/`, SQL persistente/ATTACH e
 escritas dos testes no repositório. Cada caso verifica transações, proprietários,
-heartbeats e chamadas fake em andamento; o teardown expira owners abandonados
-somente no relógio fake e elimina o estado privado dos fakes, inclusive claims
-e conteúdo. A finalização do próprio pytest pode atualizar seu cache.
+heartbeats e chamadas fake em andamento antes de qualquer descarte. Resíduos de
+lease/claim só são aceitos em cenários explícitos de interrupção, com token,
+identidade e prazo exatos declarados pelo caso e conferidos antes da limpeza.
+O teardown não avança o relógio nem expira owners: primeiro valida os resíduos,
+depois elimina o estado privado dos fakes e seu conteúdo. A finalização do
+próprio pytest pode atualizar seu cache.
 
 Os IDs `state-01` a `state-48` e `flow-01` a `flow-77` identificam itens
 executáveis da spec aprovada; eles podem ser selecionados com `pytest -k` ou
 pelo node ID completo. Os testes usam barreiras e snapshots SQL sintéticos;
 não comprovam isolamento ou entrega em serviços hospedados.
 
-Verificação local da Task 11: estado **166**, fluxo **899**, segurança **272**,
-concorrência **212** e suíte completa **1549 testes aprovados**. Os cinco comandos
-acima terminaram com exit `0`. A suíte completa registrou 413 avisos do escape
+Verificação local da Task 11 após a revisão: estado **166**, fluxo **908**, segurança **274**,
+concorrência **212** e suíte completa **1560 testes aprovados**. Os cinco comandos
+acima terminaram com exit `0`. A suíte completa registrou 414 avisos do escape
 preexistente em `app/main.py:2318`; nenhum serviço externo foi acessado.
 
 ### Sinais de disponibilidade e proprietários das falhas

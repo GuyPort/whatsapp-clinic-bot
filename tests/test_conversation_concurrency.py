@@ -65,7 +65,7 @@ def test_committing_barrier_ignores_new_owners_precommit_sql_snapshot(transition
 
 @pytest.mark.parametrize("offset,winner", [(-1, False), (0, True), (1, True)])
 @pytest.mark.parametrize("_case", [None], ids=["state-38"])
-def test_claim_takeover_exact_deadline_rejects_old_token(_case, offset, winner):
+def test_claim_takeover_exact_deadline_rejects_old_token(_case, offset, winner, conversation_resources):
     from tests.test_conversation_state import batch_api, append_batch, batch_command
     domain, store = batch_api(), make_store()
     with store.contact_lease(PHONE) as lease:
@@ -81,11 +81,13 @@ def test_claim_takeover_exact_deadline_rejects_old_token(_case, offset, winner):
             with pytest.raises(domain.ConversationMutationPending):
                 store.stage_agent_result(command, old.attempt, result, store.clock.now(), lease)
             store.stage_agent_result(command, claim.attempt, result, store.clock.now(), lease)
+    if not winner:
+        conversation_resources.expect_crashed_claim(store, command, old.attempt, reason="original worker is dead but its claim is not yet due")
 
 
 @pytest.mark.parametrize("kind", ["processing", "staging", "batch", "dedupe", "staging_index"])
 @pytest.mark.parametrize("_case", [None], ids=["state-43"])
-def test_staged_missing_detail_or_membership_quarantines_before_new_claim(_case, kind):
+def test_staged_missing_detail_or_membership_quarantines_before_new_claim(_case, kind, conversation_resources):
     from tests.test_conversation_state import batch_api, append_batch, batch_command, batch_details
     batch_api()
     store = make_store()
@@ -101,6 +103,8 @@ def test_staged_missing_detail_or_membership_quarantines_before_new_claim(_case,
             store.claim_or_resume_batch(command, store.clock.now(), lease)
         assert store.is_quarantined(PHONE)
         assert "synthetic text" not in str(store.contact_snapshot(PHONE))
+    if kind != "processing":
+        conversation_resources.expect_crashed_claim(store, command, reason="partial loss quarantines the stopped worker while its claim detail survives")
 
 
 @pytest.mark.parametrize("operation", [
@@ -109,7 +113,7 @@ def test_staged_missing_detail_or_membership_quarantines_before_new_claim(_case,
     pytest.param("stage_agent_result", id="state-39-atomic-result"),
     pytest.param("exhaust_batch", id="state-42-atomic-exhaustion"),
 ])
-def test_batch_atomic_fault_at_each_write_preserves_all_details_and_manifest(operation):
+def test_batch_atomic_fault_at_each_write_preserves_all_details_and_manifest(operation, conversation_resources):
     from tests.test_conversation_state import batch_api, append_batch, batch_command
     domain = batch_api()
     def prepared():
@@ -131,7 +135,10 @@ def test_batch_atomic_fault_at_each_write_preserves_all_details_and_manifest(ope
             if operation == "finalize_ingress_once":
                 return append_batch(store, lease)
             if operation == "claim_or_resume_batch":
-                return store.claim_or_resume_batch(command, store.clock.now(), lease)
+                claimed = store.claim_or_resume_batch(command, store.clock.now(), lease)
+                conversation_resources.expect_crashed_claim(store, command, claimed.attempt,
+                    reason="atomic-write crash probe stops after successful retry of initial claim")
+                return claimed
             if operation == "stage_agent_result":
                 result = domain.AgentResult("synthetic output", [], None, {}, domain.AgentIntent.SAVE_CONTEXT)
                 return store.stage_agent_result(command, attempt, result, store.clock.now(), lease)
@@ -158,7 +165,7 @@ def test_batch_atomic_fault_at_each_write_preserves_all_details_and_manifest(ope
 
 
 @pytest.mark.parametrize("_case", [None], ids=["flow-26"])
-def test_batch_two_consumers_observe_only_one_live_claim(_case, ):
+def test_batch_two_consumers_observe_only_one_live_claim(_case, conversation_resources):
     from tests.test_conversation_state import batch_api, append_batch, batch_command
     batch_api()
     store = make_store()
@@ -181,6 +188,7 @@ def test_batch_two_consumers_observe_only_one_live_claim(_case, ):
         assert not thread.is_alive()
     assert outcomes.count("CLAIMED") == 1
     assert set(outcomes) <= {"CLAIMED", "DUPLICATE", "LOCKED"}
+    conversation_resources.expect_crashed_claim(store, command, reason="winning consumer stops after claim; loser never takes ownership")
 
 
 @pytest.mark.parametrize("boundary", ["prepare_mutation", "enter_committing"])
@@ -315,7 +323,7 @@ def test_enqueue_old_owner_completion_cannot_overwrite_successor_reservation():
 
 
 @pytest.mark.parametrize("_case", [None], ids=["state-16"])
-def test_staged_heartbeat_renews_only_owned_claim_and_keeps_original_processing_horizon(_case, ):
+def test_staged_heartbeat_renews_only_owned_claim_and_keeps_original_processing_horizon(_case, conversation_resources):
     from tests.test_conversation_state import batch_api, append_batch, batch_command, batch_details
     batch_api()
     store = make_store()
@@ -333,9 +341,11 @@ def test_staged_heartbeat_renews_only_owned_claim_and_keeps_original_processing_
         before = batch_details(store, lease, "processing")[0]
         store.renew_lease(lease)
         assert batch_details(store, lease, "processing")[0] == before
+    conversation_resources.expect_crashed_claim(store, command, claim.attempt,
+        claim_deadline=claim.attempt.processing_deadline, reason="worker stops after its final bounded heartbeat")
 
 
-def test_staged_other_batch_cannot_call_agent_until_current_batch_is_terminal():
+def test_staged_other_batch_cannot_call_agent_until_current_batch_is_terminal(conversation_resources):
     from tests.test_conversation_state import batch_api, append_batch, batch_command
     domain, store = batch_api(), make_store()
     with store.contact_lease(PHONE) as lease:
@@ -347,6 +357,7 @@ def test_staged_other_batch_cannot_call_agent_until_current_batch_is_terminal():
         with pytest.raises(domain.ConversationMutationPending):
             store.claim_or_resume_batch(second, store.clock.now(), lease)
         assert store.snapshot() == before
+    conversation_resources.expect_crashed_claim(store, first, reason="first worker stops before result; second batch remains blocked")
 
 
 def test_batch_generation_change_discards_old_result_before_sql(transition_env):
@@ -368,7 +379,7 @@ def test_batch_generation_change_discards_old_result_before_sql(transition_env):
 
 @pytest.mark.parametrize("fault", ["epoch_absent", "run_id_mismatch", "fingerprint"])
 @pytest.mark.parametrize("_case", [None], ids=["flow-65"])
-def test_batch_recovery_coordination_failure_preserves_index_without_broker_effect(_case, fault):
+def test_batch_recovery_coordination_failure_preserves_index_without_broker_effect(_case, fault, conversation_resources):
     from tests.test_conversation_state import batch_api, append_batch, batch_command
     from tests.fakes import ScriptedBroker
     domain, store, broker = batch_api(), make_store(), ScriptedBroker()
@@ -385,6 +396,8 @@ def test_batch_recovery_coordination_failure_preserves_index_without_broker_effe
         for key, value in index_before.items():
             assert store.client.sets[key] == value
         assert broker.calls == []
+    if fault in ("epoch_absent", "run_id_mismatch"):
+        conversation_resources.expect_unreleased_lease(store, lease, reason="coordination fault prevents release after interrupted recovery")
 
 
 def test_batch_result_identity_cannot_be_substituted_before_mutation(transition_env):
@@ -508,7 +521,7 @@ def test_batch_recovery_dependency_error_exposes_only_enumerated_reason():
     assert caught.value.__cause__ is None
 
 
-def test_batch_claim_cannot_publish_mismatching_operation_or_epoch():
+def test_batch_claim_cannot_publish_mismatching_operation_or_epoch(conversation_resources):
     from tests.test_conversation_state import batch_api, append_batch, batch_command
     domain, store = batch_api(), make_store()
     with store.contact_lease(PHONE) as lease:
@@ -520,6 +533,7 @@ def test_batch_claim_cannot_publish_mismatching_operation_or_epoch():
             altered = replace(claim.attempt, **{field: "00000000-0000-4000-8000-999999999999"})
             with pytest.raises(domain.ConversationMutationPending):
                 store.stage_agent_result(command, altered, result, store.clock.now(), lease)
+    conversation_resources.expect_crashed_claim(store, command, claim.attempt, reason="worker stops after all substituted results are refused")
 
 
 @pytest.mark.parametrize("_case", [None], ids=["flow-61"])
@@ -625,7 +639,7 @@ def test_enqueue_untyped_confirmation_fails_closed_and_preserves_reservation():
 
 
 @pytest.mark.parametrize("other_phase", ["RESULT_READY", "CLAIMED"])
-def test_terminal_processing_batch_cannot_authorize_another_operation_or_result(transition_env, other_phase):
+def test_terminal_processing_batch_cannot_authorize_another_operation_or_result(transition_env, other_phase, conversation_resources):
     from tests.test_conversation_state import batch_api, append_batch, batch_command
     coordinator, db, store, clock = transition_env
     domain = batch_api()
@@ -653,6 +667,8 @@ def test_terminal_processing_batch_cannot_authorize_another_operation_or_result(
         # A retry of its own proven terminal operation still returns without SQL.
         coordinator.apply_agent_result(db, PHONE, first_result, first.processing_id, first.operation_id, clock.now(), lease)
         assert db.events == []
+    if other_phase == "CLAIMED":
+        conversation_resources.expect_crashed_claim(store, second_command, second, reason="second worker stops before result; terminal first worker cannot replace it")
 
 
 def test_terminal_processing_batch_validates_result_fingerprint_before_short_circuit(transition_env):
@@ -1835,9 +1851,12 @@ def test_lease_claim_renewal_is_atomic_and_bounded_by_processing_deadline(_case,
         assert renewed.entry.version == 2
         assert current.contact_revision == anchor.contact_revision + 1
         assert current.manifest_fingerprint != anchor.manifest_fingerprint
+        completed = replace(renewed, entry=replace(renewed.entry, version=3), body={**renewed.body, "phase": "DONE"}, terminal=True)
+        store.compare_and_set(lease, current, (completed,))
+        assert store.read_details(lease)[0].body["phase"] == "DONE"
 
 
-def test_epoch_change_between_readiness_and_cas_blocks_mutation():
+def test_epoch_change_between_readiness_and_cas_blocks_mutation(conversation_resources):
     """Catches relying on stale readiness after the global epoch changes."""
     store = make_store()
     with store.contact_lease(PHONE) as lease:
@@ -1846,6 +1865,7 @@ def test_epoch_change_between_readiness_and_cas_blocks_mutation():
         with pytest.raises(ReadinessUnavailable):
             store.compare_and_set(lease, anchor, ())
         assert store.contact_snapshot(PHONE)["revision"] == anchor.contact_revision
+    conversation_resources.expect_unreleased_lease(store, lease, reason="epoch changes before CAS and prevents former-owner release")
 
 
 @pytest.mark.parametrize("_case", [None], ids=["state-29"])
@@ -1902,7 +1922,7 @@ def test_lease_invalid_configuration_fails_with_domain_reason_before_acquire():
 
 
 @pytest.mark.parametrize("quarantine", [False, True])
-def test_manifest_acl_denial_of_later_write_keeps_entire_state_unchanged(quarantine):
+def test_manifest_acl_denial_of_later_write_keeps_entire_state_unchanged(quarantine, conversation_resources):
     """Catches a denied later SADD leaving earlier SET/DEL writes committed."""
     from app.conversation_redis import DISPATCH_INDEX_KEY, QUARANTINE_INDEX_KEY
     store = make_store()
@@ -1920,6 +1940,8 @@ def test_manifest_acl_denial_of_later_write_keeps_entire_state_unchanged(quarant
                 store.compare_and_set(lease, anchor, (detail(store),))
         unchanged = store.snapshot() == before
         assert unchanged
+    if quarantine:
+        conversation_resources.expect_unreleased_lease(store, lease, reason="ACL-denied quarantine repair also prevents release")
 
 
 @pytest.mark.parametrize("target", ["anchor", "control"])
@@ -2201,7 +2223,7 @@ def test_processing_and_sender_heartbeat_cover_external_call_past_original_ttl(_
 
 
 @pytest.mark.parametrize("_case", [None], ids=["flow-19"])
-def test_process_batch_lost_lease_during_agent_has_zero_dml_or_outbound(_case, task_api, processing_runtime):
+def test_process_batch_lost_lease_during_agent_has_zero_dml_or_outbound(_case, task_api, processing_runtime, conversation_resources):
     from app.conversation_redis import contact_keys
     rt = processing_runtime
     command = rt.buffer()
@@ -2210,6 +2232,7 @@ def test_process_batch_lost_lease_during_agent_has_zero_dml_or_outbound(_case, t
         task_api.process_batch(command, rt)
     assert not any("commit_entered" in s.events for s in rt.sessions)
     assert rt.outbound_broker.calls == []
+    conversation_resources.expect_crashed_claim(rt.store, command, reason="model worker loses lease before RESULT_READY")
 
 
 def test_sender_transport_failure_releases_lease_and_exposes_only_reason(task_api, processing_runtime, caplog):

@@ -255,7 +255,7 @@ def test_exhausted_task_returns_before_content_sql_model_or_transport(processing
 
 
 @pytest.mark.parametrize("_case", [None], ids=["flow-74-worker-initial-staging-atomicity"])
-def test_worker_initial_staging_faults_never_leave_orphan_claim_or_partial_manifest(session_factory, task_api, _case):
+def test_worker_initial_staging_faults_never_leave_orphan_claim_or_partial_manifest(session_factory, task_api, _case, conversation_resources):
     from app.simple_config import settings
     from tests.fakes import ProcessingRuntime
     config = domain.ConversationConfig.from_settings(settings)
@@ -263,6 +263,7 @@ def test_worker_initial_staging_faults_never_leave_orphan_claim_or_partial_manif
     command = baseline.buffer()
     with baseline.store.contact_lease(PHONE) as lease:
         baseline.store.claim_or_resume_batch(command, baseline.clock.now(), lease)
+    conversation_resources.expect_crashed_claim(baseline.store, command, reason="reference worker stops immediately after successful atomic staging")
     count = baseline.store.client.write_counts["claim_or_resume_batch"]
     assert count >= 4
     for index in range(count):
@@ -453,7 +454,7 @@ def test_ready_race_ingress_stops_before_next_effect(main_module, ingress_runtim
 
 @pytest.mark.parametrize("boundary", ["acquire", "claim_or_resume_batch", "snapshot", "agent",
     "stage_agent_result", "prepare_mutation", "flush", "enter_committing", "commit_returned", "reserve_outbound_enqueue"])
-def test_ready_race_processing_rechecks_before_agent_sql_and_outbound(processing_runtime, task_api, monkeypatch, boundary):
+def test_ready_race_processing_rechecks_before_agent_sql_and_outbound(processing_runtime, task_api, monkeypatch, boundary, conversation_resources):
     rt = processing_runtime
     command = rt.buffer()
     if boundary == "snapshot":
@@ -479,6 +480,8 @@ def test_ready_race_processing_rechecks_before_agent_sql_and_outbound(processing
         assert db.bind.url.database in (None, "", ":memory:")
         row = db.get(ConversationContext, command.phone)
         assert (row is not None) is (boundary in ("commit_returned", "reserve_outbound_enqueue"))
+    if boundary in ("claim_or_resume_batch", "snapshot"):
+        conversation_resources.expect_crashed_claim(rt.store, command, reason="worker stops on readiness loss before RESULT_READY")
 
 
 def test_ready_race_outbound_ack_still_records_and_completes(processing_runtime, task_api):
@@ -1605,7 +1608,7 @@ def test_ready_broker_probe_is_bounded_and_never_publishes(main_module, monkeypa
     assert any(entry["task"] == "app.main.recover_conversations_task" for entry in schedule.values())
 
 
-def test_recovery_healthy_claim_is_not_listed_and_busy_contact_does_not_block_next(processing_runtime, monkeypatch):
+def test_recovery_healthy_claim_is_not_listed_and_busy_contact_does_not_block_next(processing_runtime, monkeypatch, conversation_resources):
     from contextlib import contextmanager
     api = recovery_api()
     rt = processing_runtime
@@ -1629,6 +1632,7 @@ def test_recovery_healthy_claim_is_not_listed_and_busy_contact_does_not_block_ne
     report = api.RecoveryService(rt).run_once(rt.clock.now())
     assert report.failed == 1 and report.rescheduled == 1
     assert [c.phone for c in rt.processing_broker.calls[before:]] == [other.phone]
+    conversation_resources.expect_crashed_claim(rt.store, healthy, reason="healthy owner stops without publishing during the recovery scan")
 
 
 def test_recovery_committed_without_ack_only_republishes_internal_work(task_api, processing_runtime):
@@ -1645,18 +1649,66 @@ def test_recovery_committed_without_ack_only_republishes_internal_work(task_api,
     assert rt.transport.calls == []
 
 
+@pytest.mark.parametrize("staged", [False, True], ids=["dispatch", "staged"])
+@pytest.mark.parametrize("fault", ["lock", "heartbeat", "broker"],
+                         ids=["flow-65-lock", "flow-65-heartbeat", "flow-65-broker"])
+def test_recovery_failure_preserves_batch_staging_and_indices(processing_runtime, staged, fault):
+    from tests.fakes import ControlledWait
+    rt = processing_runtime
+    command = rt.buffer("recovery retained input")
+    if staged:
+        with rt.store.contact_lease(PHONE) as lease:
+            rt.store.claim_or_resume_batch(command, rt.clock.now(), lease)
+    rt.clock.advance(timedelta(seconds=60))
+    content_before = {d.entry.id: (d.entry.kind, d.body) for d in rt.details()
+                      if d.entry.kind in ("buffer", "staging", "processing")}
+    indices_before = deepcopy(rt.store.client.sets)
+    before_calls = len(rt.processing_broker.calls)
+    if fault == "lock":
+        rt.store.fail_next_atomic("acquire")
+    elif fault == "heartbeat":
+        waiter = ControlledWait(rt.clock)
+        rt.store.heartbeat_wait = waiter
+        def lose_heartbeat():
+            rt.store.fail_next_atomic("renew")
+            waiter.tick(20)
+        rt.session_hooks["execute"] = lose_heartbeat
+    else:
+        rt.processing_broker.next_result = domain.EnqueueResult.DEFINITIVE_FAILURE
+    report = recovery_api().RecoveryService(rt).run_once(rt.clock.now())
+    assert report.failed == 1
+    assert report.rescheduled == report.completed == report.exhausted == report.quarantined == 0
+    assert len(rt.processing_broker.calls) == before_calls + int(fault == "broker")
+    assert rt.agent.calls == rt.outbound_broker.calls == rt.transport.calls == []
+    assert not any("commit_entered" in session.events for session in rt.sessions)
+    assert rt.store.client.sets == indices_before
+    if fault == "heartbeat":
+        assert waiter.worker is not None and not waiter.worker.is_alive()
+        rt.store.heartbeat_wait = None
+    assert {d.entry.id: (d.entry.kind, d.body) for d in rt.details()
+            if d.entry.kind in ("buffer", "staging", "processing")} == content_before
+    assert [envelope["content"] for envelope in rt.envelopes()] == ["recovery retained input"]
+    if fault == "broker":
+        assert rt.processing_broker.calls[-1].batch_id == command.batch_id
+
+
 @pytest.mark.parametrize("staged", [False, True])
 @pytest.mark.parametrize("_case", [None], ids=["flow-75"])
 def test_recovery_reschedules_stale_dispatch_without_agent_or_transport(_case, processing_runtime, staged):
     api = recovery_api()
     rt = processing_runtime
     command = rt.buffer()
+    with rt.store.contact_lease(command.phone) as lease:
+        due = rt.store.dispatch(command, lease).next_enqueue_at
     if staged:
         with rt.store.contact_lease(command.phone) as lease:
             claim = rt.store.claim_or_resume_batch(command, rt.clock.now(), lease)
-    rt.clock.advance(timedelta(seconds=61))
     before = len(rt.processing_broker.calls)
     service = api.RecoveryService(rt)
+    rt.clock.set(due - timedelta(microseconds=1))
+    assert service.run_once(rt.clock.now()).rescheduled == 0
+    assert len(rt.processing_broker.calls) == before
+    rt.clock.set(due)
     report = service.run_once(rt.clock.now())
     assert report.rescheduled == 1
     assert len(rt.processing_broker.calls) == before + 1
@@ -1666,6 +1718,9 @@ def test_recovery_reschedules_stale_dispatch_without_agent_or_transport(_case, p
         assert recovered.processing_id == claim.attempt.processing_id
         assert recovered.staging_id == command.batch_id
     assert service.run_once(rt.clock.now()).rescheduled == 0
+    rt.clock.advance(timedelta(microseconds=1))
+    assert service.run_once(rt.clock.now()).rescheduled == 0
+    assert len(rt.processing_broker.calls) == before + 1
     assert rt.agent.calls == rt.outbound_broker.calls == rt.transport.calls == []
 
 
@@ -2044,7 +2099,7 @@ def test_reset_simulator_deletes_only_test_state_in_one_fenced_transaction(admin
 
 @pytest.mark.parametrize("paused", [False, True])
 @pytest.mark.parametrize("_case", [None], ids=["flow-53"])
-def test_scheduler_inactive_context_closes_and_preserves_administrative_pause(_case, scheduler_module, admin_runtime, session_factory, paused):
+def test_scheduler_inactive_context_closes_and_preserves_administrative_pause(_case, scheduler_module, admin_runtime, session_factory, paused, main_module, task_api):
     import asyncio
     from app.models import ConversationContext, PausedContact
     rt = admin_runtime
@@ -2066,6 +2121,25 @@ def test_scheduler_inactive_context_closes_and_preserves_administrative_pause(_c
     assert anchor.cycle is (domain.ConversationCycle.PAUSED if paused else domain.ConversationCycle.CLOSED)
     assert rt.store.contact_snapshot(SIMULATOR_PHONE) == other
     assert sum(s.events.count("commit_returned") for s in rt.sessions) == 1
+    if paused:
+        assert webhook(main_module, jid=ADMIN_PHONE, text="dropped during retained pause", message_id="scheduler-paused").status_code == 200
+        assert rt.processing_broker.calls == []
+        assert _anchor(rt, ADMIN_PHONE).cycle is domain.ConversationCycle.PAUSED
+        rt.clock.set(datetime(2026, 9, 12, 15, tzinfo=timezone.utc))
+    assert webhook(main_module, jid=ADMIN_PHONE, text="resumed after scheduler", message_id="scheduler-resumed").status_code == 200
+    command = rt.processing_broker.calls[-1]
+    assert command.generation != str(anchor.last_generation)
+    assert task_api.process_batch(command, rt) is task_api.ProcessingOutcome.PROCESSED
+    assert rt.agent.calls[-1][2].messages == []
+    assert _anchor(rt, ADMIN_PHONE).cycle is domain.ConversationCycle.OPEN
+    with session_factory() as db:
+        assert db.get(PausedContact, ADMIN_PHONE) is None
+        assert db.get(ConversationContext, ADMIN_PHONE).messages == [
+            {"role": "user", "content": "resumed after scheduler"},
+            {"role": "assistant", "content": "Resposta sintética"},
+        ]
+    assert rt.outbound_broker.calls[-1].generation == command.generation
+    assert rt.store.contact_snapshot(SIMULATOR_PHONE) == other
 
 
 @pytest.mark.parametrize("_case", [None], ids=["flow-32"])
@@ -2879,7 +2953,7 @@ def test_process_batch_lost_ack_reuses_result_without_model_reentry(task_api, pr
 
 @pytest.mark.parametrize("fault", ["readiness", "lease", "generation", "session"])
 @pytest.mark.parametrize("_case", [None], ids=["flow-22"])
-def test_process_batch_dependency_failure_before_agent_has_no_patient_response(_case, task_api, processing_runtime, fault, monkeypatch):
+def test_process_batch_dependency_failure_before_agent_has_no_patient_response(_case, task_api, processing_runtime, fault, monkeypatch, conversation_resources):
     from app.conversation_redis import contact_keys
     rt = processing_runtime
     command = rt.buffer()
@@ -2899,6 +2973,8 @@ def test_process_batch_dependency_failure_before_agent_has_no_patient_response(_
     assert rt.agent.calls == rt.outbound_broker.calls == rt.transport.calls == []
     if fault == "readiness":
         assert (rt.lease_calls, rt.session_calls) == (leases, sessions)
+    if fault == "session":
+        conversation_resources.expect_crashed_claim(rt.store, command, reason="worker cannot open SQL after obtaining its claim")
 
 
 def test_process_batch_mixed_fixed_and_text_keeps_fixed_inputs_out_of_agent(task_api, processing_runtime):
@@ -3079,6 +3155,60 @@ def test_webhook_secretary_pause_renews_24h_but_duplicate_id_never_renews(main_m
     assert ingress_runtime.processing_broker.calls == []
 
 
+@pytest.mark.parametrize("boundary", ["flush", "enter_committing_ack"],
+                         ids=["flow-38-staged-flush", "flow-38-staged-definitive-rollback"])
+def test_staged_transfer_retry_keeps_prepared_operation_and_applies_once(processing_runtime, task_api, boundary):
+    from sqlalchemy.exc import SQLAlchemyError
+    from app.models import ConversationContext, PausedContact
+    rt = processing_runtime
+    rt.seed_contact(PHONE)
+    rt.agent.intent = domain.AgentIntent.PAUSE_FOR_SECRETARY
+    command = rt.buffer("transfer through staged retry")
+    started = rt.clock.now()
+    def fail():
+        raise SQLAlchemyError("synthetic SQL boundary failure")
+    if boundary == "flush":
+        rt.session_hooks["flush"] = fail
+    else:
+        rt.store.client.after_operation["enter_committing"] = fail
+    with pytest.raises(task_api.RetryRequested) as caught:
+        task_api.process_batch(command, rt)
+    retry = caught.value.command
+    assert retry.batch_id == retry.staging_id == command.batch_id
+    assert retry.generation == command.generation
+    with rt.store.contact_lease(PHONE) as lease:
+        prepared = rt.store.inspect_mutation(PHONE, retry.operation_id, lease)
+        assert prepared.phase is domain.MutationPhase.PREPARED
+        processing = next(d for d in rt.store.read_details(lease) if d.entry.kind == "processing")
+        assert processing.body["phase"] == "APPLYING"
+        assert processing.body["operation_id"] == retry.operation_id
+        assert processing.entry.id == retry.processing_id
+        assert [e.content for e in rt.store.claim_or_resume_batch(retry, rt.clock.now(), lease).envelopes] == ["transfer through staged retry"]
+    with rt._factory() as db:
+        assert db.get(PausedContact, PHONE) is None
+        assert db.get(ConversationContext, PHONE).messages == [{"role": "user", "content": "synthetic history"}]
+    assert len(rt.agent.calls) == 1
+    assert rt.outbound_broker.calls == rt.transport.calls == []
+    rt.clock.advance(timedelta(seconds=3))
+    assert task_api.process_batch(retry, rt) is task_api.ProcessingOutcome.PROCESSED
+    with rt.store.contact_lease(PHONE) as lease:
+        completed = rt.store.inspect_mutation(PHONE, retry.operation_id, lease)
+        assert completed.phase is domain.MutationPhase.COMMITTED
+        assert completed.generation == prepared.generation
+        assert completed.target_fingerprint == prepared.target_fingerprint
+        assert rt.store.dispatch(retry, lease).phase is domain.DispatchPhase.PROCESSED
+    with rt._factory() as db:
+        assert db.get(ConversationContext, PHONE) is None
+        assert db.get(PausedContact, PHONE).paused_until == (started + timedelta(hours=24)).replace(tzinfo=None)
+    assert len(rt.agent.calls) == len(rt.outbound_broker.calls) == 1
+    outbound = rt.outbound_broker.calls[0]
+    assert outbound.operation_id == retry.operation_id
+    assert outbound.generation == str(prepared.generation)
+    assert outbound.pause_ref.generation == outbound.generation
+    assert task_api.send_outbound(outbound, rt) is task_api.SendOutcome.SENT
+    assert len(rt.transport.calls) == 1
+
+
 @pytest.mark.parametrize("_case", [None], ids=["flow-38"])
 def test_webhook_secretary_pause_retries_same_prepared_operation(_case, main_module, ingress_runtime, monkeypatch, session_factory):
     from sqlalchemy.orm import Session
@@ -3135,16 +3265,38 @@ def test_webhook_active_media_buffers_only_required_content(main_module, ingress
 
 
 @pytest.mark.parametrize("_case", [None], ids=["flow-10"])
-def test_webhook_pause_expiry_at_exact_deadline_opens_new_generation(_case, main_module, ingress_runtime, session_factory):
-    from app.models import PausedContact
-    ref = ingress_runtime.pause()
-    ingress_runtime.clock.set(ref.paused_until)
+@pytest.mark.parametrize("preserved", [False, True], ids=["create-context", "reuse-administrative-context"])
+def test_webhook_pause_expiry_at_exact_deadline_opens_new_generation(_case, main_module, admin_runtime, session_factory, task_api, preserved):
+    from app.models import PausedContact, ConversationContext
+    rt = admin_runtime
+    if preserved:
+        rt.seed_contact(PHONE, paused_hours=24)
+        old_generation = str(_anchor(rt, PHONE).last_generation)
+        deadline = rt.clock.now() + timedelta(hours=24)
+    else:
+        ref = rt.pause()
+        old_generation, deadline = ref.generation, ref.paused_until
+    rt.clock.set(deadline)
     response = webhook(main_module)
     assert response.status_code == 200
-    envelope = ingress_runtime.envelopes()[0]
-    assert envelope["generation"] != ref.generation
+    envelope = rt.envelopes()[0]
+    assert envelope["generation"] != old_generation
+    command = rt.processing_broker.calls[-1]
+    assert task_api.process_batch(command, rt) is task_api.ProcessingOutcome.PROCESSED
+    expected_history = [{"role": "user", "content": "synthetic history"}] if preserved else []
+    assert rt.agent.calls[0][2].messages == expected_history
+    assert str(_anchor(rt, PHONE).last_generation) == command.generation == envelope["generation"]
+    assert _anchor(rt, PHONE).cycle is domain.ConversationCycle.OPEN
+    assert rt.outbound_broker.calls[-1].generation == command.generation
     with session_factory() as db:
         assert db.get(PausedContact, PHONE) is None
+        context = db.get(ConversationContext, PHONE)
+        assert context is not None, "expiry input must be processed, not merely buffered"
+        assert context.messages[-2:] == [
+            {"role": "user", "content": "Mensagem sintética"},
+            {"role": "assistant", "content": "Resposta sintética"},
+        ]
+        assert context.messages[:-2] == expected_history
 
 
 @pytest.mark.parametrize("failure", [

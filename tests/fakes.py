@@ -19,6 +19,49 @@ class ConversationResources:
         self.active_network_calls = 0
         self.active_leases = 0
         self.lock = RLock()
+        self.expected_crash_residue = {}
+        self.issued_claims = {}
+
+    def expect_crashed_claim(self, store, command, attempt=None, *, reason, claim_deadline=None):
+        """Declare one known abandoned claim, not whatever happens to remain."""
+        from app.conversation_redis import contact_keys
+        assert reason.strip(), "crash residue needs an explicit scenario"
+        if attempt is None:
+            attempt = self.issued_claims[(id(store.client), command.batch_id)]
+        key = contact_keys(command.phone).processing_prefix + attempt.processing_id
+        self.expected_crash_residue[(id(store.client), key)] = (
+            "claim", attempt.claim_token, (claim_deadline or attempt.claim_deadline).timestamp(),
+            attempt.operation_id, command.batch_id, str(command.generation),
+        )
+
+    def expect_unreleased_lease(self, store, lease, *, reason, owner_token=None):
+        """Release-failure scenarios identify the exact former owner's token."""
+        from app.conversation_redis import contact_keys
+        assert reason.strip(), "lease residue needs an explicit scenario"
+        self.expected_crash_residue[(id(store.client), contact_keys(lease.phone).lease)] = (
+            "lease", owner_token or lease.owner_token, lease.lease_deadline.timestamp(),
+        )
+
+    def _live_residue(self):
+        observed = {}
+        for client in self.clients:
+            with client.lock:
+                now = client.clock.now().timestamp()
+                for key, value in client.values.items():
+                    expiry = client.expiry.get(key, float("inf"))
+                    if expiry <= now:
+                        continue
+                    if key.endswith(":lease"):
+                        observed[(id(client), key)] = ("lease", value, expiry)
+                    elif ":processing:" in key:
+                        record = json.loads(value)
+                        body = record["body"]
+                        if body.get("phase") == "CLAIMED" and body["claim_deadline"] > now:
+                            observed[(id(client), key)] = (
+                                "claim", body["claim_token"], body["claim_deadline"],
+                                body["operation_id"], body["batch_id"], body["generation"],
+                            )
+        return observed
 
     @contextmanager
     def network_call(self):
@@ -32,29 +75,14 @@ class ConversationResources:
 
     def assert_idle(self):
         assert not any(session.in_transaction() for session in self.sessions), "open SQL transaction"
-        assert self.active_network_calls == 0, "pending fake network call"
-        assert not any(waiter.worker and waiter.worker.is_alive() for waiter in self.waiters), "live heartbeat"
-        for client in self.clients:
-            with client.lock:
-                client._expire()
-                assert not any(key.endswith(":lease") for key in client.values), "live lease"
-
-    def settle_expiring_owners(self):
-        """Fault tests may prevent Redis release; expire TTLs on the fake clock.
-
-        This is fixture cleanup, after all owners/heartbeats/calls have returned.
-        It cannot hide a live critical section or run any production operation.
-        """
         assert self.active_leases == 0, "live lease context"
         assert self.active_network_calls == 0, "pending fake network call"
         assert not any(waiter.worker and waiter.worker.is_alive() for waiter in self.waiters), "live heartbeat"
-        for client in self.clients:
-            deadlines = [deadline for key, deadline in client.expiry.items() if key.endswith(":lease")]
-            if deadlines:
-                terminal = datetime.fromtimestamp(max(deadlines), timezone.utc)
-                if terminal > client.clock.now():
-                    client.clock.set(terminal)
-                client._expire()
+        observed = self._live_residue()
+        for key, residue in observed.items():
+            assert key in self.expected_crash_residue, f"unexpected live {residue[0]}: {key[1]}"
+            assert residue == self.expected_crash_residue[key], "crash residue identity or deadline changed"
+        assert observed.keys() == self.expected_crash_residue.keys(), "declared crash residue missing"
 
     def dispose(self):
         self.assert_idle()
@@ -79,6 +107,8 @@ class ConversationResources:
         self.clients.clear()
         self.waiters.clear()
         self.recorders.clear()
+        self.expected_crash_residue.clear()
+        self.issued_claims.clear()
 
 
 class ManualClock:
