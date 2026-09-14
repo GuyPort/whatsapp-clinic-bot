@@ -367,6 +367,61 @@ zip backup-$(date +%Y%m%d).zip data/appointments.db
 
 ## Readiness e recuperação das conversas
 
+### Configuração da Fase 1
+
+Forneça a configuração pelo ambiente operacional. A lista registra nomes e
+semântica; credenciais e valores de produção não pertencem ao runbook.
+
+| Variável | Semântica |
+|---|---|
+| `WASENDER_WEBHOOK_SECRET` | Segredo obrigatório, validado antes do payload do webhook. |
+| `ADMIN_PASSWORD` | Autenticação administrativa do dashboard e das três rotas do simulador. |
+| `DATABASE_URL`, `REDIS_URL` | Dependências SQL e Redis/broker; URLs não devem aparecer em logs. |
+| `CONVERSATION_COORDINATION_EPOCH` | UUID externo compartilhado pelas instâncias e conferido contra a âncora Redis. |
+| `CONVERSATION_REDIS_EXPECTED_RUN_ID` | Identidade esperada do processo Redis. |
+| `CONVERSATION_REDIS_ATTEST_NOEVICTION`, `CONVERSATION_REDIS_ATTEST_PERSISTENCE` | Atestações operacionais obrigatórias, acompanhadas das verificações do servidor. |
+| `CONTACT_LEASE_TTL_SECONDS`, `CONTACT_LEASE_HEARTBEAT_SECONDS` | Prazo da lease e intervalo de renovação; o heartbeat não pode exceder um terço do TTL. |
+| `CLAIM_TTL_SECONDS` | Prazo de propriedade do processamento, inferior ao horizonte de processamento. |
+| `DISPATCH_RETRY_SECONDS` | Horizonte do batch antes de staging. |
+| `PROCESSING_RETRY_SECONDS` | Horizonte criado no primeiro claim; governa resultado e fronteira de commit após staging. |
+| `ENQUEUE_VISIBILITY_SECONDS`, `ENQUEUE_BACKOFF_SECONDS` | Próxima tentativa após confirmação/ambiguidade ou falha definitiva do broker; ambos inferiores ao horizonte de despacho. |
+| `REPLAY_WINDOW_SECONDS`, `TTL_MARGIN_SECONDS` | Retenção de deduplicação e margem; a janela geral nunca é menor que sete dias, e descarte durante pausa cobre também seu vencimento. |
+| `BATCH_RECOVERY_INTERVAL_SECONDS` | Intervalo das passagens periódicas de recuperação. |
+| `BATCH_RECOVERY_PAGE_SIZE`, `BATCH_RECOVERY_MAX_PAGES` | Limites de metadados visitados por passagem. |
+| `APP_SKIP_DOTENV` | Impede carregamento de dotenv no ambiente de testes e nas rotinas que exigem configuração externa. |
+
+### Testes locais descartáveis
+
+Execute na raiz do checkout, com as dependências já disponíveis:
+
+```powershell
+python -m pytest tests/test_conversation_state.py -q
+python -m pytest tests/test_conversation_flow.py -q
+python -m pytest tests/test_conversation_security.py -q
+python -m pytest tests/test_conversation_concurrency.py -q
+python -m pytest -q
+```
+
+O harness fornece configuração sintética e SQLite estritamente em memória.
+Após o bootstrap dos plugins do pytest e antes da coleta dos testes, ele bloqueia
+rede, DNS, subprocessos, dotenv, leitura de `data/`, SQL persistente/ATTACH e
+escritas dos testes no repositório. Cada caso verifica transações, proprietários,
+heartbeats e chamadas fake em andamento; o teardown expira owners abandonados
+somente no relógio fake e elimina o estado privado dos fakes, inclusive claims
+e conteúdo. A finalização do próprio pytest pode atualizar seu cache.
+
+Os IDs `state-01` a `state-48` e `flow-01` a `flow-77` identificam itens
+executáveis da spec aprovada; eles podem ser selecionados com `pytest -k` ou
+pelo node ID completo. Os testes usam barreiras e snapshots SQL sintéticos;
+não comprovam isolamento ou entrega em serviços hospedados.
+
+Verificação local da Task 11: estado **166**, fluxo **899**, segurança **272**,
+concorrência **212** e suíte completa **1549 testes aprovados**. Os cinco comandos
+acima terminaram com exit `0`. A suíte completa registrou 413 avisos do escape
+preexistente em `app/main.py:2318`; nenhum serviço externo foi acessado.
+
+### Sinais de disponibilidade e proprietários das falhas
+
 `GET /health` é apenas liveness: responde 200 quando o processo HTTP está vivo,
 sem sondar SQL, Redis ou broker. `GET /ready` responde 200 somente quando todas
 as dependências obrigatórias estão disponíveis; caso contrário, responde 503.
@@ -432,6 +487,27 @@ Confirmação local de enqueue não comprova entrega e não oferece exactly-once
 Redis/Lua/ACL, broker, SQL hospedado, serviços externos e os procedimentos reais
 de recovery/rotação continuam **NÃO VERIFICADOS** por testes locais simulados.
 
+| Fronteira | Quem retoma ou resolve |
+|---|---|
+| Webhook | Retorna `503` em indisponibilidade; a nova entrega pertence ao fornecedor. Assinatura inválida permanece `401`. |
+| Dashboard e simulador | Retornam `503` sem efeito parcial; nova tentativa pertence ao operador/chamador. Duração inválida retorna `400`. |
+| Processamento e sender | A task converte a falha tipada em retry, preservando o comando interno e seus IDs. |
+| Broker de processamento | Replay e recuperador respeitam a reserva e `next_enqueue_at`, sem novo append da mensagem. |
+| Scheduler e recuperador | A próxima passagem reavalia o estado; readiness fechada não autoriza efeitos. |
+| `COMMITTING` incerto / `QUARANTINED` | Operador autorizado, com quiescência e prova externa; ausência momentânea de uma linha SQL não autoriza repetir ou abortar o commit. |
+
+Os eventos usam classes fixas como `dependency_unavailable`, `coordination_failed`,
+`persistence_failed` e `transport_failed`, sem detalhes sensíveis da exceção.
+O resumo final do scheduler conta candidatos examinados e ainda pode registrar
+`recovered/completed` mesmo quando houve falhas por contato; consulte também os
+eventos individuais. Esse limite conhecido não é uma prova de limpeza concluída.
+
+Entrega exatamente uma vez sem outbox permanece **NÃO VERIFICADA**. Persistência
+e failover de Redis, ambiguidade do broker, Wasender e Claude reais permanecem
+**NÃO VERIFICADOS**. Quiescência e rotação de epoch em produção permanecem
+**NÃO VERIFICADAS** até execução por operador autorizado. A Fase 1 não executa
+migração nem alteração de estado em produção.
+
 ### Rotação do epoch com quiescência obrigatória
 
 1. Pare ingresso HTTP, workers, scheduler/beat e sender em todas as instâncias.
@@ -443,10 +519,10 @@ de recovery/rotação continuam **NÃO VERIFICADOS** por testes locais simulados
 4. No ambiente operacional autorizado, execute **uma única vez**:
 
    ```bash
-   python scripts/rotate_conversation_epoch.py --expected-current-epoch 2d7ae851-8c7c-4a28-a1db-437654383e63 --new-epoch f3572ad0-a11c-47ac-a516-d01ac570878a --confirm-quiescent
+   python scripts/rotate_conversation_epoch.py --expected-current-epoch UUID_ATUAL --new-epoch UUID_NOVO --confirm-quiescent
    ```
 
-   Substitua os UUIDs de exemplo. O comando consome a configuração externa,
+   Substitua os marcadores pelos UUIDs operacionais aprovados. O comando consome a configuração externa,
    não carrega `.env`, exige que o novo UUID seja o configurado e verifica
    SQL/Redis/broker e atestação antes do CAS atômico do anchor antigo.
 5. Reinicie os processos e confirme `GET /ready` com 200 em todas as instâncias.
@@ -500,7 +576,7 @@ não publica nem apaga dados de pacientes e não substitui a drenagem.
 - **Validação de identidade**: Nome + data de nascimento para modificar consultas
 - **Sem orientação médica**: Bot recusa dar diagnósticos ou orientações médicas
 - **Rate limiting**: Evita spam (implementar se necessário)
-- **Logs completos**: Todas interações são logadas para auditoria
+- **Auditoria conversacional**: eventos, transições e resultados operacionais sanitizados; conteúdo e identificadores de pacientes não entram nos logs da Fase 1.
 - **LGPD**: Apenas dados essenciais são coletados (nome, telefone, data nascimento)
 
 ## 🤝 Contribuindo

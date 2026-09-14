@@ -27,8 +27,45 @@ def make_store():
     return InMemoryConversationStore(ConversationConfig.from_settings(Settings(_valid_environment())))
 
 
+@pytest.mark.parametrize("_case", [None], ids=["state-25-old-commit-empty-visible-snapshot"])
+def test_committing_barrier_ignores_new_owners_precommit_sql_snapshot(transition_env, _case):
+    """An independent memory SQL snapshot models what a new transaction sees.
+
+    SQLite StaticPool shares one connection, so a second disposable database is
+    used for the uncommitted target's absence; Redis authority remains shared.
+    """
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import Session
+    from sqlalchemy.pool import StaticPool
+    from app.models import Base, PausedContact
+    from app.conversation_state import ConversationMutationPending, ConversationMutationAmbiguous, MutationPhase
+    coordinator, db, store, clock = transition_env
+    visible_engine = create_engine("sqlite://", poolclass=StaticPool)
+    Base.metadata.create_all(visible_engine)
+    try:
+        with Session(visible_engine) as visible:
+            def blocked_commit():
+                clock.advance(timedelta(seconds=61))
+                with store.contact_lease(PHONE) as successor:
+                    assert visible.get(PausedContact, PHONE) is None
+                    with pytest.raises(ConversationMutationPending):
+                        coordinator.pause_for_secretary(visible, PHONE, "secretary_manual_pause", clock.now(), successor, "new-operation")
+                    store.preserve_or_abort_prepared(PHONE, "old-operation", successor, clock.now())
+                    assert store.inspect_mutation(PHONE, "old-operation", successor).phase is MutationPhase.COMMITTING
+                    assert visible.get(PausedContact, PHONE) is None
+            with store.contact_lease(PHONE) as old:
+                db.hooks["commit_entered"] = blocked_commit
+                with pytest.raises(ConversationMutationAmbiguous):
+                    coordinator.pause_for_secretary(db, PHONE, "secretary_manual_pause", clock.now(), old, "old-operation")
+            assert db.events.count("commit_returned") == 1
+            assert db.get(PausedContact, PHONE) is not None
+    finally:
+        visible_engine.dispose()
+
+
 @pytest.mark.parametrize("offset,winner", [(-1, False), (0, True), (1, True)])
-def test_claim_takeover_exact_deadline_rejects_old_token(offset, winner):
+@pytest.mark.parametrize("_case", [None], ids=["state-38"])
+def test_claim_takeover_exact_deadline_rejects_old_token(_case, offset, winner):
     from tests.test_conversation_state import batch_api, append_batch, batch_command
     domain, store = batch_api(), make_store()
     with store.contact_lease(PHONE) as lease:
@@ -47,7 +84,8 @@ def test_claim_takeover_exact_deadline_rejects_old_token(offset, winner):
 
 
 @pytest.mark.parametrize("kind", ["processing", "staging", "batch", "dedupe", "staging_index"])
-def test_staged_missing_detail_or_membership_quarantines_before_new_claim(kind):
+@pytest.mark.parametrize("_case", [None], ids=["state-43"])
+def test_staged_missing_detail_or_membership_quarantines_before_new_claim(_case, kind):
     from tests.test_conversation_state import batch_api, append_batch, batch_command, batch_details
     batch_api()
     store = make_store()
@@ -65,7 +103,12 @@ def test_staged_missing_detail_or_membership_quarantines_before_new_claim(kind):
         assert "synthetic text" not in str(store.contact_snapshot(PHONE))
 
 
-@pytest.mark.parametrize("operation", ["finalize_ingress_once", "claim_or_resume_batch", "stage_agent_result", "exhaust_batch"])
+@pytest.mark.parametrize("operation", [
+    pytest.param("finalize_ingress_once", id="flow-36-atomic-append"),
+    pytest.param("claim_or_resume_batch", id="state-45-atomic-staging"),
+    pytest.param("stage_agent_result", id="state-39-atomic-result"),
+    pytest.param("exhaust_batch", id="state-42-atomic-exhaustion"),
+])
 def test_batch_atomic_fault_at_each_write_preserves_all_details_and_manifest(operation):
     from tests.test_conversation_state import batch_api, append_batch, batch_command
     domain = batch_api()
@@ -114,7 +157,8 @@ def test_batch_atomic_fault_at_each_write_preserves_all_details_and_manifest(ope
             context.__exit__(None, None, None)
 
 
-def test_batch_two_consumers_observe_only_one_live_claim():
+@pytest.mark.parametrize("_case", [None], ids=["flow-26"])
+def test_batch_two_consumers_observe_only_one_live_claim(_case, ):
     from tests.test_conversation_state import batch_api, append_batch, batch_command
     batch_api()
     store = make_store()
@@ -141,7 +185,8 @@ def test_batch_two_consumers_observe_only_one_live_claim():
 
 @pytest.mark.parametrize("boundary", ["prepare_mutation", "enter_committing"])
 @pytest.mark.parametrize("offset", [-1, 0, 1])
-def test_batch_mutation_processing_deadline_aborts_before_sql_commit(transition_env, boundary, offset):
+@pytest.mark.parametrize("_case", [None], ids=["state-47"])
+def test_batch_mutation_processing_deadline_aborts_before_sql_commit(_case, transition_env, boundary, offset):
     from tests.test_conversation_state import batch_api, append_batch, batch_command, batch_details
     from app.conversation_redis import contact_keys
     coordinator, db, store, clock = transition_env
@@ -174,7 +219,8 @@ def test_batch_mutation_processing_deadline_aborts_before_sql_commit(transition_
         assert batch_details(store, lease, "dedupe")[0].body["disposition"] == "FAILED"
 
 
-def test_batch_committing_death_quarantines_content_without_repeating_mutation(transition_env):
+@pytest.mark.parametrize("_case", [None], ids=["state-37"])
+def test_batch_committing_death_quarantines_content_without_repeating_mutation(_case, transition_env):
     from tests.test_conversation_state import batch_api, append_batch, batch_command
     coordinator, db, store, clock = transition_env
     domain = batch_api()
@@ -200,7 +246,8 @@ def test_batch_committing_death_quarantines_content_without_repeating_mutation(t
 
 
 @pytest.mark.parametrize("intent", ["SAVE_CONTEXT", "PAUSE_FOR_SECRETARY", "CLOSE_CONTEXT"])
-def test_batch_complete_atomic_failure_retries_without_losing_sql_receipt(transition_env, intent):
+@pytest.mark.parametrize("_case", [None], ids=["flow-50"])
+def test_batch_complete_atomic_failure_retries_without_losing_sql_receipt(_case, transition_env, intent):
     from tests.test_conversation_state import batch_api, append_batch, batch_command, batch_details
     coordinator, db, store, clock = transition_env
     domain = batch_api()
@@ -267,7 +314,8 @@ def test_enqueue_old_owner_completion_cannot_overwrite_successor_reservation():
         assert store.dispatch(command, lease).scheduled_at == store.clock.now()
 
 
-def test_staged_heartbeat_renews_only_owned_claim_and_keeps_original_processing_horizon():
+@pytest.mark.parametrize("_case", [None], ids=["state-16"])
+def test_staged_heartbeat_renews_only_owned_claim_and_keeps_original_processing_horizon(_case, ):
     from tests.test_conversation_state import batch_api, append_batch, batch_command, batch_details
     batch_api()
     store = make_store()
@@ -319,7 +367,8 @@ def test_batch_generation_change_discards_old_result_before_sql(transition_env):
 
 
 @pytest.mark.parametrize("fault", ["epoch_absent", "run_id_mismatch", "fingerprint"])
-def test_batch_recovery_coordination_failure_preserves_index_without_broker_effect(fault):
+@pytest.mark.parametrize("_case", [None], ids=["flow-65"])
+def test_batch_recovery_coordination_failure_preserves_index_without_broker_effect(_case, fault):
     from tests.test_conversation_state import batch_api, append_batch, batch_command
     from tests.fakes import ScriptedBroker
     domain, store, broker = batch_api(), make_store(), ScriptedBroker()
@@ -473,7 +522,8 @@ def test_batch_claim_cannot_publish_mismatching_operation_or_epoch():
                 store.stage_agent_result(command, altered, result, store.clock.now(), lease)
 
 
-def test_batch_ack_loss_after_append_staging_and_result_keeps_one_atomic_winner():
+@pytest.mark.parametrize("_case", [None], ids=["flow-61"])
+def test_batch_ack_loss_after_append_staging_and_result_keeps_one_atomic_winner(_case, ):
     from tests.test_conversation_state import batch_api, append_batch, batch_command, batch_details
     domain, store = batch_api(), make_store()
     def lost():
@@ -503,7 +553,8 @@ def test_batch_ack_loss_after_append_staging_and_result_keeps_one_atomic_winner(
 
 
 @pytest.mark.parametrize("timeout", [False, True])
-def test_batch_quarantine_resolution_preserves_current_batch_receipt(transition_env, timeout):
+@pytest.mark.parametrize("_case", [None], ids=["state-28"])
+def test_batch_quarantine_resolution_preserves_current_batch_receipt(_case, transition_env, timeout):
     from tests.test_conversation_state import batch_api, append_batch, batch_command
     coordinator, db, store, clock = transition_env
     domain = batch_api()
@@ -800,7 +851,8 @@ def test_mutation_flush_lease_cas_commit_and_finalize_order(transition_env):
         assert db.events.index("flush") < db.events.index("lease_proof") < db.events.index("commit_entered") < db.events.index("commit_returned")
 
 
-def test_mutation_lease_loss_after_flush_rolls_back_without_commit(transition_env):
+@pytest.mark.parametrize("_case", [None], ids=["state-23"])
+def test_mutation_lease_loss_after_flush_rolls_back_without_commit(_case, transition_env):
     from app.conversation_redis import contact_keys
     from app.conversation_state import MutationPhase
     from app.models import ConversationContext, PausedContact
@@ -819,7 +871,8 @@ def test_mutation_lease_loss_after_flush_rolls_back_without_commit(transition_en
         assert mutation_for(store, lease).phase is MutationPhase.PREPARED
 
 
-def test_mutation_precommit_failure_aborts_and_allows_new_operation(transition_env):
+@pytest.mark.parametrize("_case", [None], ids=["state-08"])
+def test_mutation_precommit_failure_aborts_and_allows_new_operation(_case, transition_env):
     from app.conversation_state import MutationPhase, FailureReason
     from app.models import ConversationContext, PausedContact
     coordinator, db, store, clock = transition_env
@@ -841,7 +894,8 @@ def test_mutation_precommit_failure_aborts_and_allows_new_operation(transition_e
 
 
 @pytest.mark.parametrize("boundary", ["flush", "commit_entered", "commit_returned"])
-def test_mutation_pending_blocks_competing_operation_at_each_sql_barrier(transition_env, boundary):
+@pytest.mark.parametrize("_case", [None], ids=["state-20"])
+def test_mutation_pending_blocks_competing_operation_at_each_sql_barrier(_case, transition_env, boundary):
     from app.conversation_state import ConversationMutationPending, MutationPhase
     from app.models import ConversationContext
     coordinator, db, store, clock = transition_env
@@ -861,7 +915,8 @@ def test_mutation_pending_blocks_competing_operation_at_each_sql_barrier(transit
         assert db.events.count("commit_entered") == 1
 
 
-def test_committing_finalize_failure_is_ambiguous_and_never_repeats_dml(transition_env):
+@pytest.mark.parametrize("_case", [None], ids=["state-26"])
+def test_committing_finalize_failure_is_ambiguous_and_never_repeats_dml(_case, transition_env):
     from app.conversation_state import ConversationMutationAmbiguous, ConversationMutationPending, MutationPhase
     from app.models import PausedContact
     coordinator, db, store, clock = transition_env
@@ -900,7 +955,8 @@ def test_committing_exception_quarantines_even_when_sql_result_is_unknown(transi
             coordinator.close_context(db, PHONE, clock.now(), lease, "close-2")
 
 
-def test_quarantine_timeout_is_compact_durable_and_requires_exact_quiescent_resolution(transition_env):
+@pytest.mark.parametrize("_case", [None], ids=["state-27"])
+def test_quarantine_timeout_is_compact_durable_and_requires_exact_quiescent_resolution(_case, transition_env):
     from app.conversation_state import ConversationMutationAmbiguous, ConversationMutationPending, MutationPhase, ConversationCycle
     coordinator, db, store, clock = transition_env
     with store.contact_lease(PHONE) as lease:
@@ -1022,7 +1078,8 @@ def test_mutation_rollback_failure_preserves_prepared_fence(transition_env):
         assert "commit_entered" not in db.events
 
 
-def test_quarantine_contact_a_does_not_block_contact_b_sql_or_generation(transition_env):
+@pytest.mark.parametrize("_case", [None], ids=["state-07"])
+def test_quarantine_contact_a_does_not_block_contact_b_sql_or_generation(_case, transition_env):
     from app.conversation_state import ConversationMutationAmbiguous
     from app.models import ConversationContext, PausedContact
     coordinator, db, store, clock = transition_env
@@ -1043,7 +1100,8 @@ def test_quarantine_contact_a_does_not_block_contact_b_sql_or_generation(transit
         assert db.get(ConversationContext, OTHER) is None
 
 
-def test_committing_cas_ack_loss_before_commit_uses_definitive_local_rollback(transition_env):
+@pytest.mark.parametrize("_case", [None], ids=["state-26"])
+def test_committing_cas_ack_loss_before_commit_uses_definitive_local_rollback(_case, transition_env):
     from app.conversation_state import MutationPhase
     from app.models import PausedContact
     coordinator, db, store, clock = transition_env
@@ -1079,7 +1137,8 @@ def test_committing_rollback_without_local_receipt_cannot_release_fence(transiti
         assert mutation_for(store, lease).phase is MutationPhase.COMMITTING
 
 
-def test_mutation_inactivity_refresh_between_read_and_delete_preserves_new_context(transition_env):
+@pytest.mark.parametrize("_case", [None], ids=["state-18"])
+def test_mutation_inactivity_refresh_between_read_and_delete_preserves_new_context(_case, transition_env):
     from sqlalchemy import update
     from app.models import ConversationContext
     from app.conversation_state import ConversationCycle
@@ -1146,7 +1205,8 @@ def test_quarantine_can_resolve_after_preserved_terminal_receipt_horizon(transit
 
 @pytest.mark.parametrize("fault", ["phase", "generation", "target_fingerprint", "request_fingerprint",
                                    "target_cycle", "paused_until", "reason", "terminal", "extra"])
-def test_committing_divergent_detail_cannot_bypass_durable_receipt(transition_env, fault):
+@pytest.mark.parametrize("_case", [None], ids=["state-29"])
+def test_committing_divergent_detail_cannot_bypass_durable_receipt(_case, transition_env, fault):
     from app.conversation_state import ConversationMutationAmbiguous, ConversationDomainError, MutationPhase
     from app.models import PausedContact
     coordinator, db, store, clock = transition_env
@@ -1201,7 +1261,8 @@ def test_quarantine_resolution_rotates_generation_and_rejects_old_outbound(trans
 
 
 @pytest.mark.parametrize("kind", ["pause", "manual", "extend", "unpause", "close", "inactive", "save"])
-def test_mutation_identical_prepared_retry_resumes_original_target(transition_env, kind):
+@pytest.mark.parametrize("_case", [None], ids=["state-21"])
+def test_mutation_identical_prepared_retry_resumes_original_target(_case, transition_env, kind):
     from app.conversation_state import AgentResult, AgentIntent, MutationPhase
     from app.models import PausedContact, ConversationContext
     coordinator, db, store, clock = transition_env
@@ -1276,7 +1337,8 @@ def test_mutation_changed_prepared_retry_is_rejected_without_dml(transition_env)
         assert "commit_entered" not in db.events
 
 
-def test_mutation_aborted_retry_is_terminal_and_does_not_block_later_operation(transition_env):
+@pytest.mark.parametrize("_case", [None], ids=["state-22"])
+def test_mutation_aborted_retry_is_terminal_and_does_not_block_later_operation(_case, transition_env):
     from app.conversation_state import ConversationDomainError, FailureReason, MutationPhase
     coordinator, db, store, clock = transition_env
     with store.contact_lease(PHONE) as lease:
@@ -1572,7 +1634,8 @@ def detail(store, kind="batch", flags=("dispatch",), terminal=False):
 
 
 @pytest.mark.parametrize("fault", ["epoch_absent", "epoch_mismatch", "run_id_mismatch", "noeviction_invalid", "persistence_invalid"])
-def test_readiness_fails_closed_for_each_coordination_fault(fault):
+@pytest.mark.parametrize("_case", [None], ids=["state-29"])
+def test_readiness_fails_closed_for_each_coordination_fault(_case, fault):
     """Catches accepting an untrusted Redis incarnation or configuration."""
     store = make_store()
     assert store.readiness().ready
@@ -1591,7 +1654,8 @@ def test_store_never_initializes_epoch_implicitly():
     assert store.global_epoch_writes == 0
 
 
-def test_anchor_initialization_requires_explicit_empty_database_evidence():
+@pytest.mark.parametrize("_case", [None], ids=["state-40"])
+def test_anchor_initialization_requires_explicit_empty_database_evidence(_case, ):
     """Catches silently reconstructing lost Redis state over existing SQL state."""
     store = make_store()
     with store.contact_lease(PHONE) as lease:
@@ -1605,7 +1669,8 @@ def test_anchor_initialization_requires_explicit_empty_database_evidence():
 
 
 @pytest.mark.parametrize("kind,flags", [("batch", ("dispatch",)), ("buffer", ()), ("staging", ("staging",)), ("processing", ()), ("mutation", ()), ("dedupe", ())])
-def test_manifest_missing_detail_quarantines_only_affected_contact(kind, flags):
+@pytest.mark.parametrize("_case", [None], ids=["state-43"])
+def test_manifest_missing_detail_quarantines_only_affected_contact(_case, kind, flags):
     """Catches missing referenced state being silently recreated or poisoning peers."""
     store = make_store()
     with store.contact_lease(PHONE) as lease, store.contact_lease(OTHER) as other:
@@ -1621,7 +1686,8 @@ def test_manifest_missing_detail_quarantines_only_affected_contact(kind, flags):
 
 
 @pytest.mark.parametrize("fault", ["dispatch", "staging", "fingerprint", "manifest", "generation"])
-def test_manifest_divergence_quarantines_contact(fault):
+@pytest.mark.parametrize("_case", [None], ids=["flow-51"])
+def test_manifest_divergence_quarantines_contact(_case, fault):
     """Catches accepting missing indices, malformed anchors, or generation divergence."""
     store = make_store()
     with store.contact_lease(PHONE) as lease:
@@ -1633,7 +1699,8 @@ def test_manifest_divergence_quarantines_contact(fault):
         assert store.is_quarantined(PHONE)
 
 
-def test_anchor_stale_revision_and_fingerprint_never_write():
+@pytest.mark.parametrize("_case", [None], ids=["state-44"])
+def test_anchor_stale_revision_and_fingerprint_never_write(_case, ):
     """Catches stale callers overwriting newer complete state."""
     store = make_store()
     with store.contact_lease(PHONE) as lease:
@@ -1658,7 +1725,8 @@ def test_anchor_generation_cannot_reuse_an_earlier_uuid():
         assert store.is_quarantined(PHONE)
 
 
-def test_manifest_atomic_failure_preserves_all_keys_indices_revision():
+@pytest.mark.parametrize("_case", [None], ids=["state-39"])
+def test_manifest_atomic_failure_preserves_all_keys_indices_revision(_case, ):
     """Catches partial detail/index/anchor writes on a failed CAS."""
     store = make_store()
     with store.contact_lease(PHONE) as lease:
@@ -1671,7 +1739,8 @@ def test_manifest_atomic_failure_preserves_all_keys_indices_revision():
         assert unchanged
 
 
-def test_manifest_cleanup_removes_terminal_details_only_at_horizon():
+@pytest.mark.parametrize("_case", [None], ids=["state-32"])
+def test_manifest_cleanup_removes_terminal_details_only_at_horizon(_case, ):
     """Catches early removal and expired terminal details being treated as loss."""
     store = make_store()
     with store.contact_lease(PHONE) as lease:
@@ -1728,7 +1797,8 @@ def test_lease_two_owners_barrier_loser_changes_no_state():
     assert sorted(outcomes) == [("lost", True), ("won", 0)]
 
 
-def test_lease_heartbeat_renews_at_one_third_ttl_and_stops():
+@pytest.mark.parametrize("_case", [None], ids=["state-16"])
+def test_lease_heartbeat_renews_at_one_third_ttl_and_stops(_case, ):
     """Catches delayed renewal, leaked heartbeat workers, and swallowed lease loss."""
     from tests.fakes import ControlledWait
     store = make_store()
@@ -1747,7 +1817,8 @@ def test_lease_heartbeat_renews_at_one_third_ttl_and_stops():
     assert waiter.stopped
 
 
-def test_lease_claim_renewal_is_atomic_and_bounded_by_processing_deadline():
+@pytest.mark.parametrize("_case", [None], ids=["state-16"])
+def test_lease_claim_renewal_is_atomic_and_bounded_by_processing_deadline(_case, ):
     """Catches renewal extending a claim past its processing horizon or stale manifest."""
     store = make_store()
     with store.contact_lease(PHONE) as lease:
@@ -1777,7 +1848,8 @@ def test_epoch_change_between_readiness_and_cas_blocks_mutation():
         assert store.contact_snapshot(PHONE)["revision"] == anchor.contact_revision
 
 
-def test_anchor_missing_with_surviving_details_quarantines_contact():
+@pytest.mark.parametrize("_case", [None], ids=["state-29"])
+def test_anchor_missing_with_surviving_details_quarantines_contact(_case, ):
     """Catches an absent anchor being treated as a clean contact despite remnants."""
     from app.conversation_redis import contact_keys
     store = make_store()
@@ -1806,7 +1878,8 @@ def test_anchor_initialization_rejects_orphan_global_index_membership():
         assert store.is_quarantined(PHONE)
 
 
-def test_manifest_update_rejects_regressive_or_unchanged_detail_version():
+@pytest.mark.parametrize("_case", [None], ids=["state-32"])
+def test_manifest_update_rejects_regressive_or_unchanged_detail_version(_case, ):
     """Catches changing a detail while reusing the old manifest version fence."""
     store = make_store()
     with store.contact_lease(PHONE) as lease:
@@ -1955,7 +2028,8 @@ def test_anchor_corrupt_uuid_json_types_quarantine_with_domain_reason(field, val
 from tests.test_conversation_flow import task_api, processing_runtime
 
 
-def test_sender_pause_committed_first_discards_normal_before_provider(task_api, processing_runtime):
+@pytest.mark.parametrize("_case", [None], ids=["flow-14"])
+def test_sender_pause_committed_first_discards_normal_before_provider(_case, task_api, processing_runtime):
     rt = processing_runtime
     task_api.process_batch(rt.buffer(), rt)
     outbound = rt.outbound_broker.calls[-1]
@@ -1966,7 +2040,8 @@ def test_sender_pause_committed_first_discards_normal_before_provider(task_api, 
     assert rt.transport.calls == []
 
 
-def test_sender_provider_started_first_holds_lease_until_return(task_api, processing_runtime):
+@pytest.mark.parametrize("_case", [None], ids=["flow-17"])
+def test_sender_provider_started_first_holds_lease_until_return(_case, task_api, processing_runtime):
     from concurrent.futures import ThreadPoolExecutor
     from threading import Barrier
     rt = processing_runtime
@@ -1990,8 +2065,12 @@ def test_sender_provider_started_first_holds_lease_until_return(task_api, proces
     assert len(rt.transport.calls) == 1
 
 
-@pytest.mark.parametrize("intent", ["PAUSE_FOR_SECRETARY", "CLOSE_CONTEXT"])
-@pytest.mark.parametrize("change,allowed", [("current", True), ("missing", False), ("reference", False), ("generation", False), ("later", False)])
+@pytest.mark.parametrize("intent,change,allowed", [
+    pytest.param(intent, change, allowed,
+        id=("flow-41" if intent == "CLOSE_CONTEXT" and change == "later" else "flow-15") + "-" + intent + "-" + change)
+    for intent in ("PAUSE_FOR_SECRETARY", "CLOSE_CONTEXT")
+    for change, allowed in (("current", True), ("missing", False), ("reference", False), ("generation", False), ("later", False))
+])
 def test_sender_requires_current_exact_transition_reference(task_api, processing_runtime, intent, change, allowed):
     from dataclasses import replace
     from uuid import uuid4
@@ -2018,7 +2097,10 @@ def test_sender_requires_current_exact_transition_reference(task_api, processing
     assert len(rt.transport.calls) == int(allowed)
 
 
-@pytest.mark.parametrize("fault", ["readiness", "lease", "generation", "sql", "lost_before_provider"])
+@pytest.mark.parametrize("fault", [
+    pytest.param(value, id=f"{'flow-23' if value == 'sql' else 'flow-22'}-{value}")
+    for value in ("readiness", "lease", "generation", "sql", "lost_before_provider")
+])
 def test_sender_dependency_failure_retries_before_provider(task_api, processing_runtime, fault, monkeypatch):
     from app.conversation_state import DependencyName
     from app.conversation_redis import contact_keys
@@ -2095,7 +2177,8 @@ def test_no_sql_fence_rejects_old_claims_and_substituted_results(task_api, proce
 
 
 @pytest.mark.parametrize("boundary", ["agent", "transport"])
-def test_processing_and_sender_heartbeat_cover_external_call_past_original_ttl(task_api, processing_runtime, boundary):
+@pytest.mark.parametrize("_case", [None], ids=["flow-18"])
+def test_processing_and_sender_heartbeat_cover_external_call_past_original_ttl(_case, task_api, processing_runtime, boundary):
     from tests.fakes import ControlledWait
     rt = processing_runtime
     command = rt.buffer()
@@ -2117,7 +2200,8 @@ def test_processing_and_sender_heartbeat_cover_external_call_past_original_ttl(t
     assert wait.stopped
 
 
-def test_process_batch_lost_lease_during_agent_has_zero_dml_or_outbound(task_api, processing_runtime):
+@pytest.mark.parametrize("_case", [None], ids=["flow-19"])
+def test_process_batch_lost_lease_during_agent_has_zero_dml_or_outbound(_case, task_api, processing_runtime):
     from app.conversation_redis import contact_keys
     rt = processing_runtime
     command = rt.buffer()

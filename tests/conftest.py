@@ -1,4 +1,5 @@
 import os
+import sys
 from contextlib import asynccontextmanager
 
 import pytest
@@ -9,6 +10,7 @@ from sqlalchemy.pool import StaticPool
 
 
 os.environ["APP_SKIP_DOTENV"] = "1"
+sys.dont_write_bytecode = True
 os.environ["DATABASE_URL"] = "sqlite://"
 os.environ["REDIS_URL"] = "redis://synthetic.invalid/0"
 os.environ["WASENDER_WEBHOOK_SECRET"] = "synthetic-webhook-secret"
@@ -30,7 +32,29 @@ os.environ["BATCH_RECOVERY_INTERVAL_SECONDS"] = "20"
 
 @pytest.hookimpl(tryfirst=True)
 def pytest_configure(config):
-    config.inicfg.setdefault("asyncio_default_fixture_loop_scope", "function")
+    if config.pluginmanager.hasplugin("asyncio"):
+        config.inicfg.setdefault("asyncio_default_fixture_loop_scope", "function")
+
+
+@pytest.hookimpl(trylast=True)
+def pytest_sessionstart(session):
+    # Plugins have finished bootstrap. No test module has been collected/imported.
+    session.config._conversation_guard_patch = pytest.MonkeyPatch()
+    session.config._conversation_boundaries = _install_conversation_boundaries(
+        session.config._conversation_guard_patch)
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_sessionfinish(session, exitstatus):
+    # Tests and fixture teardowns finished; allow pytest's own cache/report cleanup.
+    pytest_unconfigure(session.config)
+
+
+def pytest_unconfigure(config):
+    guard = getattr(config, "_conversation_guard_patch", None)
+    if guard is not None:
+        guard.undo()
+        config._conversation_guard_patch = None
 
 
 @pytest.fixture
@@ -168,9 +192,62 @@ def scheduler_application_log_records(scheduler_module, caplog):
     return observed
 
 
-@pytest.fixture
-def conversation_security_boundaries(monkeypatch):
-    """Fail closed if audit tests cross a forbidden external/write boundary."""
+@pytest.fixture(autouse=True)
+def conversation_security_boundaries(request):
+    """Every test shares the immutable boundary policy, never application state."""
+    return request.config._conversation_boundaries
+
+
+@pytest.fixture(autouse=True)
+def conversation_resources(conversation_security_boundaries, monkeypatch):
+    """Assert every test closes SQL/owners/calls, then erase its private fakes."""
+    from functools import wraps
+    from sqlalchemy.orm import Session
+    from tests import fakes
+
+    ledger = fakes.ConversationResources()
+
+    def track_constructor(cls, destination):
+        original = cls.__init__
+        @wraps(original)
+        def initialize(instance, *args, **kwargs):
+            original(instance, *args, **kwargs)
+            destination.append(instance)
+        monkeypatch.setattr(cls, "__init__", initialize)
+
+    track_constructor(Session, ledger.sessions)
+    track_constructor(fakes.ScriptRedis, ledger.clients)
+    track_constructor(fakes.ControlledWait, ledger.waiters)
+    from contextlib import contextmanager
+    original_lease = fakes.InMemoryConversationStore.contact_lease
+    @contextmanager
+    def observed_lease(store, *args, **kwargs):
+        ledger.active_leases += 1
+        try:
+            with original_lease(store, *args, **kwargs) as lease:
+                yield lease
+        finally:
+            ledger.active_leases -= 1
+    monkeypatch.setattr(fakes.InMemoryConversationStore, "contact_lease", observed_lease)
+    for cls, method in (
+            (fakes.ScriptedBroker, "enqueue_processing"),
+            (fakes.ScriptedOutboundBroker, "enqueue_outbound"),
+            (fakes.ScriptedTransport, "send_message"),
+            (fakes.ScriptedAgent, "prepare_result"),
+            (fakes.ScriptedClaude, "create")):
+        track_constructor(cls, ledger.recorders)
+        original = getattr(cls, method)
+        def guarded_call(instance, *args, _method=original, **kwargs):
+            with ledger.network_call():
+                return _method(instance, *args, **kwargs)
+        monkeypatch.setattr(cls, method, guarded_call)
+    yield ledger
+    ledger.settle_expiring_owners()
+    ledger.dispose()
+
+
+def _install_conversation_boundaries(monkeypatch):
+    """Fail closed before collection and throughout every focused/full test run."""
     import builtins
     import io
     import os
@@ -184,8 +261,11 @@ def conversation_security_boundaries(monkeypatch):
     from sqlalchemy.pool import StaticPool
 
     workspace = Path(__file__).parents[1].resolve()
+    repository = workspace.parent.parent if workspace.parent.name == ".worktrees" else workspace
     original_open = builtins.open
+    original_os_open = os.open
     original_socket_connect = socket.socket.connect
+    original_getaddrinfo = socket.getaddrinfo
     original_create_engine = sqlalchemy.create_engine
     original_sqlite_connect = sqlite3.connect
     original_path_methods = {name: getattr(Path, name) for name in
@@ -198,7 +278,7 @@ def conversation_security_boundaries(monkeypatch):
             target = Path(value).resolve()
         except (TypeError, OSError):
             return False
-        return target == workspace or workspace in target.parents
+        return target == repository or repository in target.parents
 
     def guarded_connect(sock, address):
         caller = sys._getframe(1)
@@ -216,13 +296,27 @@ def conversation_security_boundaries(monkeypatch):
     def guarded_create_connection(*args, **kwargs):
         raise AssertionError("network forbidden")
 
+    def guarded_getaddrinfo(host, *args, **kwargs):
+        caller = sys._getframe(1)
+        while caller is not None:
+            if (caller.f_code.co_name == "_fallback_socketpair"
+                    and caller.f_globals.get("__name__") == "socket"
+                    and host in ("127.0.0.1", "::1")):
+                return original_getaddrinfo(host, *args, **kwargs)
+            caller = caller.f_back
+        raise AssertionError("network forbidden")
+
     def safe_sqlite_database(database):
         return str(database) == ":memory:"
 
     def guarded_sqlite_connect(database, *args, **kwargs):
         if not safe_sqlite_database(database):
             raise AssertionError("persistent_sql forbidden")
-        return original_sqlite_connect(database, *args, **kwargs)
+        connection = original_sqlite_connect(database, *args, **kwargs)
+        connection.set_authorizer(lambda action, *details:
+            sqlite3.SQLITE_DENY if action in (sqlite3.SQLITE_ATTACH, sqlite3.SQLITE_DETACH)
+            else sqlite3.SQLITE_OK)
+        return connection
 
     def guarded_create_engine(url, *args, **kwargs):
         parsed = sqlalchemy.engine.make_url(url)
@@ -258,20 +352,43 @@ def conversation_security_boundaries(monkeypatch):
         return call
 
     def guarded_open(file, mode="r", *args, **kwargs):
+        reject_sensitive_file(file)
         if any(flag in mode for flag in ("w", "a", "x", "+")):
             try:
                 target = Path(file).resolve()
             except (TypeError, OSError):
                 target = None
-            if target is not None and (target == workspace or workspace in target.parents):
+            if target is not None and in_workspace(target):
                 pytest.fail("repository write forbidden in conversation security test")
         return original_open(file, mode, *args, **kwargs)
 
+    def reject_sensitive_file(file):
+        try:
+            target = Path(file).resolve()
+        except (TypeError, OSError):
+            return
+        if target.name.lower().startswith(".env") or (
+                in_workspace(target) and "data" in target.relative_to(repository).parts):
+            raise AssertionError("sensitive_file forbidden")
+
+    def guarded_os_open(file, flags, *args, **kwargs):
+        reject_sensitive_file(file)
+        if flags & (os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND) and in_workspace(file):
+            raise AssertionError("repository write forbidden")
+        return original_os_open(file, flags, *args, **kwargs)
+
     monkeypatch.setattr(builtins, "open", guarded_open)
     monkeypatch.setattr(io, "open", guarded_open)
+    monkeypatch.setattr(os, "open", guarded_os_open)
     monkeypatch.setattr(socket.socket, "connect", guarded_connect)
     monkeypatch.setattr(socket.socket, "connect_ex", guarded_connect_ex)
     monkeypatch.setattr(socket, "create_connection", guarded_create_connection)
+    monkeypatch.setattr(socket, "getaddrinfo", guarded_getaddrinfo)
+    for name in ("gethostbyname", "gethostbyname_ex", "gethostbyaddr"):
+        monkeypatch.setattr(socket, name, guarded_create_connection)
+    monkeypatch.setattr(socket.socket, "sendto", guarded_create_connection)
+    if hasattr(socket.socket, "sendmsg"):
+        monkeypatch.setattr(socket.socket, "sendmsg", guarded_create_connection)
     monkeypatch.setattr(sqlalchemy, "create_engine", guarded_create_engine)
     monkeypatch.setattr(sqlite3, "connect", guarded_sqlite_connect)
     monkeypatch.setattr(sqlite3.dbapi2, "connect", guarded_sqlite_connect)

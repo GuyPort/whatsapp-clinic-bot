@@ -98,7 +98,8 @@ def test_ready_probe_missing_exception_and_nonboolean_never_open(value, caplog):
 
 @pytest.mark.parametrize("fault", [None, "epoch_absent", "epoch_mismatch", "run_id_mismatch",
                                   "noeviction_invalid", "persistence_invalid"])
-def test_ready_real_attestation_separates_redis_availability_from_epoch(fault):
+@pytest.mark.parametrize("_case", [None], ids=["state-41"])
+def test_ready_real_attestation_separates_redis_availability_from_epoch(_case, fault):
     from tests.fakes import InMemoryConversationStore
     api = recovery_api()
     store = InMemoryConversationStore(ConversationConfig.from_settings(Settings(_valid_environment())))
@@ -212,7 +213,8 @@ def test_manual_pause_accepts_exact_maximum_and_rejects_later_deadline():
     assert raised.value.reason_code is FailureReason.ABOVE_MAXIMUM
 
 
-def test_manual_pause_translates_timedelta_overflow_to_domain_error():
+@pytest.mark.parametrize("_case", [None], ids=["state-33"])
+def test_manual_pause_translates_timedelta_overflow_to_domain_error(_case, ):
     """Catches huge finite input escaping as a platform OverflowError."""
     with pytest.raises(InvalidManualPauseDuration) as raised:
         manual_pause_deadline(datetime.max.replace(tzinfo=timezone.utc), 1)
@@ -559,6 +561,176 @@ OTHER = "5551888880000"
 TEST_PHONE = "5500000000000"
 
 
+@pytest.mark.parametrize("_case", [None], ids=["state-10-never-reused-generation"])
+def test_pause_mutations_and_rejected_negative_extension_cannot_restore_generation(transition_env, _case):
+    coordinator, db, store, clock = transition_env
+    generations = []
+    with store.contact_lease(PHONE) as lease:
+        generations.append(coordinator.resolve_ingress(db, PHONE, clock.now(), lease).generation)
+        generations.append(coordinator.pause_manual(db, PHONE, 2, "secretary_dashboard_pause", clock.now(), lease, "manual").generation)
+        generations.append(coordinator.extend_pause(db, PHONE, 1, clock.now(), lease, "extend").generation)
+        before = store.contact_snapshot(PHONE)
+        with pytest.raises(InvalidManualPauseDuration):
+            coordinator.extend_pause(db, PHONE, -1, clock.now(), lease, "negative")
+        assert store.contact_snapshot(PHONE) == before
+        coordinator.unpause(db, PHONE, clock.now(), lease, "resume")
+        generations.append(str(store.read_anchor(lease).last_generation))
+        generations.append(coordinator.pause_manual(db, PHONE, 2, "secretary_dashboard_pause", clock.now(), lease, "again").generation)
+    assert len(set(generations)) == len(generations)
+    assert all(UUID(value).version == 4 for value in generations)
+
+
+@pytest.mark.parametrize("hours", [0, -1, "invalid", float("inf"), float("nan")],
+                         ids=["state-11-zero", "state-11-negative", "state-11-text", "state-11-infinity", "state-11-nan"])
+def test_invalid_manual_duration_has_no_preparation_or_sql_effect(transition_env, hours):
+    coordinator, db, store, clock = transition_env
+    with store.contact_lease(PHONE) as lease:
+        before = store.snapshot()
+        with pytest.raises(InvalidManualPauseDuration):
+            coordinator.pause_manual(db, PHONE, hours, "secretary_dashboard_pause", clock.now(), lease, "invalid")
+        assert store.snapshot() == before
+        assert db.events == []
+
+
+@pytest.mark.parametrize("phone", [
+    pytest.param("", id="state-09-empty"), pytest.param("123", id="state-09-short"),
+    pytest.param("1111111111111111", id="state-09-long"),
+])
+def test_invalid_contact_never_initializes_coordination_or_sql(transition_env, phone):
+    coordinator, db, store, clock = transition_env
+    before = store.snapshot()
+    with pytest.raises(InvalidCanonicalContact):
+        with store.contact_lease(phone) as lease:
+            coordinator.resolve_ingress(db, phone, clock.now(), lease)
+    assert store.snapshot() == before
+    assert db.events == []
+
+
+@pytest.mark.parametrize("change", ["missing", "renewed", "removed", "old_generation"],
+                         ids=lambda value: "state-13-" + value)
+def test_state_transfer_reference_rejects_every_stale_binding(transition_env, change):
+    from dataclasses import replace
+    coordinator, db, store, clock = transition_env
+    with store.contact_lease(PHONE) as lease:
+        reference = coordinator.pause_for_secretary(db, PHONE, "user_requested_human_assistance",
+                                                   clock.now(), lease, "transfer")
+        outbound = OutboundEnvelope(PHONE, "synthetic", OutboundKind.TRANSFER_CONFIRMATION,
+                                    reference.generation, "processing", "transfer", pause_ref=reference)
+        if change == "missing":
+            outbound = replace(outbound, pause_ref=None)
+        elif change == "old_generation":
+            outbound = replace(outbound, generation="00000000-0000-4000-8000-000000000099")
+        elif change == "renewed":
+            clock.advance(timedelta(seconds=1))
+            coordinator.pause_for_secretary(db, PHONE, "secretary_manual_pause", clock.now(), lease, "renewal")
+        else:
+            coordinator.unpause(db, PHONE, clock.now(), lease, "unpause")
+        before = db.events.count("commit_entered")
+        assert coordinator.may_send(db, outbound, clock.now(), lease) is False
+        assert db.events.count("commit_entered") == before
+
+
+@pytest.mark.parametrize("intent", [AgentIntent.SAVE_CONTEXT, AgentIntent.PAUSE_FOR_SECRETARY],
+                         ids=["state-15-save", "state-15-transfer"])
+def test_nested_coordinator_operations_use_one_top_level_lease(transition_env, intent):
+    coordinator, db, store, clock = transition_env
+    before = store.client.operation_calls.get("acquire", 0)
+    with store.contact_lease(PHONE) as lease:
+        coordinator.resolve_ingress(db, PHONE, clock.now(), lease)
+        result = AgentResult("synthetic", [], None, {}, intent)
+        outbound = coordinator.apply_agent_result(db, PHONE, result, "processing", "operation", clock.now(), lease)
+        assert coordinator.may_send(db, outbound, clock.now(), lease)
+        assert store.client.operation_calls["acquire"] == before + 1
+    assert store.client.operation_calls["acquire"] == before + 1
+
+
+@pytest.mark.parametrize("fail_prepare", [False, True], ids=["state-19-prepared", "state-19-failed-cas"])
+def test_preparation_persists_complete_barrier_before_first_sql_effect(transition_env, fail_prepare):
+    coordinator, db, store, clock = transition_env
+    with store.contact_lease(PHONE) as lease:
+        opened = coordinator.resolve_ingress(db, PHONE, clock.now(), lease)
+        seed_context(db, PHONE, clock.now())
+        db.events.clear()
+        before = store.contact_snapshot(PHONE)
+        if fail_prepare:
+            store.fail_next_atomic("prepare_mutation")
+            with pytest.raises(ConversationStateUnavailable):
+                coordinator.pause_for_secretary(db, PHONE, "secretary_manual_pause", clock.now(), lease, "prepare-proof")
+            assert store.contact_snapshot(PHONE) == before
+            assert not any(event in db.events for event in ("execute", "add_returned", "flush_entered", "commit_entered"))
+        else:
+            def first_dml():
+                attempt = store.inspect_mutation(PHONE, "prepare-proof", lease)
+                assert attempt.phase is MutationPhase.PREPARED
+                assert attempt.operation_id == "prepare-proof"
+                assert attempt.prior_cycle is ConversationCycle.OPEN
+                assert attempt.target_cycle is ConversationCycle.PAUSED
+                assert str(attempt.generation) != opened.generation
+                assert UUID(opened.generation) in store.read_anchor(lease).generation_history
+                assert attempt.target_fingerprint
+                assert store.read_anchor(lease).cycle is ConversationCycle.MUTATING
+            db.hooks["execute"] = first_dml
+            coordinator.pause_for_secretary(db, PHONE, "secretary_manual_pause", clock.now(), lease, "prepare-proof")
+            assert "execute" in db.events
+
+
+@pytest.mark.parametrize("fault", ["epoch", "owner", "expired_lease", "phase"],
+                         ids=lambda value: "state-24-" + value)
+def test_committing_cas_rechecks_every_authority_before_sql_commit(transition_env, fault):
+    from app.conversation_redis import contact_keys
+    from app.conversation_state import ConversationDomainError
+    coordinator, db, store, clock = transition_env
+    with store.contact_lease(PHONE) as lease:
+        coordinator.resolve_ingress(db, PHONE, clock.now(), lease)
+        def change_authority():
+            keys = contact_keys(PHONE)
+            if fault == "epoch":
+                store.delete_global_epoch()
+            elif fault == "owner":
+                store.client.values[keys.lease] = "different-owner"
+            elif fault == "expired_lease":
+                clock.advance(timedelta(seconds=61))
+            else:
+                key = next(key for key in store.client.values if key.startswith(keys.mutation_prefix))
+                value = json.loads(store.client.values[key])
+                assert value["body"]["operation_id"] == "cas-proof"
+                value["body"]["phase"] = "ABORTED"
+                store.client.values[key] = json.dumps(value)
+        store.client.before_operation["enter_committing"] = change_authority
+        with pytest.raises(ConversationDomainError) as caught:
+            coordinator.pause_for_secretary(db, PHONE, "secretary_manual_pause", clock.now(), lease, "cas-proof")
+        assert caught.value.reason_code.value == {
+            "epoch": "readiness_unavailable", "owner": "contact_lease_lost",
+            "expired_lease": "contact_lease_lost", "phase": "conversation_generation_unavailable",
+        }[fault]
+        assert "flush" in db.events
+        assert "commit_entered" not in db.events
+        assert "rollback" in db.events
+
+
+@pytest.mark.parametrize("checkpoint", ["commit_entered", "commit_returned"],
+                         ids=["state-35-normal-barrier", "normal-commit-returned-baseline"])
+def test_normal_context_commit_is_fenced_until_redis_finalization(transition_env, checkpoint):
+    from app.models import ConversationContext
+    from app.conversation_state import ConversationMutationPending
+    coordinator, db, store, clock = transition_env
+    with store.contact_lease(PHONE) as lease:
+        coordinator.resolve_ingress(db, PHONE, clock.now(), lease)
+        result = AgentResult("synthetic", [{"role": "user", "content": "new context"}], None, {}, AgentIntent.SAVE_CONTEXT)
+        def observe_barrier():
+            attempt = store.inspect_mutation(PHONE, "normal-save", lease)
+            assert attempt.phase is MutationPhase.COMMITTING
+            assert store.read_anchor(lease).cycle is ConversationCycle.MUTATING
+            assert "flush" in db.events
+            with pytest.raises(ConversationMutationPending):
+                coordinator.apply_agent_result(db, PHONE, result, "competitor", "competing-save", clock.now(), lease)
+        db.hooks[checkpoint] = observe_barrier
+        coordinator.apply_agent_result(db, PHONE, result, "processing", "normal-save", clock.now(), lease)
+        assert db.events.count("commit_entered") == 1
+        assert db.get(ConversationContext, PHONE).messages == [{"role": "user", "content": "new context"}]
+        assert store.inspect_mutation(PHONE, "normal-save", lease).phase is MutationPhase.COMMITTED
+
+
 def seed_context(db, phone, now):
     from app.models import ConversationContext
     assert db.get_bind().url.database in (None, "", ":memory:")
@@ -570,7 +742,8 @@ def seed_context(db, phone, now):
     return row
 
 
-def test_state_ingress_without_pause_is_open_and_does_not_commit(transition_env):
+@pytest.mark.parametrize("_case", [None], ids=["state-01"])
+def test_state_ingress_without_pause_is_open_and_does_not_commit(_case, transition_env):
     coordinator, db, store, clock = transition_env
     with store.contact_lease(PHONE) as lease:
         resolved = coordinator.resolve_ingress(db, PHONE, clock.now(), lease)
@@ -580,7 +753,11 @@ def test_state_ingress_without_pause_is_open_and_does_not_commit(transition_env)
     assert "commit_entered" not in db.events
 
 
-@pytest.mark.parametrize("delta,paused", [(-1, True), (0, False), (1, False)])
+@pytest.mark.parametrize("delta,paused", [
+    pytest.param(-1, True, id="state-02-before"),
+    pytest.param(0, False, id="state-03-exact"),
+    pytest.param(1, False, id="state-04-after"),
+])
 def test_pause_exact_expiry_boundary(transition_env, delta, paused):
     from app.models import PausedContact
     coordinator, db, store, clock = transition_env
@@ -595,7 +772,8 @@ def test_pause_exact_expiry_boundary(transition_env, delta, paused):
         assert result.cycle is (ConversationCycle.PAUSED if paused else ConversationCycle.OPEN)
 
 
-def test_pause_transfer_atomically_deletes_context_and_preserves_other_contact(transition_env):
+@pytest.mark.parametrize("_case", [None], ids=["state-05"])
+def test_pause_transfer_atomically_deletes_context_and_preserves_other_contact(_case, transition_env):
     from app.models import ConversationContext, PausedContact
     coordinator, db, store, clock = transition_env
     with store.contact_lease(PHONE) as lease:
@@ -612,7 +790,8 @@ def test_pause_transfer_atomically_deletes_context_and_preserves_other_contact(t
     assert db.events.count("commit_entered") == 1
 
 
-def test_pause_beatriz_renewal_rotates_generation_but_retry_does_not(transition_env):
+@pytest.mark.parametrize("_case", [None], ids=["state-06"])
+def test_pause_beatriz_renewal_rotates_generation_but_retry_does_not(_case, transition_env):
     coordinator, db, store, clock = transition_env
     with store.contact_lease(PHONE) as lease:
         first = coordinator.pause_for_secretary(db, PHONE, "secretary_manual_pause", clock.now(), lease, "op-1")
@@ -628,7 +807,8 @@ def test_pause_beatriz_renewal_rotates_generation_but_retry_does_not(transition_
     assert db.events.count("commit_entered") == 2
 
 
-def test_pause_manual_and_extension_enforce_resulting_365_day_limit(transition_env):
+@pytest.mark.parametrize("_case", [None], ids=["state-33"])
+def test_pause_manual_and_extension_enforce_resulting_365_day_limit(_case, transition_env):
     from app.models import ConversationContext, PausedContact
     coordinator, db, store, clock = transition_env
     with store.contact_lease(PHONE) as lease:
@@ -653,7 +833,8 @@ def test_pause_manual_and_extension_enforce_resulting_365_day_limit(transition_e
         assert store.read_anchor(lease).cycle is ConversationCycle.OPEN
 
 
-def test_closed_new_ingress_rotates_generation_and_invalidates_closure_send(transition_env):
+@pytest.mark.parametrize("_case", [None], ids=["state-31"])
+def test_closed_new_ingress_rotates_generation_and_invalidates_closure_send(_case, transition_env):
     from app.models import ConversationContext
     coordinator, db, store, clock = transition_env
     with store.contact_lease(PHONE) as lease:
@@ -671,7 +852,8 @@ def test_closed_new_ingress_rotates_generation_and_invalidates_closure_send(tran
         assert not coordinator.may_send(db, envelope, clock.now(), lease)
 
 
-def test_send_exact_pause_reference_and_current_open_generation_only(transition_env):
+@pytest.mark.parametrize("_case", [None], ids=["state-12"])
+def test_send_exact_pause_reference_and_current_open_generation_only(_case, transition_env):
     from dataclasses import replace
     coordinator, db, store, clock = transition_env
     with store.contact_lease(PHONE) as lease:
@@ -690,7 +872,8 @@ def test_send_exact_pause_reference_and_current_open_generation_only(transition_
 
 
 @pytest.mark.parametrize("kind", list(OutboundKind))
-def test_send_missing_coordination_never_initializes_contact(transition_env, kind):
+@pytest.mark.parametrize("_case", [None], ids=["state-14"])
+def test_send_missing_coordination_never_initializes_contact(_case, transition_env, kind):
     """Sender authorization must not recreate state after coordination loss."""
     from app.models import ConversationContext, PausedContact
     coordinator, db, store, clock = transition_env
@@ -714,7 +897,8 @@ def test_send_missing_coordination_never_initializes_contact(transition_env, kin
     (AgentIntent.PAUSE_FOR_SECRETARY, OutboundKind.TRANSFER_CONFIRMATION, ConversationCycle.PAUSED),
     (AgentIntent.CLOSE_CONTEXT, OutboundKind.CLOSURE_CONFIRMATION, ConversationCycle.CLOSED),
 ])
-def test_mutation_agent_result_is_persisted_once_with_typed_send(transition_env, intent, kind, cycle):
+@pytest.mark.parametrize("_case", [None], ids=["state-17"])
+def test_mutation_agent_result_is_persisted_once_with_typed_send(_case, transition_env, intent, kind, cycle):
     from app.models import ConversationContext
     coordinator, db, store, clock = transition_env
     result = AgentResult("synthetic", [{"role": "assistant", "content": "synthetic"}], "duvidas", {"done": True}, intent)
@@ -778,7 +962,8 @@ def test_mutation_reset_is_exact_test_contact_only(transition_env):
     assert db.query(Appointment).filter_by(patient_phone=OTHER).count() == 1
 
 
-def test_state_existing_sql_without_anchor_fails_closed(transition_env):
+@pytest.mark.parametrize("_case", [None], ids=["state-40"])
+def test_state_existing_sql_without_anchor_fails_closed(_case, transition_env):
     coordinator, db, store, clock = transition_env
     seed_context(db, PHONE, clock.now())
     with store.contact_lease(PHONE) as lease:
@@ -921,7 +1106,8 @@ def batch_details(store, lease, kind):
     return [item for item in store.read_details(lease) if item.entry.kind == kind]
 
 
-def test_dedup_buffer_accepts_once_and_preserves_raw_id_only_in_envelope():
+@pytest.mark.parametrize("_case", [None], ids=["state-32"])
+def test_dedup_buffer_accepts_once_and_preserves_raw_id_only_in_envelope(_case, ):
     from tests.test_conversation_concurrency import make_store
     import hashlib
     domain, store = batch_api(), make_store()
@@ -956,7 +1142,8 @@ def test_buffer_without_id_accepts_twice_without_replay_guarantee():
 
 
 @pytest.mark.parametrize("action", ["DROPPED", "IGNORED"])
-def test_dedup_dropped_and_ignored_retain_no_message_content(transition_env, action):
+@pytest.mark.parametrize("_case", [None], ids=["flow-55"])
+def test_dedup_dropped_and_ignored_retain_no_message_content(_case, transition_env, action):
     coordinator, db, store, clock = transition_env
     domain = batch_api()
     with store.contact_lease(PHONE) as lease:
@@ -1004,7 +1191,8 @@ def test_dedup_secretary_command_applied_only_with_committed_finalization(transi
 @pytest.mark.parametrize("outcome,delay,phase", [("CONFIRMED", 60, "SCHEDULED"),
     ("DEFINITIVE_FAILURE", 30, "PENDING"), ("AMBIGUOUS", 60, "PENDING")])
 @pytest.mark.parametrize("offset,called", [(-1, False), (0, True), (1, True)])
-def test_enqueue_reserves_before_broker_and_obeys_inclusive_next_time(outcome, delay, phase, offset, called):
+@pytest.mark.parametrize("_case", [None], ids=["state-48"])
+def test_enqueue_reserves_before_broker_and_obeys_inclusive_next_time(_case, outcome, delay, phase, offset, called):
     from tests.test_conversation_concurrency import make_store
     from tests.fakes import ScriptedBroker
     domain, store = batch_api(), make_store()
@@ -1039,7 +1227,8 @@ def test_enqueue_reserves_before_broker_and_obeys_inclusive_next_time(outcome, d
 
 
 @pytest.mark.parametrize("delta,terminal", [(-1, False), (0, True), (1, True)])
-def test_batch_dispatch_deadline_exhausts_without_content_or_recreation(delta, terminal):
+@pytest.mark.parametrize("_case", [None], ids=["state-42"])
+def test_batch_dispatch_deadline_exhausts_without_content_or_recreation(_case, delta, terminal):
     from tests.test_conversation_concurrency import make_store
     domain, store = batch_api(), make_store()
     with store.contact_lease(PHONE) as lease:
@@ -1061,7 +1250,8 @@ def test_batch_dispatch_deadline_exhausts_without_content_or_recreation(delta, t
             assert store.recoverable_batches().commands == ()
 
 
-def test_staged_ignores_old_dispatch_deadline_and_never_drains_new_buffer():
+@pytest.mark.parametrize("_case", [None], ids=["state-46"])
+def test_staged_ignores_old_dispatch_deadline_and_never_drains_new_buffer(_case, ):
     from tests.test_conversation_concurrency import make_store
     domain, store = batch_api(), make_store()
     with store.contact_lease(PHONE) as lease:
@@ -1086,7 +1276,8 @@ def test_staged_ignores_old_dispatch_deadline_and_never_drains_new_buffer():
         assert store.finalize_ingress_once(PHONE, None, "synthetic-id", command.generation, lease).disposition is domain.IngressDisposition.DUPLICATE
 
 
-def test_result_ready_complete_batch_lifecycle_reuses_result_and_purges_content(transition_env):
+@pytest.mark.parametrize("_case", [None], ids=["state-34"])
+def test_result_ready_complete_batch_lifecycle_reuses_result_and_purges_content(_case, transition_env):
     coordinator, db, store, clock = transition_env
     domain = batch_api()
     with store.contact_lease(PHONE) as lease:
@@ -1116,7 +1307,8 @@ def test_result_ready_complete_batch_lifecycle_reuses_result_and_purges_content(
 
 
 @pytest.mark.parametrize("offset,accepted", [(-1, True), (0, False), (1, False)])
-def test_result_ready_processing_deadline_is_inclusive(offset, accepted):
+@pytest.mark.parametrize("_case", [None], ids=["state-47"])
+def test_result_ready_processing_deadline_is_inclusive(_case, offset, accepted):
     from tests.test_conversation_concurrency import make_store
     domain, store = batch_api(), make_store()
     with store.contact_lease(PHONE) as lease:
@@ -1150,7 +1342,8 @@ def test_batch_command_rejects_invalid_or_extra_payload_without_leaking_input():
     assert domain.ProcessingCommand.from_payload(json.loads(json.dumps(command.to_payload()))) == command
 
 
-def test_enqueue_initial_time_and_dispatch_deadline_use_received_at():
+@pytest.mark.parametrize("_case", [None], ids=["state-48"])
+def test_enqueue_initial_time_and_dispatch_deadline_use_received_at(_case, ):
     from tests.test_conversation_concurrency import make_store
     domain, store = batch_api(), make_store()
     with store.contact_lease(PHONE) as lease:

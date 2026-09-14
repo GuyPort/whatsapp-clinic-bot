@@ -36,6 +36,398 @@ def close_ready(runtime):
     runtime.dependencies[domain.DependencyName.SECRET] = False
 
 
+@pytest.mark.parametrize("_case", [None], ids=["flow-08-delayed-worker-after-pause"])
+def test_paused_ingress_cannot_reappear_in_a_worker_delayed_past_expiry(main_module, admin_runtime, task_api, _case):
+    rt = admin_runtime
+    old = rt.buffer("older pending input")
+    reference = rt.pause()
+    assert webhook(main_module, text="discarded while paused", message_id="paused-drop").status_code == 200
+    rt.clock.set(reference.paused_until + timedelta(seconds=1))
+    assert task_api.process_batch(old, rt) is task_api.ProcessingOutcome.TERMINAL
+    assert rt.agent.calls == rt.outbound_broker.calls == rt.transport.calls == []
+    assert "discarded while paused" not in str(rt.store.snapshot())
+    assert len(rt.processing_broker.calls) == 1
+
+
+@pytest.mark.parametrize("_case", [None], ids=["flow-25-producer-retries-during-staging-owner"])
+def test_concurrent_producer_retains_new_message_after_other_batch_is_staged(main_module, admin_runtime, task_api, _case):
+    from threading import Event, Thread
+    rt = admin_runtime
+    command = rt.buffer("first batch")
+    staged, finish = Event(), Event()
+    outcomes, errors = [], []
+    def model_boundary():
+        staged.set()
+        assert finish.wait(5), "producer did not reach the ownership boundary"
+    rt.agent.on_prepare = model_boundary
+    def consume():
+        try:
+            outcomes.append(task_api.process_batch(command, rt))
+        except Exception as error:
+            errors.append(error)
+    worker = Thread(target=consume)
+    worker.start()
+    try:
+        assert staged.wait(5)
+        assert webhook(main_module, text="new message", message_id="concurrent-producer").status_code == 503
+    finally:
+        finish.set()
+        worker.join(timeout=5)
+    assert not worker.is_alive() and errors == []
+    assert outcomes == [task_api.ProcessingOutcome.PROCESSED]
+    assert webhook(main_module, text="new message", message_id="concurrent-producer").status_code == 200
+    assert [entry["content"] for entry in rt.envelopes()] == ["new message"]
+    assert [call[0] for call in rt.agent.calls] == ["first batch"]
+    assert rt.processing_broker.calls[-1].batch_id != command.batch_id
+
+
+@pytest.mark.parametrize("_case", [None], ids=["flow-42-long-pause-ttl-and-epoch"])
+def test_long_pause_extension_retains_generation_and_epoch_loss_blocks_old_work(processing_runtime, task_api, _case):
+    from dataclasses import replace
+    from uuid import UUID
+    from app.conversation_redis import contact_keys, EpochStore, GLOBAL_EPOCH_KEY
+    rt = processing_runtime
+    old_command = rt.buffer("old work")
+    with rt.store.contact_lease(PHONE) as lease, rt.session_factory() as db:
+        reference = rt.coordinator.pause_manual(db, PHONE, 30 * 24, "secretary_dashboard_pause", rt.clock.now(), lease, "long-pause")
+    rt.clock.advance(timedelta(days=8))
+    with rt.store.contact_lease(PHONE) as lease, rt.session_factory() as db:
+        extended = rt.coordinator.extend_pause(db, PHONE, 48, rt.clock.now(), lease, "extend-long")
+        assert extended.generation != reference.generation
+        assert extended.paused_until == reference.paused_until + timedelta(days=2)
+        key = contact_keys(PHONE).generation
+        assert rt.store.client.values[key]
+        expiry = rt.store.client.expiry.get(key)
+        assert expiry is None or expiry >= (extended.paused_until + timedelta(days=7)).timestamp()
+    old_epoch = rt.store.config.coordination_epoch
+    rt.store.delete_global_epoch()
+    with pytest.raises(task_api.RetryRequested):
+        task_api.process_batch(old_command, rt)
+    rt.store.client.values[GLOBAL_EPOCH_KEY] = str(old_epoch)  # Isolated fake restoration only.
+    new_epoch = UUID("00000000-0000-4000-8000-000000000088")
+    assert EpochStore(rt.store.client, replace(rt.store.config, coordination_epoch=new_epoch)).rotate(old_epoch, new_epoch) == new_epoch
+    with pytest.raises(task_api.RetryRequested):
+        task_api.process_batch(old_command, rt)
+    assert rt.agent.calls == rt.outbound_broker.calls == rt.transport.calls == []
+
+
+@pytest.mark.parametrize("_case", [None], ids=["flow-09-passive-expiry"])
+def test_clock_and_background_passes_do_not_send_pause_expiration(admin_runtime, scheduler_module, _case):
+    import asyncio
+    rt = admin_runtime
+    reference = rt.pause()
+    rt.clock.set(reference.paused_until + timedelta(seconds=1))
+    asyncio.run(scheduler_module.check_inactive_contexts(rt))
+    recovery_api().RecoveryService(rt).run_once(rt.clock.now())
+    assert rt.processing_broker.calls == rt.outbound_broker.calls == rt.agent.calls == rt.transport.calls == []
+
+
+@pytest.mark.parametrize("_case", [None], ids=["flow-11-existing-context-handoff"])
+def test_transfer_discards_preexisting_context_and_never_resaves_agent_delta(processing_runtime, task_api, session_factory, _case):
+    from app.models import ConversationContext, PausedContact
+    rt = processing_runtime
+    rt.seed_contact(PHONE)
+    rt.agent.intent = domain.AgentIntent.PAUSE_FOR_SECRETARY
+    assert task_api.process_batch(rt.buffer("ATENDIMENTO"), rt) is task_api.ProcessingOutcome.PROCESSED
+    assert rt.agent.calls[0][2].messages
+    with session_factory() as db:
+        assert db.get(ConversationContext, PHONE) is None
+        assert db.get(PausedContact, PHONE).paused_until == (rt.clock.now() + timedelta(hours=24)).replace(tzinfo=None)
+
+
+@pytest.mark.parametrize("_case", [None], ids=["flow-16-local-confirmation-request"])
+def test_transfer_submits_one_local_confirmation_without_claiming_provider_delivery(processing_runtime, task_api, _case):
+    rt = processing_runtime
+    rt.agent.intent = domain.AgentIntent.PAUSE_FOR_SECRETARY
+    command = rt.buffer("ATENDIMENTO")
+    assert task_api.process_batch(command, rt) is task_api.ProcessingOutcome.PROCESSED
+    assert len(rt.outbound_broker.calls) == 1
+    confirmation = rt.outbound_broker.calls[0]
+    assert confirmation.kind is domain.OutboundKind.TRANSFER_CONFIRMATION
+    assert confirmation.pause_ref.generation == confirmation.generation
+    assert rt.transport.calls == []
+    # Provider ambiguity is observable separately from the successful local enqueue.
+    rt.transport.result = False
+    with pytest.raises(task_api.RetryRequested):
+        task_api.send_outbound(confirmation, rt)
+    assert len(rt.transport.calls) == len(rt.outbound_broker.calls) == 1
+
+
+@pytest.mark.parametrize("boundary", ["lock", "sql"], ids=["flow-27-before-staging", "flow-27-after-staging"])
+def test_retry_keeps_original_buffer_or_staging_at_dependency_failure(processing_runtime, task_api, monkeypatch, boundary):
+    rt = processing_runtime
+    command = rt.buffer("retained input")
+    original = rt.session_factory
+    if boundary == "lock":
+        rt.store.fail_next_atomic("acquire")
+    else:
+        def failed_session():
+            raise domain.ConversationStateUnavailable(domain.FailureReason.STATE_UNAVAILABLE)
+        monkeypatch.setattr(rt, "session_factory", failed_session)
+    with pytest.raises(task_api.RetryRequested) as caught:
+        task_api.process_batch(command, rt)
+    assert [entry["content"] for entry in rt.envelopes()] == ["retained input"]
+    details = rt.details()
+    assert any(item.entry.kind == ("buffer" if boundary == "lock" else "staging") for item in details)
+    assert rt.agent.calls == rt.outbound_broker.calls == rt.transport.calls == []
+    monkeypatch.setattr(rt, "session_factory", original)
+    if boundary == "sql":
+        assert caught.value.command.staging_id == command.batch_id
+        rt.clock.advance(timedelta(seconds=45))
+    assert task_api.process_batch(caught.value.command, rt) is task_api.ProcessingOutcome.PROCESSED
+    assert len(rt.agent.calls) == 1
+
+
+@pytest.mark.parametrize("_case", [None], ids=["flow-35-authenticated-duplicate-effects"])
+def test_authenticated_duplicate_has_one_buffer_result_and_local_effect_set(main_module, admin_runtime, task_api, _case):
+    rt = admin_runtime
+    for _ in range(2):
+        assert webhook(main_module, text="one synthetic input", message_id="same-provider-id").status_code == 200
+    assert len(rt.envelopes()) == 1
+    command = rt.processing_broker.calls[0]
+    assert task_api.process_batch(command, rt) is task_api.ProcessingOutcome.PROCESSED
+    assert task_api.process_batch(command, rt) is task_api.ProcessingOutcome.TERMINAL
+    assert len(rt.agent.calls) == len(rt.outbound_broker.calls) == 1
+    assert sum(session.events.count("commit_entered") for session in rt.sessions) == 1
+    assert task_api.send_outbound(rt.outbound_broker.calls[0], rt) is task_api.SendOutcome.SENT
+    assert len(rt.transport.calls) == 1
+
+
+@pytest.mark.parametrize("_case", [None], ids=["flow-44-paused-id-retained-after-expiry"])
+def test_dropped_id_remains_terminal_after_long_pause_without_retaining_text(main_module, admin_runtime, _case):
+    rt = admin_runtime
+    with rt.store.contact_lease(PHONE) as lease, rt.session_factory() as db:
+        reference = rt.coordinator.pause_manual(db, PHONE, 30 * 24, "secretary_dashboard_pause", rt.clock.now(), lease, "long-manual")
+    assert webhook(main_module, message_id="long-dropped-id", text="must be discarded").status_code == 200
+    rt.clock.set(reference.paused_until + timedelta(days=1))
+    assert webhook(main_module, message_id="long-dropped-id", text="replay must be discarded").status_code == 200
+    assert rt.processing_broker.calls == rt.agent.calls == rt.outbound_broker.calls == rt.transport.calls == []
+    assert "must be discarded" not in str(rt.store.snapshot())
+
+
+@pytest.mark.parametrize("failure", ["definitive", "ack-loss"], ids=["flow-47-no-provider-replay", "flow-48-broker-ack-before-record"])
+def test_recovery_dispatches_persisted_batch_without_another_inbound(main_module, admin_runtime, task_api, failure):
+    rt = admin_runtime
+    if failure == "definitive":
+        rt.processing_broker.next_result = domain.EnqueueResult.DEFINITIVE_FAILURE
+    else:
+        rt.store.fail_next_atomic("finish_enqueue")
+    assert webhook(main_module, text="recoverable input").status_code == 503
+    command = rt.processing_broker.calls[0]
+    assert [entry["content"] for entry in rt.envelopes()] == ["recoverable input"]
+    rt.processing_broker.next_result = domain.EnqueueResult.CONFIRMED
+    rt.clock.advance(timedelta(seconds=60))
+    assert recovery_api().RecoveryService(rt).run_once(rt.clock.now()).rescheduled == 1
+    assert len(rt.processing_broker.calls) == 2
+    assert all(item.batch_id == command.batch_id for item in rt.processing_broker.calls)
+    assert task_api.process_batch(command, rt) is task_api.ProcessingOutcome.PROCESSED
+    assert task_api.process_batch(command, rt) is task_api.ProcessingOutcome.TERMINAL
+    assert len(rt.agent.calls) == len(rt.outbound_broker.calls) == 1
+
+
+@pytest.mark.parametrize("_case", [None], ids=["flow-49-delayed-past-old-buffer-window"])
+def test_recovery_keeps_delayed_batch_content_inside_dispatch_horizon(processing_runtime, task_api, _case):
+    rt = processing_runtime
+    command = rt.buffer("delayed synthetic input")
+    rt.clock.advance(timedelta(seconds=311))
+    assert recovery_api().RecoveryService(rt).run_once(rt.clock.now()).rescheduled == 1
+    assert [entry["content"] for entry in rt.envelopes()] == ["delayed synthetic input"]
+    assert task_api.process_batch(command, rt) is task_api.ProcessingOutcome.PROCESSED
+    assert rt.agent.calls[0][0] == "delayed synthetic input"
+
+
+@pytest.mark.parametrize("_case", [None], ids=["flow-63-terminal-task-no-content-or-sql"])
+def test_exhausted_task_returns_before_content_sql_model_or_transport(processing_runtime, task_api, monkeypatch, _case):
+    from app.conversation_redis import contact_keys
+    rt = processing_runtime
+    command = rt.buffer()
+    rt.clock.advance(timedelta(seconds=900))
+    assert recovery_api().RecoveryService(rt).run_once(rt.clock.now()).exhausted == 1
+    keys = contact_keys(command.phone)
+    original = rt.store.client.get
+    def metadata_only(key):
+        assert not key.startswith((keys.buffer_prefix, keys.staging_prefix)), "terminal task read content"
+        return original(key)
+    monkeypatch.setattr(rt.store.client, "get", metadata_only)
+    monkeypatch.setattr(rt, "session_factory", lambda: pytest.fail("terminal task opened SQL"))
+    assert task_api.process_batch(command, rt) is task_api.ProcessingOutcome.TERMINAL
+    assert rt.agent.calls == rt.outbound_broker.calls == rt.transport.calls == []
+
+
+@pytest.mark.parametrize("_case", [None], ids=["flow-74-worker-initial-staging-atomicity"])
+def test_worker_initial_staging_faults_never_leave_orphan_claim_or_partial_manifest(session_factory, task_api, _case):
+    from app.simple_config import settings
+    from tests.fakes import ProcessingRuntime
+    config = domain.ConversationConfig.from_settings(settings)
+    baseline = ProcessingRuntime(session_factory, config)
+    command = baseline.buffer()
+    with baseline.store.contact_lease(PHONE) as lease:
+        baseline.store.claim_or_resume_batch(command, baseline.clock.now(), lease)
+    count = baseline.store.client.write_counts["claim_or_resume_batch"]
+    assert count >= 4
+    for index in range(count):
+        rt = ProcessingRuntime(session_factory, config)
+        command = rt.buffer()
+        before = rt.store.contact_snapshot(PHONE), deepcopy(rt.store.client.sets)
+        rt.store.client.fail_write_at = ("claim_or_resume_batch", index)
+        with pytest.raises(task_api.RetryRequested):
+            task_api.process_batch(command, rt)
+        assert (rt.store.contact_snapshot(PHONE), rt.store.client.sets) == before
+        assert rt.agent.calls == rt.outbound_broker.calls == rt.transport.calls == []
+        assert not any("commit_entered" in session.events for session in rt.sessions)
+    assert task_api.process_batch(command, rt) is task_api.ProcessingOutcome.PROCESSED
+
+
+@pytest.mark.parametrize("offset", [0, 1], ids=["flow-72-at-deadline", "flow-72-after-deadline"])
+def test_late_agent_result_is_rejected_while_lease_remains_valid(processing_runtime, task_api, offset):
+    from app.conversation_redis import contact_keys
+    rt = processing_runtime
+    command = rt.buffer()
+    started = rt.clock.now()
+    def delayed_result():
+        rt.clock.set(started + timedelta(seconds=600, microseconds=offset))
+        rt.store.client.expiry[contact_keys(command.phone).lease] = (rt.clock.now() + timedelta(seconds=60)).timestamp()
+    rt.agent.on_prepare = delayed_result
+    with pytest.raises(task_api.RetryRequested):
+        task_api.process_batch(command, rt)
+    assert len(rt.agent.calls) == 1
+    assert not any("flush" in session.events or "commit_entered" in session.events for session in rt.sessions)
+    assert rt.outbound_broker.calls == rt.transport.calls == []
+    assert task_api.process_batch(command, rt) is task_api.ProcessingOutcome.TERMINAL
+    assert not rt.envelopes()
+
+
+@pytest.mark.parametrize("fault,offset", [
+    pytest.param("lease", 0, id="flow-40-lost-after-flush"),
+    pytest.param("deadline", 0, id="flow-73-at-deadline"),
+    pytest.param("deadline", 1, id="flow-73-after-deadline"),
+])
+def test_processing_flush_cannot_cross_failed_commit_authority(processing_runtime, task_api, fault, offset):
+    from app.conversation_redis import contact_keys
+    rt = processing_runtime
+    command = rt.buffer()
+    started = rt.clock.now()
+    def after_flush():
+        key = contact_keys(command.phone).lease
+        if fault == "lease":
+            rt.store.client.values.pop(key)
+        else:
+            rt.clock.set(started + timedelta(seconds=600, microseconds=offset))
+            rt.store.client.expiry[key] = (rt.clock.now() + timedelta(seconds=60)).timestamp()
+    rt.persistent_session_hooks["flush"] = after_flush
+    with pytest.raises(task_api.RetryRequested):
+        task_api.process_batch(command, rt)
+    assert rt.sessions[-1].events.count("flush") == 1
+    assert "rollback" in rt.sessions[-1].events
+    assert "commit_entered" not in rt.sessions[-1].events
+    assert rt.outbound_broker.calls == rt.transport.calls == []
+    if fault == "deadline":
+        assert task_api.process_batch(command, rt) is task_api.ProcessingOutcome.TERMINAL
+
+
+@pytest.mark.parametrize("intent,checkpoint", [
+    pytest.param(domain.AgentIntent.PAUSE_FOR_SECRETARY, "commit_entered", id="flow-39-handoff-commit"),
+    pytest.param(domain.AgentIntent.SAVE_CONTEXT, "commit_entered", id="flow-57-normal-commit"),
+    pytest.param(domain.AgentIntent.SAVE_CONTEXT, "commit_returned", id="state-36-normal-finalization"),
+])
+def test_new_owner_cannot_repeat_sql_or_model_during_old_commit(processing_runtime, task_api, intent, checkpoint):
+    rt = processing_runtime
+    command = rt.buffer()
+    rt.agent.intent = intent
+    observed = []
+    def blocked_commit():
+        rt.clock.advance(timedelta(seconds=61))
+        calls = len(rt.agent.calls), len(rt.outbound_broker.calls), rt.session_calls
+        with pytest.raises(task_api.RetryRequested):
+            task_api.process_batch(command, rt)
+        assert (len(rt.agent.calls), len(rt.outbound_broker.calls), rt.session_calls) == calls
+        observed.append("new owner refused while old commit is still entered")
+    rt.session_hooks[checkpoint] = blocked_commit
+    with pytest.raises(task_api.RetryRequested):
+        task_api.process_batch(command, rt)
+    assert observed == ["new owner refused while old commit is still entered"]
+    assert sum(session.events.count("commit_returned") for session in rt.sessions) == 1
+    assert len(rt.agent.calls) == 1
+    assert rt.outbound_broker.calls == rt.transport.calls == []
+    rt.clock.advance(timedelta(seconds=600))
+    recovery_api().RecoveryService(rt).run_once(rt.clock.now())
+    assert rt.store.is_quarantined(command.phone)
+
+
+@pytest.mark.parametrize("_case", [None], ids=["flow-59-old-model-response"])
+def test_takeover_accepts_only_new_claim_result_after_old_model_returns(processing_runtime, task_api, _case):
+    from threading import Event, Thread
+    from app.conversation_redis import contact_keys
+    rt = processing_runtime
+    command = rt.buffer()
+    entered, return_old = Event(), Event()
+    old_errors = []
+    def model_boundary():
+        if len(rt.agent.calls) == 1:
+            entered.set()
+            assert return_old.wait(5), "new claimant did not finish"
+    rt.agent.on_prepare = model_boundary
+    def old_worker():
+        try:
+            task_api.process_batch(command, rt)
+        except Exception as error:
+            old_errors.append(error)
+    worker = Thread(target=old_worker)
+    worker.start()
+    try:
+        assert entered.wait(5), "old model did not start"
+        rt.store.client.values.pop(contact_keys(command.phone).lease)
+        rt.clock.advance(timedelta(seconds=45))
+        assert task_api.process_batch(command, rt) is task_api.ProcessingOutcome.PROCESSED
+    finally:
+        return_old.set()
+        worker.join(timeout=5)
+    assert not worker.is_alive()
+    assert len(old_errors) == 1 and isinstance(old_errors[0], task_api.RetryRequested)
+    assert len(rt.agent.calls) == 2
+    assert sum(session.events.count("commit_entered") for session in rt.sessions) == 1
+    assert len(rt.outbound_broker.calls) == 1
+    assert rt.transport.calls == []
+
+
+@pytest.mark.parametrize("_case", [None], ids=["flow-64-two-recoverers"])
+def test_two_recoverers_share_one_due_reservation_and_one_winning_batch(processing_runtime, task_api, monkeypatch, _case):
+    from threading import Barrier, Thread
+    rt = processing_runtime
+    command = rt.buffer()
+    rt.clock.advance(timedelta(seconds=60))
+    expected, position = rt.store.recovery_checkpoint()
+    rt.store.save_recovery_checkpoint(expected, (1, *position[1:]))
+    discovered = Barrier(2)
+    original = rt.store.recoverable_batches
+    def same_page(*args, **kwargs):
+        page = original(*args, **kwargs)
+        discovered.wait(timeout=5)
+        return page
+    monkeypatch.setattr(rt.store, "recoverable_batches", same_page)
+    reports, errors = [], []
+    def recover():
+        try:
+            reports.append(recovery_api().RecoveryService(rt, max_pages=1).run_once(rt.clock.now()))
+        except Exception as error:
+            errors.append(error)
+    workers = [Thread(target=recover) for _ in range(2)]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(timeout=8)
+    assert not any(worker.is_alive() for worker in workers)
+    assert errors == []
+    assert len(reports) == 2
+    assert sum(report.rescheduled for report in reports) == 1
+    assert len(rt.processing_broker.calls) == 2
+    assert all(call.batch_id == command.batch_id for call in rt.processing_broker.calls)
+    assert task_api.process_batch(command, rt) is task_api.ProcessingOutcome.PROCESSED
+    assert task_api.process_batch(command, rt) is task_api.ProcessingOutcome.TERMINAL
+    assert len(rt.agent.calls) == len(rt.outbound_broker.calls) == 1
+    assert rt.envelopes() == []
+
+
 @pytest.mark.parametrize("boundary", ["json", "acquire", "finalize_ingress_once", "reserve_enqueue"])
 def test_ready_race_ingress_stops_before_next_effect(main_module, ingress_runtime, monkeypatch, boundary):
     import asyncio
@@ -132,7 +524,8 @@ def test_ready_race_provider_ack_is_not_reclassified_as_retry(processing_runtime
 
 
 @pytest.mark.parametrize("boundary", ["session", "acquire", "authorization", "last_lease_assert"])
-def test_ready_race_sender_stops_before_provider(processing_runtime, task_api, monkeypatch, boundary):
+@pytest.mark.parametrize("_case", [None], ids=["flow-19"])
+def test_ready_race_sender_stops_before_provider(_case, processing_runtime, task_api, monkeypatch, boundary):
     from contextlib import contextmanager
     rt = processing_runtime
     command = rt.buffer()
@@ -1143,7 +1536,8 @@ def test_ready_worker_and_recovery_share_one_composed_runtime(main_module, admin
 
 
 @pytest.mark.parametrize("dependency", list(domain.DependencyName))
-def test_ready_closed_gates_all_phase_one_effects(main_module, admin_runtime, scheduler_module, task_api, monkeypatch, dependency):
+@pytest.mark.parametrize("_case", [None], ids=["flow-69"])
+def test_ready_closed_gates_all_phase_one_effects(_case, main_module, admin_runtime, scheduler_module, task_api, monkeypatch, dependency):
     import asyncio
     api = recovery_api()
     rt = admin_runtime
@@ -1252,7 +1646,8 @@ def test_recovery_committed_without_ack_only_republishes_internal_work(task_api,
 
 
 @pytest.mark.parametrize("staged", [False, True])
-def test_recovery_reschedules_stale_dispatch_without_agent_or_transport(processing_runtime, staged):
+@pytest.mark.parametrize("_case", [None], ids=["flow-75"])
+def test_recovery_reschedules_stale_dispatch_without_agent_or_transport(_case, processing_runtime, staged):
     api = recovery_api()
     rt = processing_runtime
     command = rt.buffer()
@@ -1275,7 +1670,8 @@ def test_recovery_reschedules_stale_dispatch_without_agent_or_transport(processi
 
 
 @pytest.mark.parametrize("staged", [False, True])
-def test_recovery_exhausts_only_at_configured_horizon_and_purges_content(processing_runtime, staged):
+@pytest.mark.parametrize("_case", [None], ids=["flow-70"])
+def test_recovery_exhausts_only_at_configured_horizon_and_purges_content(_case, processing_runtime, staged):
     api = recovery_api()
     rt = processing_runtime
     command = rt.buffer()
@@ -1496,7 +1892,8 @@ def _admin_request(client, action, *, hours=3.5, phone=ADMIN_PHONE):
     return client.delete(f"/api/paused-contacts/{phone}")
 
 
-def test_dashboard_manual_pause_create_extend_unpause_rotates_and_preserves_context(admin_client, admin_runtime, session_factory):
+@pytest.mark.parametrize("_case", [None], ids=["flow-30"])
+def test_dashboard_manual_pause_create_extend_unpause_rotates_and_preserves_context(_case, admin_client, admin_runtime, session_factory):
     from app.models import ConversationContext, PausedContact
     rt = admin_runtime
     rt.seed_contact(ADMIN_PHONE)
@@ -1523,7 +1920,8 @@ def test_dashboard_manual_pause_create_extend_unpause_rotates_and_preserves_cont
 
 
 @pytest.mark.parametrize("action,hours", [("create", 8760), ("extend", 8759)])
-def test_dashboard_manual_pause_accepts_exact_365_day_result(admin_client, admin_runtime, action, hours):
+@pytest.mark.parametrize("_case", [None], ids=["flow-43"])
+def test_dashboard_manual_pause_accepts_exact_365_day_result(_case, admin_client, admin_runtime, action, hours):
     if action == "extend":
         admin_runtime.seed_contact(ADMIN_PHONE, paused_hours=1)
     response = _admin_request(admin_client, action, hours=hours)
@@ -1534,7 +1932,8 @@ def test_dashboard_manual_pause_accepts_exact_365_day_result(admin_client, admin
 
 @pytest.mark.parametrize("action", ["create", "extend"])
 @pytest.mark.parametrize("hours", [0, -1, "24", None, True, float("inf"), 1e308, 10 ** 400, 1e-308, 8760 + 1 / 3600])
-def test_dashboard_manual_pause_rejects_invalid_duration_before_preparation(admin_client, admin_runtime, action, hours):
+@pytest.mark.parametrize("_case", [None], ids=["flow-31"])
+def test_dashboard_manual_pause_rejects_invalid_duration_before_preparation(_case, admin_client, admin_runtime, action, hours):
     rt = admin_runtime
     rt.seed_contact(ADMIN_PHONE, paused_hours=1)
     before = rt.store.contact_snapshot(ADMIN_PHONE)
@@ -1548,7 +1947,8 @@ def test_dashboard_manual_pause_rejects_invalid_duration_before_preparation(admi
     assert not any("commit_entered" in s.events for s in rt.sessions)
 
 
-def test_dashboard_extend_rejects_365_days_plus_one_second_result(admin_client, admin_runtime):
+@pytest.mark.parametrize("_case", [None], ids=["flow-43"])
+def test_dashboard_extend_rejects_365_days_plus_one_second_result(_case, admin_client, admin_runtime):
     rt = admin_runtime
     rt.seed_contact(ADMIN_PHONE, paused_hours=1)
     before = rt.store.contact_snapshot(ADMIN_PHONE)
@@ -1557,7 +1957,8 @@ def test_dashboard_extend_rejects_365_days_plus_one_second_result(admin_client, 
     assert rt.store.contact_snapshot(ADMIN_PHONE) == before
 
 
-def test_dashboard_manual_pause_datetime_overflow_precedes_lease(admin_client, admin_runtime):
+@pytest.mark.parametrize("_case", [None], ids=["flow-43"])
+def test_dashboard_manual_pause_datetime_overflow_precedes_lease(_case, admin_client, admin_runtime):
     rt = admin_runtime
     rt.clock.set(datetime.max.replace(tzinfo=timezone.utc))
     response = _admin_request(admin_client, "create", hours=1)
@@ -1587,7 +1988,8 @@ def test_dashboard_missing_paused_contact_is_404_without_mutation(admin_client, 
 
 
 @pytest.mark.parametrize("message", ["Mensagem sintética", "/pausar", "/pause"])
-def test_test_chat_simulator_uses_central_batch_and_local_capture(admin_client, admin_runtime, session_factory, message):
+@pytest.mark.parametrize("_case", [None], ids=["flow-33"])
+def test_test_chat_simulator_uses_central_batch_and_local_capture(_case, admin_client, admin_runtime, session_factory, message):
     from app.models import ConversationContext, PausedContact
     rt = admin_runtime
     rt.seed_contact(ADMIN_PHONE, paused_hours=5)
@@ -1641,7 +2043,8 @@ def test_reset_simulator_deletes_only_test_state_in_one_fenced_transaction(admin
 
 
 @pytest.mark.parametrize("paused", [False, True])
-def test_scheduler_inactive_context_closes_and_preserves_administrative_pause(scheduler_module, admin_runtime, session_factory, paused):
+@pytest.mark.parametrize("_case", [None], ids=["flow-53"])
+def test_scheduler_inactive_context_closes_and_preserves_administrative_pause(_case, scheduler_module, admin_runtime, session_factory, paused):
     import asyncio
     from app.models import ConversationContext, PausedContact
     rt = admin_runtime
@@ -1665,7 +2068,8 @@ def test_scheduler_inactive_context_closes_and_preserves_administrative_pause(sc
     assert sum(s.events.count("commit_returned") for s in rt.sessions) == 1
 
 
-def test_scheduler_inactive_refresh_at_conditional_delete_preserves_updated_context(scheduler_module, admin_runtime, session_factory):
+@pytest.mark.parametrize("_case", [None], ids=["flow-32"])
+def test_scheduler_inactive_refresh_at_conditional_delete_preserves_updated_context(_case, scheduler_module, admin_runtime, session_factory):
     import asyncio
     from sqlalchemy import update
     from app.models import ConversationContext
@@ -1782,7 +2186,8 @@ def test_reset_rolls_back_context_and_pause_if_appointment_delete_fails(admin_cl
         assert db.query(Appointment).filter_by(patient_phone=SIMULATOR_PHONE).count() == 1
 
 
-def test_scheduler_refresh_after_scan_before_lease_preserves_context(scheduler_module, admin_runtime, session_factory, monkeypatch):
+@pytest.mark.parametrize("_case", [None], ids=["flow-32"])
+def test_scheduler_refresh_after_scan_before_lease_preserves_context(_case, scheduler_module, admin_runtime, session_factory, monkeypatch):
     import asyncio
     from contextlib import contextmanager
     from sqlalchemy import update
@@ -1846,8 +2251,8 @@ def processing_runtime(session_factory, monkeypatch):
 
 
 @pytest.mark.parametrize("intent,kind", [
-    (domain.AgentIntent.SAVE_CONTEXT, domain.OutboundKind.NORMAL),
-    (domain.AgentIntent.PAUSE_FOR_SECRETARY, domain.OutboundKind.TRANSFER_CONFIRMATION),
+    pytest.param(domain.AgentIntent.SAVE_CONTEXT, domain.OutboundKind.NORMAL, id="flow-56-normal-result-sql-output"),
+    pytest.param(domain.AgentIntent.PAUSE_FOR_SECRETARY, domain.OutboundKind.TRANSFER_CONFIRMATION, id="flow-20-nested-transfer"),
     (domain.AgentIntent.CLOSE_CONTEXT, domain.OutboundKind.CLOSURE_CONFIRMATION),
 ])
 def test_process_batch_commits_winning_result_before_enqueue_and_done(task_api, processing_runtime, session_factory, intent, kind):
@@ -1894,7 +2299,8 @@ def test_process_batch_commits_winning_result_before_enqueue_and_done(task_api, 
     assert len(rt.agent.calls) == len(rt.outbound_broker.calls) == 1
 
 
-def test_process_batch_retry_after_result_ready_reuses_result_and_explicit_ids(task_api, processing_runtime):
+@pytest.mark.parametrize("_case", [None], ids=["flow-24"])
+def test_process_batch_retry_after_result_ready_reuses_result_and_explicit_ids(_case, task_api, processing_runtime):
     rt = processing_runtime
     command = rt.buffer()
     rt.store.fail_next_atomic("prepare_mutation")
@@ -1911,7 +2317,8 @@ def test_process_batch_retry_after_result_ready_reuses_result_and_explicit_ids(t
     assert len(rt.agent.calls) == len(rt.outbound_broker.calls) == 1
 
 
-def test_process_batch_sql_commit_then_lost_finalization_never_repeats_dml(task_api, processing_runtime):
+@pytest.mark.parametrize("_case", [None], ids=["flow-58"])
+def test_process_batch_sql_commit_then_lost_finalization_never_repeats_dml(_case, task_api, processing_runtime):
     rt = processing_runtime
     command = rt.buffer()
     rt.store.fail_next_atomic("finalize_committed")
@@ -2322,13 +2729,27 @@ def test_task_wrapper_invalid_payload_never_retries_or_creates_effects(main_modu
     assert processing_runtime.lease_calls == 0
 
 
-def test_task_wrapper_processing_retry_preserves_staging_ids_and_celery_retry(main_module, processing_runtime, task_api, monkeypatch, caplog):
+@pytest.mark.parametrize("fault", [
+    pytest.param("coordination", id="redis-preparation-retry"),
+    pytest.param("sql", id="flow-23-sql-flush-retry"),
+])
+def test_task_wrapper_processing_retry_preserves_staging_ids_and_celery_retry(fault, main_module, processing_runtime, task_api, monkeypatch, caplog):
     from celery.exceptions import Retry
     from tests.fakes import RetryTask
     rt, task = processing_runtime, RetryTask()
     monkeypatch.setattr(main_module.app.state, "conversation_runtime", rt, raising=False)
     command = rt.buffer()
-    rt.store.fail_next_atomic("prepare_mutation")
+    if fault == "coordination":
+        rt.store.fail_next_atomic("prepare_mutation")
+    else:
+        from sqlalchemy.exc import SQLAlchemyError
+        original_flush = Session.flush
+        def fail_once(db, *args, **kwargs):
+            if not (db.new or db.dirty or db.deleted):
+                return original_flush(db, *args, **kwargs)
+            monkeypatch.setattr(Session, "flush", original_flush)
+            raise SQLAlchemyError("synthetic-private-flush-error")
+        monkeypatch.setattr(Session, "flush", fail_once)
     with caplog.at_level(logging.INFO):
         logging.getLogger("unrelated_control").info("visible_control")
         with pytest.raises(Retry):
@@ -2337,6 +2758,7 @@ def test_task_wrapper_processing_retry_preserves_staging_ids_and_celery_retry(ma
     retry = domain.ProcessingCommand.from_payload(task.calls[0]["args"][0])
     assert retry.processing_id and retry.operation_id and retry.staging_id == command.batch_id
     assert task.calls[0]["kwargs"] == {}
+    assert rt.outbound_broker.calls == rt.transport.calls == []
     assert main_module.process_message_task(RetryTask(), retry.to_payload()) == "PROCESSED"
     captured = "\n".join(record.getMessage() for record in caplog.records)
     assert "visible_control" in captured
@@ -2405,7 +2827,8 @@ def test_task_celery_brokers_publish_json_commands_and_keep_task_routes(main_mod
         "app.main.process_message_task": {"queue": "celery"}}
 
 
-def test_process_batch_ack_loss_after_claim_returns_explicit_resume_command(task_api, processing_runtime):
+@pytest.mark.parametrize("_case", [None], ids=["flow-66"])
+def test_process_batch_ack_loss_after_claim_returns_explicit_resume_command(_case, task_api, processing_runtime):
     rt = processing_runtime
     command = rt.buffer()
     def lost():
@@ -2419,7 +2842,8 @@ def test_process_batch_ack_loss_after_claim_returns_explicit_resume_command(task
     assert task_api.process_batch(retry, rt) is task_api.ProcessingOutcome.PROCESSED
 
 
-def test_process_batch_agent_failure_can_retry_only_same_staging_after_claim_expiry(task_api, processing_runtime):
+@pytest.mark.parametrize("_case", [None], ids=["flow-28"])
+def test_process_batch_agent_failure_can_retry_only_same_staging_after_claim_expiry(_case, task_api, processing_runtime):
     rt = processing_runtime
     command = rt.buffer("primeiro lote")
     def failure():
@@ -2454,7 +2878,8 @@ def test_process_batch_lost_ack_reuses_result_without_model_reentry(task_api, pr
 
 
 @pytest.mark.parametrize("fault", ["readiness", "lease", "generation", "session"])
-def test_process_batch_dependency_failure_before_agent_has_no_patient_response(task_api, processing_runtime, fault, monkeypatch):
+@pytest.mark.parametrize("_case", [None], ids=["flow-22"])
+def test_process_batch_dependency_failure_before_agent_has_no_patient_response(_case, task_api, processing_runtime, fault, monkeypatch):
     from app.conversation_redis import contact_keys
     rt = processing_runtime
     command = rt.buffer()
@@ -2489,7 +2914,8 @@ def test_process_batch_mixed_fixed_and_text_keeps_fixed_inputs_out_of_agent(task
     assert "Resposta sintética" in text
 
 
-def test_sender_runs_async_transport_inside_live_lease_and_fresh_session(task_api, processing_runtime):
+@pytest.mark.parametrize("_case", [None], ids=["flow-29"])
+def test_sender_runs_async_transport_inside_live_lease_and_fresh_session(_case, task_api, processing_runtime):
     rt = processing_runtime
     task_api.process_batch(rt.buffer(), rt)
     outbound = rt.outbound_broker.calls[-1]
@@ -2556,7 +2982,8 @@ def webhook(main, **payload_args):
     ("123456789012345@lid", {"senderPn": PHONE + "@c.us"}),
 ])
 @pytest.mark.parametrize("nested", [True, False])
-def test_webhook_identity_normalizes_once_to_one_canonical_lease(main_module, ingress_runtime, monkeypatch, jid, fields, nested):
+@pytest.mark.parametrize("_case", [None], ids=["flow-05"])
+def test_webhook_identity_normalizes_once_to_one_canonical_lease(_case, main_module, ingress_runtime, monkeypatch, jid, fields, nested):
     normalized = []
     original = main_module.normalize_phone
     def normalize(raw):
@@ -2572,7 +2999,14 @@ def test_webhook_identity_normalizes_once_to_one_canonical_lease(main_module, in
     assert ingress_runtime.envelopes()[0]["message_id"] == "synthetic-message-id"
 
 
-@pytest.mark.parametrize("media", [None, "audioMessage", "imageMessage", "videoMessage", "documentMessage", "stickerMessage"])
+@pytest.mark.parametrize("media", [
+    pytest.param(None, id="flow-06-paused-text"),
+    pytest.param("audioMessage", id="flow-07-paused-audio"),
+    pytest.param("imageMessage", id="flow-07-paused-image"),
+    pytest.param("videoMessage", id="flow-07-paused-video"),
+    pytest.param("documentMessage", id="flow-07-paused-document"),
+    pytest.param("stickerMessage", id="flow-07-paused-sticker"),
+])
 def test_webhook_paused_text_and_media_are_dropped_before_batch_and_remain_dropped(main_module, ingress_runtime, media):
     ref = ingress_runtime.pause()
     response = webhook(main_module, media=media, text="synthetic-discarded-content")
@@ -2598,7 +3032,8 @@ def test_webhook_paused_text_and_media_are_dropped_before_batch_and_remain_dropp
 
 
 @pytest.mark.parametrize("alias", ["/pausar", "/pause"])
-def test_webhook_patient_pause_alias_buffers_fixed_help_only_while_active(main_module, ingress_runtime, session_factory, alias):
+@pytest.mark.parametrize("_case", [None], ids=["flow-12"])
+def test_webhook_patient_pause_alias_buffers_fixed_help_only_while_active(_case, main_module, ingress_runtime, session_factory, alias):
     from app.models import PausedContact
     response = webhook(main_module, text=alias)
     assert response.status_code == 200
@@ -2616,7 +3051,10 @@ def test_webhook_patient_pause_alias_buffers_fixed_help_only_while_active(main_m
     assert any(item.body.get("disposition") == "DROPPED" for item in ingress_runtime.details())
 
 
-@pytest.mark.parametrize("alias", ["/pausar", "/pause"])
+@pytest.mark.parametrize("alias", [
+    pytest.param("/pausar", id="flow-13-secretary-pausar"),
+    pytest.param("/pause", id="flow-45-secretary-pause-replay"),
+])
 def test_webhook_secretary_pause_renews_24h_but_duplicate_id_never_renews(main_module, ingress_runtime, session_factory, alias):
     from app.models import PausedContact
     start = ingress_runtime.clock.now()
@@ -2641,7 +3079,8 @@ def test_webhook_secretary_pause_renews_24h_but_duplicate_id_never_renews(main_m
     assert ingress_runtime.processing_broker.calls == []
 
 
-def test_webhook_secretary_pause_retries_same_prepared_operation(main_module, ingress_runtime, monkeypatch, session_factory):
+@pytest.mark.parametrize("_case", [None], ids=["flow-38"])
+def test_webhook_secretary_pause_retries_same_prepared_operation(_case, main_module, ingress_runtime, monkeypatch, session_factory):
     from sqlalchemy.orm import Session
     from app.models import PausedContact
     original = Session.flush
@@ -2670,7 +3109,8 @@ def test_webhook_secretary_pause_retries_same_prepared_operation(main_module, in
     assert sum(item.entry.kind == "mutation" for item in details) == 1
 
 
-def test_webhook_ordinary_origin_from_me_is_ignored_with_terminal_receipt(main_module, ingress_runtime):
+@pytest.mark.parametrize("_case", [None], ids=["flow-54"])
+def test_webhook_ordinary_origin_from_me_is_ignored_with_terminal_receipt(_case, main_module, ingress_runtime):
     response = webhook(main_module, text="Resposta da clínica", from_me=True)
     assert response.status_code == 200
     assert ingress_runtime.lease_calls == 1
@@ -2694,7 +3134,8 @@ def test_webhook_active_media_buffers_only_required_content(main_module, ingress
     assert "synthetic-media-url" not in json.dumps(envelope)
 
 
-def test_webhook_pause_expiry_at_exact_deadline_opens_new_generation(main_module, ingress_runtime, session_factory):
+@pytest.mark.parametrize("_case", [None], ids=["flow-10"])
+def test_webhook_pause_expiry_at_exact_deadline_opens_new_generation(_case, main_module, ingress_runtime, session_factory):
     from app.models import PausedContact
     ref = ingress_runtime.pause()
     ingress_runtime.clock.set(ref.paused_until)
@@ -2706,7 +3147,10 @@ def test_webhook_pause_expiry_at_exact_deadline_opens_new_generation(main_module
         assert db.get(PausedContact, PHONE) is None
 
 
-@pytest.mark.parametrize("failure", [domain.EnqueueResult.DEFINITIVE_FAILURE, domain.EnqueueResult.AMBIGUOUS])
+@pytest.mark.parametrize("failure", [
+    pytest.param(domain.EnqueueResult.DEFINITIVE_FAILURE, id="flow-46-definitive-broker-failure"),
+    pytest.param(domain.EnqueueResult.AMBIGUOUS, id="flow-76-ambiguous-reservation"),
+])
 def test_webhook_broker_failure_keeps_one_batch_and_replay_respects_due_time(main_module, ingress_runtime, failure):
     ingress_runtime.processing_broker.next_result = failure
     response = webhook(main_module)
@@ -2733,7 +3177,8 @@ def test_webhook_broker_failure_keeps_one_batch_and_replay_respects_due_time(mai
     ({"disposition": None}, False),
 ])
 @pytest.mark.parametrize("bypass_shortcut", [False, True])
-def test_webhook_invalid_retained_receipt_fails_closed_before_sql_or_dispatch(
+@pytest.mark.parametrize("_case", [None], ids=["flow-77"])
+def test_webhook_invalid_retained_receipt_fails_closed_before_sql_or_dispatch(_case,
         main_module, ingress_runtime, session_factory, monkeypatch, body_changes, terminal, bypass_shortcut):
     from dataclasses import replace
     from sqlalchemy import event
@@ -2783,7 +3228,8 @@ def test_webhook_invalid_retained_receipt_fails_closed_before_sql_or_dispatch(
 ])
 @pytest.mark.parametrize("bypass_shortcut", [False, True])
 @pytest.mark.parametrize("without_message_id", [False, True])
-def test_webhook_snapshot_corruption_is_not_clean_absence_before_sql(
+@pytest.mark.parametrize("_case", [None], ids=["flow-60"])
+def test_webhook_snapshot_corruption_is_not_clean_absence_before_sql(_case,
         main_module, ingress_runtime, session_factory, monkeypatch, corruption, value, bypass_shortcut, without_message_id):
     from dataclasses import replace
     from sqlalchemy import event
@@ -2840,7 +3286,8 @@ def test_webhook_snapshot_corruption_is_not_clean_absence_before_sql(
         assert ingress_runtime.store.client.operation_calls.get(operation, 0) == operations.get(operation, 0)
 
 
-def test_webhook_virgin_clean_absence_keeps_sql_backed_initialization(main_module, ingress_runtime, session_factory):
+@pytest.mark.parametrize("_case", [None], ids=["flow-60"])
+def test_webhook_virgin_clean_absence_keeps_sql_backed_initialization(_case, main_module, ingress_runtime, session_factory):
     from sqlalchemy import event
 
     before = ingress_runtime.store.snapshot()
@@ -2871,7 +3318,8 @@ def test_webhook_virgin_clean_absence_keeps_sql_backed_initialization(main_modul
     assert len(ingress_runtime.envelopes()) == 1
 
 
-def test_webhook_replay_after_dispatch_deadline_is_terminal_without_rebuffer(main_module, ingress_runtime):
+@pytest.mark.parametrize("_case", [None], ids=["flow-62"])
+def test_webhook_replay_after_dispatch_deadline_is_terminal_without_rebuffer(_case, main_module, ingress_runtime):
     assert webhook(main_module).status_code == 200
     ingress_runtime.clock.advance(timedelta(seconds=900))
     response = webhook(main_module)
@@ -2885,14 +3333,16 @@ def test_webhook_replay_after_dispatch_deadline_is_terminal_without_rebuffer(mai
     assert claim.envelopes == ()
 
 
-def test_webhook_without_message_id_accepts_without_replay_guarantee(main_module, ingress_runtime):
+@pytest.mark.parametrize("_case", [None], ids=["flow-37"])
+def test_webhook_without_message_id_accepts_without_replay_guarantee(_case, main_module, ingress_runtime):
     assert webhook(main_module, message_id=None).status_code == 200
     assert webhook(main_module, message_id=None).status_code == 200
     assert len(ingress_runtime.envelopes()) == 2
 
 
 @pytest.mark.parametrize("operation", ["acquire", "initialize", "finalize_ingress_once"])
-def test_webhook_coordination_failure_is_503_without_legacy_fallback(main_module, ingress_runtime, operation):
+@pytest.mark.parametrize("_case", [None], ids=["flow-21"])
+def test_webhook_coordination_failure_is_503_without_legacy_fallback(_case, main_module, ingress_runtime, operation):
     ingress_runtime.store.fail_next_atomic(operation)
     response = webhook(main_module)
     assert response.status_code == 503
@@ -2968,7 +3418,8 @@ def test_webhook_pause_does_not_block_other_canonical_contact(main_module, ingre
     assert ingress_runtime.envelopes(PHONE) == []
 
 
-def test_webhook_staged_replay_uses_processing_deadline_not_old_dispatch_deadline(main_module, ingress_runtime):
+@pytest.mark.parametrize("_case", [None], ids=["flow-71"])
+def test_webhook_staged_replay_uses_processing_deadline_not_old_dispatch_deadline(_case, main_module, ingress_runtime):
     assert webhook(main_module).status_code == 200
     command = ingress_runtime.processing_broker.calls[0]
     ingress_runtime.clock.advance(timedelta(seconds=850))

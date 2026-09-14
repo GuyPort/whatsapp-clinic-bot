@@ -4,6 +4,81 @@ from datetime import datetime, timedelta, timezone
 from threading import Condition, RLock, current_thread
 from copy import deepcopy
 import json
+from contextlib import contextmanager
+
+
+class ConversationResources:
+    """Per-test ownership of disposable SQL, Redis and fake external calls.
+
+    Live owners and transactions are checked before disposal. Retryable claims
+    intentionally left by a crash test are destroyed with that test's private
+    Redis world; this never runs recovery or clears a production fence.
+    """
+    def __init__(self):
+        self.sessions, self.clients, self.waiters, self.recorders = [], [], [], []
+        self.active_network_calls = 0
+        self.active_leases = 0
+        self.lock = RLock()
+
+    @contextmanager
+    def network_call(self):
+        with self.lock:
+            self.active_network_calls += 1
+        try:
+            yield
+        finally:
+            with self.lock:
+                self.active_network_calls -= 1
+
+    def assert_idle(self):
+        assert not any(session.in_transaction() for session in self.sessions), "open SQL transaction"
+        assert self.active_network_calls == 0, "pending fake network call"
+        assert not any(waiter.worker and waiter.worker.is_alive() for waiter in self.waiters), "live heartbeat"
+        for client in self.clients:
+            with client.lock:
+                client._expire()
+                assert not any(key.endswith(":lease") for key in client.values), "live lease"
+
+    def settle_expiring_owners(self):
+        """Fault tests may prevent Redis release; expire TTLs on the fake clock.
+
+        This is fixture cleanup, after all owners/heartbeats/calls have returned.
+        It cannot hide a live critical section or run any production operation.
+        """
+        assert self.active_leases == 0, "live lease context"
+        assert self.active_network_calls == 0, "pending fake network call"
+        assert not any(waiter.worker and waiter.worker.is_alive() for waiter in self.waiters), "live heartbeat"
+        for client in self.clients:
+            deadlines = [deadline for key, deadline in client.expiry.items() if key.endswith(":lease")]
+            if deadlines:
+                terminal = datetime.fromtimestamp(max(deadlines), timezone.utc)
+                if terminal > client.clock.now():
+                    client.clock.set(terminal)
+                client._expire()
+
+    def dispose(self):
+        self.assert_idle()
+        for client in self.clients:
+            with client.lock:
+                for name in ("values", "sets", "expiry", "before_operation", "after_operation"):
+                    getattr(client, name).clear()
+                client.before_atomic = None
+        for recorder in self.recorders:
+            for name in ("calls", "responses"):
+                value = getattr(recorder, name, None)
+                if isinstance(value, list):
+                    value.clear()
+            for name in ("on_create", "on_prepare", "on_enqueue", "on_send"):
+                if hasattr(recorder, name):
+                    setattr(recorder, name, None)
+        # No live claim, payload, callback or retained fake-call value crosses tests.
+        assert all(not client.values and not client.sets and not client.expiry for client in self.clients)
+        assert all(not getattr(recorder, "calls", ()) and not getattr(recorder, "responses", ())
+                   for recorder in self.recorders)
+        self.sessions.clear()
+        self.clients.clear()
+        self.waiters.clear()
+        self.recorders.clear()
 
 
 class ManualClock:

@@ -16,6 +16,24 @@ pytestmark = pytest.mark.usefixtures("conversation_security_boundaries")
 DEPENDENCY_NAMES = ("secret", "sql", "redis", "epoch", "broker")
 
 
+@pytest.mark.parametrize("relative", [".env.phase-one-nonexistent-tripwire", "data/phase-one-nonexistent-tripwire.json"])
+@pytest.mark.parametrize("reader", ["builtin", "path", "os"])
+def test_phase_one_harness_blocks_direct_sensitive_reads(relative, reader):
+    """Bypassing load_dotenv or a model loader must still stop before file IO."""
+    import os
+
+    target = Path(__file__).parents[1] / relative
+    assert not target.exists(), "the synthetic tripwire must never name real data"
+    with pytest.raises(AssertionError, match="sensitive_file forbidden"):
+        if reader == "builtin":
+            with open(target, encoding="utf-8"):
+                pass
+        elif reader == "path":
+            target.read_bytes()
+        else:
+            os.close(os.open(target, os.O_RDONLY))
+
+
 class _RecordCapture(logging.Handler):
     def __init__(self):
         super().__init__()
@@ -23,6 +41,50 @@ class _RecordCapture(logging.Handler):
 
     def emit(self, record):
         self.records.append(record)
+
+
+@pytest.mark.parametrize("resource", ["sql", "lease", "network"])
+def test_phase_one_cleanup_detects_live_resources_before_disposal(session_factory, resource):
+    """Removing any teardown check must expose an intentionally held resource."""
+    from tests import fakes
+    from tests.test_conversation_concurrency import make_store
+    from sqlalchemy import text
+
+    ledger_type = getattr(fakes, "ConversationResources", None)
+    assert ledger_type is not None, "missing suite-wide resource cleanup contract"
+    ledger = ledger_type()
+    if resource == "sql":
+        with session_factory() as session:
+            ledger.sessions.append(session)
+            session.execute(text("SELECT 1"))
+            with pytest.raises(AssertionError, match="open SQL transaction"):
+                ledger.assert_idle()
+    elif resource == "lease":
+        store = make_store()
+        ledger.clients.append(store.client)
+        with store.contact_lease("5551999990000"):
+            with pytest.raises(AssertionError, match="live lease"):
+                ledger.assert_idle()
+    else:
+        with ledger.network_call():
+            with pytest.raises(AssertionError, match="pending fake network call"):
+                ledger.assert_idle()
+    ledger.assert_idle()
+    ledger.dispose()
+
+
+def test_phase_one_guards_deny_dns_and_sqlite_attach_without_external_io():
+    import socket
+    import sqlite3
+
+    # A numeric host does no DNS/network even before the guard is implemented.
+    with pytest.raises(AssertionError, match="network forbidden"):
+        socket.getaddrinfo("192.0.2.1", 9, flags=socket.AI_NUMERICHOST)
+    with sqlite3.connect(":memory:") as connection:
+        # Use memory in RED too; never attempt an ATTACH of a real file.
+        with pytest.raises(sqlite3.DatabaseError, match="not authorized"):
+            connection.execute("ATTACH DATABASE ':memory:' AS forbidden_attachment")
+        assert connection.execute("SELECT 1").fetchone() == (1,)
 
 
 def test_security_module_collection_has_no_pre_guard_application_imports(monkeypatch):
@@ -466,6 +528,12 @@ def test_conversation_audit_sentinel_capture_covers_all_operational_paths(
         "PRIVATE-BASIC-USER-85", "PRIVATE-BASIC-PASSWORD-86",
         "PRIVATE-PROMPT-OUTPUT-87", "PRIVATE-BOUNDARY-EXCEPTION-88",
     )
+    from app.conversation_redis import contact_digest
+    coordination_sentinels = (
+        str(rt.store.config.coordination_epoch), contact_digest(phone),
+        phone + "@s.whatsapp.net", hashlib.sha256(sentinels[2].encode()).hexdigest(),
+        "PRIVATE-SIGNATURE", "SIGNATURE-84", "PRIVATE-BASIC-PASSWORD", "PASSWORD-86",
+    )
 
     def agent_result(message, contact, snapshot):
         return AgentResult(sentinels[8], snapshot.messages, snapshot.current_flow,
@@ -518,7 +586,7 @@ def test_conversation_audit_sentinel_capture_covers_all_operational_paths(
     application_records = [record for record in caplog.records
                            if record.name.startswith("app.") or record.name == scheduler_module.logger.name]
     captured = _serialized_application_records(application_records)
-    for sentinel in sentinels:
+    for sentinel in (*sentinels, *coordination_sentinels):
         normalized = "".join(character for character in sentinel.lower() if character.isalnum())
         assert sentinel not in captured
         assert sentinel.lower() not in captured.lower()
@@ -536,8 +604,50 @@ def test_conversation_audit_sentinel_capture_covers_all_operational_paths(
     assert "unaffected_control" in caplog.text
 
 
+def test_celery_import_initialization_and_probe_keep_secrets_out_of_audit(
+        main_module, ingress_runtime, monkeypatch, caplog):
+    """The real initializer/probe must not log even partial broker credentials."""
+    import celery
+    from app.simple_config import settings
+
+    credentials = "CELERY-PRIVATE-PREFIX-941-CELERY-PRIVATE-SUFFIX-942"
+    broker_url = f"redis://synthetic:{credentials}@synthetic.invalid/0"
+    exception = "CELERY-PRIVATE-EXCEPTION-943"
+    configured = []
+
+    class FakeCelery:
+        def __init__(self, *args, **kwargs):
+            self.conf = {}
+            configured.append(kwargs)
+
+        def connection_for_read(self, **kwargs):
+            raise RuntimeError(exception + broker_url)
+
+    monkeypatch.setattr(settings, "redis_url", broker_url)
+    monkeypatch.setattr(celery, "Celery", FakeCelery)
+    with caplog.at_level(logging.DEBUG):
+        spec = importlib.util.spec_from_file_location(
+            "app.synthetic_celery_privacy", Path(__file__).parents[1] / "app" / "celery_app.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        assert module.probe_broker(module.celery_app) is False
+        assert call_webhook(main_module, webhook_payload(text="/pausar", from_me=True))[0].status_code == 200
+    assert configured == [{"broker": broker_url, "backend": broker_url}]
+    records = [record for record in caplog.records if record.name.startswith("app.")]
+    assert any(record.name == "app.synthetic_celery_privacy"
+               and record.getMessage() == "conversation_celery_configured" for record in records)
+    audit = [record.audit for record in records if hasattr(record, "audit")]
+    assert any(row["event"] == "transition" and row["outcome"] == "applied" for row in audit)
+    _assert_sensitive_fragments_absent(records, (
+        broker_url, credentials, "CELERY-PRIVATE-PREFIX-941", "CELERY-PRIVATE-SUFFIX-942", exception,
+        str(ingress_runtime.store.config.coordination_epoch), "synthetic-message-id",
+        hashlib.sha256(b"synthetic-message-id").hexdigest(), "5551999990000"))
+    configured.clear()
+
+
 @pytest.mark.parametrize("failed", [None, "secret", "sql", "redis", "epoch", "broker"])
-def test_ready_endpoint_exact_shape_and_health_never_probes(app_client, ingress_runtime, failed):
+@pytest.mark.parametrize("_case", [None], ids=["flow-67"])
+def test_ready_endpoint_exact_shape_and_health_never_probes(_case, app_client, ingress_runtime, failed):
     from app.conversation_state import DependencyName
     if failed:
         ingress_runtime.dependencies[DependencyName(failed)] = False
@@ -657,7 +767,8 @@ def test_epoch_cli_import_and_rejected_args_never_construct_dependencies(monkeyp
 
 
 @pytest.mark.parametrize("fault", ["owner", "cas_race", "acl", "acl_missing", "persistence", "same", "invalid"])
-def test_epoch_rotation_rejects_faults_before_any_write_and_invalidates_owner(fault):
+@pytest.mark.parametrize("_case", [None], ids=["state-30"])
+def test_epoch_rotation_rejects_faults_before_any_write_and_invalidates_owner(_case, fault):
     from dataclasses import replace
     from uuid import UUID
     from app.simple_config import settings
@@ -717,7 +828,8 @@ def test_recovery_mutation_pages_only_expired_ids_and_terminal_index_is_empty(ad
 @pytest.mark.parametrize("fault,code,output", [(None, 0, "succeeded"), ("confirmation", 2, "rejected"),
     ("invalid", 2, "rejected"), ("same", 2, "rejected"), ("config", 2, "rejected"),
     ("cas", 3, "failed"), ("dependency", 3, "failed"), ("attestation", 3, "failed")])
-def test_epoch_rotation_cli_is_injected_guarded_cas_and_sanitized(fault, code, output, capsys):
+@pytest.mark.parametrize("_case", [None], ids=["flow-52"])
+def test_epoch_rotation_cli_is_injected_guarded_cas_and_sanitized(_case, fault, code, output, capsys):
     from dataclasses import replace
     from uuid import UUID
     from app.simple_config import settings
@@ -770,7 +882,8 @@ def webhook_payload(*args, **kwargs):
 
 @pytest.mark.parametrize("method,path", [("GET", "/test/chat"), ("POST", "/test/chat"), ("POST", "/test/reset")])
 @pytest.mark.parametrize("auth", [None, ("synthetic-admin", "wrong-password")])
-def test_test_chat_reset_auth_precedes_state_agent_and_body(admin_client, admin_runtime, method, path, auth):
+@pytest.mark.parametrize("_case", [None], ids=["flow-33"])
+def test_test_chat_reset_auth_precedes_state_agent_and_body(_case, admin_client, admin_runtime, method, path, auth):
     rt = admin_runtime
     before = rt.store.snapshot()
     response = admin_client.request(method, path, auth=auth, content="{malformed")
@@ -782,7 +895,8 @@ def test_test_chat_reset_auth_precedes_state_agent_and_body(admin_client, admin_
 
 @pytest.mark.parametrize("route", ["create", "extend", "unpause", "test_chat", "reset"])
 @pytest.mark.parametrize("dependency", DEPENDENCY_NAMES)
-def test_dashboard_test_chat_reset_readiness_precedes_content_lease_sql(admin_runtime, main_module, route, dependency):
+@pytest.mark.parametrize("_case", [None], ids=["flow-68"])
+def test_dashboard_test_chat_reset_readiness_precedes_content_lease_sql(_case, admin_runtime, main_module, route, dependency):
     from tests.test_conversation_flow import ADMIN_PHONE
     from fastapi import HTTPException
     from app.conversation_state import DependencyName
@@ -812,7 +926,8 @@ def test_dashboard_test_chat_reset_readiness_precedes_content_lease_sql(admin_ru
 
 @pytest.mark.parametrize("action", ["create", "extend", "unpause", "test_chat", "reset"])
 @pytest.mark.parametrize("failure", ["lease", "database", "commit", "lease_loss"])
-def test_dashboard_simulator_reset_failure_is_closed_and_sanitized(admin_client, admin_runtime, session_factory, caplog, action, failure):
+@pytest.mark.parametrize("_case", [None], ids=["flow-34"])
+def test_dashboard_simulator_reset_failure_is_closed_and_sanitized(_case, admin_client, admin_runtime, session_factory, caplog, action, failure):
     from tests.test_conversation_flow import ADMIN_PHONE, SIMULATOR_PHONE, _admin_request
     from app.models import ConversationContext, PausedContact, Appointment
     rt = admin_runtime
@@ -954,7 +1069,8 @@ def call_webhook(main, payload=None, **kwargs):
 
 
 @pytest.mark.parametrize("signature", [None, "wrong", "", "synthetic-webhook-secret-extra", "assinatura-ç"])
-def test_webhook_invalid_signature_never_reads_body_or_probes(main_module, ingress_runtime, signature):
+@pytest.mark.parametrize("_case", [None], ids=["flow-01"])
+def test_webhook_invalid_signature_never_reads_body_or_probes(_case, main_module, ingress_runtime, signature):
     response, request = call_webhook(main_module, signature=signature, json_error=AssertionError("body read"))
     assert response.status_code == 401
     assert json.loads(response.body) == {"status": "unauthorized"}
@@ -962,7 +1078,8 @@ def test_webhook_invalid_signature_never_reads_body_or_probes(main_module, ingre
     assert ingress_runtime.session_calls == 0
 
 
-def test_webhook_missing_secret_precedes_signature_and_body(main_module, ingress_runtime, monkeypatch):
+@pytest.mark.parametrize("_case", [None], ids=["flow-02"])
+def test_webhook_missing_secret_precedes_signature_and_body(_case, main_module, ingress_runtime, monkeypatch):
     monkeypatch.setattr(main_module.settings, "webhook_secret", None)
     response, request = call_webhook(main_module, signature="wrong", json_error=AssertionError("body read"))
     assert response.status_code == 503
@@ -971,7 +1088,8 @@ def test_webhook_missing_secret_precedes_signature_and_body(main_module, ingress
 
 
 @pytest.mark.parametrize("dependency", DEPENDENCY_NAMES)
-def test_webhook_readiness_precedes_json_lease_and_sql(main_module, ingress_runtime, dependency):
+@pytest.mark.parametrize("_case", [None], ids=["flow-68"])
+def test_webhook_readiness_precedes_json_lease_and_sql(_case, main_module, ingress_runtime, dependency):
     from app.conversation_state import DependencyName
     dependency = DependencyName(dependency)
     ingress_runtime.dependencies[dependency] = False
@@ -989,7 +1107,8 @@ def test_webhook_unconfigured_runtime_is_closed_before_json(main_module):
     assert request.json_calls == 0
 
 
-def test_webhook_signature_uses_constant_time_comparison(main_module, ingress_runtime, monkeypatch):
+@pytest.mark.parametrize("_case", [None], ids=["flow-03"])
+def test_webhook_signature_uses_constant_time_comparison(_case, main_module, ingress_runtime, monkeypatch):
     original = main_module.secrets.compare_digest
     comparisons = []
     def compare(left, right):
@@ -1008,7 +1127,8 @@ def test_webhook_signature_uses_constant_time_comparison(main_module, ingress_ru
     ("1234567890123@lid", {"senderPn": "1234567890123@g.us"}),
     ("1234567890123@unknown", {}),
 ])
-def test_webhook_rejects_raw_group_newsletter_lid_before_normalization(main_module, ingress_runtime, monkeypatch, jid, fields):
+@pytest.mark.parametrize("_case", [None], ids=["flow-04"])
+def test_webhook_rejects_raw_group_newsletter_lid_before_normalization(_case, main_module, ingress_runtime, monkeypatch, jid, fields):
     def forbidden(raw):
         pytest.fail("numeric normalization reached")
     monkeypatch.setattr(main_module, "normalize_phone", forbidden)
@@ -1022,7 +1142,8 @@ def test_webhook_rejects_raw_group_newsletter_lid_before_normalization(main_modu
 
 @pytest.mark.parametrize("raw", ["", "123", "1" * 16, "0551999990000", None, 5551999990000,
     "prefix5551999990000", "5551999990000foo@s.whatsapp.net", "/5551999990000"])
-def test_webhook_invalid_identity_has_no_lease_state_or_task(main_module, ingress_runtime, raw):
+@pytest.mark.parametrize("_case", [None], ids=["flow-05"])
+def test_webhook_invalid_identity_has_no_lease_state_or_task(_case, main_module, ingress_runtime, raw):
     response, _ = call_webhook(main_module, webhook_payload(jid=raw))
     assert response.status_code == 200
     assert json.loads(response.body) == {"status": "ignored"}
