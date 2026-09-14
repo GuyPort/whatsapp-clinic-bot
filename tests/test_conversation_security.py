@@ -25,6 +25,32 @@ class _RecordCapture(logging.Handler):
         self.records.append(record)
 
 
+def test_security_module_collection_has_no_pre_guard_application_imports(monkeypatch):
+    import builtins
+    import sys
+
+    observed = []
+    original_import = builtins.__import__
+    def observing_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "tests.fakes" or name == "app" or name.startswith("app."):
+            observed.append(name)
+        return original_import(name, globals, locals, fromlist, level)
+
+    saved_fakes = sys.modules.pop("tests.fakes", None)
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "synthetic_conversation_security_collection", Path(__file__))
+        module = importlib.util.module_from_spec(spec)
+        with monkeypatch.context() as collection_guard:
+            collection_guard.setattr(builtins, "__import__", observing_import)
+            spec.loader.exec_module(module)
+    finally:
+        sys.modules.pop("tests.fakes", None)
+        if saved_fakes is not None:
+            sys.modules["tests.fakes"] = saved_fakes
+    assert observed == []
+
+
 def test_conversation_audit_payload_is_visible_in_message_only_formatter_and_unrelated_unchanged(
         conversation_security_boundaries):
     from app.utils import AuditEvent, ConversationAuditLogger
@@ -68,6 +94,52 @@ def test_conversation_security_guards_block_external_mutation_and_allow_memory_r
             getattr(guards, name)()
     guards.memory_sql()
     assert "conversation_security_boundaries" in guards.readonly_file()
+
+
+def test_sql_guard_rejects_misleading_memory_query_before_engine_creation(
+        conversation_security_boundaries):
+    import sqlite3
+    import sqlalchemy
+
+    target = Path(__file__).parents[1] / "forbidden-mode-memory-bypass.db"
+    assert not target.exists()
+    unsafe_urls = (
+        f"sqlite:///{target}?mode=memory",
+        f"sqlite:///{target}?mode=memory&uri=true",
+        f"sqlite:///file:{target.name}?mode=memory",
+        f"sqlite:///file:{target.name}?mode=memory&uri=true",
+        f"sqlite:///{target}",
+        "sqlite://?mode=memory",
+        "postgresql://synthetic:synthetic@invalid.local/synthetic",
+    )
+    for url in unsafe_urls:
+        with pytest.raises(AssertionError, match="persistent_sql forbidden"):
+            sqlalchemy.create_engine(url)
+    for database, kwargs in (("", {}),
+                             (f"file:{target.name}?mode=memory", {"uri": True})):
+        with pytest.raises(AssertionError, match="persistent_sql forbidden"):
+            sqlite3.connect(database, **kwargs)
+    assert not target.exists()
+
+
+@pytest.mark.parametrize("url", ("sqlite://", "sqlite:///:memory:"))
+def test_sql_guard_allows_only_literal_memory_engines(
+        conversation_security_boundaries, url):
+    import sqlite3
+    import sqlalchemy
+    from sqlalchemy.pool import StaticPool
+
+    target = Path(__file__).parents[1] / "forbidden-mode-memory-bypass.db"
+    engine = sqlalchemy.create_engine(
+        url, poolclass=StaticPool, connect_args={"check_same_thread": False})
+    try:
+        with engine.connect() as connection:
+            assert connection.exec_driver_sql("SELECT 1").scalar() == 1
+    finally:
+        engine.dispose()
+    with sqlite3.connect(":memory:") as connection:
+        assert connection.execute("SELECT 1").fetchone() == (1,)
+    assert not target.exists()
 
 
 def _serialized_application_records(records):
@@ -686,7 +758,14 @@ def test_epoch_rotation_cli_is_injected_guarded_cas_and_sanitized(fault, code, o
         assert cli.main(args, configured_epoch=new, epoch_store=epoch, dependency_probe=lambda: True) == 3
         assert store.global_epoch_writes == 1
 
-from tests.fakes import WebhookRequest, webhook_payload
+def WebhookRequest(*args, **kwargs):
+    from tests.fakes import WebhookRequest as request_type
+    return request_type(*args, **kwargs)
+
+
+def webhook_payload(*args, **kwargs):
+    from tests.fakes import webhook_payload as payload_factory
+    return payload_factory(*args, **kwargs)
 
 
 @pytest.mark.parametrize("method,path", [("GET", "/test/chat"), ("POST", "/test/chat"), ("POST", "/test/reset")])

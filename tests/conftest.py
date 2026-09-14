@@ -216,14 +216,11 @@ def conversation_security_boundaries(monkeypatch):
     def guarded_create_connection(*args, **kwargs):
         raise AssertionError("network forbidden")
 
-    def safe_sqlite_database(database, *, uri=False):
-        value = str(database)
-        if value in ("", ":memory:"):
-            return True
-        return uri and value.startswith("file:") and "mode=memory" in value
+    def safe_sqlite_database(database):
+        return str(database) == ":memory:"
 
     def guarded_sqlite_connect(database, *args, **kwargs):
-        if not safe_sqlite_database(database, uri=kwargs.get("uri", False)):
+        if not safe_sqlite_database(database):
             raise AssertionError("persistent_sql forbidden")
         return original_sqlite_connect(database, *args, **kwargs)
 
@@ -232,8 +229,8 @@ def conversation_security_boundaries(monkeypatch):
         database = parsed.database
         query = dict(parsed.query)
         safe = (parsed.get_backend_name() == "sqlite"
-                and (database in (None, "", ":memory:")
-                     or query.get("mode") == "memory"))
+                and database in (None, "", ":memory:")
+                and not query)
         if not safe:
             raise AssertionError("persistent_sql forbidden")
         return original_create_engine(url, *args, **kwargs)
