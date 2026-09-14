@@ -713,10 +713,13 @@ class RedisConversationStore:
                         raise ValueError
                     if attempt.phase in (ProcessingPhase.RESULT_READY, ProcessingPhase.APPLYING, ProcessingPhase.DONE) and not staging.body.get("result"):
                         raise ValueError
+                    receipt = None
+                    if "outbound_reservation" in processing.body:
+                        receipt = OutboundReservation.from_payload(processing.body["outbound_reservation"])
                     if "outbound_attempted" in processing.body or "outbound_attempt_id" in processing.body:
-                        receipt = OutboundReservation.from_payload(processing.body.get("outbound_reservation"))
                         attempt_id = processing.body.get("outbound_attempt_id")
                         if (processing.body.get("outbound_attempted") is not True
+                                or receipt is None
                                 or not isinstance(attempt_id, str)
                                 or str(UUID(attempt_id)) != attempt_id
                                 or attempt_id != receipt.reservation_id):

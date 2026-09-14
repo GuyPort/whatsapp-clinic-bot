@@ -775,6 +775,128 @@ def test_recovery_malformed_ack_type_and_asymmetry_controls(processing_runtime, 
                                    boundary, composed, domain.DependencyName.SECRET, corruption)
 
 
+@pytest.mark.parametrize("boundary", ["snapshot", "validation", "claim", "completion", "claim_transition",
+                                      "completion_transition", "claim_atomic", "completion_atomic"])
+@pytest.mark.parametrize("composed", [False, True])
+@pytest.mark.parametrize("dependency", list(domain.DependencyName))
+def test_recovery_present_reservation_without_ack_is_validated(processing_runtime, task_api, monkeypatch, request,
+                                                              boundary, composed, dependency):
+    """Guard the present-reservation branch independently of ACK marker keys."""
+    from app.conversation_redis import ATOMIC_SCRIPT, contact_keys
+    from tests.fakes import compose_recovery_fixture, RecoveryWriteAudit
+    rt = processing_runtime
+    command = rt.buffer()
+    rt.store.fail_next_atomic("complete_batch")
+    with pytest.raises(task_api.RetryRequested):
+        task_api.process_batch(command, rt)
+    rt.clock.advance(timedelta(seconds=61))
+    runtime = compose_recovery_fixture(rt, monkeypatch) if composed else rt
+    store, client, keys = runtime.store, rt.store.client, contact_keys(command.phone)
+    audit = RecoveryWriteAudit(runtime, monkeypatch)
+    audit.witness_outbound(command)
+    sql = observe_recovery_sql(rt, request)
+    effects = (len(rt.agent.calls), len(rt.processing_broker.calls), len(rt.outbound_broker.calls), len(rt.transport.calls))
+    evidence, closed_writes, quarantines = [], [], []
+    def remove_markers():
+        if evidence:
+            return
+        rt.dependencies[dependency] = False
+        key = next(key for key in client.values if key.startswith(keys.processing_prefix))
+        record = json.loads(client.values[key])
+        record["body"].pop("outbound_attempted")
+        record["body"].pop("outbound_attempt_id")
+        record["body"]["outbound_reservation"]["reservation_id"] = "not-a-uuid"
+        client.values[key] = json.dumps(record)
+        evidence.append(({key: value for key, value in client.values.items() if key != keys.lease}, deepcopy(client.sets)))
+    evaluate = client.eval
+    def observe(script, count, *args):
+        result = evaluate(script, count, *args)
+        if script == ATOMIC_SCRIPT:
+            plan = json.loads(args[count])
+            if plan["quarantine"] and result == "generation":
+                quarantines.append(plan["operation"])
+            # A late atomic hook can still submit a stale-fenced attempt; it
+            # must never apply any write after the raw evidence has changed.
+            if (not rt.dependencies[dependency] and result in ("ok", "pending", "generation")
+                    and plan["operation"] not in ("acquire", "assert", "renew", "release")
+                    and (plan["writes"] or plan["deadline_writes"] or plan["quarantine"])):
+                closed_writes.append(plan["operation"])
+        return result
+    monkeypatch.setattr(client, "eval", observe)
+    method = {"snapshot": "_snapshot", "validation": "_validate_batch_details",
+              "claim": "claim_or_resume_batch", "completion": "complete_batch"}.get(boundary, "_transition")
+    target = "complete_batch" if boundary.startswith("completion") else "claim_or_resume_batch"
+    original = getattr(store, method)
+    def intercept(*args, **kwargs):
+        if not boundary.endswith("transition") or kwargs.get("operation") == target:
+            remove_markers()
+        return original(*args, **kwargs)
+    if boundary.endswith("atomic"):
+        client.before_operation[target] = remove_markers
+    else:
+        monkeypatch.setattr(store, method, intercept)
+    closed = recovery_api().RecoveryService(runtime).run_once(rt.clock.now())
+    assert len(evidence) == 1
+    values, indexes = evidence[0]
+    assert {key: value for key, value in client.values.items() if key != keys.lease} == values
+    assert client.sets == indexes
+    assert closed.completed == closed.rescheduled == closed.quarantined == closed.exhausted == 0
+    assert closed_writes == quarantines == sql == audit.violations == []
+    assert effects == (len(rt.agent.calls), len(rt.processing_broker.calls), len(rt.outbound_broker.calls), len(rt.transport.calls))
+    monkeypatch.setattr(store, method, original)
+    rt.dependencies[dependency] = True
+    resumed = recovery_api().RecoveryService(runtime).run_once(rt.clock.now())
+    first_values, first_indexes = dict(client.values), deepcopy(client.sets)
+    writes = dict(client.operation_calls)
+    again = recovery_api().RecoveryService(runtime).run_once(rt.clock.now())
+    assert (resumed.quarantined, resumed.failed, again.quarantined, again.failed) == (1, 0, 0, 0)
+    assert resumed.rescheduled == resumed.completed == resumed.exhausted == 0
+    assert again.rescheduled == again.completed == again.exhausted == 0
+    assert quarantines == ["validate"]
+    assert client.values == first_values and client.sets == first_indexes
+    for operation in ("claim_or_resume_batch", "complete_batch", "reserve_enqueue", "validate"):
+        assert client.operation_calls.get(operation, 0) == writes.get(operation, 0)
+    assert effects == (len(rt.agent.calls), len(rt.processing_broker.calls), len(rt.outbound_broker.calls), len(rt.transport.calls))
+    assert sql == closed_writes == audit.violations == []
+
+
+@pytest.mark.parametrize("composed", [False, True])
+@pytest.mark.parametrize("dependency", list(domain.DependencyName))
+def test_recovery_valid_reservation_without_ack_reschedules_once(processing_runtime, task_api, monkeypatch, request,
+                                                               composed, dependency):
+    from tests.fakes import compose_recovery_fixture, RecoveryWriteAudit
+    rt = processing_runtime
+    command = rt.buffer()
+    rt.store.fail_next_atomic("record_outbound_attempt")
+    with pytest.raises(task_api.RetryRequested):
+        task_api.process_batch(command, rt)
+    rt.clock.advance(timedelta(seconds=61))
+    processing = next(detail for detail in rt.details() if detail.entry.kind == "processing")
+    assert "outbound_reservation" in processing.body
+    assert "outbound_attempted" not in processing.body and "outbound_attempt_id" not in processing.body
+    runtime = compose_recovery_fixture(rt, monkeypatch) if composed else rt
+    client = rt.store.client
+    audit = RecoveryWriteAudit(runtime, monkeypatch)
+    rt.processing_broker.on_enqueue = audit.witness_processing
+    sql = observe_recovery_sql(rt, request)
+    effects = (len(rt.agent.calls), len(rt.processing_broker.calls), len(rt.outbound_broker.calls), len(rt.transport.calls))
+    rt.dependencies[dependency] = False
+    values, indexes = dict(client.values), deepcopy(client.sets)
+    assert recovery_api().RecoveryService(runtime).run_once(rt.clock.now()) == domain.RecoveryReport()
+    assert client.values == values and client.sets == indexes
+    assert effects == (len(rt.agent.calls), len(rt.processing_broker.calls), len(rt.outbound_broker.calls), len(rt.transport.calls))
+    rt.dependencies[dependency] = True
+    resumed = recovery_api().RecoveryService(runtime).run_once(rt.clock.now())
+    assert (resumed.rescheduled, resumed.quarantined, resumed.failed, resumed.completed) == (1, 0, 0, 0)
+    after = len(rt.processing_broker.calls)
+    assert after == effects[1] + 1  # Only the legitimate processing reschedule.
+    again = recovery_api().RecoveryService(runtime).run_once(rt.clock.now())
+    assert again.rescheduled == again.quarantined == again.failed == again.completed == 0
+    assert (len(rt.agent.calls), len(rt.processing_broker.calls), len(rt.outbound_broker.calls), len(rt.transport.calls)) == (
+        effects[0], after, effects[2], effects[3])
+    assert sql == audit.violations == []
+
+
 @pytest.mark.parametrize("ack_path", ["processing_broker", "persisted_outbound"])
 @pytest.mark.parametrize("corrupt", [False, True])
 def test_recovery_ack_records_only_identity_bound_effect_without_destructive_repair(processing_runtime, task_api,
