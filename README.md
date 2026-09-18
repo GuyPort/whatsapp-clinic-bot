@@ -121,9 +121,9 @@ Após definir as variáveis, inicialize o banco executando `python run.py` (ou c
 1. Configure uma sessão na WasenderAPI e conecte o WhatsApp.
 2. Configure o webhook da sessão:
    - URL: `https://seu-dominio.com/webhook/whatsapp`
-   - Eventos: `messages.received` e `message.sent`
+   - Eventos: `messages.received` e `messages.upsert`
 
-O evento `message.sent` é necessário para reconhecer `/pausar` enviado pela secretária no WhatsApp. Mantenha `messages.received` para as mensagens dos pacientes.
+O evento `messages.upsert` permite reconhecer `/pausar` enviado pela secretária no WhatsApp. Mantenha `messages.received` para as mensagens dos pacientes; o bot ignora as entradas repetidas em `messages.upsert`.
 
 #### 3.4 Informações da Clínica
 
@@ -214,7 +214,7 @@ Somente após aplicar a migração reinicie o bot para evitar falhas ao persisti
 1. Copie a URL do seu app no Railway (ex: `https://seu-app.up.railway.app`)
 2. Configure na sessão da WasenderAPI:
    - Webhook URL: `https://seu-app.up.railway.app/webhook/whatsapp`
-   - Eventos: `messages.received` e `message.sent`
+   - Eventos: `messages.received` e `messages.upsert`
 
 ## 📱 Como Usar
 

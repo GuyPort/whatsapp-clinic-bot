@@ -201,31 +201,45 @@ async def health_check():
     }
 
 
+def _handle_outgoing_pause_command(messages: dict):
+    key = messages.get('key') or {}
+    if not isinstance(key, dict) or not key.get('fromMe'):
+        return None
+
+    message_data = messages.get('message') or {}
+    if not isinstance(message_data, dict):
+        return None
+    message_text = (
+        message_data.get('conversation')
+        or (message_data.get('extendedTextMessage') or {}).get('text')
+        or messages.get('messageBody')
+        or ''
+    )
+    if not isinstance(message_text, str) or message_text.strip().lower() not in {'/pausar', '/pause'}:
+        return None
+
+    remote_jid = key.get('remoteJid', '')
+    if not isinstance(remote_jid, str) or not remote_jid or '@newsletter' in remote_jid or '@g.us' in remote_jid:
+        return None
+    patient_jid = remote_jid
+    if '@lid' in remote_jid:
+        patient_jid = key.get('cleanedSenderPn') or key.get('senderPn') or ''
+    patient_phone = normalize_phone(patient_jid)
+    if not patient_phone:
+        return None
+
+    logger.info(f"⏸️ Comando /pausar recebido da secretária para {patient_phone}")
+    with get_db() as db:
+        ai_agent._handle_secretary_pause(db, patient_phone)
+    return {"status": "processed", "action": "secretary_pause", "patient": patient_phone}
+
+
 @app.post("/webhook/whatsapp")
 async def whatsapp_webhook(request: Request):
     """
-    Webhook para receber mensagens do Evolution API.
-    
-    Evolution API envia payloads no formato:
-    {
-        "event": "messages.upsert",
-        "instance": "instance_name",
-        "data": {
-            "key": {
-                "remoteJid": "5511999999999@s.whatsapp.net",
-                "fromMe": false,
-                "id": "message_id"
-            },
-            "message": {
-                "conversation": "texto da mensagem",
-                "extendedTextMessage": {
-                    "text": "texto"
-                }
-            },
-            "messageTimestamp": "1234567890",
-            "pushName": "Nome do Usuário"
-        }
-    }
+    Recebe eventos da WasenderAPI. messages.received traz uma mensagem de
+    entrada em data.messages; messages.upsert pode trazer uma lista de
+    mensagens de entrada e saída. message.sent contém o envio em data.result.
     """
     try:
         payload = await request.json()
@@ -238,9 +252,31 @@ async def whatsapp_webhook(request: Request):
             return {"status": "ignored", "reason": "not a message event"}
         
         data = payload.get('data', {})
-        if event == 'message.sent' and data.get('success') is False:
-            return {"status": "ignored", "reason": "outgoing message failed"}
-        messages = data if event == 'message.sent' else data.get('messages', {})
+        if event == 'messages.upsert':
+            # messages.received cuida da entrada; upsert serve aqui para comandos enviados pela secretária.
+            outgoing = data.get('messages') or []
+            if isinstance(outgoing, dict):
+                outgoing = [outgoing]
+            if not isinstance(outgoing, list):
+                return {"status": "ignored", "reason": "invalid upsert payload"}
+            processed = []
+            for message in outgoing:
+                if isinstance(message, dict):
+                    result = _handle_outgoing_pause_command(message)
+                    if result:
+                        processed.append(result)
+            if len(processed) == 1:
+                return processed[0]
+            if processed:
+                return {"status": "processed", "action": "secretary_pause", "count": len(processed)}
+            return {"status": "ignored", "reason": "no outgoing command"}
+        if event == 'message.sent':
+            if data.get('success') is False:
+                return {"status": "ignored", "reason": "outgoing message failed"}
+            result = _handle_outgoing_pause_command(data.get('result') or data)
+            return result or {"status": "ignored", "reason": "no outgoing command"}
+
+        messages = data.get('messages', {})
         key = messages.get('key', {})
         message_data = messages.get('message', {})
         remote_jid = key.get('remoteJid', '')
@@ -267,19 +303,11 @@ async def whatsapp_webhook(request: Request):
         
         is_from_me = key.get('fromMe', False)
         
-        # Tratar comando /pause da secretária (mensagens enviadas pelo número da clínica)
+        # Tratar eventual mensagem de saída incluída em messages.received.
         if is_from_me:
-            lowered = (message_text or '').strip().lower()
-            if lowered in {"/pausar", "/pause"} and remote_jid and '@newsletter' not in remote_jid and '@g.us' not in remote_jid:
-                patient_jid = remote_jid
-                if '@lid' in remote_jid:
-                    patient_jid = key.get('cleanedSenderPn') or key.get('senderPn') or ''
-                patient_phone = normalize_phone(patient_jid)
-                if patient_phone:
-                    logger.info(f"⏸️ Comando /pause recebido da secretária para {patient_phone}")
-                    with get_db() as db:
-                        ai_agent._handle_secretary_pause(db, patient_phone)
-                    return {"status": "processed", "action": "secretary_pause", "patient": patient_phone}
+            result = _handle_outgoing_pause_command(messages)
+            if result:
+                return result
             # Outras mensagens enviadas por nós devem ser ignoradas
             return {"status": "ignored", "reason": "message from bot"}
         

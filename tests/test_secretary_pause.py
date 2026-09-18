@@ -52,7 +52,7 @@ def database(monkeypatch):
 
 def webhook_payload(message, *, from_me=True):
     return {
-        "event": "messages.upsert",
+        "event": "messages.upsert" if from_me else "messages.received",
         "data": {
             "messages": {
                 "key": {
@@ -115,8 +115,10 @@ def test_secretary_command_in_message_sent_event_pauses_patient(database):
     payload = webhook_payload({"conversation": "/pausar"})
     payload["event"] = "message.sent"
     payload["data"] = {
-        **payload["data"]["messages"],
         "success": True,
+        "jid": f"{PHONE}@s.whatsapp.net",
+        "msgId": "outgoing-command",
+        "result": payload["data"]["messages"],
     }
 
     result = asyncio.run(main.whatsapp_webhook(JsonRequest(payload)))
@@ -132,8 +134,10 @@ def test_failed_message_sent_event_does_not_pause_patient(database):
     payload = webhook_payload({"conversation": "/pausar"})
     payload["event"] = "message.sent"
     payload["data"] = {
-        **payload["data"]["messages"],
         "success": False,
+        "jid": f"{PHONE}@s.whatsapp.net",
+        "msgId": "failed-command",
+        "result": payload["data"]["messages"],
     }
 
     result = asyncio.run(main.whatsapp_webhook(JsonRequest(payload)))
@@ -141,6 +145,65 @@ def test_failed_message_sent_event_does_not_pause_patient(database):
     with database() as db:
         assert db.get(PausedContact, PHONE) is None
     assert result["status"] == "ignored"
+
+
+def test_secretary_command_in_upsert_array_pauses_patient(database):
+    payload = webhook_payload({"conversation": "/pausar"})
+    payload["data"]["messages"] = [payload["data"]["messages"]]
+
+    result = asyncio.run(main.whatsapp_webhook(JsonRequest(payload)))
+
+    with database() as db:
+        pause = db.get(PausedContact, PHONE)
+        assert pause is not None
+        assert pause.reason == "secretary_manual_pause"
+    assert result["action"] == "secretary_pause"
+
+
+def test_upsert_array_processes_each_outgoing_pause(database):
+    other_phone = "5551888888888"
+    first = webhook_payload({"conversation": "/pausar"})["data"]["messages"]
+    second = webhook_payload({"conversation": "/pausar"})["data"]["messages"]
+    second["key"]["remoteJid"] = f"{other_phone}@s.whatsapp.net"
+    payload = {"event": "messages.upsert", "data": {"messages": [first, second]}}
+
+    result = asyncio.run(main.whatsapp_webhook(JsonRequest(payload)))
+
+    with database() as db:
+        assert db.get(PausedContact, PHONE) is not None
+        assert db.get(PausedContact, other_phone) is not None
+    assert result["status"] == "processed"
+
+
+def test_incoming_upsert_does_not_duplicate_received_event(database, monkeypatch):
+    payload = webhook_payload({"conversation": "Olá"}, from_me=False)
+    payload["data"]["messages"]["key"]["id"] = "patient-message"
+    upsert = {
+        "event": "messages.upsert",
+        "data": {"messages": [payload["data"]["messages"]]},
+    }
+    received = {
+        "event": "messages.received",
+        "data": {"messages": payload["data"]["messages"]},
+    }
+    buffered = []
+    monkeypatch.setattr(
+        main.whatsapp_service,
+        "add_message_to_buffer",
+        lambda phone, text, message_id: buffered.append((phone, text, message_id)) or True,
+    )
+    monkeypatch.setattr(
+        main.process_message_task,
+        "apply_async",
+        lambda **kwargs: SimpleNamespace(id="scheduled"),
+    )
+
+    upsert_result = asyncio.run(main.whatsapp_webhook(JsonRequest(upsert)))
+    received_result = asyncio.run(main.whatsapp_webhook(JsonRequest(received)))
+
+    assert upsert_result["status"] == "ignored"
+    assert received_result["status"] == "buffered"
+    assert buffered == [(PHONE, "Olá", "patient-message")]
 
 
 def test_queued_reply_is_not_sent_after_secretary_pauses(database, monkeypatch):
