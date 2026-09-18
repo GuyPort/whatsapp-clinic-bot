@@ -116,14 +116,14 @@ Após definir as variáveis, inicialize o banco executando `python run.py` (ou c
    - Gere uma chave JSON e salve como `google-credentials.json` na raiz
 5. Compartilhe seu Google Calendar com o email da Service Account (com permissão de "Make changes to events")
 
-#### 3.3 Evolution API
+#### 3.3 WasenderAPI
 
-1. Configure sua instância do Evolution API (você pode usar uma instância hospedada ou self-hosted)
-2. Crie uma instância chamada `clinica-bot` (ou o nome definido no .env)
-3. Escaneie o QR code para conectar o WhatsApp
-4. Configure o webhook:
+1. Configure uma sessão na WasenderAPI e conecte o WhatsApp.
+2. Configure o webhook da sessão:
    - URL: `https://seu-dominio.com/webhook/whatsapp`
-   - Events: `messages.upsert`
+   - Eventos: `messages.received` e `message.sent`
+
+O evento `message.sent` é necessário para reconhecer `/pausar` enviado pela secretária no WhatsApp. Mantenha `messages.received` para as mensagens dos pacientes.
 
 #### 3.4 Informações da Clínica
 
@@ -212,9 +212,9 @@ Somente após aplicar a migração reinicie o bot para evitar falhas ao persisti
 ### 3. Configurar Webhook
 
 1. Copie a URL do seu app no Railway (ex: `https://seu-app.up.railway.app`)
-2. Configure no Evolution API:
+2. Configure na sessão da WasenderAPI:
    - Webhook URL: `https://seu-app.up.railway.app/webhook/whatsapp`
-   - Events: `messages.upsert`
+   - Eventos: `messages.received` e `message.sent`
 
 ## 📱 Como Usar
 

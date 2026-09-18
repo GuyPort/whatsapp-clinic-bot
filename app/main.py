@@ -232,13 +232,15 @@ async def whatsapp_webhook(request: Request):
         logger.info(f"Webhook recebido: {payload.get('event')}")
         logger.info(f"Payload completo: {payload}")  # DEBUG: Ver payload completo
         
-        # Verificar se é mensagem recebida (não enviada por nós)
+        # Aceitar mensagens recebidas e eventos de envio da sessão.
         event = payload.get('event', '')
-        if event not in ['messages.upsert', 'messages.received']:
+        if event not in ['messages.upsert', 'messages.received', 'message.sent']:
             return {"status": "ignored", "reason": "not a message event"}
         
         data = payload.get('data', {})
-        messages = data.get('messages', {})
+        if event == 'message.sent' and data.get('success') is False:
+            return {"status": "ignored", "reason": "outgoing message failed"}
+        messages = data if event == 'message.sent' else data.get('messages', {})
         key = messages.get('key', {})
         message_data = messages.get('message', {})
         remote_jid = key.get('remoteJid', '')

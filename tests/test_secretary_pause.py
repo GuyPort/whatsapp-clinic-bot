@@ -111,6 +111,38 @@ def test_secretary_command_uses_patient_number_for_linked_device(database):
     assert result["action"] == "secretary_pause"
 
 
+def test_secretary_command_in_message_sent_event_pauses_patient(database):
+    payload = webhook_payload({"conversation": "/pausar"})
+    payload["event"] = "message.sent"
+    payload["data"] = {
+        **payload["data"]["messages"],
+        "success": True,
+    }
+
+    result = asyncio.run(main.whatsapp_webhook(JsonRequest(payload)))
+
+    with database() as db:
+        pause = db.get(PausedContact, PHONE)
+        assert pause is not None
+        assert pause.reason == "secretary_manual_pause"
+    assert result["action"] == "secretary_pause"
+
+
+def test_failed_message_sent_event_does_not_pause_patient(database):
+    payload = webhook_payload({"conversation": "/pausar"})
+    payload["event"] = "message.sent"
+    payload["data"] = {
+        **payload["data"]["messages"],
+        "success": False,
+    }
+
+    result = asyncio.run(main.whatsapp_webhook(JsonRequest(payload)))
+
+    with database() as db:
+        assert db.get(PausedContact, PHONE) is None
+    assert result["status"] == "ignored"
+
+
 def test_queued_reply_is_not_sent_after_secretary_pauses(database, monkeypatch):
     with database() as db:
         db.add(PausedContact(
