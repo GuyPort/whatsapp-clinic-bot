@@ -2,7 +2,7 @@
 Serviço de integração com Evolution API para WhatsApp.
 """
 import httpx
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Callable
 import logging
 import asyncio
 import redis
@@ -38,7 +38,9 @@ class WhatsAppService:
         logger.info(f"WhatsAppService - instance_name: {self.instance_name}")
         logger.info(f"WhatsAppService - api_key: {self.api_key[:10] if self.api_key else 'None'}...")
     
-    async def send_message(self, phone: str, message: str) -> bool:
+    async def send_message(
+        self, phone: str, message: str, pre_send_check: Optional[Callable[[], bool]] = None
+    ) -> Optional[bool]:
         """
         Envia uma mensagem de texto para um número de WhatsApp.
         Usa Redis Lock para garantir rate limiting de 1 mensagem a cada 5 segundos.
@@ -46,13 +48,16 @@ class WhatsAppService:
         Args:
             phone: Número do telefone (formato: 5511999999999)
             message: Texto da mensagem
+            pre_send_check: Verificação opcional após obter o limite de envio
             
         Returns:
-            True se enviado com sucesso, False caso contrário
+            True se enviado, False se falhou, None se foi suprimido
         """
         # Se Redis não estiver disponível, tenta enviar sem lock (fallback)
         if not self.redis_client:
             logger.warning("⚠️ Redis não disponível, enviando sem rate limiting")
+            if pre_send_check and not pre_send_check():
+                return None
             return await self._send_message_internal(phone, message)
         
         lock_key = "whatsapp:send_message:lock"
@@ -77,6 +82,8 @@ class WhatsAppService:
             # Tentar enviar mensagem (com retry automático para 429)
             max_retries = 3
             for attempt in range(max_retries):
+                if pre_send_check and not pre_send_check():
+                    return None
                 success = await self._send_message_internal(phone, message)
                 
                 if success:

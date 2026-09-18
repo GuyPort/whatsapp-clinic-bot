@@ -269,7 +269,10 @@ async def whatsapp_webhook(request: Request):
         if is_from_me:
             lowered = (message_text or '').strip().lower()
             if lowered in {"/pausar", "/pause"} and remote_jid and '@newsletter' not in remote_jid and '@g.us' not in remote_jid:
-                patient_phone = remote_jid.replace('@s.whatsapp.net', '')
+                patient_jid = remote_jid
+                if '@lid' in remote_jid:
+                    patient_jid = key.get('cleanedSenderPn') or key.get('senderPn') or ''
+                patient_phone = normalize_phone(patient_jid)
                 if patient_phone:
                     logger.info(f"⏸️ Comando /pause recebido da secretária para {patient_phone}")
                     with get_db() as db:
@@ -303,6 +306,8 @@ async def whatsapp_webhook(request: Request):
                 return {"status": "ignored", "reason": "LID without senderPn"}
         else:
             phone = phone.replace('@s.whatsapp.net', '').replace('@c.us', '')
+
+        phone = normalize_phone(phone)
         
         if not phone:
             logger.warning("Mensagem sem telefone")
@@ -310,6 +315,10 @@ async def whatsapp_webhook(request: Request):
 
         if not message_text:
             if media_type:
+                with get_db() as db:
+                    pause = db.query(PausedContact).filter_by(phone=phone).first()
+                    if pause and datetime.utcnow() < pause.paused_until:
+                        return {"status": "ignored", "reason": "contact paused"}
                 # Responde que não processa mídia
                 logger.info(f"Mídia recebida de {phone}: {media_type}")
                 resposta = (
@@ -352,13 +361,15 @@ async def whatsapp_webhook(request: Request):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-def _send_message_sync(phone: str, message: str) -> bool:
+def _send_message_sync(phone: str, message: str, pre_send_check=None):
     """
     Wrapper síncrono para whatsapp_service.send_message (async).
     Usado dentro de tasks Celery que são síncronas.
     """
     try:
-        return asyncio.run(whatsapp_service.send_message(phone, message))
+        return asyncio.run(whatsapp_service.send_message(
+            phone, message, pre_send_check=pre_send_check
+        ))
     except Exception as e:
         logger.error(f"Erro ao enviar mensagem via wrapper síncrono: {str(e)}")
         return False
@@ -376,8 +387,16 @@ def _mark_message_as_read_sync(phone: str, message_id: str) -> bool:
         return False
 
 
+def _can_send_bot_reply(phone: str, allow_handoff: bool = False) -> bool:
+    with get_db() as db:
+        pause = db.query(PausedContact).filter_by(phone=phone).first()
+        if not pause or datetime.utcnow() >= pause.paused_until:
+            return True
+        return allow_handoff and pause.reason == "user_requested_human_assistance"
+
+
 @celery_app.task(bind=True, max_retries=3, default_retry_delay=60)
-def send_message_task(self, phone: str, message: str):
+def send_message_task(self, phone: str, message: str, allow_handoff: bool = False):
     """
     Task Celery dedicada para envio de mensagens para WhatsApp API.
     Esta task é roteada para a fila 'send_queue' e usa rate limiting de 5 segundos.
@@ -385,6 +404,7 @@ def send_message_task(self, phone: str, message: str):
     Args:
         phone: Número do telefone
         message: Texto da mensagem a ser enviada
+        allow_handoff: Permite somente o aviso da transferência criada por esta tarefa
     """
     task_id = self.request.id
     logger.info(f"📤 Task de envio {task_id} iniciada para {phone}")
@@ -392,9 +412,22 @@ def send_message_task(self, phone: str, message: str):
     try:
         # Normalizar telefone
         phone = normalize_phone(phone)
+
+        # Uma resposta pode ter sido enfileirada antes de a secretária pausar o chat.
+        # Consultar o estado novamente imediatamente antes do envio.
+        if not _can_send_bot_reply(phone, allow_handoff):
+            logger.info(f"Envio automático suprimido durante pausa para {phone}")
+            return
         
         # Enviar mensagem usando wrapper síncrono (já tem rate limiting)
-        success = _send_message_sync(phone, message)
+        success = _send_message_sync(
+            phone, message,
+            pre_send_check=lambda: _can_send_bot_reply(phone, allow_handoff),
+        )
+
+        if success is None:
+            logger.info(f"Envio automático suprimido antes do provedor para {phone}")
+            return
         
         if success:
             logger.info(f"✅ Task de envio {task_id} concluída - Mensagem enviada para {phone}")
@@ -479,7 +512,7 @@ def process_message_task(self, phone: str, message_text: str = None, message_id:
                 logger.info(f"Comando /pausar recebido para {phone}")
                 response = ai_agent._handle_request_human_assistance({}, db, phone)
                 if response:
-                    send_message_task.delay(phone, response)
+                    send_message_task.delay(phone, response, True)
                 return
 
         # Verificar se bot está pausado para este telefone
@@ -497,12 +530,21 @@ def process_message_task(self, phone: str, message_text: str = None, message_id:
                     db.delete(paused_contact)
                     db.commit()
 
-        # Processar com IA
-        response = ai_agent.process_message(message_text, phone, db)
+            # Manter a sessão aberta durante a geração e detectar transferência.
+            response = ai_agent.process_message(message_text, phone, db)
+            current_pause = db.query(PausedContact).filter_by(phone=phone).first()
+            allow_handoff = bool(
+                db.info.pop("handoff_created_phone", None) == phone
+                and response
+                and current_pause
+                and current_pause.reason == "user_requested_human_assistance"
+                and datetime.utcnow() < current_pause.paused_until
+            )
         
         # Enfileirar mensagem para envio na fila separada
         if response:
-            send_task = send_message_task.delay(phone, response)
+            args = (phone, response, True) if allow_handoff else (phone, response)
+            send_task = send_message_task.delay(*args)
             logger.info(f"✅ Task {task_id} concluída - Resposta enfileirada para envio (task: {send_task.id})")
         else:
             logger.warning(f"⚠️ Task {task_id} - Nenhuma resposta gerada para {phone}")

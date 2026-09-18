@@ -268,6 +268,7 @@ Após responder qualquer dúvida ou enviar um link:
         except Exception as exc:
             logger.error(f"❌ Erro ao aplicar pausa manual da secretária: {exc}")
             db.rollback()
+            raise
 
     def _is_clinic_open_now(self) -> tuple:
         """Verifica se a clínica está aberta no momento atual"""
@@ -410,6 +411,7 @@ Após responder qualquer dúvida ou enviar um link:
 
         except Exception as e:
             logger.error(f"Erro ao processar mensagem: {str(e)}")
+            db.info.pop("handoff_created_phone", None)
             return "Desculpe, ocorreu um erro. Tente novamente em alguns instantes."
 
     def _process_claude_response(self, response, claude_messages: list, db: Session, phone: str) -> str:
@@ -438,8 +440,8 @@ Após responder qualquer dúvida ou enviar um link:
                 if content.type == "tool_use":
                     tool_result = self._execute_tool(content.name, content.input, db, phone)
 
-                    # end_conversation retorna imediatamente
-                    if content.name == "end_conversation":
+                    # Encerramento e transferência já fornecem a resposta final.
+                    if content.name in {"end_conversation", "request_human_assistance"}:
                         return tool_result
 
                     # Continuar conversa com resultado da tool
@@ -532,12 +534,15 @@ Após responder qualquer dúvida ou enviar um link:
         try:
             logger.info(f"🛑 Tool request_human_assistance chamada para {phone}")
 
+            existing_pause = db.query(PausedContact).filter_by(phone=phone).first()
+            if existing_pause and datetime.utcnow() < existing_pause.paused_until:
+                return ""
+
             # Pausar sempre, independente do horário
             existing_context = db.query(ConversationContext).filter_by(phone=phone).first()
             if existing_context:
                 db.delete(existing_context)
 
-            existing_pause = db.query(PausedContact).filter_by(phone=phone).first()
             if existing_pause:
                 db.delete(existing_pause)
 
@@ -549,6 +554,7 @@ Após responder qualquer dúvida ou enviar um link:
             )
             db.add(paused_contact)
             db.commit()
+            db.info["handoff_created_phone"] = phone
 
             logger.info(f"⏸️ Bot pausado para {phone} até {paused_until}")
 
@@ -567,8 +573,9 @@ Após responder qualquer dúvida ou enviar um link:
 
         except Exception as e:
             logger.error(f"Erro ao pausar bot para humano: {str(e)}")
+            db.info.pop("handoff_created_phone", None)
             db.rollback()
-            return f"Erro ao transferir para humano: {str(e)}"
+            return "Desculpe, não consegui encaminhar sua solicitação agora. Tente novamente em instantes."
 
     def _handle_end_conversation(self, tool_input: Dict, db: Session, phone: str) -> str:
         """Tool: end_conversation - Encerrar conversa e limpar contexto"""
