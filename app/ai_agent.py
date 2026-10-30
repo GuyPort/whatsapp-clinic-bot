@@ -30,6 +30,11 @@ def format_for_whatsapp(texto: str) -> str:
     return re.sub(r"\*{2,}", "", texto)
 
 
+def main_content_block(blocos):
+    """Bloco que decide a resposta: a tool, se o modelo chamou uma (mesmo depois de um texto)"""
+    return next((b for b in blocos if b.type == "tool_use"), blocos[0])
+
+
 def format_closed_days(dias_fechados: List[str]) -> str:
     """Agrupa dias consecutivos e formata bonito"""
     if not dias_fechados:
@@ -448,7 +453,9 @@ Sobre estas férias você DEVE informar o paciente (exceção à regra de DISPON
                     "cache_control": {"type": "ephemeral"}
                 }],
                 messages=claude_messages,
-                tools=self.tools
+                tools=self.tools,
+                # Uma tool por resposta: o follow-up só devolve um tool_result
+                tool_choice={"type": "auto", "disable_parallel_tool_use": True}
             )
 
             # 7. Processar resposta
@@ -479,7 +486,7 @@ Sobre estas férias você DEVE informar o paciente (exceção à regra de DISPON
         if not response.content:
             return "Desculpe, não consegui processar sua mensagem. Tente novamente."
 
-        content = response.content[0]
+        content = main_content_block(response.content)
 
         if content.type == "text":
             return content.text
@@ -492,16 +499,25 @@ Sobre estas férias você DEVE informar o paciente (exceção à regra de DISPON
                 if not current_response.content:
                     break
 
-                content = current_response.content[0]
+                content = main_content_block(current_response.content)
 
                 if content.type == "text":
                     return content.text
 
                 if content.type == "tool_use":
                     tool_result = self._execute_tool(content.name, content.input, db, phone)
+                    texto_modelo = "\n\n".join(
+                        b.text for b in current_response.content if b.type == "text" and b.text.strip()
+                    )
 
-                    # Encerramento e transferência já fornecem a resposta final.
-                    if content.name in {"end_conversation", "request_human_assistance"}:
+                    # Encerramento: a resposta escrita junto com a despedida não se perde
+                    if content.name == "end_conversation":
+                        return texto_modelo or tool_result
+
+                    # Transferência: a mensagem fixa já é a resposta final
+                    if content.name == "request_human_assistance":
+                        if texto_modelo:
+                            logger.info(f"Texto do modelo descartado na transferência de {phone}: {texto_modelo[:200]}")
                         return tool_result
 
                     # Continuar conversa com resultado da tool
