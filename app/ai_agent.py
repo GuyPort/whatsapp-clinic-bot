@@ -2,7 +2,7 @@
 Agente de IA com Claude SDK para tirar dúvidas sobre a clínica.
 Versão simplificada: responde dúvidas e redireciona ações para páginas web.
 """
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import Optional, Dict, Any, List
 import json
 import logging
@@ -17,6 +17,8 @@ from app.models import Appointment, AppointmentStatus, ConversationContext, Paus
 from app.utils import load_clinic_info, normalize_phone, now_brazil, get_brazil_timezone
 
 logger = logging.getLogger(__name__)
+
+DIAS_SEMANA = ['segunda-feira', 'terça-feira', 'quarta-feira', 'quinta-feira', 'sexta-feira', 'sábado', 'domingo']
 
 
 def format_closed_days(dias_fechados: List[str]) -> str:
@@ -199,11 +201,13 @@ Após responder qualquer dúvida ou enviar um link:
         sep = '&' if '?' in base_receita else '?'
         link_receita = f"{base_receita}{sep}tel={phone}" if phone else base_receita
 
-        return (
+        prompt = (
             self.system_prompt
             .replace('__LINK_AGENDAR__', link_agendar)
             .replace('__LINK_RECEITA__', link_receita)
         )
+        # Avaliado a cada mensagem: o system_prompt é montado só no startup
+        return prompt + self._format_vacation_notice(now_brazil().date())
 
     def _define_tools(self) -> List[Dict]:
         """Define as tools disponíveis para o Claude"""
@@ -314,6 +318,51 @@ Após responder qualquer dúvida ou enviar um link:
         """Formata dias fechados"""
         dias_fechados = self.clinic_info.get('dias_fechados', [])
         return format_closed_days(dias_fechados) if dias_fechados else "Nenhum dia especial fechado."
+
+    def _get_vacation(self, today: date) -> Optional[Dict[str, date]]:
+        """Retorna as datas das férias enquanto o aviso vale (até o último dia de férias)"""
+        ferias = self.clinic_info.get('ferias')
+        if not ferias:
+            return None
+        try:
+            datas = {
+                chave: datetime.strptime(ferias[chave], '%d/%m/%Y').date()
+                for chave in ('inicio', 'fim', 'retorno')
+            }
+        except Exception as e:
+            logger.error(f"Erro ao ler férias do clinic_info: {e}")
+            return None
+        if not datas['inicio'] <= datas['fim'] < datas['retorno']:
+            logger.error(f"Férias inconsistentes no clinic_info: {ferias}")
+            return None
+        if today > datas['fim']:
+            return None
+        return datas
+
+    def _format_vacation_notice(self, today: date) -> str:
+        """Bloco do system prompt sobre as férias (vazio depois que elas acabam)"""
+        datas = self._get_vacation(today)
+        if not datas:
+            return ""
+
+        inicio = f"{datas['inicio']:%d/%m/%Y}"
+        fim = f"{datas['fim']:%d/%m/%Y}"
+        retorno = f"{datas['retorno']:%d/%m/%Y}"
+
+        return f"""
+
+[AVISO DE FÉRIAS - TEM PRIORIDADE SOBRE AS REGRAS ACIMA]
+
+Hoje é {DIAS_SEMANA[today.weekday()]}, {today:%d/%m/%Y}.
+
+De {inicio} a {fim} a Dra. Rose está de férias, viajando, e o consultório fica fechado. Os atendimentos voltam em {retorno} ({DIAS_SEMANA[datas['retorno'].weekday()]}).
+
+Sobre estas férias você DEVE informar o paciente (exceção à regra de DISPONIBILIDADE DE DATAS):
+- Marcar consulta (incluindo domiciliar): avise das férias e que os atendimentos voltam em {retorno}; depois envie o link de agendamento normalmente, onde aparecem as datas disponíveis
+- Receita: pode pedir normalmente pelo link; avise que a receita será feita quando a Dra. Rose voltar
+- Se perguntarem se a Dra. está atendendo ou sobre horários neste período: explique as férias e a data de volta
+- Emergência: continue orientando a ligar para a Dra. Rose, como em EMERGÊNCIA
+- Não fale das férias em respostas sem relação com agenda, receita ou atendimento"""
 
     def _format_consultation_prices(self) -> str:
         """Formata preços das consultas"""
@@ -453,7 +502,7 @@ Após responder qualquer dúvida ou enviar um link:
                         extra_body={"output_config": {"effort": "low"}},
                         system=[{
                             "type": "text",
-                            "text": self.system_prompt,
+                            "text": self._get_system_prompt_for(normalize_phone(phone)),
                             "cache_control": {"type": "ephemeral"}
                         }],
                         messages=claude_messages + [
@@ -522,6 +571,13 @@ Após responder qualquer dúvida ou enviar um link:
                     "🚫 Dias especiais sem atendimento:",
                     self._format_closed_days()
                 ])
+
+            ferias = self._get_vacation(now_brazil().date())
+            if ferias:
+                resposta.append(
+                    f"🧳 Férias: Dra. Rose de férias de {ferias['inicio']:%d/%m/%Y} a {ferias['fim']:%d/%m/%Y}, "
+                    f"consultório fechado. Atendimentos voltam em {ferias['retorno']:%d/%m/%Y}."
+                )
 
             return "\n".join(resposta)
 

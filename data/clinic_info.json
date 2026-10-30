@@ -24,6 +24,12 @@
 
   "dias_fechados": [],
 
+  "ferias": {
+    "inicio": "01/11/2026",
+    "fim": "30/11/2026",
+    "retorno": "01/12/2026"
+  },
+
   "periodo_agendamento_manual": [],
   
   
