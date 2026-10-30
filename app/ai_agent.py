@@ -6,6 +6,7 @@ from datetime import date, datetime, timedelta
 from typing import Optional, Dict, Any, List
 import json
 import logging
+import re
 import pytz
 
 from anthropic import Anthropic
@@ -19,6 +20,14 @@ from app.utils import load_clinic_info, normalize_phone, now_brazil, get_brazil_
 logger = logging.getLogger(__name__)
 
 DIAS_SEMANA = ['segunda-feira', 'terça-feira', 'quarta-feira', 'quinta-feira', 'sexta-feira', 'sábado', 'domingo']
+
+
+def format_for_whatsapp(texto: str) -> str:
+    """Troca o negrito markdown (**x**) pelo do WhatsApp (*x*); ** que sobrar é removido"""
+    if not texto:
+        return texto
+    texto = re.sub(r"\*\*([^*\n]+?)\*\*", r"*\1*", texto)
+    return re.sub(r"\*{2,}", "", texto)
 
 
 def format_closed_days(dias_fechados: List[str]) -> str:
@@ -443,7 +452,9 @@ Sobre estas férias você DEVE informar o paciente (exceção à regra de DISPON
             )
 
             # 7. Processar resposta
-            bot_response = self._process_claude_response(response, claude_messages, db, phone)
+            bot_response = format_for_whatsapp(
+                self._process_claude_response(response, claude_messages, db, phone)
+            )
 
             # 8. Salvar resposta no histórico
             context.messages.append({
